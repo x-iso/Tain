@@ -232,20 +232,17 @@ impl Immersive {
             // a session with no way out.
             platform::set_escape_shortcut(self.escape.0, self.escape.1);
             platform::install_key_hook();
-            // Stops this machine acting on Win and Alt+Tab, which the hook
-            // alone cannot be relied on to do — see `suppress_shell_keys`.
-            platform::suppress_shell_keys(true);
             tracing::info!("Immersive mode on — the keyboard goes to the host, pointer confined");
         } else {
-            let (swallowed, passed, reinstalls) = platform::counters();
+            let (swallowed, passed, reinstalls, entered) = platform::counters();
             self.release();
             // Logged here rather than per key, because here it is free.
             // `passed` above zero means the callback ran and chose not to
             // swallow; both at zero means it never ran at all. Those are
             // different faults and the numbers tell them apart.
             tracing::info!(
-                "Immersive mode off — {swallowed} keys taken, {passed} passed through, \
-                 {reinstalls} hook installs"
+                "Immersive mode off — callback entered {entered} times, \
+                 {swallowed} keys taken, {passed} passed through, {reinstalls} hook installs"
             );
         }
     }
@@ -260,7 +257,6 @@ impl Immersive {
         // forwarding, which belongs to the session rather than to this mode —
         // leaving immersive must not stop a plain session sending modifiers.
         platform::remove_key_hook();
-        platform::suppress_shell_keys(false);
         platform::release_cursor();
     }
 
@@ -316,10 +312,6 @@ mod platform {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SystemParametersInfoW, SPI_SETSCREENSAVERRUNNING,
-        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, ClipCursor, GetCursorPos, WindowFromPoint, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
         PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
@@ -455,48 +447,6 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
         matches!(vk, 0x09 | 0x10 | 0x11 | 0x12 | 0xA0..=0xA5)
     }
 
-    /// Stop Windows itself acting on the Win key and Alt+Tab.
-    ///
-    /// # Why this is separate from the hook
-    ///
-    /// Capturing a key and suppressing it are two different problems, and this
-    /// codebase kept conflating them. A low-level hook does both — badly:
-    /// Windows gives its callback a deadline (`LowLevelHooksTimeout`) and
-    /// **silently uninstalls the hook** when it is missed, rather than skipping
-    /// one keystroke. Miss it between an Alt down and its up and the modifier
-    /// is stuck on this machine with nothing to release it, which is exactly
-    /// what the task-switcher staying open without Alt being held looks like.
-    ///
-    /// `SPI_SETSCREENSAVERRUNNING` is the mechanism kiosk software and
-    /// fullscreen games use: while it is set, the shell does not act on Win or
-    /// Alt+Tab at all. Nothing has to be intercepted in time, so there is no
-    /// deadline to miss and no state to get stuck.
-    ///
-    /// It must be cleared again — leaving it set means the screensaver never
-    /// starts — which is why it is tied to the same on/off as the rest of the
-    /// mode, and why `Immersive`'s `Drop` reaches it too.
-    pub fn suppress_shell_keys(active: bool) {
-        let mut previous = windows::Win32::Foundation::BOOL(0);
-        // SAFETY: documented call. The out parameter receives the prior value,
-        // which is not used but must be supplied.
-        let result = unsafe {
-            SystemParametersInfoW(
-                SPI_SETSCREENSAVERRUNNING,
-                u32::from(active),
-                Some(&mut previous as *mut _ as *mut _),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-            )
-        };
-        match result {
-            Ok(()) => tracing::info!(
-                "Shell key handling {} — Win and Alt+Tab {} act on this machine",
-                if active { "suspended" } else { "restored" },
-                if active { "no longer" } else { "again" },
-            ),
-            Err(e) => tracing::warn!("Could not change shell key handling: {e}"),
-        }
-    }
-
     /// Turn plain-session forwarding on or off.
     pub fn set_forwarding(active: bool) {
         FORWARD_ACTIVE.store(active, Ordering::Relaxed);
@@ -572,11 +522,12 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     static PASSED: AtomicU32 = AtomicU32::new(0);
 
     /// What the hook has done so far: swallowed, passed through, reinstalls.
-    pub fn counters() -> (u32, u32, u32) {
+    pub fn counters() -> (u32, u32, u32, u32) {
         (
             SWALLOWED.load(Ordering::Relaxed),
             PASSED.load(Ordering::Relaxed),
             REINSTALLS.load(Ordering::Relaxed),
+            ENTERED.load(Ordering::Relaxed),
         )
     }
 
@@ -594,7 +545,20 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
         bits
     }
 
+    /// Every entry to the callback, before any condition is looked at.
+    ///
+    /// # Why this is counted separately
+    ///
+    /// "0 keys taken, 0 passed through" has two completely different meanings:
+    /// the callback never ran, or it ran and the flags said to do nothing. The
+    /// first is a hook that Windows is not calling; the second is a bug in this
+    /// file. They need opposite fixes, and every counter so far sat *inside* a
+    /// conditional and so could not tell them apart.
+    static ENTERED: AtomicU32 = AtomicU32::new(0);
+
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        ENTERED.fetch_add(1, Ordering::Relaxed);
+
         // Forwarding mode, when immersive is not on. Copied to the host and
         // then handed onward untouched, so this machine behaves exactly as it
         // would with no hook installed at all.
@@ -1032,7 +996,6 @@ mod platform {
     pub fn key_is_down(_vk: u16) -> bool {
         false
     }
-    pub fn suppress_shell_keys(_active: bool) {}
     pub fn drain_captured() -> Vec<(u16, u16, bool, bool)> {
         Vec::new()
     }
