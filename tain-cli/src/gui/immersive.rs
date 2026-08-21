@@ -308,8 +308,6 @@ mod platform {
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
     use std::sync::Mutex;
     use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
-    use windows::Win32::Foundation::HINSTANCE;
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -782,14 +780,23 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
         let previous = HOOK.load(Ordering::Relaxed);
         // SAFETY: a WH_KEYBOARD_LL hook takes no module handle and is delivered
         // to this thread, which pumps messages.
-        // SAFETY: the module handle of this executable, which is what the
-        // documented examples pass. NULL is accepted for low-level hooks, but
-        // this removes one difference from every working sample before the
-        // platform gets blamed for anything.
-        let module = unsafe { GetModuleHandleW(windows::core::PCWSTR::null()) }
-            .map(|m| HINSTANCE(m.0))
-            .unwrap_or_default();
-        match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0) } {
+        // # The module handle must be null here
+        //
+        // This passed `GetModuleHandleW(NULL)` for a while, on the reasoning
+        // that the documented examples supply a module and matching them
+        // removed a variable. It removed the wrong one: the callback stopped
+        // being invoked entirely — `SetWindowsHookExW` kept returning a valid
+        // handle, and Windows simply never called it. The log said "callback
+        // entered 0 times, 2 hook installs", which is what that looks like.
+        //
+        // A non-null module tells Windows the procedure lives in a DLL it
+        // should inject into other processes. Ours is in an executable, so
+        // there is nothing injectable, and the hook is registered but dead.
+        // Low-level hooks do not need injection — they are always called in the
+        // installing thread — so the handle is meaningless and must be null.
+        //
+        // rdev, which is what RustDesk grabs keys with, passes null.
+        match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) } {
             Ok(hook) => {
                 HOOK.store(hook.0 as isize, Ordering::Relaxed);
                 REINSTALLS.fetch_add(1, Ordering::Relaxed);
