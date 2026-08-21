@@ -1,6 +1,5 @@
 # Rust build artifacts
 /target/
-Cargo.lock
 
 # Machine-specific build config (nasm path). See .cargo/config.toml.example.
 /.cargo/config.toml
