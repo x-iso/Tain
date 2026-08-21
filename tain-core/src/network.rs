@@ -268,9 +268,23 @@ impl HostServer {
         *self.endpoint.id().as_bytes()
     }
 
+    /// The relay this host is currently reachable through, if any.
+    ///
+    /// Travels inside every code so a guest never has to look this machine up.
+    /// See `connection_code` for why that lookup is the thing most likely to
+    /// fail on a restricted network.
+    fn home_relay(&self) -> Option<String> {
+        use iroh::Watcher as _;
+        // `get` needs the watcher by value and mutably; it is a snapshot of a
+        // list that is empty until the first relay handshake completes.
+        let mut status = self.endpoint.home_relay_status();
+        status.get().first().map(|relay| relay.url().to_string())
+    }
+
     /// Wrap a secret into a shareable code carrying this host's address.
     fn code_for(&self, typ: PasscodeType, secret: [u8; 32]) -> String {
-        ConnectionCode::new(typ, secret, self.endpoint_id_bytes()).encode()
+        ConnectionCode::with_relay(typ, secret, self.endpoint_id_bytes(), self.home_relay())
+            .encode()
     }
 
     /// Shared session table — lets the GUI observe and control live sessions.
@@ -2096,13 +2110,42 @@ pub struct GuestClient {
 impl GuestClient {
     /// Connect to the host identified by its PublicKey (EndpointId).
     pub async fn connect(host_public_key: &iroh::PublicKey) -> Result<Self> {
+        Self::connect_via(host_public_key, None).await
+    }
+
+    /// Connect, using a relay the code supplied rather than looking one up.
+    ///
+    /// # Why the relay matters more than it looks
+    ///
+    /// An endpoint id is a public key, not an address. With only that, iroh
+    /// asks its lookup service — a DNS query — to translate it. Where that
+    /// query does not return, the connection does not fail: it retries with a
+    /// growing backoff and waits indefinitely, which from outside is an
+    /// application that simply never connects.
+    ///
+    /// A relay in the code removes that step entirely: the guest dials the
+    /// relay and hole punching proceeds from there.
+    pub async fn connect_via(
+        host_public_key: &iroh::PublicKey,
+        relay_url: Option<&str>,
+    ) -> Result<Self> {
         let endpoint = iroh::Endpoint::bind(iroh::endpoint::presets::N0).await?;
         endpoint.online().await;
 
-        // EndpointAddr can be built from just a PublicKey — iroh resolves
-        // relay/direct addresses via its address lookup service.
-        let addr = iroh::EndpointAddr::new(*host_public_key);
-        info!("Connecting to host...");
+        let mut addr = iroh::EndpointAddr::new(*host_public_key);
+        match relay_url.filter(|url| !url.is_empty()) {
+            Some(url) => match url.parse() {
+                Ok(parsed) => {
+                    addr = addr.with_relay_url(parsed);
+                    info!("Connecting to host via {url}");
+                }
+                // A code from a newer or hand-edited build. The lookup path
+                // still exists, so this is a warning rather than a refusal.
+                Err(e) => warn!("Ignoring the relay address in this code ({e}) — looking it up"),
+            },
+            None => info!("Connecting to host (no relay in the code — looking it up)"),
+        }
+
         let conn = endpoint.connect(addr, ALPN).await.context("Failed to connect to host")?;
         info!("Connected to host: {}", conn.remote_id());
 
@@ -2121,7 +2164,12 @@ impl GuestClient {
     /// This is the whole point of the code format: the guest needs no separate
     /// ticket, because the address travels with the secret.
     pub async fn connect_with_code(code: &ConnectionCode) -> Result<Self> {
-        Self::connect_from_bytes(&code.endpoint_id).await
+        let public_key =
+            iroh::PublicKey::from_bytes(&code.endpoint_id).context("Invalid endpoint ID bytes")?;
+        // The relay the host put in the code, so no lookup is needed to find
+        // it. Codes issued before this existed carry none, and fall back to the
+        // lookup path.
+        Self::connect_via(&public_key, code.relay_url.as_deref()).await
     }
 
     /// Take ownership of the underlying connection's stream pair, authenticating first.
