@@ -80,8 +80,6 @@ pub struct Immersive {
     /// Whether modifiers and Tab are being copied to the host outside
     /// immersive mode.
     forwarding: bool,
-    /// Last reported pointer-in-window state, so the OS is told only on change.
-    pointer_inside: bool,
 }
 
 impl Immersive {
@@ -109,16 +107,30 @@ impl Immersive {
         platform::set_escape_shortcut(vk, mods);
     }
 
-    /// Tell the hook whether the pointer is inside the session window.
+    /// End the mode if this application is no longer in front.
     ///
-    /// Called every frame while a session is open. This is the grab region —
-    /// see `platform::POINTER_INSIDE`.
-    pub fn set_pointer_inside(&mut self, inside: bool) {
-        if self.pointer_inside == inside {
-            return;
+    /// # A recovery path, not a gate
+    ///
+    /// The hook swallows unconditionally while the mode is on, so in principle
+    /// nothing can take the foreground away — Alt+Tab goes to the host like
+    /// everything else. In practice the hook can still be removed by Windows
+    /// without warning, a key can leak, and someone can end up in another
+    /// application with immersive mode still armed.
+    ///
+    /// This notices that and switches the mode off. It runs on the UI thread,
+    /// after the fact, where taking a moment costs nothing and where it cannot
+    /// be raced by the keystroke it is reacting to — which is exactly what went
+    /// wrong every time this decision was attempted inside the callback.
+    ///
+    /// Returns true when it ended the mode, so the caller can release whatever
+    /// the host still believes is held.
+    pub fn end_if_backgrounded(&mut self) -> bool {
+        if !self.active || platform::app_has_focus() {
+            return false;
         }
-        self.pointer_inside = inside;
-        platform::set_pointer_inside(inside);
+        tracing::info!("Immersive mode ended — another application came to the front");
+        self.set_active(false);
+        true
     }
 
     /// Whether keys have gone to another application since the last frame.
@@ -186,8 +198,6 @@ impl Immersive {
     pub fn release(&mut self) {
         self.active = false;
         self.applied_clip = None;
-        self.pointer_inside = false;
-        platform::set_pointer_inside(false);
         // Stops the swallowing. Whether the hook itself comes off depends on
         // forwarding, which belongs to the session rather than to this mode —
         // leaving immersive must not stop a plain session sending modifiers.
@@ -253,7 +263,7 @@ mod platform {
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, ClipCursor, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+        CallNextHookEx, ClipCursor, GetCursorPos, WindowFromPoint, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
         PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
         UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE,
         WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -262,25 +272,6 @@ mod platform {
 
     /// The hook callback is a bare C function, so its state has to be static.
     static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
-    /// Whether the pointer is inside the session window.
-    ///
-    /// # The grab region is the window, not the picture
-    ///
-    /// RustDesk grabs when the pointer enters the remote *view*. Copied
-    /// literally that breaks the toolbar, which is drawn over the video here
-    /// and would count as leaving — so reaching for a button would drop the
-    /// grab, and using one would flap it. The whole window counts instead:
-    /// video, toolbar and tabs.
-    ///
-    /// In immersive mode the pointer is clipped to the window anyway, so this
-    /// cannot spuriously go false while the mode is on. That is the property
-    /// that makes the region self-consistent.
-    ///
-    /// The pointer is the right signal because **a keystroke cannot move it**.
-    /// The foreground window can be moved by the very key being judged, which
-    /// is what made every foreground-based gate unwinnable.
-    static POINTER_INSIDE: AtomicBool = AtomicBool::new(false);
-
     /// The six modifier keys, left and right told apart.
     pub const MODIFIER_VKS: [u16; 6] = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
 
@@ -288,22 +279,49 @@ mod platform {
     ///
     /// # Why the OS rather than egui or the hook
     ///
-    /// egui reports modifiers as a state flag on its input, and inside an
-    /// immediate viewport that flag is not dependable — the same context where
-    /// `i.focused` read false while the window was plainly in use. The hook is
-    /// not dependable either, for reasons this file documents at length.
+    /// egui reports modifiers as a state flag, and inside an immediate viewport
+    /// that flag is not dependable — the same context whose `focused` read
+    /// false while the window was plainly in use. The hook is not dependable
+    /// either, for reasons this file documents at length.
     ///
     /// `GetAsyncKeyState` is neither: it asks Windows what is held right now.
-    /// It cannot be stale, it cannot be uninstalled, and it distinguishes left
-    /// from right, which egui cannot express at all.
+    /// It cannot be stale, cannot be uninstalled, and distinguishes left from
+    /// right, which egui cannot express at all.
     pub fn key_is_down(vk: u16) -> bool {
-        // SAFETY: a documented read of global key state; no ownership involved.
+        // SAFETY: a documented read of global key state; nothing is owned.
         (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0
     }
 
-    /// Note whether the pointer is within the session window.
-    pub fn set_pointer_inside(inside: bool) {
-        POINTER_INSIDE.store(inside, Ordering::Relaxed);
+    /// Whether the pointer is over a window belonging to this process.
+    ///
+    /// # Why the OS rather than egui
+    ///
+    /// This used to be egui's pointer position, reported from inside the
+    /// session viewport and pushed down here every frame. That is the third
+    /// thing taken from that viewport's input — after `focused` and
+    /// `modifiers` — and the first two were both wrong in ways that took days
+    /// to find. There is no reason to trust the third.
+    ///
+    /// `WindowFromPoint` answers the question directly and cannot be stale: it
+    /// takes the cursor's real position and names the window under it. Asking
+    /// whether that window belongs to us also covers the main window and any
+    /// popup without having to enumerate rectangles.
+    pub fn pointer_over_our_window() -> bool {
+        // SAFETY: documented reads of global cursor and window state; no
+        // handles are owned or freed here.
+        unsafe {
+            let mut at = POINT::default();
+            if GetCursorPos(&mut at).is_err() {
+                return false;
+            }
+            let window = WindowFromPoint(at);
+            if window.is_invalid() {
+                return false;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(window, Some(&mut pid));
+            pid != 0 && pid == GetCurrentProcessId()
+        }
     }
 
     /// Set when a key arrived while another application was in front.
@@ -544,6 +562,7 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
             if !injected
                 && (pressed || released)
                 && forwardable(vk)
+                && pointer_over_our_window()
                 && app_has_focus()
                 && let Ok(mut queue) = CAPTURED.lock()
                 && queue.len() < MAX_QUEUED_KEYS
@@ -592,35 +611,25 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
             // is typing to a different machine. So this fails closed: nothing
             // is forwarded unless this application is positively identified as
             // the one in front.
-            // # Both conditions, and what each one is for
+            // # Immersive mode takes the keyboard, full stop
             //
-            // The pointer being inside the window is the grab: it says this
-            // session owns the keyboard, and no keystroke can change it.
+            // This was gated on the pointer being inside the window and the
+            // application being in front. Both gates were wrong here, for the
+            // same underlying reason: they are questions about *state that the
+            // key being judged can change*. Pressing Win moves the foreground
+            // before anyone can ask about it. That is what made every gated
+            // version leak the first press.
             //
-            // The foreground check is a safety condition on top, and it is here
-            // for one reason: our suppression is not reliable, so a person can
-            // succeed in leaving with Alt+Tab while the pointer stays sitting
-            // over the window. Without it, everything typed into whatever they
-            // landed in goes to the host — which happened, and is far worse
-            // than any keystroke this drops.
+            // Immersive mode is not a guess about intent. Somebody switched it
+            // on, the toolbar shows it is on, and the pointer is clipped inside
+            // the window for as long as it is. There is nothing left to infer:
+            // while it is on, every key belongs to the host.
             //
-            // Both must hold. The failure direction is deliberate: being wrong
-            // here loses a keystroke, and can never send one to the wrong
-            // machine.
-            let ours = POINTER_INSIDE.load(Ordering::Relaxed) && app_has_focus();
-
-            if !injected && (pressed || released) && !ours {
-                // Not ours to take. Passed through untouched, so the
-                // application actually being used behaves normally.
-                //
-                // Flagged so the UI can release whatever the host still thinks
-                // is held: leaving on a chord means the key-up never gets
-                // forwarded, and a modifier stuck down on the far machine
-                // changes the meaning of everything typed after it.
-                LOST_FOREGROUND.store(true, Ordering::Relaxed);
-                return unsafe { CallNextHookEx(None, code, wparam, lparam) };
-            }
-
+            // Leaving is handled where it belongs — on the UI thread, which
+            // notices the application losing the foreground and switches the
+            // mode off, releasing everything held. That is a recovery path, not
+            // a gate: it runs after the fact, where being slow costs nothing,
+            // and it cannot be raced by the keystroke it is reacting to.
             if !injected && (pressed || released) {
                 note_modifier(vk, pressed);
                 report(vk, pressed, true);
@@ -656,7 +665,7 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     /// decide whether to swallow a key — that is the mistake documented on
     /// [`super::Immersive`], where the key being judged was the one that moved
     /// the foreground.
-    fn app_has_focus() -> bool {
+    pub fn app_has_focus() -> bool {
         // SAFETY: reading our own process id.
         let ours = unsafe { GetCurrentProcessId() };
         foreground_pid() == Some(ours)
@@ -937,7 +946,12 @@ mod platform {
     pub fn take_lost_foreground() -> bool {
         false
     }
-    pub fn set_pointer_inside(_inside: bool) {}
+    pub fn app_has_focus() -> bool {
+        true
+    }
+    pub fn pointer_over_our_window() -> bool {
+        false
+    }
     pub const MODIFIER_VKS: [u16; 6] = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
     pub fn key_is_down(_vk: u16) -> bool {
         false

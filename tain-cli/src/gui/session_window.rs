@@ -208,19 +208,16 @@ impl SessionWindow {
                     actions.close_all = true;
                 }
 
-                // The grab region: the whole window, so reaching for the
-                // toolbar does not release the keyboard. See
-                // `Immersive::set_pointer_inside`.
-                let inside = ctx.input(|i| {
-                    let bounds = i.viewport().inner_rect.or(i.viewport().outer_rect);
-                    match (i.pointer.latest_pos(), bounds) {
-                        (Some(at), Some(rect)) => rect.contains(at),
-                        // No pointer position reported yet: treat as outside, so
-                        // nothing is forwarded on a guess.
-                        _ => false,
+                // If something else came to the front while immersive mode was
+                // on, end it and let go of everything the host thinks is held.
+                if immersive.end_if_backgrounded()
+                    && let Some(session) = sessions.get_mut(self.active_tab)
+                {
+                    session.release_held_keys();
+                    for event in session.modifiers_mut().release_all() {
+                        session.send_input(InputEvent::Key(event));
                     }
-                });
-                immersive.set_pointer_inside(inside);
+                }
 
                 let active_tab_id = sessions.get(self.active_tab).map(|s| s.tab_id);
                 let reserved =
