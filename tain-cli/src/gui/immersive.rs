@@ -80,6 +80,10 @@ pub struct Immersive {
     /// Whether modifiers and Tab are being copied to the host outside
     /// immersive mode.
     forwarding: bool,
+    /// When another application first took the front, if it currently holds it.
+    backgrounded_since: Option<std::time::Instant>,
+    /// Rate limit for [`Immersive::log_foreground`].
+    last_foreground_log: Option<std::time::Instant>,
 }
 
 impl Immersive {
@@ -125,12 +129,66 @@ impl Immersive {
     /// Returns true when it ended the mode, so the caller can release whatever
     /// the host still believes is held.
     pub fn end_if_backgrounded(&mut self) -> bool {
-        if !self.active || platform::app_has_focus() {
+        /// How long another application must hold the front before the mode
+        /// ends.
+        ///
+        /// Not instant, deliberately. The previous version ended the mode on a
+        /// single unfocused frame, using a signal already known to be
+        /// unreliable — the same `GetForegroundWindow` that once named
+        /// explorer.exe while this application was plainly the one in use. One
+        /// wrong reading then switched the whole mode off, which is a far worse
+        /// outcome than the leaked keystroke it was reacting to.
+        const PATIENCE: std::time::Duration = std::time::Duration::from_millis(600);
+
+        if !self.active {
+            self.backgrounded_since = None;
             return false;
         }
-        tracing::info!("Immersive mode ended — another application came to the front");
+
+        if platform::app_has_focus() {
+            self.backgrounded_since = None;
+            return false;
+        }
+
+        let since = *self.backgrounded_since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < PATIENCE {
+            return false;
+        }
+
+        tracing::info!(
+            "Immersive mode ended — another application held the front for {:?} ({})",
+            since.elapsed(),
+            platform::foreground_description(),
+        );
+        self.backgrounded_since = None;
         self.set_active(false);
         true
+    }
+
+    /// Report what the foreground looks like, at most once a second.
+    ///
+    /// # Why this is being measured rather than reasoned about
+    ///
+    /// Every remaining decision here depends on whether `GetForegroundWindow`
+    /// can be trusted, and it has never been checked on its own. It has been
+    /// used as a gate, blamed, removed, restored and blamed again across many
+    /// attempts — on the strength of one log line showing it naming
+    /// explorer.exe at a moment when it should have named this application.
+    ///
+    /// One line a second while the mode is on settles it. If it names this
+    /// process throughout, the signal is fine and the fault is in the hook. If
+    /// it wanders, everything built on it has to go.
+    pub fn log_foreground(&mut self) {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+        if !self.active {
+            return;
+        }
+        let due = self.last_foreground_log.is_none_or(|at| at.elapsed() >= EVERY);
+        if !due {
+            return;
+        }
+        self.last_foreground_log = Some(std::time::Instant::now());
+        tracing::info!("Immersive: foreground is {}", platform::foreground_description());
     }
 
     /// Whether keys have gone to another application since the last frame.
@@ -659,6 +717,21 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 
+    /// The foreground window's process, named, and whether it is ours.
+    ///
+    /// For diagnostics only — nothing keys off this. Names the executable
+    /// rather than a bare process id, because "12748" needed a separate lookup
+    /// last time and by then the process was gone.
+    pub fn foreground_description() -> String {
+        // SAFETY: reading our own process id.
+        let ours = unsafe { GetCurrentProcessId() };
+        match foreground_pid() {
+            Some(pid) if pid == ours => format!("ours (pid {pid})"),
+            Some(pid) => format!("pid {pid} — NOT ours (we are {ours})"),
+            None => "unknown — no foreground window".to_string(),
+        }
+    }
+
     /// Whether this process owns the foreground window.
     ///
     /// Used only by the forwarding path. It is emphatically **not** used to
@@ -948,6 +1021,9 @@ mod platform {
     }
     pub fn app_has_focus() -> bool {
         true
+    }
+    pub fn foreground_description() -> String {
+        "not applicable".to_string()
     }
     pub fn pointer_over_our_window() -> bool {
         false

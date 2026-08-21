@@ -208,6 +208,8 @@ impl SessionWindow {
                     actions.close_all = true;
                 }
 
+                immersive.log_foreground();
+
                 // If something else came to the front while immersive mode was
                 // on, end it and let go of everything the host thinks is held.
                 if immersive.end_if_backgrounded()
