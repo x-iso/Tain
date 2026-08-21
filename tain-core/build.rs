@@ -30,9 +30,17 @@ fn main() {
     }
 
     let Some(dir) = ffmpeg_dir() else {
+        // Named rather than merely described: the fix is one command, and a
+        // warning that says what is missing without saying how to get it just
+        // moves the search somewhere else.
+        //
+        // Deliberately not fetched here. ffmpeg is optional — everything below
+        // is skipped and the crate still builds and still decodes — so a
+        // `cargo build` that quietly downloaded 149 MB would be a surprise,
+        // would fail offline, and would repeat on every clean CI runner.
         println!(
             "cargo:warning=no ffmpeg tree found — building without hardware decode. \
-             Set FFMPEG_DIR or unpack one into third_party/ffmpeg."
+             Run scripts/fetch-ffmpeg.ps1 to download it, or set FFMPEG_DIR \n             to point at an existing shared build."
         );
         return;
     };
