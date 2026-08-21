@@ -1,0 +1,88 @@
+[package]
+name = "tain-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core library for P2P remote desktop protocol, networking, and video pipeline"
+
+[dependencies]
+# Networking - iroh 1.x P2P QUIC connections with NAT traversal (hole punching + relay)
+# Note: iroh uses tokio internally; no feature flag needed — just declare tokio as a dep.
+iroh = "1"
+anyhow = "1"
+thiserror = "2"
+bytes = "1"
+
+# Lossless frame compression. Desktop content is mostly static, so an XOR delta
+# against the previous frame is nearly all zeroes and compresses enormously.
+zstd = "0.13"
+
+# Serialization - binary protocol messages over QUIC streams
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+
+# Async runtime (shared with iroh's tokio integration)
+tokio = { version = "1", features = ["full"] }
+
+# Random number generation for passcodes
+rand = "0.9"
+
+# Compact encoding for connection codes. The "check" feature adds the checksum
+# that makes a truncated or mangled paste fail loudly instead of parsing.
+bs58 = { version = "0.5", features = ["check"] }
+
+# Hex encoding for debug logging of secrets
+hex = "0.4"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+openh264 = "0.9"
+
+# Screen capture backend — windows-capture via scap (optional, pinned to avoid transitive API conflicts)
+# scap = { version = "=0.0.8", optional = true }
+# For now, use StubCapturer as the only backend; real capture can be added when deps align.
+
+# Real input injection (SendInput) and screen capture (DXGI Desktop Duplication).
+[target.'cfg(windows)'.dependencies]
+# The `implement` macro expands to `::windows_core::...` paths, so the crate has
+# to be a direct dependency rather than reached through `windows::core`.
+windows-core = "0.58"
+windows = { version = "0.58", features = [
+    # Implementing IActivateAudioInterfaceCompletionHandler in Rust, for the
+    # asynchronous activation that per-process audio capture requires.
+    "implement",
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # EnumDisplaySettings, for the display's real pixel count.
+    "Win32_Graphics_Gdi",
+    # Decoding the desktop wallpaper for a card picture.
+    "Win32_Graphics_Imaging",
+    # Hardware video encoding via Media Foundation transforms.
+    "Win32_Media_MediaFoundation",
+    # System audio capture via WASAPI loopback, including per-process exclusion.
+    "Win32_Media_Audio",
+    # CreateEventW lives behind Threading but is typed against SECURITY_ATTRIBUTES.
+    "Win32_System_Threading",
+    "Win32_Security",
+    # LoadLibraryW, to probe for a delay-loaded ffmpeg before calling into it.
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+
+# The libavcodec shim is compiled by build.rs with the same MSVC toolchain Rust
+# already needs, which keeps LLVM/bindgen out of the prerequisites.
+[target.'cfg(windows)'.build-dependencies]
+cc = "1"
+# Compressing the ffmpeg runtime into the binary, so a single exe is portable.
+zstd = "0.13"
+
+[features]
+default = []

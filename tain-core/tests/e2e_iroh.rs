@@ -1,0 +1,671 @@
+//! End-to-end test over a real iroh transport.
+//!
+//! The duplex-based tests in `network.rs` cover session logic; this covers the
+//! parts they can't: ALPN negotiation, stream direction (`open_bi` on the guest
+//! vs `accept_bi` on the host), and passcode validation across a real connection.
+//!
+//! Requires network access for the n0 relay, so it is `#[ignore]`d by default:
+//!
+//! ```bash
+//! cargo test -p tain-core --test e2e_iroh -- --ignored --nocapture
+//! ```
+
+use anyhow::{Context, Result};
+use tain_core::codec_h264::H264Decoder;
+use tain_core::network::{read_stream_message, write_stream_message, SessionConfig};
+use tain_core::{
+    ApprovalDecision, CaptureConfig, ConnectionCode, ControlGrants, EncodeConfig, GuestClient,
+    HostServer, Message, QualityScale, VideoCodec,
+};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Small frames keep the test fast and well inside the message cap.
+fn test_config() -> SessionConfig {
+    SessionConfig {
+        capture: CaptureConfig {
+                fps: 30,
+                quality: QualityScale::Native,
+                show_cursor: false,
+                native_override: Some((64, 36)),
+            },
+        encode: EncodeConfig::default(),
+        approval_timeout: Duration::from_secs(5),
+        auto_regen_guest_passcode: true,
+        exclude_audio_processes: Vec::new(),
+        audio_bitrate_kbps: 160,
+        host_name: Some("Test Host".into()),
+        priority: Default::default(),
+    }
+}
+
+/// Next message from the host, or `None` on timeout / clean end of stream.
+async fn next_message(recv: &mut iroh::endpoint::RecvStream) -> Option<Message> {
+    let bytes = tokio::time::timeout(Duration::from_secs(30), read_stream_message(recv))
+        .await
+        .ok()?
+        .ok()??;
+    bincode::deserialize::<Message>(&bytes).ok()
+}
+
+fn decode_endpoint_id(hex_str: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str).context("endpoint id is not valid hex")?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().context("endpoint id is not 32 bytes")?;
+    Ok(arr)
+}
+
+/// Bring up a host, returning its handle, a master passcode, and its endpoint id.
+async fn start_host() -> Result<(Arc<HostServer>, String, [u8; 32])> {
+    let server = Arc::new(HostServer::bind().await?.with_config(test_config()));
+    let passcode = server.generate_master_passcode().await?;
+    let id = decode_endpoint_id(&server.endpoint_id())?;
+
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            if let Err(e) = server.run().await {
+                eprintln!("host server stopped: {e}");
+            }
+        }
+    });
+
+    Ok((server, passcode, id))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn guest_authenticates_and_receives_frames_over_iroh() -> Result<()> {
+    let (server, passcode, host_id) = start_host().await?;
+
+    let mut guest = GuestClient::connect_from_bytes(&host_id).await?;
+    let (mut send, mut recv) = guest.authenticate(&passcode, Some("Test Guest")).await?;
+
+    // First message must be SessionStart, carrying the host-assigned session id.
+    let bytes = tokio::time::timeout(Duration::from_secs(30), read_stream_message(&mut recv))
+        .await
+        .context("timed out waiting for SessionStart")??
+        .context("stream closed before SessionStart")?;
+
+    let session_id = match bincode::deserialize::<Message>(&bytes)? {
+        Message::SessionStart(ss) => {
+            assert_eq!(ss.screen_info.width, 64);
+            assert_eq!(ss.screen_info.height, 36);
+            assert_eq!(
+                ss.encoder_type,
+                VideoCodec::H264.wire_name(),
+                "host must advertise the encoder it actually runs"
+            );
+            assert_eq!(
+                ss.host_name.as_deref(),
+                Some("Test Host"),
+                "the guest needs a name to file this connection under"
+            );
+            assert_ne!(ss.session_id, 0, "host must assign a real session id");
+            ss.session_id
+        }
+        other => panic!("expected SessionStart, got {other:?}"),
+    };
+
+    // A master passcode gets control immediately, with no approval prompt.
+    assert_eq!(server.sessions().grants(session_id), Some(ControlGrants::ALL));
+
+    // Frames must arrive without the guest having sent anything since Auth,
+    // and must decode with the codec the host said it was using.
+    let mut decoder = H264Decoder::new()?;
+    let mut decoded: Vec<Vec<u8>> = Vec::new();
+    let mut frames = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while frames < 3 {
+            let bytes = read_stream_message(&mut recv).await?.context("stream closed")?;
+            if let Message::Frame(f) = bincode::deserialize::<Message>(&bytes)? {
+                assert_eq!((f.width, f.height), (64, 36));
+                // Frames are compressed now, so the payload must be *smaller*
+                // than the pixels it carries.
+                assert!(
+                    f.data.len() < 64 * 36 * 4,
+                    "frame #{} was {} bytes, no smaller than raw",
+                    f.sequence_number,
+                    f.data.len()
+                );
+                if let Some(picture) = decoder.decode(&f.data).expect("frame failed to decode") {
+                    assert_eq!((picture.width, picture.height), (64, 36));
+                    decoded.push(picture.rgba);
+                    frames += 1;
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("timed out waiting for frames")??;
+
+    // Decoding must reconstruct exactly the right number of pixels, and the
+    // animated test pattern must actually differ between frames.
+    assert!(decoded.iter().all(|f| f.len() == 64 * 36 * 4));
+    assert!(decoded.windows(2).any(|w| w[0] != w[1]), "frames never changed");
+
+    // Ping must be answered while the frame pump keeps running.
+    write_stream_message(&mut send, &Message::Ping(99)).await?;
+    let pong = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let bytes = read_stream_message(&mut recv).await?.context("stream closed")?;
+            if let Message::Pong { echo: ts, .. } = bincode::deserialize::<Message>(&bytes)? {
+                return Ok::<_, anyhow::Error>(ts);
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for Pong")??;
+    assert_eq!(pong, 99);
+
+    guest.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn a_connection_code_alone_is_enough_to_reach_the_host() -> Result<()> {
+    // The whole point of the code format: the guest is given *only* the string,
+    // never the endpoint id out of band.
+    let server = Arc::new(HostServer::bind().await?.with_config(test_config()));
+    let code_string = server.generate_master_passcode().await?;
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { server.run().await }
+    });
+
+    let code = ConnectionCode::parse(&code_string)?;
+    assert_eq!(
+        code.endpoint_id,
+        server.endpoint_id_bytes(),
+        "code must address the host that issued it"
+    );
+
+    let mut guest = GuestClient::connect_with_code(&code).await?;
+    let (_send, mut recv) = guest.authenticate(&code_string, None).await?;
+
+    let bytes = tokio::time::timeout(Duration::from_secs(30), read_stream_message(&mut recv))
+        .await
+        .context("timed out waiting for SessionStart")??
+        .context("stream closed before SessionStart")?;
+    assert!(matches!(
+        bincode::deserialize::<Message>(&bytes)?,
+        Message::SessionStart(_)
+    ));
+
+    guest.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn a_code_for_a_different_host_is_rejected() -> Result<()> {
+    // Same secret, wrong endpoint: the host must refuse rather than accept a
+    // code that was never issued for it.
+    let server = Arc::new(HostServer::bind().await?.with_config(test_config()));
+    let real = ConnectionCode::parse(&server.generate_master_passcode().await?)?;
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { server.run().await }
+    });
+
+    let forged = ConnectionCode::new(real.passcode_type, real.secret, [0xAAu8; 32]).encode();
+
+    let mut guest = GuestClient::connect_from_bytes(&real.endpoint_id).await?;
+    let (_send, mut recv) = guest.authenticate(&forged, None).await?;
+
+    let bytes = tokio::time::timeout(Duration::from_secs(30), read_stream_message(&mut recv))
+        .await
+        .context("timed out waiting for rejection")??
+        .context("stream closed without a reason")?;
+    match bincode::deserialize::<Message>(&bytes)? {
+        Message::SessionEnd(se) => assert_eq!(se.reason, "invalid_passcode"),
+        other => panic!("expected rejection, got {other:?}"),
+    }
+    assert_eq!(server.sessions().count(), 0);
+
+    guest.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn invalid_passcode_is_rejected_with_session_end() -> Result<()> {
+    let (server, _passcode, host_id) = start_host().await?;
+
+    let mut guest = GuestClient::connect_from_bytes(&host_id).await?;
+    let (_send, mut recv) = guest.authenticate("MASTER-not-a-real-code", None).await?;
+
+    let bytes = tokio::time::timeout(Duration::from_secs(30), read_stream_message(&mut recv))
+        .await
+        .context("timed out waiting for rejection")??
+        .context("stream closed without a reason")?;
+
+    match bincode::deserialize::<Message>(&bytes)? {
+        Message::SessionEnd(se) => assert_eq!(se.reason, "invalid_passcode"),
+        other => panic!("expected SessionEnd, got {other:?}"),
+    }
+
+    assert_eq!(server.sessions().count(), 0, "rejected auth must not create a session");
+
+    guest.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// The probe must answer honestly and, above all, silently: a saved-connection
+/// card checking whether a host is up must not put a prompt on that host's
+/// screen. Approval requests arriving here would make the whole feature unusable
+/// — a card that refreshes every 45 seconds would be a doorbell.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn a_probe_answers_without_disturbing_the_host() -> Result<()> {
+    use tain_core::network::{ProbeOutcome, Prober};
+
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = Arc::new(
+        HostServer::bind()
+            .await?
+            .with_config(test_config())
+            .with_approval_channel(approval_tx),
+    );
+    let guest_code = server.generate_guest_passcode().await?;
+    let master_code = server.generate_master_passcode().await?;
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { server.run().await }
+    });
+
+    let prober = Prober::bind().await?;
+    let timeout = Duration::from_secs(20);
+
+    // A valid guest code: reachable, current, and it says approval is needed.
+    let code = ConnectionCode::parse(&guest_code)?;
+    match prober.probe(&code, timeout).await {
+        ProbeOutcome::Valid { host_name, needs_approval } => {
+            assert_eq!(host_name.as_deref(), Some("Test Host"));
+            assert!(needs_approval, "a guest code must report that it will ask");
+        }
+        other => panic!("expected a valid probe, got {other:?}"),
+    }
+
+    // A master code is equally valid but would not wait for anyone.
+    let master = ConnectionCode::parse(&master_code)?;
+    match prober.probe(&master, timeout).await {
+        ProbeOutcome::Valid { needs_approval, .. } => {
+            assert!(!needs_approval, "a master code connects without asking");
+        }
+        other => panic!("expected a valid probe, got {other:?}"),
+    }
+
+    // A code this host has never issued: reachable, but not current. That is
+    // exactly the "the host regenerated while you were away" case, and it must
+    // be distinguishable from the host being off.
+    server.regenerate_passcode(tain_core::PasscodeType::Guest).await?;
+    assert_eq!(prober.probe(&code, timeout).await, ProbeOutcome::Stale);
+
+    // And through all of it, nobody was asked anything.
+    assert!(
+        approval_rx.try_recv().is_err(),
+        "probing raised an approval request — the host's user would be prompted \
+         every time a saved card refreshed"
+    );
+    assert_eq!(server.sessions().count(), 0, "a probe must not leave a session behind");
+
+    prober.shutdown().await;
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Bring up a host that requires approval, and connect a guest to it.
+async fn start_host_with_guest(
+    approval_timeout: Duration,
+    client_name: Option<&str>,
+) -> Result<(
+    Arc<HostServer>,
+    tokio::sync::mpsc::UnboundedReceiver<tain_core::ApprovalRequest>,
+    GuestClient,
+    iroh::endpoint::RecvStream,
+)> {
+    let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel();
+    let config = SessionConfig { approval_timeout, ..test_config() };
+    let server = Arc::new(
+        HostServer::bind()
+            .await?
+            .with_config(config)
+            .with_approval_channel(approval_tx),
+    );
+    let guest_code = server.generate_guest_passcode().await?;
+    let host_id = decode_endpoint_id(&server.endpoint_id())?;
+
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { server.run().await }
+    });
+
+    let mut guest = GuestClient::connect_from_bytes(&host_id).await?;
+    let (send, recv) = guest.authenticate(&guest_code, client_name).await?;
+    // The send half is dropped by the caller's ignorance, so keep it alive by
+    // leaking it into the guest — the guest never writes in these tests, but
+    // dropping the stream would close it and race the host's own writes.
+    std::mem::forget(send);
+
+    Ok((server, approval_rx, guest, recv))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn a_guest_sees_nothing_until_the_host_allows_it() -> Result<()> {
+    let (server, mut approval_rx, guest, mut recv) =
+        start_host_with_guest(Duration::from_secs(30), Some("Test Guest")).await?;
+
+    // The host raises an approval request carrying the guest's own name.
+    let req = tokio::time::timeout(Duration::from_secs(30), approval_rx.recv())
+        .await
+        .context("timed out waiting for approval request")?
+        .context("approval channel closed")?;
+    let session_id = req.session_id;
+    assert_eq!(req.label, "Test Guest");
+    assert!(req.label_is_self_reported, "a guest-chosen name must be marked as such");
+    assert_eq!(server.sessions().grants(session_id), Some(ControlGrants::NONE));
+
+    // The guest is told to wait, and nothing else follows while it waits.
+    match next_message(&mut recv).await.context("no message from host")? {
+        Message::GuestApprovalRequest(_) => {}
+        other => panic!("expected an approval request first, got {other:?}"),
+    }
+    let quiet =
+        tokio::time::timeout(Duration::from_millis(800), read_stream_message(&mut recv)).await;
+    assert!(quiet.is_err(), "the host streamed its screen before being allowed to");
+
+    // Allowing the mouse alone must not hand over the keyboard as well.
+    let partial = ControlGrants::new(true, false);
+    req.approve_tx
+        .send(ApprovalDecision::Allow(partial))
+        .expect("server dropped the approval responder");
+
+    let mut saw_start = false;
+    let mut announced = None;
+    let mut saw_frame = false;
+    for _ in 0..60 {
+        match next_message(&mut recv).await {
+            Some(Message::SessionStart(_)) => saw_start = true,
+            Some(Message::ControlState(cs)) => announced = Some(cs.grants),
+            Some(Message::Frame(_)) => {
+                saw_frame = true;
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(saw_start, "an allowed guest should get SessionStart");
+    assert!(saw_frame, "an allowed guest should get frames");
+    assert_eq!(announced, Some(partial), "the guest must be told its permissions");
+    assert_eq!(server.sessions().grants(session_id), Some(partial));
+
+    guest.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn a_denied_guest_is_told_why_and_never_sees_a_frame() -> Result<()> {
+    let (server, mut approval_rx, guest, mut recv) =
+        start_host_with_guest(Duration::from_secs(30), None).await?;
+
+    let req = tokio::time::timeout(Duration::from_secs(30), approval_rx.recv())
+        .await
+        .context("timed out waiting for approval request")?
+        .context("approval channel closed")?;
+    let session_id = req.session_id;
+    // An anonymous guest still gets a usable label, just a generated one.
+    assert_eq!(req.label, format!("Guest #{session_id}"));
+    assert!(!req.label_is_self_reported);
+
+    req.approve_tx.send(ApprovalDecision::Deny).expect("server dropped the responder");
+
+    let mut ended = false;
+    for _ in 0..10 {
+        match next_message(&mut recv).await {
+            Some(Message::SessionEnd(se)) => {
+                assert!(!se.reason.is_empty(), "a refusal should say something");
+                ended = true;
+                break;
+            }
+            Some(Message::Frame(_)) => panic!("a denied guest must never see a frame"),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(ended, "a denied guest should be told, not just dropped");
+
+    // And the session is cleared from the host's table.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while server.sessions().active_sessions().contains(&session_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("a denied session was left in the table")?;
+
+    guest.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn an_unanswered_guest_is_refused_rather_than_left_watching() -> Result<()> {
+    // An unattended machine must not hand out its screen by default, so the
+    // approval timeout has to deny rather than downgrade.
+    let (server, mut approval_rx, guest, mut recv) =
+        start_host_with_guest(Duration::from_millis(500), None).await?;
+
+    let req = tokio::time::timeout(Duration::from_secs(30), approval_rx.recv())
+        .await
+        .context("timed out waiting for approval request")?
+        .context("approval channel closed")?;
+    // Deliberately never answer, and never drop the responder either — this is
+    // the "nobody is at the keyboard" case, not the "UI went away" one.
+    std::mem::forget(req.approve_tx);
+
+    let mut ended = false;
+    for _ in 0..10 {
+        match next_message(&mut recv).await {
+            Some(Message::SessionEnd(_)) => {
+                ended = true;
+                break;
+            }
+            Some(Message::Frame(_)) => panic!("a timed-out guest must never see a frame"),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(ended, "the guest should be refused once the prompt times out");
+
+    guest.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn a_guest_that_gives_up_while_waiting_leaves_no_session_behind() -> Result<()> {
+    // The approval wait is long enough for a guest to hang up mid-way. Every
+    // write after that fails, so any early return between registering the
+    // session and cleaning it up would strand a dead entry: the host would show
+    // a pill for a guest that is gone, and the guest code would never
+    // regenerate because the session count never reached zero.
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel();
+    let config = SessionConfig { approval_timeout: Duration::from_millis(600), ..test_config() };
+    let server = Arc::new(
+        HostServer::bind()
+            .await?
+            .with_config(config)
+            .with_approval_channel(approval_tx),
+    );
+    let guest_code = server.generate_guest_passcode().await?;
+    let host_id = decode_endpoint_id(&server.endpoint_id())?;
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { server.run().await }
+    });
+
+    let mut guest = GuestClient::connect_from_bytes(&host_id).await?;
+    let (_send, _recv) = guest.authenticate(&guest_code, None).await?;
+
+    let req = tokio::time::timeout(Duration::from_secs(30), approval_rx.recv())
+        .await
+        .context("timed out waiting for approval request")?
+        .context("approval channel closed")?;
+    let session_id = req.session_id;
+    assert!(server.sessions().active_sessions().contains(&session_id));
+
+    // The guest walks away without waiting for an answer.
+    guest.shutdown().await?;
+    drop(req);
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while server.sessions().active_sessions().contains(&session_id) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("the abandoned session was never cleaned up")?;
+
+    assert_eq!(server.sessions().count(), 0);
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn reconnecting_with_the_same_code_asks_again() -> Result<()> {
+    // Approval is per connection, not per code. A guest that was allowed once
+    // must not be able to walk back in unannounced.
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel();
+    let config =
+        SessionConfig { auto_regen_guest_passcode: false, ..test_config() };
+    let server = Arc::new(
+        HostServer::bind()
+            .await?
+            .with_config(config)
+            .with_approval_channel(approval_tx),
+    );
+    let guest_code = server.generate_guest_passcode().await?;
+    let host_id = decode_endpoint_id(&server.endpoint_id())?;
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { server.run().await }
+    });
+
+    let mut first_session = None;
+    for attempt in 0..2 {
+        let mut guest = GuestClient::connect_from_bytes(&host_id).await?;
+        let (_send, mut recv) = guest.authenticate(&guest_code, None).await?;
+
+        let req = tokio::time::timeout(Duration::from_secs(30), approval_rx.recv())
+            .await
+            .with_context(|| format!("no approval request on attempt {attempt}"))?
+            .context("approval channel closed")?;
+
+        match first_session {
+            None => first_session = Some(req.session_id),
+            Some(previous) => assert_ne!(
+                previous, req.session_id,
+                "a reconnect must be a new session, not a resumed one"
+            ),
+        }
+
+        req.approve_tx.send(ApprovalDecision::Allow(ControlGrants::ALL)).ok();
+
+        // Drain until frames start, then hang up so the next attempt is clean.
+        for _ in 0..60 {
+            match next_message(&mut recv).await {
+                Some(Message::Frame(_)) | None => break,
+                Some(_) => {}
+            }
+        }
+        guest.shutdown().await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn a_code_handed_out_yesterday_still_works_after_a_restart() -> Result<()> {
+    // The whole point of saving the identity and the code together. Neither half
+    // is sufficient: a restored passcode under a new keypair produces a string
+    // that dials nowhere, and a restored keypair with a new passcode produces
+    // one the host refuses. So this test keeps the code from the *first* run and
+    // connects with it to the *second*.
+    let first = HostServer::bind().await?.with_config(test_config());
+    let code = first.generate_master_passcode().await?;
+    let identity = first.identity_bytes();
+    let parsed = ConnectionCode::parse(&code)?;
+    first.shutdown().await?;
+    drop(first);
+
+    // A second process, as far as iroh is concerned.
+    let second = Arc::new(
+        HostServer::bind_with_identity(Some(identity)).await?.with_config(test_config()),
+    );
+    let restored = second.adopt_passcode(parsed.passcode_type, parsed.secret).await;
+    assert_eq!(restored, code, "the code the user copied must be the code they still have");
+
+    tokio::spawn({
+        let server = Arc::clone(&second);
+        async move { server.run().await }
+    });
+
+    let mut guest = GuestClient::connect_from_bytes(&parsed.endpoint_id).await?;
+    let (_send, mut recv) = guest.authenticate(&code, Some("Returning Guest")).await?;
+
+    let mut got_frame = false;
+    for _ in 0..60 {
+        match next_message(&mut recv).await {
+            Some(Message::Frame(_)) => {
+                got_frame = true;
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(got_frame, "yesterday's master code must stream today");
+
+    guest.shutdown().await?;
+    second.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn a_fresh_identity_produces_a_different_endpoint() -> Result<()> {
+    // Guards the assumption the whole feature rests on: iroh mints a new keypair
+    // per bind unless told otherwise. If this ever stopped being true the
+    // identity persistence would look like it worked while doing nothing.
+    let a = HostServer::bind().await?;
+    let b = HostServer::bind().await?;
+    assert_ne!(a.endpoint_id_bytes(), b.endpoint_id_bytes());
+
+    let reused = HostServer::bind_with_identity(Some(a.identity_bytes())).await?;
+    assert_eq!(
+        reused.endpoint_id_bytes(),
+        a.endpoint_id_bytes(),
+        "restoring the key must restore the address every code points at"
+    );
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    reused.shutdown().await?;
+    Ok(())
+}

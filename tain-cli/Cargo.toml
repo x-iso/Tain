@@ -1,0 +1,61 @@
+[package]
+name = "tain-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI binary for P2P remote desktop host and guest modes"
+
+[[bin]]
+name = "tain"
+path = "src/main.rs"
+
+[dependencies]
+tain-core = { path = "../tain-core" }
+iroh = "1"
+
+# Async runtime + CLI framework
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+
+# GUI - egui for rendering frames and capturing input
+egui = "0.29"
+eframe = { version = "0.29", features = ["default_fonts", "glow"] }
+# svg feature powers the icon set in assets/
+egui_extras = { version = "0.29", features = ["svg"] }
+# egui only surfaces paste as a keyboard event; the design's "Paste passcode"
+# button needs to read the clipboard on demand.
+arboard = "3"
+
+# Error handling + serialization
+anyhow = "1"
+thiserror = "2"
+bincode = "1.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+keyring = "4"
+
+# Immersive mode: a low-level keyboard hook to capture the Win key (egui never
+# reports it) and cursor clipping to keep the pointer inside the window.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_OpenGL",
+    # Registering and controlling the Tain service.
+    "Win32_System_Services",
+    "Win32_System_LibraryLoader",
+    # ShellExecuteW with the runas verb, to elevate for install and uninstall.
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+# Locating dumpbin.exe and lib.exe for the import-library regeneration.
+[target.'cfg(windows)'.build-dependencies]
+cc = "1"

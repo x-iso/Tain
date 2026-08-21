@@ -1,0 +1,22 @@
+# Copy to `.cargo/config.toml` if `nasm` is not on your PATH.
+#
+# `openh264-sys2` builds OpenH264 from source and needs `nasm` to assemble its
+# SIMD kernels. When `nasm` is missing it does not fail — it prints one line and
+# silently builds plain C instead. Measured on a 2560x1600 desktop that costs
+# 1147 ms per frame against 67 ms with assembly: a 17x regression with no error
+# and symptoms that look like a network problem rather than an encoder one.
+#
+# `rdp-core/build.rs` warns loudly if it cannot find nasm. Do not ignore it.
+#
+# The Windows winget package installs to the path below but does *not* add
+# itself to PATH, which is the common reason to need this file. Adjust to match
+# your own install.
+#
+#     winget install NASM.NASM      # Windows
+#     brew install nasm             # macOS
+#     apt install nasm              # Debian/Ubuntu
+#
+# This file is gitignored, because the path is specific to one machine.
+
+[env]
+NASM = { value = "C:\\Users\\YOUR-NAME\\AppData\\Local\\bin\\NASM\\nasm.exe", force = false }
