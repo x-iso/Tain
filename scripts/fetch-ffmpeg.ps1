@@ -28,17 +28,30 @@
 
 [CmdletBinding()]
 param(
-    # Set once, then left alone. A moving "latest" URL would make every clone a
-    # different build, which is the opposite of what pinning is for.
-    [string]$Url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip',
+    # A dated release, not the `latest` tag.
+    #
+    # This said "set once, then left alone" while pointing at
+    # .../releases/download/latest/..., which BtbN republishes daily — it was
+    # republished twice during the afternoon this was pinned. So the URL named
+    # a different archive from one clone to the next, and no checksum could
+    # have been pinned against it: the first rebuild upstream would have turned
+    # every fetch into a mismatch.
+    #
+    # The version is 7.1 because that is the ABI this project links: the DLLs
+    # are avcodec-61, avutil-59, avformat-61, and the marker checked below is
+    # avcodec-61.dll. Current builds are 8.1 and 9.0, which carry avcodec-62
+    # and -63 and would not satisfy any of that. Moving up is a real change to
+    # make deliberately, not something to inherit by following a moving tag.
+    [string]$Url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-16-13-00/ffmpeg-n7.1.5-16-g9a4bb2c579-win64-gpl-shared-7.1.zip',
 
     # SHA-256 of the archive above.
     #
-    # Deliberately empty rather than filled with a plausible-looking value: a
-    # wrong hash that nobody notices is worse than no hash, because it looks
-    # like verification is happening. Run this script once, it will print the
-    # hash of what it downloaded, then paste it here and commit.
-    [string]$Sha256 = '',
+    # Taken from `checksums.sha256` published alongside it in the same release,
+    # which is worth being precise about: it proves the download arrived intact
+    # and unchanged since, and it does not prove the publisher built what they
+    # said. That is the same trust anyone placed in the URL, narrowed to one
+    # specific archive that can no longer be swapped underneath us.
+    [string]$Sha256 = 'af514fae0af8565eb9125848ff61f7d7e9e878a6cf6af512434c4741fc6be488',
 
     # Re-download even if the files are already present.
     [switch]$Force

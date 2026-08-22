@@ -2129,8 +2129,33 @@ impl GuestClient {
         host_public_key: &iroh::PublicKey,
         relay_url: Option<&str>,
     ) -> Result<Self> {
+        /// How long to wait for the endpoint to report itself online.
+        ///
+        /// Not a requirement, a courtesy. Coming online means reaching a relay
+        /// and finishing a network report, and on a filtered connection that
+        /// can take a long time or never happen. With a relay in the code there
+        /// is nothing left to discover, so waiting past this point buys
+        /// nothing — and waiting forever is what "it just never connects" was.
+        const ONLINE_WAIT: Duration = Duration::from_secs(5);
+
+        /// How long one dial may take before the host is called unreachable.
+        ///
+        /// Generous for the same reason the paste check is: a cold path may
+        /// need a relay handshake and hole punching first, and iroh retries
+        /// inside this with a growing backoff. But it is bounded, because the
+        /// alternative is a session that sits on "Connecting" with nothing to
+        /// report and nothing to cancel.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+
         let endpoint = iroh::Endpoint::bind(iroh::endpoint::presets::N0).await?;
-        endpoint.online().await;
+
+        let online = tokio::time::timeout(ONLINE_WAIT, endpoint.online()).await.is_ok();
+        if !online {
+            warn!(
+                "This endpoint has not come online after {ONLINE_WAIT:?} — dialling anyway. \
+                 Expected where relays are filtered; a code that carries one needs no lookup."
+            );
+        }
 
         let mut addr = iroh::EndpointAddr::new(*host_public_key);
         match relay_url.filter(|url| !url.is_empty()) {
@@ -2146,7 +2171,34 @@ impl GuestClient {
             None => info!("Connecting to host (no relay in the code — looking it up)"),
         }
 
-        let conn = endpoint.connect(addr, ALPN).await.context("Failed to connect to host")?;
+        let conn = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN))
+            .await
+        {
+            Ok(Ok(conn)) => conn,
+            // A dial that failed while this endpoint had not finished coming
+            // online is the one case worth repeating: the first attempt had no
+            // relay to fall back on and the second may. Only then, and only
+            // once — retrying a refusal that had every chance of working turns
+            // a clear failure into a slow one.
+            Ok(Err(first)) if !online => {
+                warn!("First attempt failed before this endpoint was online ({first}) — retrying");
+                let _ = tokio::time::timeout(ONLINE_WAIT, endpoint.online()).await;
+                match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, ALPN)).await {
+                    Ok(result) => result.context("Failed to connect to host")?,
+                    Err(_) => anyhow::bail!(
+                        "That host did not answer within {DIAL_TIMEOUT:?}. It may be offline, \
+                         or the relay in its code may be unreachable from here — ask for a \
+                         fresh code if the host has moved network."
+                    ),
+                }
+            }
+            Ok(Err(e)) => return Err(e).context("Failed to connect to host"),
+            Err(_) => anyhow::bail!(
+                "That host did not answer within {DIAL_TIMEOUT:?}. It may be offline, or the \
+                 relay in its code may be unreachable from here — ask for a fresh code if the \
+                 host has moved network."
+            ),
+        };
         info!("Connected to host: {}", conn.remote_id());
 
         Ok(Self { endpoint, connection: Some(conn) })
