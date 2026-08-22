@@ -54,17 +54,27 @@ const VK_LWIN: u16 = 0x5B;
 
 /// Install the keyboard hook before the window system starts.
 ///
-/// # Why this is called from `main` rather than on demand
+/// # This ordering is load-bearing, and was found the hard way
 ///
-/// Installed after eframe was running, the hook was never invoked — on the
-/// UI thread or on a thread of its own — while an otherwise identical
-/// standalone program on the same machine worked on both. `SendInput`
-/// confirmed the test keystroke was really being injected, so the events
-/// existed and this process simply did not receive them.
+/// Installed *after* eframe is running, the hook is never invoked. Not on the
+/// UI thread, not on a thread of its own, and not for injected keys either —
+/// while an otherwise identical hook, in a standalone program on the same
+/// machine, works on both kinds of thread. `SendInput` confirmed the test
+/// keystrokes were genuinely being injected, so the events existed and this
+/// process simply did not receive them.
 ///
-/// What is left is the order things happen in. Putting the hook in before
-/// the window system initialises is the cheapest way to find out whether
-/// that is the difference, and if it is, it is also the fix.
+/// Installed *before* `eframe::run_native`, it works. Something in the window
+/// system's initialisation is the difference; what exactly has not been
+/// established, only that the order decides it.
+///
+/// So this is called from `main`, and must stay there. Moving it back to the
+/// first time immersive mode is switched on would silently return the whole
+/// subsystem to doing nothing — which is what it did, undetected, through many
+/// rounds of fixes aimed at everything except this.
+///
+/// The startup self-test exists to catch exactly that regression: it says in
+/// one line whether the callback is live, without anyone having to press a
+/// key.
 pub fn start_hook_early() {
     platform::install_key_hook();
     // Nothing should be captured yet: this only proves the hook can be
@@ -238,14 +248,6 @@ impl Immersive {
         }
         self.forwarding = on;
         platform::set_forwarding(on);
-    }
-
-    /// Check whether a hook installed on the caller's thread is invoked.
-    ///
-    /// Called once from the UI thread. See
-    /// `platform::probe_hook_on_this_thread` for what it distinguishes.
-    pub fn probe_hook_here(&self) {
-        platform::probe_hook_on_this_thread();
     }
 
     /// Turn immersive mode on or off. Idempotent.
@@ -887,58 +889,6 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
         );
     }
 
-    /// Install a hook on *this* thread, prove it, and take it off again.
-    ///
-    /// # Why the same test twice, on two threads
-    ///
-    /// A standalone program installing the identical hook on this machine —
-    /// main thread and spawned thread alike — has its callback invoked
-    /// normally. Inside Tain it is not. So the fault is something about this
-    /// process rather than about Windows or the mechanism, and the next thing
-    /// worth knowing is whether *any* thread here can hold a working hook.
-    ///
-    /// Run from the UI thread at startup, the answer distinguishes "this
-    /// process cannot hook at all" from "the hook thread specifically cannot",
-    /// which point at completely different causes.
-    pub fn probe_hook_on_this_thread() {
-        // SAFETY: installed on the calling thread, which is the winit event
-        // loop and therefore pumps messages, and removed again below.
-        let hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) }
-        {
-            Ok(hook) => hook,
-            Err(e) => {
-                tracing::warn!("UI-thread hook probe could not install: {e}");
-                return;
-            }
-        };
-
-        let before = ENTERED.load(Ordering::Relaxed);
-        self_test_inject();
-        // The event is delivered while this thread is retrieving messages, and
-        // the caller returns to eframe's loop immediately after, so a short
-        // pump here is what gives it the chance.
-        let mut msg = MSG::default();
-        for _ in 0..20 {
-            // SAFETY: a non-blocking peek; anything found is discarded.
-            unsafe {
-                let _ = PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE);
-            }
-            if ENTERED.load(Ordering::Relaxed) > before {
-                tracing::info!("UI-thread hook probe: callback IS invoked on this thread");
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        if ENTERED.load(Ordering::Relaxed) == before {
-            tracing::warn!("UI-thread hook probe: callback is NOT invoked on this thread either");
-        }
-
-        // SAFETY: installed just above on this thread, removed once.
-        unsafe {
-            let _ = UnhookWindowsHookEx(hook);
-        }
-    }
-
     /// Start the hook thread if it is not already running.
     ///
     /// Blocks until the hook is actually installed, so a caller that sets a
@@ -1113,7 +1063,6 @@ mod platform {
     pub fn take_trace() -> Vec<String> {
         Vec::new()
     }
-    pub fn probe_hook_on_this_thread() {}
     pub fn set_capture(_active: bool) {}
     pub fn app_has_focus() -> bool {
         true
