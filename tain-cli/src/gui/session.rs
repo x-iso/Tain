@@ -105,6 +105,12 @@ pub struct GuestSession {
     /// The user's choice, taken when the session opened. See
     /// `Settings::gpu_present` for why it is a choice.
     gpu_present: bool,
+    /// Frames in a row that arrived with neither pixels nor a texture.
+    ///
+    /// See [`Session::upload_pending_frame`], where going back to the readback
+    /// is decided.
+    #[cfg(target_os = "windows")]
+    empty_frames: u32,
     last_pointer: Option<(u16, u16)>,
     buttons_down: [bool; 3],
     modifiers: ModifierTracker,
@@ -179,6 +185,8 @@ impl GuestSession {
             #[cfg(target_os = "windows")]
             renderer: None,
             gpu_present: settings.gpu_present,
+            #[cfg(target_os = "windows")]
+            empty_frames: 0,
             last_pointer: None,
             buttons_down: [false; 3],
             modifiers: ModifierTracker::default(),
@@ -264,6 +272,8 @@ impl GuestSession {
             #[cfg(target_os = "windows")]
             renderer: None,
             gpu_present: false,
+            #[cfg(target_os = "windows")]
+            empty_frames: 0,
             last_pointer: None,
             buttons_down: [false; 3],
             modifiers: ModifierTracker::default(),
@@ -483,6 +493,10 @@ impl GuestSession {
                 .lock()
                 .unwrap()
                 .record_render(0.0);
+            #[cfg(target_os = "windows")]
+            {
+                self.empty_frames = 0;
+            }
             return;
         }
         #[cfg(target_os = "windows")]
@@ -496,7 +510,45 @@ impl GuestSession {
         // rather than returning anything, so this cannot be left to chance.
         if frame.rgba.len() < frame.width * frame.height * 4 {
             debug!("Dropped a frame with no pixels and no texture");
+            // # A window that does not always close
+            //
+            // Dropping these was written for the frame or two in flight while
+            // the decoder learns it may stop reading back. On a guest where the
+            // texture never arrives it is every frame from then on, and the
+            // picture stops at whatever was on screen when the switch happened:
+            // reported as a frozen first frame, with skip-the-readback on at
+            // one end, and it stays frozen because nothing ever reconsiders.
+            //
+            // Only the libavcodec D3D11VA decoders honour the request at all —
+            // the Media Foundation one ignores it and keeps producing pixels —
+            // so which decoder a guest ends up with decides whether the setting
+            // does anything, and neither end can see that from the other side.
+            //
+            // Rather than work out every way a texture can fail to appear, take
+            // the absence as the answer: ask for the readback again, and let
+            // the session carry on with a hiccup instead of a freeze.
+            #[cfg(target_os = "windows")]
+            {
+                /// Frames of grace before giving up. A couple can legitimately
+                /// be in flight; a tenth of a second of them cannot.
+                const PATIENCE: u32 = 8;
+
+                self.empty_frames += 1;
+                if self.empty_frames == PATIENCE
+                    && self.shared.present_on_gpu.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        "This decoder is not handing over its textures — going back to \
+                         reading frames back to the processor. Drawing straight from the \
+                         GPU is off for this session."
+                    );
+                }
+            }
             return;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.empty_frames = 0;
         }
         // A picture for this host's card, taken from a frame that is already
         // here and already decoded. Rarely, because nothing about it is urgent
@@ -768,6 +820,25 @@ impl GuestSession {
         }
         self.buttons_down = [false; 3];
 
+        // # Before the task, not after
+        //
+        // The interop device was opened against the decoder's `ID3D11Device`
+        // and holds GL textures registered against the decoder's own textures.
+        // Aborting the task first drops the decoder, and everything the
+        // teardown then unregisters and closes belongs to something that is
+        // already gone — an access violation, and the reported crash on
+        // disconnecting with skip-the-readback enabled.
+        //
+        // Released here instead, while the decoder is still alive, on the
+        // thread that owns the GL context. `Drop` keeps its own guard for the
+        // paths that do not come through here, such as the window closing.
+        #[cfg(target_os = "windows")]
+        {
+            self.gpu_frame = None;
+            self.renderer = None;
+            self.shared.present_on_gpu.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -817,6 +888,62 @@ fn pan_velocity(offset: f32, extent: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// A decoder that never hands over a texture must not freeze the picture.
+    ///
+    /// The reported fault: skip-the-readback on at one end, a frozen first
+    /// frame, and nothing that ever reconsiders. The decoder has been told to
+    /// stop reading back, so its frames carry no pixels, and it produces no
+    /// texture either — every frame from then on is dropped.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_decoder_that_never_produces_a_texture_goes_back_to_the_readback() {
+        use std::sync::atomic::Ordering;
+
+        let ctx = egui::Context::default();
+        let mut session = super::GuestSession::test_stub();
+        session.shared.present_on_gpu.store(true, Ordering::Relaxed);
+
+        // Eight frames carrying neither pixels nor a texture, which is what a
+        // decoder that ignores the request looks like from here.
+        for _ in 0..8 {
+            *session.shared.frame.lock().unwrap() = Some(crate::gui::network_bridge::FrameBuffer {
+                width: 320,
+                height: 180,
+                rgba: Vec::new(),
+                gpu: None,
+            });
+            session.upload_pending_frame(&ctx);
+        }
+
+        assert!(
+            !session.shared.present_on_gpu.load(Ordering::Relaxed),
+            "the session should have asked for the readback back rather than              dropping every frame for the rest of its life",
+        );
+    }
+
+    /// And a working GPU path is left alone.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn frames_that_carry_a_texture_keep_the_gpu_path() {
+        use std::sync::atomic::Ordering;
+
+        let ctx = egui::Context::default();
+        let mut session = super::GuestSession::test_stub();
+        session.shared.present_on_gpu.store(true, Ordering::Relaxed);
+
+        for _ in 0..8 {
+            *session.shared.frame.lock().unwrap() = Some(crate::gui::network_bridge::FrameBuffer {
+                width: 320,
+                height: 180,
+                rgba: Vec::new(),
+                gpu: Some((0xdead_beef, 1)),
+            });
+            session.upload_pending_frame(&ctx);
+        }
+
+        assert!(session.shared.present_on_gpu.load(Ordering::Relaxed));
+    }
+
     /// A local toggle narrows what the host allowed. It can never widen it.
     ///
     /// The failure this prevents is not cosmetic: if the toggle alone decided,
