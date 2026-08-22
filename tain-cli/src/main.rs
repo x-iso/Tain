@@ -101,6 +101,11 @@ async fn main() -> Result<()> {
     // decode is available.
     tain_core::warm_up_ffmpeg();
 
+    // Before the window system. See `immersive::start_hook_early` — installed
+    // after eframe is up, the keyboard hook is never invoked in this process,
+    // though the same hook works in a standalone program on the same machine.
+    gui::immersive::start_hook_early();
+
     let state = gui::AppState::persistent();
     #[cfg(debug_assertions)]
     gui::app::seed_demo_data(&state);

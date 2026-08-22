@@ -52,6 +52,26 @@ pub use platform::{key_is_down, MODIFIER_VKS, MOD_ALT, MOD_CTRL, MOD_SHIFT};
 #[cfg(test)]
 const VK_LWIN: u16 = 0x5B;
 
+/// Install the keyboard hook before the window system starts.
+///
+/// # Why this is called from `main` rather than on demand
+///
+/// Installed after eframe was running, the hook was never invoked — on the
+/// UI thread or on a thread of its own — while an otherwise identical
+/// standalone program on the same machine worked on both. `SendInput`
+/// confirmed the test keystroke was really being injected, so the events
+/// existed and this process simply did not receive them.
+///
+/// What is left is the order things happen in. Putting the hook in before
+/// the window system initialises is the cheapest way to find out whether
+/// that is the difference, and if it is, it is also the fix.
+pub fn start_hook_early() {
+    platform::install_key_hook();
+    // Nothing should be captured yet: this only proves the hook can be
+    // installed and called. Immersive mode turns capture on later.
+    platform::set_capture(false);
+}
+
 /// Immersive mode state, owned by the app.
 ///
 /// # There is exactly one state, on purpose
@@ -1006,6 +1026,11 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
         }
     }
 
+    /// Set the capture flag directly, without touching anything else.
+    pub fn set_capture(active: bool) {
+        CAPTURE_ACTIVE.store(active, Ordering::Relaxed);
+    }
+
     pub fn install_key_hook() {
         ensure_hook_thread();
         REPORTED.store(0, Ordering::Relaxed);
@@ -1089,6 +1114,7 @@ mod platform {
         Vec::new()
     }
     pub fn probe_hook_on_this_thread() {}
+    pub fn set_capture(_active: bool) {}
     pub fn app_has_focus() -> bool {
         true
     }
