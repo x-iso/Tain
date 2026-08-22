@@ -185,8 +185,15 @@ impl Immersive {
             return false;
         }
 
+        // On the same clock as the hook trace below it, which is the only way
+        // to read the two together: a Win press stamped before the foreground
+        // moved is a keystroke that leaked despite being swallowed, and one
+        // stamped after is a keystroke that arrived while something else was
+        // already in front. Those are different faults.
         tracing::info!(
-            "Immersive mode ended — another application held the front for {:?} ({})",
+            "Immersive mode ended +{}ms — another application took the front \
+             {:?} ago ({})",
+            platform::since_capture_ms(),
             since.elapsed(),
             platform::foreground_description(),
         );
@@ -219,6 +226,15 @@ impl Immersive {
         }
         self.last_foreground_log = Some(std::time::Instant::now());
         tracing::info!("Immersive: foreground is {}", platform::foreground_description());
+    }
+
+    /// Tell the hook whether this window is in front, for the frame ahead.
+    ///
+    /// The forwarding path needs that answer and the callback must not go and
+    /// ask for it — see `platform::FORWARD_ALLOWED`. Called once a frame while
+    /// a session window is open, which is the only time it is consulted.
+    pub fn publish_forward_gate(&self) {
+        platform::publish_forward_gate();
     }
 
     /// Whether keys have gone to another application since the last frame.
@@ -264,7 +280,7 @@ impl Immersive {
             platform::install_key_hook();
             tracing::info!("Immersive mode on — the keyboard goes to the host, pointer confined");
         } else {
-            let (swallowed, passed, reinstalls, entered) = platform::counters();
+            let counts = platform::counters();
             for line in platform::take_trace() {
                 tracing::info!("Immersive hook saw: {line}");
             }
@@ -273,9 +289,19 @@ impl Immersive {
             // `passed` above zero means the callback ran and chose not to
             // swallow; both at zero means it never ran at all. Those are
             // different faults and the numbers tell them apart.
+            //
+            // The slowest callback is the third answer, and the one the
+            // counters could not give: a key can be swallowed and still act on
+            // this machine, if the swallow arrived after Windows stopped
+            // waiting for it. Anything near 300ms means that is what happened.
             tracing::info!(
-                "Immersive mode off — callback entered {entered} times, \
-                 {swallowed} keys taken, {passed} passed through, {reinstalls} hook installs"
+                "Immersive mode off — callback entered {} times, {} keys taken, \
+                 {} passed through, {} hook installs, slowest callback {:.1} ms",
+                counts.entered,
+                counts.swallowed,
+                counts.passed,
+                counts.reinstalls,
+                counts.slowest_us as f32 / 1000.0,
             );
         }
     }
@@ -338,11 +364,13 @@ impl Drop for Immersive {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcessId, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, ClipCursor, GetCursorPos, WindowFromPoint, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
         PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT,
@@ -352,6 +380,33 @@ mod platform {
 
     /// The hook callback is a bare C function, so its state has to be static.
     static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    /// When this process started, for stamping events the callback records.
+    ///
+    /// A `tracing` line carries a wall-clock time, but the trace is written all
+    /// at once when the mode ends, so its entries have no times of their own.
+    /// That is what made the last round unreadable: the log showed a Win press
+    /// reaching the hook and the foreground moving to the Start menu, with no
+    /// way to tell which came first — and the whole remaining question is which
+    /// came first.
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    /// Milliseconds since this process started. One clock read, no allocation.
+    fn now_ms() -> u32 {
+        STARTED
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis()
+            .min(u32::MAX as u128) as u32
+    }
+
+    /// [`now_ms`] when immersive mode was last switched on.
+    static CAPTURE_AT: AtomicU32 = AtomicU32::new(0);
+
+    /// How long the mode has been on, in milliseconds.
+    pub fn since_capture_ms() -> u32 {
+        now_ms().saturating_sub(CAPTURE_AT.load(Ordering::Relaxed))
+    }
     /// The six modifier keys, left and right told apart.
     pub const MODIFIER_VKS: [u16; 6] = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
 
@@ -435,8 +490,55 @@ mod platform {
 /// The scancode is the one that matters — see `protocol::KeyEvent::scancode`.
 /// The virtual key travels with it because the escape shortcut is matched on
 /// it, and because a log full of scancodes is unreadable.
-type Captured = (u16, u16, bool, bool);
-static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
+    type Captured = (u16, u16, bool, bool);
+
+    /// Keys the hook has taken, waiting for the UI thread to send them.
+    ///
+    /// # Why a ring of atomics rather than a `Mutex<Vec<_>>`
+    ///
+    /// It was a mutex, drained by the UI thread every frame, and that is a lock
+    /// the callback can block on. The deadline it has to meet is not
+    /// negotiable: Windows allows `LowLevelHooksTimeout` -- 300ms by default --
+    /// and a callback that misses it has its answer thrown away. The keystroke
+    /// is delivered to this machine no matter what the callback eventually
+    /// returns.
+    ///
+    /// Frames were taking 120ms to draw on the machine where this was
+    /// reported. A callback waiting behind two of those has already lost, and
+    /// what that looks like from outside is exactly the fault reported: the
+    /// hook runs, the counter says the key was swallowed, and the Start menu
+    /// opens anyway.
+    ///
+    /// One producer (the hook thread), one consumer (the UI thread), fixed
+    /// slots, no allocation. The callback's worst case is two atomic stores.
+    const RING: usize = 256;
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY_SLOT: AtomicU64 = AtomicU64::new(0);
+    static SLOTS: [AtomicU64; RING] = [EMPTY_SLOT; RING];
+    /// How many keys the hook has written, and how many the UI has taken.
+    static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+    static READ: AtomicUsize = AtomicUsize::new(0);
+
+    fn pack(vk: u16, scancode: u16, extended: bool, pressed: bool) -> u64 {
+        vk as u64 | (scancode as u64) << 16 | (extended as u64) << 32 | (pressed as u64) << 33
+    }
+
+    fn unpack(bits: u64) -> Captured {
+        (bits as u16, (bits >> 16) as u16, bits >> 32 & 1 != 0, bits >> 33 & 1 != 0)
+    }
+
+    /// Queue a key for the host. Called only from the hook thread.
+    fn push_captured(vk: u16, scancode: u16, extended: bool, pressed: bool) {
+        let written = WRITTEN.load(Ordering::Relaxed);
+        if written.wrapping_sub(READ.load(Ordering::Acquire)) >= RING {
+            // The UI thread has stopped draining. Dropping the newest key
+            // beats overwriting one already queued, which would deliver the
+            // session's typing out of order.
+            return;
+        }
+        SLOTS[written % RING].store(pack(vk, scancode, extended, pressed), Ordering::Relaxed);
+        WRITTEN.store(written.wrapping_add(1), Ordering::Release);
+    }
     /// The way out, recognised by the hook itself.
     ///
     /// Packed as `vk | mods << 16`, because the callback cannot take a lock to
@@ -451,8 +553,30 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
     static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 
-    /// Bound on the queue, in case the app stops draining while the hook runs.
-    const MAX_QUEUED_KEYS: usize = 256;
+    /// Whether the forwarding path may take a key, as of the last frame.
+    ///
+    /// # Why the callback no longer asks Windows this itself
+    ///
+    /// It called `GetCursorPos`, `WindowFromPoint`, `GetForegroundWindow` and
+    /// `GetWindowThreadProcessId` -- four trips into the window manager, on
+    /// every keystroke, from inside a callback that is holding up the system's
+    /// input processing while it runs. The documentation for
+    /// `LowLevelKeyboardProc` asks for the opposite: return quickly, and do not
+    /// call anything that might block.
+    ///
+    /// What it answers is which window is in front. That changes on a human
+    /// timescale, so a frame-old answer is as good as a fresh one, and the UI
+    /// thread can afford to ask. It fails closed: cleared when forwarding
+    /// stops, and never set unless this application is positively in front.
+    static FORWARD_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+    /// Refresh [`FORWARD_ALLOWED`]. Called once a frame from the UI thread.
+    pub fn publish_forward_gate() {
+        let allowed = FORWARD_ACTIVE.load(Ordering::Relaxed)
+            && pointer_over_our_window()
+            && app_has_focus();
+        FORWARD_ALLOWED.store(allowed, Ordering::Relaxed);
+    }
 
     // Modifier virtual-key codes. A low-level hook reports the side-specific
     // ones, which is what makes right Alt distinguishable from left.
@@ -542,14 +666,41 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     static SWALLOWED: AtomicU32 = AtomicU32::new(0);
     static PASSED: AtomicU32 = AtomicU32::new(0);
 
-    /// What the hook has done so far: swallowed, passed through, reinstalls.
-    pub fn counters() -> (u32, u32, u32, u32) {
-        (
-            SWALLOWED.load(Ordering::Relaxed),
-            PASSED.load(Ordering::Relaxed),
-            REINSTALLS.load(Ordering::Relaxed),
-            ENTERED.load(Ordering::Relaxed),
-        )
+    /// The longest a single callback has taken, in microseconds.
+    ///
+    /// The one number that separates "the hook decided wrongly" from "the hook
+    /// decided too late". Anything approaching `LowLevelHooksTimeout` -- 300ms
+    /// unless the registry says otherwise -- means Windows stopped waiting and
+    /// delivered the keystroke here regardless of what was returned.
+    static SLOWEST_US: AtomicU32 = AtomicU32::new(0);
+
+    /// Times the callback and records the worst case seen.
+    struct Timed(std::time::Instant);
+
+    impl Drop for Timed {
+        fn drop(&mut self) {
+            let taken = self.0.elapsed().as_micros().min(u32::MAX as u128) as u32;
+            SLOWEST_US.fetch_max(taken, Ordering::Relaxed);
+        }
+    }
+
+    /// What the hook has done so far.
+    pub struct Counters {
+        pub swallowed: u32,
+        pub passed: u32,
+        pub reinstalls: u32,
+        pub entered: u32,
+        pub slowest_us: u32,
+    }
+
+    pub fn counters() -> Counters {
+        Counters {
+            swallowed: SWALLOWED.load(Ordering::Relaxed),
+            passed: PASSED.load(Ordering::Relaxed),
+            reinstalls: REINSTALLS.load(Ordering::Relaxed),
+            entered: ENTERED.load(Ordering::Relaxed),
+            slowest_us: SLOWEST_US.load(Ordering::Relaxed),
+        }
     }
 
     fn current_mods() -> u8 {
@@ -591,30 +742,48 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     /// the UI thread: a callback that formats strings is what caused an earlier
     /// round of this, since Windows removes a hook that misses its deadline.
     ///
-    /// `(hook code, message, virtual key, flags, capture flag)`.
-    type RawEvent = (i32, u32, u32, u32, bool);
+    /// `(milliseconds into the mode, hook code, message, virtual key, flags)`.
+    type RawEvent = (u32, i32, u32, u32, u32);
     static TRACE: Mutex<Vec<RawEvent>> = Mutex::new(Vec::new());
-    /// How many raw events to keep. Enough for a keypress or two.
-    const TRACE_LIMIT: usize = 8;
+    /// How many raw events to keep.
+    ///
+    /// Was eight, which the mode being switched on and off around a few
+    /// presses could exhaust before the interesting keystroke arrived -- every
+    /// trace so far was mostly events from before immersive mode started.
+    /// Recording only while capturing, and keeping more, fixes both halves.
+    const TRACE_LIMIT: usize = 64;
+
+    /// Forget the trace, so the next one covers only this immersive session.
+    pub fn clear_trace() {
+        if let Ok(mut trace) = TRACE.lock() {
+            trace.clear();
+        }
+    }
 
     /// The trace, drained and made readable.
     pub fn take_trace() -> Vec<String> {
         let Ok(mut trace) = TRACE.lock() else { return Vec::new() };
         std::mem::take(&mut *trace)
             .into_iter()
-            .map(|(code, message, vk, flags, capture)| {
+            .map(|(at, code, message, vk, flags)| {
                 format!(
-                    "code {code}, msg 0x{message:04X}, vk 0x{vk:02X}, flags 0x{flags:02X}, capture {capture}"
+                    "+{at}ms code {code}, msg 0x{message:04X}, vk 0x{vk:02X}, flags 0x{flags:02X}"
                 )
             })
             .collect()
     }
 
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        let _timed = Timed(std::time::Instant::now());
         ENTERED.fetch_add(1, Ordering::Relaxed);
 
-        // Recorded before any test, so a rejected event is still visible.
-        if let Ok(mut trace) = TRACE.lock()
+        // Recorded before any decision, so a rejected event is still visible.
+        // `try_lock`, because a callback that waits on the UI thread is the
+        // fault this file is chasing and a diagnostic must not be able to cause
+        // it. Only while capturing: outside that the trace fills with ordinary
+        // typing and the keystroke worth seeing never gets a slot.
+        if CAPTURE_ACTIVE.load(Ordering::Relaxed)
+            && let Ok(mut trace) = TRACE.try_lock()
             && trace.len() < TRACE_LIMIT
         {
             // SAFETY: for HC_ACTION the OS guarantees a KBDLLHOOKSTRUCT behind
@@ -625,7 +794,7 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
             } else {
                 (0, 0)
             };
-            trace.push((code, wparam.0 as u32, vk, flags, CAPTURE_ACTIVE.load(Ordering::Relaxed)));
+            trace.push((since_capture_ms(), code, wparam.0 as u32, vk, flags));
         }
 
         // Forwarding mode, when immersive is not on. Copied to the host and
@@ -653,12 +822,9 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
             if !injected
                 && (pressed || released)
                 && forwardable(vk)
-                && pointer_over_our_window()
-                && app_has_focus()
-                && let Ok(mut queue) = CAPTURED.lock()
-                && queue.len() < MAX_QUEUED_KEYS
+                && FORWARD_ALLOWED.load(Ordering::Relaxed)
             {
-                queue.push((vk, info.scanCode as u16, extended, pressed));
+                push_captured(vk, info.scanCode as u16, extended, pressed);
             }
         }
 
@@ -735,11 +901,7 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
                     return LRESULT(1);
                 }
 
-                if let Ok(mut queue) = CAPTURED.lock()
-                    && queue.len() < MAX_QUEUED_KEYS
-                {
-                    queue.push((vk, info.scanCode as u16, extended, pressed));
-                }
+                push_captured(vk, info.scanCode as u16, extended, pressed);
                 // Non-zero swallows it, so this machine does not also act on a
                 // keystroke meant for the other one.
                 return LRESULT(1);
@@ -894,6 +1056,8 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     /// Blocks until the hook is actually installed, so a caller that sets a
     /// capture flag immediately afterwards cannot race it.
     fn ensure_hook_thread() {
+        // Before the thread, so the callback never initialises it itself.
+        let _ = STARTED.get_or_init(std::time::Instant::now);
         let Ok(mut started) = HOOK_THREAD_STARTED.lock() else { return };
         if *started {
             return;
@@ -903,6 +1067,26 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
         let spawned = std::thread::Builder::new()
             .name("tain-keyboard-hook".into())
             .spawn(move || {
+                // # This thread has a deadline, so it is scheduled like one
+                //
+                // Windows gives the callback `LowLevelHooksTimeout` to answer,
+                // and it can only answer once this thread is running. That is a
+                // problem on the machine this was reported from, where the UI
+                // thread was taking 120ms a frame and several decoder threads
+                // were saturating the CPU: an ordinary-priority thread waiting
+                // its turn behind those can easily miss 300ms.
+                //
+                // Raising it is safe because of what the thread does, which is
+                // nothing. It sleeps in `GetMessageW`, and when woken performs
+                // a handful of atomic stores and returns. There is no loop here
+                // to starve the rest of the machine with.
+                //
+                // SAFETY: setting our own thread's priority. `GetCurrentThread`
+                // returns a pseudo-handle that must not be closed.
+                unsafe {
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                }
+
                 // SAFETY: a WH_KEYBOARD_LL hook takes no module handle — see
                 // the note below — and is delivered to this thread, which
                 // pumps messages immediately afterwards.
@@ -983,7 +1167,10 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
 
     pub fn install_key_hook() {
         ensure_hook_thread();
+        CAPTURE_AT.store(now_ms(), Ordering::Relaxed);
         REPORTED.store(0, Ordering::Relaxed);
+        SLOWEST_US.store(0, Ordering::Relaxed);
+        clear_trace();
         CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
     }
 
@@ -993,15 +1180,17 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
             ensure_hook_thread();
         }
         FORWARD_ACTIVE.store(active, Ordering::Relaxed);
+        if !active {
+            FORWARD_ALLOWED.store(false, Ordering::Relaxed);
+        }
     }
 
     pub fn remove_key_hook() {
         // The hook stays installed; only the decision changes. Nothing to
         // uninstall means nothing to get wrong about when.
         CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
-        if let Ok(mut queue) = CAPTURED.lock() {
-            queue.clear();
-        }
+        // Whatever is still queued belongs to a mode that has ended.
+        READ.store(WRITTEN.load(Ordering::Acquire), Ordering::Release);
         // The hook's own view of the modifiers goes with it: whatever was held
         // while it was swallowing is not held as far as this machine is
         // concerned, and a stale flag would misread the next escape shortcut.
@@ -1012,7 +1201,15 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     }
 
     pub fn drain_captured() -> Vec<Captured> {
-        CAPTURED.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
+        let written = WRITTEN.load(Ordering::Acquire);
+        let mut read = READ.load(Ordering::Relaxed);
+        let mut keys = Vec::with_capacity(written.wrapping_sub(read));
+        while read != written {
+            keys.push(unpack(SLOTS[read % RING].load(Ordering::Relaxed)));
+            read = read.wrapping_add(1);
+        }
+        READ.store(read, Ordering::Release);
+        keys
     }
 
     pub fn clip_cursor(rect: egui::Rect, pixels_per_point: f32) {
@@ -1062,6 +1259,21 @@ mod platform {
     }
     pub fn take_trace() -> Vec<String> {
         Vec::new()
+    }
+    pub fn clear_trace() {}
+    pub fn since_capture_ms() -> u32 {
+        0
+    }
+    pub fn publish_forward_gate() {}
+    pub struct Counters {
+        pub swallowed: u32,
+        pub passed: u32,
+        pub reinstalls: u32,
+        pub entered: u32,
+        pub slowest_us: u32,
+    }
+    pub fn counters() -> Counters {
+        Counters { swallowed: 0, passed: 0, reinstalls: 0, entered: 0, slowest_us: 0 }
     }
     pub fn set_capture(_active: bool) {}
     pub fn app_has_focus() -> bool {

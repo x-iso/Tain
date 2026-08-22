@@ -208,6 +208,8 @@ impl SessionWindow {
                     actions.close_all = true;
                 }
 
+                // The hook reads this rather than asking Windows itself.
+                immersive.publish_forward_gate();
                 immersive.log_foreground();
 
                 // If something else came to the front while immersive mode was
