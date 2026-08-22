@@ -132,6 +132,8 @@ pub struct SessionWindow {
     /// of the video, and without this a click on a button was also delivered to
     /// whatever was under it on the host.
     toolbar_rect: Option<egui::Rect>,
+    /// Whether the one-off UI-thread hook probe has run.
+    probed_hook: bool,
 }
 
 impl Default for SessionWindow {
@@ -143,6 +145,7 @@ impl Default for SessionWindow {
             show_stats: false,
             pending_fullscreen: None,
             toolbar_rect: None,
+            probed_hook: false,
         }
     }
 }
@@ -185,6 +188,13 @@ impl SessionWindow {
         // from the hook. Narrow and non-destructive — see `Immersive`. Switched
         // off with the last session, in `after_sessions_changed`.
         immersive.set_forwarding(true);
+
+        // Once per session window, to compare against the hook thread's own
+        // result. Temporary: it exists to find out why a hook that works in a
+        // standalone program does not work inside this process.
+        if !std::mem::replace(&mut self.probed_hook, true) {
+            immersive.probe_hook_here();
+        }
 
         let title = match sessions.len() {
             1 => "Tain — Session".to_string(),

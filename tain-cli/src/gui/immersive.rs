@@ -220,6 +220,14 @@ impl Immersive {
         platform::set_forwarding(on);
     }
 
+    /// Check whether a hook installed on the caller's thread is invoked.
+    ///
+    /// Called once from the UI thread. See
+    /// `platform::probe_hook_on_this_thread` for what it distinguishes.
+    pub fn probe_hook_here(&self) {
+        platform::probe_hook_on_this_thread();
+    }
+
     /// Turn immersive mode on or off. Idempotent.
     pub fn set_active(&mut self, on: bool) {
         if self.active == on {
@@ -793,7 +801,13 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     ///
     /// Runs on the hook thread, just after installing and before the message
     /// loop begins — which is exactly the arrangement being tested.
-    fn self_test() {
+    /// Inject one harmless keystroke. Returns whether it was actually sent.
+    ///
+    /// Reporting the send separately matters: without it a probe cannot tell
+    /// "the hook is dead" from "nothing was ever injected", and would report
+    /// the first for the second. `SendInput` is refused when a
+    /// higher-integrity window holds the foreground, among other reasons.
+    fn self_test_inject() -> bool {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
         };
@@ -801,7 +815,6 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
         /// F24. A real key, and one nothing in practice is bound to.
         const PROBE_VK: u16 = 0x87;
 
-        let before = ENTERED.load(Ordering::Relaxed);
         let key = |flags| INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
@@ -815,10 +828,22 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
             },
         };
         let events = [key(Default::default()), key(KEYEVENTF_KEYUP)];
-        // SAFETY: two well-formed keyboard events from a slice that outlives
-        // the call.
-        unsafe {
-            SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+        // SAFETY: two well-formed events in a slice that outlives the call.
+        let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
+        if sent != events.len() as u32 {
+            tracing::warn!(
+                "Hook probe inconclusive — SendInput sent {sent} of {} events",
+                events.len()
+            );
+            return false;
+        }
+        true
+    }
+
+    fn self_test() {
+        let before = ENTERED.load(Ordering::Relaxed);
+        if !self_test_inject() {
+            return;
         }
 
         // The hook is called during message retrieval, so this cannot simply
@@ -840,6 +865,58 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
         tracing::warn!(
             "Keyboard hook self-test FAILED — SetWindowsHookExW succeeded but the              callback is never invoked. Immersive mode cannot capture keys on this              machine; see task 48."
         );
+    }
+
+    /// Install a hook on *this* thread, prove it, and take it off again.
+    ///
+    /// # Why the same test twice, on two threads
+    ///
+    /// A standalone program installing the identical hook on this machine —
+    /// main thread and spawned thread alike — has its callback invoked
+    /// normally. Inside Tain it is not. So the fault is something about this
+    /// process rather than about Windows or the mechanism, and the next thing
+    /// worth knowing is whether *any* thread here can hold a working hook.
+    ///
+    /// Run from the UI thread at startup, the answer distinguishes "this
+    /// process cannot hook at all" from "the hook thread specifically cannot",
+    /// which point at completely different causes.
+    pub fn probe_hook_on_this_thread() {
+        // SAFETY: installed on the calling thread, which is the winit event
+        // loop and therefore pumps messages, and removed again below.
+        let hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) }
+        {
+            Ok(hook) => hook,
+            Err(e) => {
+                tracing::warn!("UI-thread hook probe could not install: {e}");
+                return;
+            }
+        };
+
+        let before = ENTERED.load(Ordering::Relaxed);
+        self_test_inject();
+        // The event is delivered while this thread is retrieving messages, and
+        // the caller returns to eframe's loop immediately after, so a short
+        // pump here is what gives it the chance.
+        let mut msg = MSG::default();
+        for _ in 0..20 {
+            // SAFETY: a non-blocking peek; anything found is discarded.
+            unsafe {
+                let _ = PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE);
+            }
+            if ENTERED.load(Ordering::Relaxed) > before {
+                tracing::info!("UI-thread hook probe: callback IS invoked on this thread");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if ENTERED.load(Ordering::Relaxed) == before {
+            tracing::warn!("UI-thread hook probe: callback is NOT invoked on this thread either");
+        }
+
+        // SAFETY: installed just above on this thread, removed once.
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook);
+        }
     }
 
     /// Start the hook thread if it is not already running.
@@ -1011,6 +1088,7 @@ mod platform {
     pub fn take_trace() -> Vec<String> {
         Vec::new()
     }
+    pub fn probe_hook_on_this_thread() {}
     pub fn app_has_focus() -> bool {
         true
     }
