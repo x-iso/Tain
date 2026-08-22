@@ -308,17 +308,15 @@ impl Drop for Immersive {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Mutex;
     use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, ClipCursor, GetCursorPos, WindowFromPoint, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-        PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-        UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE,
-        WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-        WM_USER,
+        SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+        LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
     /// The hook callback is a bare C function, so its state has to be static.
@@ -446,15 +444,6 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     /// makes the foreground test below trustworthy for them.
     fn forwardable(vk: u16) -> bool {
         matches!(vk, 0x09 | 0x10 | 0x11 | 0x12 | 0xA0..=0xA5)
-    }
-
-    /// Turn plain-session forwarding on or off.
-    pub fn set_forwarding(active: bool) {
-        FORWARD_ACTIVE.store(active, Ordering::Relaxed);
-        if active {
-            tell_hook_thread(MSG_INSTALL);
-        }
-        // Never uninstalled here. See `remove_key_hook`.
     }
 
     pub const MOD_CTRL: u8 = 1;
@@ -779,212 +768,121 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
 
     /// The hook thread, started once and kept for the life of the process.
     ///
-    /// # Never joined, deliberately
+    /// # Installed on the thread, before the loop — nothing is posted
     ///
-    /// An earlier version posted `WM_QUIT` and joined from the UI thread. That
-    /// deadlocked it: `PostThreadMessageW` fails if the target thread has not
-    /// created its message queue yet, and the ready signal was being sent
-    /// before the first `GetMessageW` created it. When the post was lost the
-    /// thread sat in `GetMessageW` forever and the join froze the entire
-    /// application — which from outside looks exactly like "it blocks my input
-    /// even with immersive mode off".
+    /// This used to start the thread, let it enter its message loop, and then
+    /// post it a message asking it to install the hook. That indirection was
+    /// mine, and it cost several rounds: a trace of the raw callback events
+    /// showed the hook delivering nothing for a whole immersive session and
+    /// then waking up immediately after the mode was switched off. Whatever the
+    /// precise race, the fix is to remove the opportunity for one.
     ///
-    /// Nothing needs joining anyway: `CAPTURE_ACTIVE` makes the callback inert
-    /// in one atomic load, so a hook still installed for a few milliseconds
-    /// after the mode ends passes every key straight through.
+    /// rdev — the library RustDesk grabs keys with — calls `SetWindowsHookExW`
+    /// directly on the grab thread and enters `GetMessage` on the next line.
+    /// This now does the same. The hook goes in when the thread starts, comes
+    /// out when the process exits, and nothing installs or removes it in
+    /// between.
+    ///
+    /// Turning capture on and off is therefore two atomic stores and no
+    /// syscalls at all. An installed hook with both flags clear costs one
+    /// `CallNextHookEx`, which is nothing.
     static HOOK_THREAD_STARTED: Mutex<bool> = Mutex::new(false);
-    static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
-    /// The installed hook. Written only by the hook thread.
-    static HOOK: AtomicIsize = AtomicIsize::new(0);
 
-    /// Install, or reinstall to regain the head of the hook chain.
-    const MSG_INSTALL: u32 = WM_APP + 1;
-    /// Take the hook off.
-    const MSG_UNINSTALL: u32 = WM_APP + 2;
-
-    // # Why there is no reinstall timer
-    //
-    // There was one, at 250ms, to stay ahead of any other application that
-    // hooks the same keys. It did not help, and it costs something real: each
-    // reinstall is two system calls on the hook thread, so the thread is busy
-    // rather than waiting, and a key arriving during one has to wait — against
-    // a deadline whose penalty is the hook being removed outright.
-    //
-    // rdev, which is what RustDesk grabs keys with, installs once and leaves it
-    // alone for the life of the grab. Matching that removes a self-inflicted
-    // source of exactly the stall being chased.
-
-    /// Put the hook on, replacing any existing one. Hook-thread only.
+    /// Start the hook thread if it is not already running.
     ///
-    /// # New one first, old one after
-    ///
-    /// The obvious order — unhook, then hook — leaves a window with no hook
-    /// installed at all, and a key arriving in it goes straight to this
-    /// machine. That window is short, but this runs on a timer, so "short and
-    /// frequent" is exactly the shape that eventually catches a keystroke.
-    ///
-    /// Installing first means the chain briefly holds both. That is harmless:
-    /// the newer one is called first and swallows, so the older never sees the
-    /// key. A failed install also leaves the previous hook in place rather than
-    /// disarming us on the way to an error.
-    fn install_here() {
-        let previous = HOOK.load(Ordering::Relaxed);
-        // SAFETY: a WH_KEYBOARD_LL hook takes no module handle and is delivered
-        // to this thread, which pumps messages.
-        // # The module handle must be null here
-        //
-        // This passed `GetModuleHandleW(NULL)` for a while, on the reasoning
-        // that the documented examples supply a module and matching them
-        // removed a variable. It removed the wrong one: the callback stopped
-        // being invoked entirely — `SetWindowsHookExW` kept returning a valid
-        // handle, and Windows simply never called it. The log said "callback
-        // entered 0 times, 2 hook installs", which is what that looks like.
-        //
-        // A non-null module tells Windows the procedure lives in a DLL it
-        // should inject into other processes. Ours is in an executable, so
-        // there is nothing injectable, and the hook is registered but dead.
-        // Low-level hooks do not need injection — they are always called in the
-        // installing thread — so the handle is meaningless and must be null.
-        //
-        // rdev, which is what RustDesk grabs keys with, passes null.
-        match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) } {
-            Ok(hook) => {
-                HOOK.store(hook.0 as isize, Ordering::Relaxed);
-                REINSTALLS.fetch_add(1, Ordering::Relaxed);
-                if previous != 0 {
-                    // SAFETY: came from SetWindowsHookExW on this thread, and is
-                    // removed exactly once — the store above means no other path
-                    // can reach it now.
-                    unsafe {
-                        let _ = UnhookWindowsHookEx(HHOOK(previous as *mut _));
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(
-                "Could not install the keyboard hook: {e}. Keys will stay on this machine."
-            ),
-        }
-    }
-
-    /// Take the hook off, if one is on. Hook-thread only.
-    fn uninstall_here() {
-        let handle = HOOK.swap(0, Ordering::Relaxed);
-        if handle != 0 {
-            // SAFETY: came from SetWindowsHookExW on this thread, removed once.
-            unsafe {
-                let _ = UnhookWindowsHookEx(HHOOK(handle as *mut _));
-            }
-        }
-    }
-
-    /// The hook lives here so it can always answer at once.
-    ///
-    /// # Why it cannot live on the UI thread
-    ///
-    /// A low-level hook callback is delivered to **the thread that installed
-    /// it**, and Windows waits only `LowLevelHooksTimeout` — 300 ms by default
-    /// — for an answer. Miss that and the return value is discarded and the key
-    /// passes through as though the hook had never run.
-    ///
-    /// It used to be installed on eframe's UI thread, which spends its life
-    /// blocked on vsync and GPU work while video is being drawn. That produced
-    /// a hook that behaved backwards: with the session window focused the
-    /// thread was busy, the answer came late, and the Win key opened the local
-    /// Start menu — while the log recorded it as swallowed, because the
-    /// callback really did run and really did return 1. Windows had stopped
-    /// listening. Unfocused, eframe stops repainting, the thread goes idle, and
-    /// every key was captured correctly. Same code, opposite behaviour, decided
-    /// by how busy the renderer was.
-    fn hook_thread_main(ready: std::sync::mpsc::Sender<()>) {
-        let mut msg = MSG::default();
-        // Force the message queue into existence *before* anyone is told this
-        // thread is ready, so a PostThreadMessageW that follows cannot be lost.
-        // SAFETY: a non-removing peek, purely for that side effect.
-        unsafe {
-            let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
-        }
-        // SAFETY: reading this thread's own id.
-        HOOK_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
-        let _ = ready.send(());
-
-        // SAFETY: a standard message loop. GetMessageW returns 0 on WM_QUIT and
-        // -1 on error; both end it.
-        while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-            match msg.message {
-                MSG_INSTALL => install_here(),
-                MSG_UNINSTALL => uninstall_here(),
-                _ => {}
-            }
-        }
-        uninstall_here();
-    }
-
-    /// Post to the hook thread, starting it if it is not running yet.
-    fn tell_hook_thread(message: u32) {
+    /// Blocks until the hook is actually installed, so a caller that sets a
+    /// capture flag immediately afterwards cannot race it.
+    fn ensure_hook_thread() {
         let Ok(mut started) = HOOK_THREAD_STARTED.lock() else { return };
-        if !*started {
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            match std::thread::Builder::new()
-                .name("tain-keyboard-hook".into())
-                .spawn(move || hook_thread_main(ready_tx))
-            {
-                // Waits for the queue to exist, not for the hook: the post
-                // below would otherwise race the thread's first instruction.
-                Ok(_) => match ready_rx.recv() {
-                    Ok(()) => *started = true,
-                    Err(_) => {
-                        tracing::warn!("The keyboard hook thread stopped before it was ready");
+        if *started {
+            return;
+        }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("tain-keyboard-hook".into())
+            .spawn(move || {
+                // SAFETY: a WH_KEYBOARD_LL hook takes no module handle — see
+                // the note below — and is delivered to this thread, which
+                // pumps messages immediately afterwards.
+                //
+                // # The module handle must be null
+                //
+                // Passing `GetModuleHandleW(NULL)` here left the hook
+                // registered and dead: the call succeeded and the callback was
+                // never invoked. A non-null module tells Windows the procedure
+                // lives in a DLL to inject into other processes; ours is in an
+                // executable, so there is nothing to inject. Low-level hooks
+                // are always called on the installing thread and need none.
+                let installed =
+                    unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) };
+
+                let hook = match installed {
+                    Ok(hook) => {
+                        REINSTALLS.fetch_add(1, Ordering::Relaxed);
+                        let _ = ready_tx.send(true);
+                        hook
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Could not install the keyboard hook: {e}. \
+                             Keys will stay on this machine."
+                        );
+                        let _ = ready_tx.send(false);
                         return;
                     }
-                },
-                Err(e) => {
-                    tracing::warn!("Could not start the keyboard hook thread: {e}");
-                    return;
+                };
+
+                // Nothing is dispatched here. The loop exists so the OS has a
+                // thread in a message wait to call the hook on, and this thread
+                // does nothing else, so it is always free to answer inside the
+                // deadline Windows allows.
+                let mut msg = MSG::default();
+                // SAFETY: a standard message loop; 0 on WM_QUIT, -1 on error.
+                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {}
+
+                // SAFETY: installed on this thread, removed once, here.
+                unsafe {
+                    let _ = UnhookWindowsHookEx(hook);
+                }
+            });
+
+        match spawned {
+            // Failure leaves this unstarted, so a later attempt tries again
+            // rather than assuming a hook that is not there.
+            Ok(_) => {
+                if let Ok(true) = ready_rx.recv() {
+                    *started = true;
+                    tracing::info!("Keyboard hook installed on its own thread");
                 }
             }
-        }
-        let thread_id = HOOK_THREAD_ID.load(Ordering::Relaxed);
-        if thread_id != 0 {
-            // SAFETY: posting to a thread whose queue is known to exist.
-            unsafe {
-                let _ = PostThreadMessageW(thread_id, message, WPARAM(0), LPARAM(0));
-            }
+            Err(e) => tracing::warn!("Could not start the keyboard hook thread: {e}"),
         }
     }
 
     pub fn install_key_hook() {
-        CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+        ensure_hook_thread();
         REPORTED.store(0, Ordering::Relaxed);
-        tell_hook_thread(MSG_INSTALL);
-        tracing::info!(
-            "Immersive mode: keyboard hook installed on its own thread — keys go to the host"
-        );
+        CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+    }
+
+    /// Turn plain-session forwarding on or off.
+    pub fn set_forwarding(active: bool) {
+        if active {
+            ensure_hook_thread();
+        }
+        FORWARD_ACTIVE.store(active, Ordering::Relaxed);
     }
 
     pub fn remove_key_hook() {
-        // # The hook is not uninstalled here, or anywhere
-        //
-        // Tying the hook's *existence* to session state was the mistake. It
-        // went in and out on every immersive toggle, every forwarding change,
-        // and — for a while — every 250ms on a timer. Each cycle is a window in
-        // which a key arrives with no hook to see it, and each install is work
-        // on the thread that must be free to answer within a deadline whose
-        // penalty is Windows removing the hook outright.
-        //
-        // rdev, which is what RustDesk grabs keys with, starts its grab once
-        // and leaves it for the life of the process; a flag decides whether to
-        // swallow. That is what this does now. An installed hook with both
-        // flags clear costs two atomic loads and a `CallNextHookEx`, which is
-        // nothing, and it is never absent at the moment a key arrives.
-        //
-        // Windows tears it down when the process exits, which is the only
-        // teardown that was ever needed.
+        // The hook stays installed; only the decision changes. Nothing to
+        // uninstall means nothing to get wrong about when.
         CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
         if let Ok(mut queue) = CAPTURED.lock() {
             queue.clear();
         }
         // The hook's own view of the modifiers goes with it: whatever was held
-        // while it was swallowing keys is not held as far as this machine is
+        // while it was swallowing is not held as far as this machine is
         // concerned, and a stale flag would misread the next escape shortcut.
         CTRL_DOWN.store(false, Ordering::Relaxed);
         SHIFT_DOWN.store(false, Ordering::Relaxed);
