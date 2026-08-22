@@ -970,36 +970,54 @@ mod platform {
     /// The hook thread, so a refresh can be asked for.
     static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
-    /// Asks the hook thread to take its hook out and put it back.
-    const MSG_REFRESH: u32 = WM_APP + 1;
+    /// Asks the hook thread to check whether its hook still works.
+    const MSG_PROBE: u32 = WM_APP + 1;
 
-    /// Put this process's hook back at the head of the chain.
+    /// The moments worth measuring at, in the order they happen.
+    const STAGE_SESSION: u32 = 1;
+    const STAGE_IMMERSIVE: u32 = 2;
+
+    fn stage_name(stage: u32) -> &'static str {
+        match stage {
+            STAGE_SESSION => "when a session window opened",
+            STAGE_IMMERSIVE => "on the way into immersive mode",
+            _ => "at an unnamed moment",
+        }
+    }
+
+    /// Ask the hook thread to report whether its hook is still being called.
     ///
-    /// # Why the hook is reinstalled rather than left alone
+    /// # This used to reinstall the hook, and reinstalling breaks it
     ///
-    /// Windows calls low-level keyboard hooks **most recently installed
-    /// first**, and any of them can end the chain by returning non-zero. A hook
-    /// installed when the process started therefore sits behind every hook
-    /// installed by anything else since — which, for an application someone
-    /// leaves running, is most of what they have launched today.
+    /// The theory was chain position: Windows calls low-level keyboard hooks
+    /// most recently installed first, so a hook installed at process start
+    /// sits behind every hook installed by anything launched since, and rdev —
+    /// what RustDesk grabs with — installs on grab rather than at startup.
+    /// Reinstalling on the way into immersive mode should have put this at the
+    /// front.
     ///
-    /// That is the shape of the fault the logs show. The hook is alive, its
-    /// self-test passes, and it is simply not called for the Win press that
-    /// opens the Start menu; four hundred milliseconds later it is called for
-    /// the next one. Something ahead of it in the chain is taking the first.
+    /// Measured, it puts it in the grave. `SetWindowsHookExW` succeeds and the
+    /// replacement is never called: zero of four injected events, where the
+    /// hook installed at startup had just passed the same probe. Since the old
+    /// hook is removed first, that session had no working hook at all — worse
+    /// than the fault it was meant to fix.
     ///
-    /// Every standalone experiment run against this said the mechanism was
-    /// fine, and every one of them installed its hook seconds before testing —
-    /// always at the head of the chain, so none of them tested the case that
-    /// fails. rdev, which is what RustDesk grabs keys with, installs on *grab*
-    /// rather than at startup, and so is always at the head too. That is the
-    /// difference, and this is it copied.
+    /// The same unhook-and-reinstall in a bare process, on a spawned thread
+    /// sitting in `GetMessageW`, works: four of four, before and after. So this
+    /// is something about *this* process, and until it is understood the one
+    /// hook that works is not being thrown away to test a theory.
     ///
-    /// Sent rather than waited on. A hook is installed from startup either way,
-    /// so nothing is uncovered while this is in flight, and the alternative is
-    /// stalling the UI thread for the length of a self-test every time somebody
-    /// presses the button.
-    fn refresh_hook() {
+    /// What is left is the measurement, which costs nothing: the probes below
+    /// say whether the hook is alive and whether the Win key reaches it, at the
+    /// moment somebody switches immersive mode on.
+    ///
+    /// `stage` names the moment, because the useful measurement is not one
+    /// answer but where between them it changes. The hook passes its probe at
+    /// startup and then misses real keystrokes, so something between those two
+    /// points is what to look for, and nothing so far has narrowed it: it is
+    /// not the timing, not the chain, not eframe, and not a window holding the
+    /// foreground — each of those was tested on this machine and cleared.
+    fn probe_hook(stage: u32) {
         let thread = HOOK_THREAD_ID.load(Ordering::Relaxed);
         if thread == 0 {
             return;
@@ -1007,7 +1025,7 @@ mod platform {
         // SAFETY: posting to a thread that has a message queue — it made one by
         // calling `SetWindowsHookExW` and sits in `GetMessageW`.
         unsafe {
-            let _ = PostThreadMessageW(thread, MSG_REFRESH, WPARAM(0), LPARAM(0));
+            let _ = PostThreadMessageW(thread, MSG_PROBE, WPARAM(stage as usize), LPARAM(0));
         }
     }
 
@@ -1124,7 +1142,7 @@ mod platform {
     /// Four injected events. Four seen means the Win key reaches us; two means
     /// the Ctrl pair arrived and the Win pair was taken by somebody in front of
     /// us in the chain.
-    fn chain_test() {
+    fn chain_test(stage: &str) {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
         };
@@ -1155,7 +1173,7 @@ mod platform {
         // SAFETY: four well-formed events in a slice that outlives the call.
         let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
         if sent != events.len() as u32 {
-            tracing::warn!("Chain probe inconclusive — SendInput sent {sent} of 4 events");
+            tracing::warn!("Chain probe {stage} inconclusive — SendInput sent {sent} of 4");
             return;
         }
 
@@ -1166,17 +1184,31 @@ mod platform {
                 let _ = PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE);
             }
             if ENTERED.load(Ordering::Relaxed).saturating_sub(before) >= 4 {
-                tracing::info!("Chain probe: all 4 events reached the hook — the Win key is ours");
+                tracing::info!(
+                    "Chain probe {stage}: all 4 events reached the hook — the Win key is ours"
+                );
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let seen = ENTERED.load(Ordering::Relaxed).saturating_sub(before);
-        tracing::warn!(
-            "Chain probe: only {seen} of 4 injected events reached the hook. Another \
-             low-level hook is ahead of ours and is taking the key before we see it."
-        );
+        // Nothing at all is a dead hook, and it says nothing about the chain:
+        // the Ctrl events are of no interest to anyone else and would have
+        // arrived. Some but not all is the interesting case — the Ctrl pair
+        // came through and the Win pair was taken by a hook ahead of ours.
+        if seen == 0 {
+            tracing::warn!(
+                "Chain probe {stage}: none of the 4 injected events reached the hook — it \
+                 is not being called at all, so immersive mode cannot take keys."
+            );
+        } else {
+            tracing::warn!(
+                "Chain probe {stage}: only {seen} of 4 injected events reached the hook. \
+                 The Ctrl pair arrived and the Win pair did not, so a low-level hook ahead \
+                 of ours is taking the Win key before we see it."
+            );
+        }
     }
 
     /// Self-test, and say so either way.
@@ -1188,6 +1220,7 @@ mod platform {
     /// running: a failure here means the hook is not merely outranked but dead,
     /// and those need different answers.
     fn self_test_and_report(what: &str) {
+        // Borrowed rather than 'static: the stage is formatted at the call.
         if self_test() {
             tracing::info!("Keyboard hook {what} — self-test passed, the callback is live");
         } else {
@@ -1241,7 +1274,7 @@ mod platform {
 
                 let installed = install_hook();
 
-                let Some(mut hook) = installed else {
+                let Some(hook) = installed else {
                     let _ = ready_tx.send(false);
                     return;
                 };
@@ -1261,6 +1294,7 @@ mod platform {
                 // ignores injected events for every other purpose. F24 is a
                 // real virtual key that essentially nothing binds.
                 self_test_and_report("installed on its own thread");
+                chain_test("at startup");
 
                 // Nothing is dispatched below, and the only message this thread
                 // is ever sent is a request to put its hook back at the head of
@@ -1270,23 +1304,15 @@ mod platform {
                 let mut msg = MSG::default();
                 // SAFETY: a standard message loop; 0 on WM_QUIT, -1 on error.
                 while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-                    if msg.message != MSG_REFRESH {
+                    if msg.message != MSG_PROBE {
                         continue;
                     }
-                    // Out and straight back in, on the thread that owns it.
-                    // Removing first rather than adding first: two live
-                    // installations would each call the callback and every key
-                    // would reach the host twice, which is worse for the few
-                    // microseconds this takes than no hook at all.
-                    //
-                    // SAFETY: installed on this thread, removed once here.
-                    unsafe {
-                        let _ = UnhookWindowsHookEx(hook);
-                    }
-                    let Some(fresh) = install_hook() else { return };
-                    hook = fresh;
-                    self_test_and_report("moved to the head of the chain");
-            chain_test();
+                    // Run here rather than on the UI thread because the probes
+                    // wait for the callback, and the callback arrives on this
+                    // thread.
+                    let stage = stage_name(msg.wParam.0 as u32);
+                    self_test_and_report(&format!("checked {stage}"));
+                    chain_test(stage);
                 }
 
                 // SAFETY: installed on this thread, removed once, here.
@@ -1315,9 +1341,9 @@ mod platform {
     }
 
     pub fn install_key_hook() {
-        // A hook installed just now is already at the head of the chain.
+        // A hook installed a moment ago has just been probed already.
         if !ensure_hook_thread() {
-            refresh_hook();
+            probe_hook(STAGE_IMMERSIVE);
         }
         CAPTURE_AT.store(now_ms(), Ordering::Relaxed);
         REPORTED.store(0, Ordering::Relaxed);
@@ -1328,12 +1354,10 @@ mod platform {
 
     /// Turn plain-session forwarding on or off.
     pub fn set_forwarding(active: bool) {
-        if active {
-            // Forwarding only copies keys, so its position in the chain costs
-            // nothing worse than a modifier the host never learns about.
-            // Immersive mode is where being outranked matters, and that asks
-            // for its own refresh.
-            ensure_hook_thread();
+        if active && !ensure_hook_thread() {
+            // Once per session window, and only the first time it opens —
+            // `Immersive::set_forwarding` filters repeats.
+            probe_hook(STAGE_SESSION);
         }
         FORWARD_ACTIVE.store(active, Ordering::Relaxed);
         if !active {
