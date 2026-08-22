@@ -917,6 +917,91 @@ mod platform {
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 
+    /// Which desktop the hook thread is on, and which one is receiving input.
+    ///
+    /// # Why this is the question
+    ///
+    /// A hook is registered against the desktop of the thread that installs it.
+    /// If that thread's desktop is not the one input is going to, the hook is
+    /// never called — and installing a fresh one on the same thread produces
+    /// another hook on the same wrong desktop, born just as dead.
+    ///
+    /// That is the only mechanism found so far that accounts for both halves of
+    /// what was measured: an installed hook that stops being called, on a
+    /// thread that is demonstrably still pumping, where reinstalling changes
+    /// nothing. The callback deadline, chain position, eframe and the
+    /// foreground window were each tested and cleared, and none of them
+    /// explains the reinstall being dead too.
+    ///
+    /// Windows switches the input desktop for UAC and for the lock screen. Both
+    /// switch back, and a hook on the original desktop should resume — but this
+    /// application is already known to go deaf when UAC appears, and the run
+    /// that failed had eight idle minutes in it.
+    ///
+    /// Two names. Equal is the boring answer and rules the theory out.
+    fn desktop_names() -> (String, String) {
+        use windows::Win32::System::StationsAndDesktops::{
+            CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop,
+            DESKTOP_READOBJECTS, DESKTOP_CONTROL_FLAGS, UOI_NAME,
+        };
+
+        /// The name behind a desktop handle, or why it could not be read.
+        fn name_of(handle: windows::Win32::System::StationsAndDesktops::HDESK) -> String {
+            let mut buffer = [0u16; 128];
+            let mut needed = 0u32;
+            // SAFETY: a documented read into a buffer we own, with its size in
+            // bytes as the API expects.
+            let ok = unsafe {
+                GetUserObjectInformationW(
+                    windows::Win32::Foundation::HANDLE(handle.0),
+                    UOI_NAME,
+                    Some(buffer.as_mut_ptr().cast()),
+                    std::mem::size_of_val(&buffer) as u32,
+                    Some(&mut needed),
+                )
+            };
+            if ok.is_err() {
+                return "unreadable".to_string();
+            }
+            let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+            String::from_utf16_lossy(&buffer[..len])
+        }
+
+        // SAFETY: `GetThreadDesktop` returns a handle that must not be closed,
+        // and `OpenInputDesktop` one that must be — hence the split below.
+        unsafe {
+            let ours = GetThreadDesktop(GetCurrentThreadId())
+                .map(name_of)
+                .unwrap_or_else(|_| "unknown".to_string());
+
+            let input = match OpenInputDesktop(
+                DESKTOP_CONTROL_FLAGS(0),
+                false,
+                DESKTOP_READOBJECTS,
+            ) {
+                Ok(handle) => {
+                    let name = name_of(handle);
+                    let _ = CloseDesktop(handle);
+                    name
+                }
+                // Refused when the input desktop belongs to another session or
+                // to Winlogon, which is itself the answer this is looking for.
+                Err(e) => format!("cannot open ({e})"),
+            };
+            (ours, input)
+        }
+    }
+
+    /// The desktop pair, as one line, for a log.
+    pub fn desktop_description() -> String {
+        let (ours, input) = desktop_names();
+        if ours == input {
+            format!("hook thread and input are both on desktop {ours}")
+        } else {
+            format!("hook thread is on desktop {ours}, but input is going to {input}")
+        }
+    }
+
     /// The foreground window's process, named, and whether it is ours.
     ///
     /// For diagnostics only — nothing keys off this. Names the executable
@@ -1122,23 +1207,71 @@ mod platform {
                 },
             },
         };
-        let events = [key(Default::default()), key(KEYEVENTF_KEYUP)];
-        // SAFETY: two well-formed events in a slice that outlives the call.
-        let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
-        if sent != events.len() as u32 {
-            tracing::warn!(
-                "Hook probe inconclusive — SendInput sent {sent} of {} events",
-                events.len()
-            );
-            return false;
+        // Down and up as separate calls, with a look at the key state in
+        // between. `SendInput` reporting success proves nothing — see
+        // [`Verdict`] — so the only trustworthy evidence that the keystroke
+        // happened is Windows itself saying the key went down.
+        // SAFETY: one well-formed event in a slice that outlives the call.
+        let down = unsafe { SendInput(&[key(Default::default())], std::mem::size_of::<INPUT>() as i32) };
+        let landed = down == 1 && probe_key_is_down();
+        // SAFETY: as above, releasing what was just pressed.
+        unsafe {
+            SendInput(&[key(KEYEVENTF_KEYUP)], std::mem::size_of::<INPUT>() as i32);
         }
-        true
+        landed
     }
 
-    fn self_test() -> bool {
+    /// What a probe found.
+    ///
+    /// # Why "the hook saw nothing" is not a verdict on its own
+    ///
+    /// `SendInput` is blocked by UIPI when a higher-integrity window holds the
+    /// foreground, and its documentation is explicit that **neither the return
+    /// value nor `GetLastError` reports it**. So a probe that injects a key and
+    /// sees nothing arrive has learned one of two very different things: the
+    /// hook is dead, or the keystroke was never delivered to anybody.
+    ///
+    /// Every "0 of 4" measured so far has been read as the first. It could have
+    /// been the second throughout, and the difference decides whether the fault
+    /// is in the hook at all.
+    ///
+    /// `GetAsyncKeyState` settles it, because it is updated by the input system
+    /// itself rather than by the hook chain. If the key went down as far as
+    /// Windows is concerned, the injection landed and a hook that missed it is
+    /// genuinely deaf.
+    enum Verdict {
+        /// The callback ran. The hook is working.
+        Live,
+        /// The key reached Windows and the callback did not run.
+        Deaf,
+        /// The key never reached Windows, so this says nothing about the hook.
+        Blocked,
+    }
+
+    impl Verdict {
+        fn describe(&self) -> &'static str {
+            match self {
+                Verdict::Live => "the callback is live",
+                Verdict::Deaf => {
+                    "the key reached Windows and the callback did not run — the hook is deaf"
+                }
+                Verdict::Blocked => {
+                    "the injected key never reached Windows either, so this says nothing \
+                     about the hook — SendInput was blocked, which UIPI does silently"
+                }
+            }
+        }
+    }
+
+    /// Whether Windows believes F24 is down. Independent of the hook chain.
+    fn probe_key_is_down() -> bool {
+        key_is_down(0x87)
+    }
+
+    fn self_test() -> Verdict {
         let before = ENTERED.load(Ordering::Relaxed);
         if !self_test_inject() {
-            return false;
+            return Verdict::Blocked;
         }
 
         // The hook is called during message retrieval, so this cannot simply
@@ -1151,11 +1284,11 @@ mod platform {
                 let _ = PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE);
             }
             if ENTERED.load(Ordering::Relaxed) > before {
-                return true;
+                return Verdict::Live;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        false
+        Verdict::Deaf
     }
 
     /// Does the Win key itself reach this hook, right now?
@@ -1239,10 +1372,13 @@ mod platform {
         // arrived. Some but not all is the interesting case — the Ctrl pair
         // came through and the Win pair was taken by a hook ahead of ours.
         if seen == 0 {
+            // The self-test that just ran says whether the injection lands at
+            // all, so this only has to add what it does not cover.
             tracing::warn!(
-                "Chain probe {stage}: none of the 4 injected events reached the hook — it \
-                 is not being called at all, so immersive mode cannot take keys. Foreground: {}",
+                "Chain probe {stage}: none of the 4 injected events reached the hook. \
+                 Foreground: {}. Desktops: {}",
                 foreground_description(),
+                desktop_description(),
             );
         } else {
             tracing::warn!(
@@ -1261,16 +1397,19 @@ mod platform {
     /// taken by the same hook that takes the real one. It is still worth
     /// running: a failure here means the hook is not merely outranked but dead,
     /// and those need different answers.
-    fn self_test_and_report(what: &str) {
+    fn self_test_and_report(what: &str) -> Verdict {
         // Borrowed rather than 'static: the stage is formatted at the call.
-        if self_test() {
-            tracing::info!("Keyboard hook {what} — self-test passed, the callback is live");
-        } else {
-            tracing::warn!(
-                "Keyboard hook {what} — self-test FAILED. SetWindowsHookExW succeeded and \
-                 the callback is never invoked, so immersive mode cannot take keys."
-            );
+        let verdict = self_test();
+        match verdict {
+            Verdict::Live => tracing::info!("Keyboard hook {what} — {}", verdict.describe()),
+            _ => tracing::warn!(
+                "Keyboard hook {what} — {}. Foreground: {}. Desktops: {}",
+                verdict.describe(),
+                foreground_description(),
+                desktop_description(),
+            ),
         }
+        verdict
     }
 
     /// Start the hook thread if it is not already running.
@@ -1335,8 +1474,10 @@ mod platform {
                 // callback counts every entry before it looks at that flag, and
                 // ignores injected events for every other purpose. F24 is a
                 // real virtual key that essentially nothing binds.
-                self_test_and_report("installed on its own thread");
+                let _ = self_test_and_report("installed on its own thread");
                 chain_test("at startup");
+                // The baseline the failing case is compared against.
+                tracing::info!("Keyboard hook: {}", desktop_description());
 
                 // Nothing is dispatched below, and the only message this thread
                 // is ever sent is a request to put its hook back at the head of
@@ -1353,7 +1494,7 @@ mod platform {
                     // wait for the callback, and the callback arrives on this
                     // thread.
                     let stage = stage_name(msg.wParam.0 as u32);
-                    self_test_and_report(&format!("checked {stage}"));
+                    let _ = self_test_and_report(&format!("checked {stage}"));
                     chain_test(&stage);
                 }
 
