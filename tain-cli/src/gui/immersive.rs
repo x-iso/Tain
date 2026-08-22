@@ -369,13 +369,15 @@ mod platform {
     use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows::Win32::System::Threading::{
-        GetCurrentProcessId, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+        GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, SetThreadPriority,
+        THREAD_PRIORITY_TIME_CRITICAL,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, ClipCursor, GetCursorPos, WindowFromPoint, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-        PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT,
-        LLKHF_EXTENDED, PM_REMOVE,
-        LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        PeekMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION,
+        HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, PM_REMOVE,
+        LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+        WM_SYSKEYUP,
     };
 
     /// The hook callback is a bare C function, so its state has to be static.
@@ -961,25 +963,80 @@ mod platform {
 
     /// The hook thread, started once and kept for the life of the process.
     ///
-    /// # Installed on the thread, before the loop — nothing is posted
-    ///
-    /// This used to start the thread, let it enter its message loop, and then
-    /// post it a message asking it to install the hook. That indirection was
-    /// mine, and it cost several rounds: a trace of the raw callback events
-    /// showed the hook delivering nothing for a whole immersive session and
-    /// then waking up immediately after the mode was switched off. Whatever the
-    /// precise race, the fix is to remove the opportunity for one.
-    ///
-    /// rdev — the library RustDesk grabs keys with — calls `SetWindowsHookExW`
-    /// directly on the grab thread and enters `GetMessage` on the next line.
-    /// This now does the same. The hook goes in when the thread starts, comes
-    /// out when the process exits, and nothing installs or removes it in
-    /// between.
-    ///
-    /// Turning capture on and off is therefore two atomic stores and no
-    /// syscalls at all. An installed hook with both flags clear costs one
-    /// `CallNextHookEx`, which is nothing.
+    /// The hook itself is reinstalled whenever immersive mode is switched on.
+    /// See [`refresh_hook`] for why that is not the churn it looks like.
     static HOOK_THREAD_STARTED: Mutex<bool> = Mutex::new(false);
+
+    /// The hook thread, so a refresh can be asked for.
+    static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
+    /// Asks the hook thread to take its hook out and put it back.
+    const MSG_REFRESH: u32 = WM_APP + 1;
+
+    /// Put this process's hook back at the head of the chain.
+    ///
+    /// # Why the hook is reinstalled rather than left alone
+    ///
+    /// Windows calls low-level keyboard hooks **most recently installed
+    /// first**, and any of them can end the chain by returning non-zero. A hook
+    /// installed when the process started therefore sits behind every hook
+    /// installed by anything else since — which, for an application someone
+    /// leaves running, is most of what they have launched today.
+    ///
+    /// That is the shape of the fault the logs show. The hook is alive, its
+    /// self-test passes, and it is simply not called for the Win press that
+    /// opens the Start menu; four hundred milliseconds later it is called for
+    /// the next one. Something ahead of it in the chain is taking the first.
+    ///
+    /// Every standalone experiment run against this said the mechanism was
+    /// fine, and every one of them installed its hook seconds before testing —
+    /// always at the head of the chain, so none of them tested the case that
+    /// fails. rdev, which is what RustDesk grabs keys with, installs on *grab*
+    /// rather than at startup, and so is always at the head too. That is the
+    /// difference, and this is it copied.
+    ///
+    /// Sent rather than waited on. A hook is installed from startup either way,
+    /// so nothing is uncovered while this is in flight, and the alternative is
+    /// stalling the UI thread for the length of a self-test every time somebody
+    /// presses the button.
+    fn refresh_hook() {
+        let thread = HOOK_THREAD_ID.load(Ordering::Relaxed);
+        if thread == 0 {
+            return;
+        }
+        // SAFETY: posting to a thread that has a message queue — it made one by
+        // calling `SetWindowsHookExW` and sits in `GetMessageW`.
+        unsafe {
+            let _ = PostThreadMessageW(thread, MSG_REFRESH, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    /// Install the hook on the calling thread, which must be the hook thread.
+    ///
+    /// # The module handle must be null
+    ///
+    /// Passing `GetModuleHandleW(NULL)` here left the hook registered and dead:
+    /// the call succeeded and the callback was never invoked. A non-null module
+    /// tells Windows the procedure lives in a DLL to inject into other
+    /// processes; ours is in an executable, so there is nothing to inject.
+    /// Low-level hooks are always called on the installing thread and need
+    /// none.
+    fn install_hook() -> Option<HHOOK> {
+        // SAFETY: a WH_KEYBOARD_LL hook takes no module handle, and is
+        // delivered to this thread, which pumps messages.
+        match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) } {
+            Ok(hook) => {
+                REINSTALLS.fetch_add(1, Ordering::Relaxed);
+                Some(hook)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Could not install the keyboard hook: {e}. Keys will stay on this machine."
+                );
+                None
+            }
+        }
+    }
 
     /// Send one synthetic keystroke and report whether the hook saw it.
     ///
@@ -1024,10 +1081,10 @@ mod platform {
         true
     }
 
-    fn self_test() {
+    fn self_test() -> bool {
         let before = ENTERED.load(Ordering::Relaxed);
         if !self_test_inject() {
-            return;
+            return false;
         }
 
         // The hook is called during message retrieval, so this cannot simply
@@ -1040,27 +1097,119 @@ mod platform {
                 let _ = PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE);
             }
             if ENTERED.load(Ordering::Relaxed) > before {
-                tracing::info!("Keyboard hook self-test passed — the callback is live");
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Does the Win key itself reach this hook, right now?
+    ///
+    /// # What this measures that the self-test cannot
+    ///
+    /// The self-test injects F24, which nothing else is interested in, so it
+    /// only proves the callback is reachable. The reported fault is narrower
+    /// than that: the callback is alive and is not called for the Win press
+    /// that opens the Start menu. If a hook installed ahead of ours is taking
+    /// it, an injected Win will disappear in exactly the same place, and the
+    /// count says so.
+    ///
+    /// Ctrl is held across it so Windows cannot act on the Win key even if it
+    /// does get through — the shell opens the Start menu only when nothing else
+    /// was pressed between the Win down and its up. So this is invisible
+    /// whichever way it comes out, which a probe that runs on every switch into
+    /// immersive mode has to be.
+    ///
+    /// Four injected events. Four seen means the Win key reaches us; two means
+    /// the Ctrl pair arrived and the Win pair was taken by somebody in front of
+    /// us in the chain.
+    fn chain_test() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+        };
+
+        const VK_LCONTROL_PROBE: u16 = 0xA2;
+        const VK_LWIN_PROBE: u16 = 0x5B;
+
+        let key = |vk: u16, flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk),
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let events = [
+            key(VK_LCONTROL_PROBE, Default::default()),
+            key(VK_LWIN_PROBE, Default::default()),
+            key(VK_LWIN_PROBE, KEYEVENTF_KEYUP),
+            key(VK_LCONTROL_PROBE, KEYEVENTF_KEYUP),
+        ];
+
+        let before = ENTERED.load(Ordering::Relaxed);
+        // SAFETY: four well-formed events in a slice that outlives the call.
+        let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
+        if sent != events.len() as u32 {
+            tracing::warn!("Chain probe inconclusive — SendInput sent {sent} of 4 events");
+            return;
+        }
+
+        let mut msg = MSG::default();
+        for _ in 0..20 {
+            // SAFETY: a non-blocking peek, discarding whatever it finds.
+            unsafe {
+                let _ = PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE);
+            }
+            if ENTERED.load(Ordering::Relaxed).saturating_sub(before) >= 4 {
+                tracing::info!("Chain probe: all 4 events reached the hook — the Win key is ours");
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
+        let seen = ENTERED.load(Ordering::Relaxed).saturating_sub(before);
         tracing::warn!(
-            "Keyboard hook self-test FAILED — SetWindowsHookExW succeeded but the              callback is never invoked. Immersive mode cannot capture keys on this              machine; see task 48."
+            "Chain probe: only {seen} of 4 injected events reached the hook. Another \
+             low-level hook is ahead of ours and is taking the key before we see it."
         );
+    }
+
+    /// Self-test, and say so either way.
+    ///
+    /// A pass proves only that the callback is reachable for a key this process
+    /// injected itself. It cannot prove the hook is ahead of everything else in
+    /// the chain, because an injected key travels the same chain and would be
+    /// taken by the same hook that takes the real one. It is still worth
+    /// running: a failure here means the hook is not merely outranked but dead,
+    /// and those need different answers.
+    fn self_test_and_report(what: &str) {
+        if self_test() {
+            tracing::info!("Keyboard hook {what} — self-test passed, the callback is live");
+        } else {
+            tracing::warn!(
+                "Keyboard hook {what} — self-test FAILED. SetWindowsHookExW succeeded and \
+                 the callback is never invoked, so immersive mode cannot take keys."
+            );
+        }
     }
 
     /// Start the hook thread if it is not already running.
     ///
     /// Blocks until the hook is actually installed, so a caller that sets a
     /// capture flag immediately afterwards cannot race it.
-    fn ensure_hook_thread() {
+    /// Returns true when this call is what started it, so a caller can skip
+    /// asking for a refresh of a hook that was installed a moment ago.
+    fn ensure_hook_thread() -> bool {
         // Before the thread, so the callback never initialises it itself.
         let _ = STARTED.get_or_init(std::time::Instant::now);
-        let Ok(mut started) = HOOK_THREAD_STARTED.lock() else { return };
+        let Ok(mut started) = HOOK_THREAD_STARTED.lock() else { return false };
         if *started {
-            return;
+            return false;
         }
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -1087,36 +1236,16 @@ mod platform {
                     let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
                 }
 
-                // SAFETY: a WH_KEYBOARD_LL hook takes no module handle — see
-                // the note below — and is delivered to this thread, which
-                // pumps messages immediately afterwards.
-                //
-                // # The module handle must be null
-                //
-                // Passing `GetModuleHandleW(NULL)` here left the hook
-                // registered and dead: the call succeeded and the callback was
-                // never invoked. A non-null module tells Windows the procedure
-                // lives in a DLL to inject into other processes; ours is in an
-                // executable, so there is nothing to inject. Low-level hooks
-                // are always called on the installing thread and need none.
-                let installed =
-                    unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) };
+                // SAFETY: reading our own thread id.
+                HOOK_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
 
-                let hook = match installed {
-                    Ok(hook) => {
-                        REINSTALLS.fetch_add(1, Ordering::Relaxed);
-                        let _ = ready_tx.send(true);
-                        hook
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Could not install the keyboard hook: {e}. \
-                             Keys will stay on this machine."
-                        );
-                        let _ = ready_tx.send(false);
-                        return;
-                    }
+                let installed = install_hook();
+
+                let Some(mut hook) = installed else {
+                    let _ = ready_tx.send(false);
+                    return;
                 };
+                let _ = ready_tx.send(true);
 
                 // # Prove the hook is live, without needing anyone to type
                 //
@@ -1131,15 +1260,34 @@ mod platform {
                 // callback counts every entry before it looks at that flag, and
                 // ignores injected events for every other purpose. F24 is a
                 // real virtual key that essentially nothing binds.
-                self_test();
+                self_test_and_report("installed on its own thread");
 
-                // Nothing is dispatched below. The loop exists so the OS has a
-                // thread in a message wait to call the hook on, and this thread
-                // does nothing else, so it is always free to answer inside the
-                // deadline Windows allows.
+                // Nothing is dispatched below, and the only message this thread
+                // is ever sent is a request to put its hook back at the head of
+                // the chain. The loop otherwise exists so the OS has a thread
+                // in a message wait to call the hook on, and this thread does
+                // nothing else, so it is always free to answer.
                 let mut msg = MSG::default();
                 // SAFETY: a standard message loop; 0 on WM_QUIT, -1 on error.
-                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {}
+                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+                    if msg.message != MSG_REFRESH {
+                        continue;
+                    }
+                    // Out and straight back in, on the thread that owns it.
+                    // Removing first rather than adding first: two live
+                    // installations would each call the callback and every key
+                    // would reach the host twice, which is worse for the few
+                    // microseconds this takes than no hook at all.
+                    //
+                    // SAFETY: installed on this thread, removed once here.
+                    unsafe {
+                        let _ = UnhookWindowsHookEx(hook);
+                    }
+                    let Some(fresh) = install_hook() else { return };
+                    hook = fresh;
+                    self_test_and_report("moved to the head of the chain");
+            chain_test();
+                }
 
                 // SAFETY: installed on this thread, removed once, here.
                 unsafe {
@@ -1158,6 +1306,7 @@ mod platform {
             }
             Err(e) => tracing::warn!("Could not start the keyboard hook thread: {e}"),
         }
+        *started
     }
 
     /// Set the capture flag directly, without touching anything else.
@@ -1166,7 +1315,10 @@ mod platform {
     }
 
     pub fn install_key_hook() {
-        ensure_hook_thread();
+        // A hook installed just now is already at the head of the chain.
+        if !ensure_hook_thread() {
+            refresh_hook();
+        }
         CAPTURE_AT.store(now_ms(), Ordering::Relaxed);
         REPORTED.store(0, Ordering::Relaxed);
         SLOWEST_US.store(0, Ordering::Relaxed);
@@ -1177,6 +1329,10 @@ mod platform {
     /// Turn plain-session forwarding on or off.
     pub fn set_forwarding(active: bool) {
         if active {
+            // Forwarding only copies keys, so its position in the chain costs
+            // nothing worse than a modifier the host never learns about.
+            // Immersive mode is where being outranked matters, and that asks
+            // for its own refresh.
             ensure_hook_thread();
         }
         FORWARD_ACTIVE.store(active, Ordering::Relaxed);
