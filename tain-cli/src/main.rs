@@ -7,6 +7,7 @@
 // for how output is restored when someone actually wants it.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod console;
 mod gui;
 mod logging;
@@ -44,6 +45,13 @@ async fn main() -> Result<()> {
     // The service modes exist so Tain stays a single portable executable: no
     // installer, no second download, and an exe handed to a friend still just
     // runs. See `service` for what the service is actually for.
+    // The per-desktop agent, started by the service. Handled with the other
+    // non-window modes: it opens no window, binds nothing, and must not be
+    // mistaken for someone launching the application.
+    if args.iter().any(|a| a == agent::AGENT_FLAG) {
+        return agent::run(agent::desktop_from_args(&args));
+    }
+
     if args.iter().any(|a| a == service::RUN_FLAG) {
         // Launched by the service control manager. Never returns until the
         // service is told to stop.

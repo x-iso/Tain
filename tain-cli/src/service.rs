@@ -149,6 +149,8 @@ mod windows_impl {
         SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
         SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     };
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::TerminateProcess;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -452,6 +454,296 @@ mod windows_impl {
     /// The status handle, needed by the control callback.
     static STATUS_HANDLE: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
 
+
+    /// Keeps exactly one agent alive, on whichever desktop is receiving input.
+    ///
+    /// # Why the service has to be the one doing this
+    ///
+    /// A process is bound to the desktop it was created on and cannot move.
+    /// Starting one on a *different* desktop needs `CreateProcessAsUser` with
+    /// `lpDesktop` set, and starting anything on the secure desktop needs to be
+    /// SYSTEM. Both are true of a service and of nothing the user runs.
+    ///
+    /// So the loop is: look at which desktop has input, compare it with where
+    /// the agent is, and if they differ replace the agent. The agent exits by
+    /// itself when it notices the same thing, so the usual case is that it has
+    /// already gone by the time this looks.
+    struct AgentSupervisor {
+        /// The running agent: its process handle and the desktop it is on.
+        current: Option<(HANDLE, String)>,
+        /// The last desktop this failed to start an agent on, so a failure
+        /// that repeats every half second is logged once.
+        complained_about: Option<String>,
+    }
+
+    impl AgentSupervisor {
+        fn new() -> Self {
+            Self { current: None, complained_about: None }
+        }
+
+        /// Bring the agent into line with the input desktop. Called on a timer.
+        fn poll(&mut self) {
+            // An agent that has exited is not an agent, whatever it was for.
+            if let Some((handle, _)) = self.current
+                && !process_is_alive(handle)
+            {
+                self.close_current();
+            }
+
+            let Some(desktop) = crate::agent::input_desktop_name_for_service() else {
+                // No input desktop readable at all. Nothing to do but wait;
+                // this happens between a session ending and the next starting.
+                return;
+            };
+
+            match &self.current {
+                Some((_, on)) if on.eq_ignore_ascii_case(&desktop) => return,
+                Some((_, on)) => {
+                    tracing::info!("Input moved from {on} to {desktop} — replacing the agent");
+                    self.close_current();
+                }
+                None => {}
+            }
+
+            match spawn_agent(&desktop) {
+                Ok(handle) => {
+                    tracing::info!("Agent started on desktop {desktop}");
+                    self.current = Some((handle, desktop));
+                    self.complained_about = None;
+                }
+                Err(e) => {
+                    // Logged once per desktop rather than twice a second. A
+                    // desktop that cannot be reached now often can be shortly —
+                    // during a session change there is a window where the token
+                    // is not available yet — so this keeps trying quietly.
+                    if self.complained_about.as_deref() != Some(desktop.as_str()) {
+                        tracing::warn!("Could not start an agent on desktop {desktop}: {e:#}");
+                        self.complained_about = Some(desktop);
+                    }
+                }
+            }
+        }
+
+        /// End the agent, if there is one.
+        fn close_current(&mut self) {
+            let Some((handle, on)) = self.current.take() else { return };
+            if process_is_alive(handle) {
+                // SAFETY: a process handle this supervisor created.
+                unsafe {
+                    let _ = TerminateProcess(handle, 0);
+                }
+                tracing::debug!("Agent on {on} was still running and has been stopped");
+            }
+            // SAFETY: created by `CreateProcessAsUserW`, closed once.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+        }
+    }
+
+    impl Drop for AgentSupervisor {
+        fn drop(&mut self) {
+            self.close_current();
+        }
+    }
+
+    /// Whether a process handle still refers to something running.
+    fn process_is_alive(handle: HANDLE) -> bool {
+        use windows::Win32::System::Threading::GetExitCodeProcess;
+
+        /// What `GetExitCodeProcess` reports for a process that has not
+        /// exited. Named here because `STILL_ACTIVE` lives among the NT status
+        /// codes rather than with the process API.
+        const STILL_RUNNING: u32 = 259;
+
+        let mut code = 0u32;
+        // SAFETY: a process handle this module owns.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok();
+        ok && code == STILL_RUNNING
+    }
+
+    /// Start an agent on `desktop`, as the right identity for that desktop.
+    ///
+    /// # Two identities, deliberately
+    ///
+    /// On the ordinary desktop the agent runs as the logged-in user: it is
+    /// their session being captured, and their profile, audio endpoints and
+    /// per-user settings are what it needs. On the secure desktop no user token
+    /// is permitted at all — that separation is the entire point of UAC — so
+    /// the agent there runs as SYSTEM, which the service already is.
+    fn spawn_agent(desktop: &str) -> Result<HANDLE> {
+        let secure = !desktop.eq_ignore_ascii_case("Default");
+        if secure {
+            spawn_as_system(desktop)
+        } else {
+            spawn_as_console_user(desktop)
+        }
+    }
+
+    /// The command line for an agent on `desktop`.
+    fn agent_command(desktop: &str) -> Result<Vec<u16>> {
+        Ok(wide(&format!(
+            "\"{}\" {} {} \"{}\"",
+            exe_path()?,
+            crate::agent::AGENT_FLAG,
+            crate::agent::DESKTOP_ARG,
+            desktop
+        )))
+    }
+
+    /// `WinSta0\<desktop>`, which is what `STARTUPINFO` wants.
+    fn desktop_path(desktop: &str) -> Vec<u16> {
+        wide(&format!("WinSta0\\{desktop}"))
+    }
+
+    /// Start the agent as the user signed in at the physical console.
+    fn spawn_as_console_user(desktop: &str) -> Result<HANDLE> {
+        use windows::Win32::Security::{
+            DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
+        };
+        use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+        use windows::Win32::System::RemoteDesktop::{
+            WTSGetActiveConsoleSessionId, WTSQueryUserToken,
+        };
+        use windows::Win32::System::Threading::{
+            CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+        };
+
+        // SAFETY: a documented read of global session state.
+        let session = unsafe { WTSGetActiveConsoleSessionId() };
+        anyhow::ensure!(session != u32::MAX, "there is no console session to run an agent in");
+
+        // SAFETY: called as SYSTEM, which is what this privilege requires; the
+        // token is closed below.
+        let mut user_token = HANDLE::default();
+        unsafe { WTSQueryUserToken(session, &mut user_token) }
+            .context("no user is signed in at the console yet")?;
+        let user_token = OwnedHandle(user_token);
+
+        // A primary token, because `CreateProcessAsUser` will not take the
+        // impersonation token `WTSQueryUserToken` hands out.
+        let mut primary = HANDLE::default();
+        // SAFETY: duplicating a token this function owns.
+        unsafe {
+            DuplicateTokenEx(
+                user_token.0,
+                TOKEN_ALL_ACCESS,
+                None,
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut primary,
+            )
+        }
+        .context("could not duplicate the console user's token")?;
+        let primary = OwnedHandle(primary);
+
+        // The user's environment, so the agent sees their profile rather than
+        // the service's. Not fatal if it cannot be built.
+        let mut environment = std::ptr::null_mut();
+        // SAFETY: documented; destroyed below if it was created.
+        let have_env =
+            unsafe { CreateEnvironmentBlock(&mut environment, primary.0, false) }.is_ok();
+
+        let mut command = agent_command(desktop)?;
+        let mut desktop_name = desktop_path(desktop);
+        let mut startup = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop_name.as_mut_ptr()),
+            ..Default::default()
+        };
+        let mut info = PROCESS_INFORMATION::default();
+
+        // SAFETY: every pointer outlives the call, and the handles the call
+        // returns are taken ownership of immediately below.
+        let started = unsafe {
+            CreateProcessAsUserW(
+                primary.0,
+                None,
+                PWSTR(command.as_mut_ptr()),
+                None,
+                None,
+                false,
+                CREATE_UNICODE_ENVIRONMENT,
+                if have_env { Some(environment) } else { None },
+                None,
+                &startup,
+                &mut info,
+            )
+        };
+
+        if have_env {
+            // SAFETY: created immediately above.
+            unsafe {
+                let _ = DestroyEnvironmentBlock(environment);
+            }
+        }
+        started.context("CreateProcessAsUser refused to start the agent")?;
+
+        // The thread handle is of no use to anyone here.
+        // SAFETY: returned by the call above, closed once.
+        unsafe {
+            let _ = CloseHandle(info.hThread);
+        }
+        let _ = &mut startup;
+        Ok(info.hProcess)
+    }
+
+    /// Start the agent as SYSTEM, which is the only identity the secure desktop
+    /// accepts.
+    fn spawn_as_system(desktop: &str) -> Result<HANDLE> {
+        use windows::Win32::System::Threading::{
+            CreateProcessW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+        };
+
+        let mut command = agent_command(desktop)?;
+        let mut desktop_name = desktop_path(desktop);
+        let mut startup = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop_name.as_mut_ptr()),
+            ..Default::default()
+        };
+        let mut info = PROCESS_INFORMATION::default();
+
+        // SAFETY: every pointer outlives the call; the returned handles are
+        // taken ownership of below.
+        unsafe {
+            CreateProcessW(
+                None,
+                PWSTR(command.as_mut_ptr()),
+                None,
+                None,
+                false,
+                PROCESS_CREATION_FLAGS(0),
+                None,
+                None,
+                &startup,
+                &mut info,
+            )
+        }
+        .context("CreateProcess refused to start the agent on the secure desktop")?;
+
+        // SAFETY: returned by the call above, closed once.
+        unsafe {
+            let _ = CloseHandle(info.hThread);
+        }
+        let _ = &mut startup;
+        Ok(info.hProcess)
+    }
+
+    /// Closes a handle however the surrounding code exits.
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                // SAFETY: owned by this type, closed once.
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
     fn report(state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE) {
         let Ok(handle) = STATUS_HANDLE.lock() else { return };
         let Some(handle) = *handle else { return };
@@ -489,13 +781,15 @@ mod windows_impl {
         report(SERVICE_RUNNING);
         tracing::info!("Tain service started");
 
-        // Nothing to do yet beyond staying alive and stopping cleanly. The
-        // per-desktop agent and the control pipe attach here next; having the
-        // service install, run and stop first means those land against
-        // something already known to work.
+        // One agent, on whichever desktop is receiving input, replaced when
+        // that changes. See `AgentSupervisor` for why the service has to be the
+        // one doing it.
+        let mut agents = AgentSupervisor::new();
         while RUNNING.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            agents.poll();
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
+        drop(agents);
 
         tracing::info!("Tain service stopping");
         report(SERVICE_STOPPED);
