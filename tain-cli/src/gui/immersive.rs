@@ -235,6 +235,9 @@ impl Immersive {
             tracing::info!("Immersive mode on — the keyboard goes to the host, pointer confined");
         } else {
             let (swallowed, passed, reinstalls, entered) = platform::counters();
+            for line in platform::take_trace() {
+                tracing::info!("Immersive hook saw: {line}");
+            }
             self.release();
             // Logged here rather than per key, because here it is free.
             // `passed` above zero means the callback ran and chose not to
@@ -554,8 +557,56 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     /// conditional and so could not tell them apart.
     static ENTERED: AtomicU32 = AtomicU32::new(0);
 
+    /// The first few raw events, exactly as the callback saw them.
+    ///
+    /// # Why raw values rather than another counter
+    ///
+    /// "Entered twice, took nothing" says the callback ran and then rejected
+    /// the event, but not which test rejected it — the capture flag, the
+    /// injected flag, or the message not looking like a key at all. Each has a
+    /// different cause and a different fix, and adding one counter per branch
+    /// would be a third round of the same guessing.
+    ///
+    /// Storing the inputs answers all of them at once. Formatting is left to
+    /// the UI thread: a callback that formats strings is what caused an earlier
+    /// round of this, since Windows removes a hook that misses its deadline.
+    ///
+    /// `(hook code, message, virtual key, flags, capture flag)`.
+    type RawEvent = (i32, u32, u32, u32, bool);
+    static TRACE: Mutex<Vec<RawEvent>> = Mutex::new(Vec::new());
+    /// How many raw events to keep. Enough for a keypress or two.
+    const TRACE_LIMIT: usize = 8;
+
+    /// The trace, drained and made readable.
+    pub fn take_trace() -> Vec<String> {
+        let Ok(mut trace) = TRACE.lock() else { return Vec::new() };
+        std::mem::take(&mut *trace)
+            .into_iter()
+            .map(|(code, message, vk, flags, capture)| {
+                format!(
+                    "code {code}, msg 0x{message:04X}, vk 0x{vk:02X}, flags 0x{flags:02X}, capture {capture}"
+                )
+            })
+            .collect()
+    }
+
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         ENTERED.fetch_add(1, Ordering::Relaxed);
+
+        // Recorded before any test, so a rejected event is still visible.
+        if let Ok(mut trace) = TRACE.lock()
+            && trace.len() < TRACE_LIMIT
+        {
+            // SAFETY: for HC_ACTION the OS guarantees a KBDLLHOOKSTRUCT behind
+            // lparam. For any other code that pointer is not ours to read.
+            let (vk, flags) = if code == HC_ACTION as i32 {
+                let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+                (info.vkCode, info.flags.0)
+            } else {
+                (0, 0)
+            };
+            trace.push((code, wparam.0 as u32, vk, flags, CAPTURE_ACTIVE.load(Ordering::Relaxed)));
+        }
 
         // Forwarding mode, when immersive is not on. Copied to the host and
         // then handed onward untouched, so this machine behaves exactly as it
@@ -989,6 +1040,9 @@ mod platform {
     pub fn set_forwarding(_active: bool) {}
     pub fn take_lost_foreground() -> bool {
         false
+    }
+    pub fn take_trace() -> Vec<String> {
+        Vec::new()
     }
     pub fn app_has_focus() -> bool {
         true
