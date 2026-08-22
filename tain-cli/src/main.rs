@@ -33,6 +33,26 @@ async fn main() -> Result<()> {
     // `logging` for why: a release build launched by double-click used to
     // produce no diagnostics whatsoever, which makes a problem on someone
     // else's machine impossible to look into.
+    // The service and the agent write to `%ProgramData%\\Tain` rather than to
+    // the user's application data — see `logging::component_log_path`. Decided
+    // before the subscriber is built, because it decides which file it opens.
+    let component = if args.iter().any(|a| a == service::RUN_FLAG) {
+        Some("service".to_string())
+    } else if args.iter().any(|a| a == agent::AGENT_FLAG) {
+        Some(format!(
+            "agent-{}",
+            agent::desktop_from_args(&args).unwrap_or_else(|| "unknown".to_string())
+        ))
+    } else {
+        None
+    };
+    if let Some(name) = &component
+        && let Some(path) = logging::component_log_path(name)
+    {
+        // SAFETY: single-threaded here; nothing else has been started yet.
+        unsafe { std::env::set_var("TAIN_LOG_FILE", &path) };
+    }
+
     if let Some(path) = logging::init(has_console) {
         tracing::info!("Logging to {}", path.display());
     }

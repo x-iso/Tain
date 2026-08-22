@@ -88,6 +88,47 @@ pub fn log_path() -> Option<PathBuf> {
     resolve_log_path(std::env::var_os("TAIN_LOG_FILE"))
 }
 
+/// Where a background process writes, given a name for it.
+///
+/// # Why these do not go where the application's log goes
+///
+/// The service runs as Local System, whose `APPDATA` is inside
+/// `C:\Windows\System32\config\systemprofile`. Nothing the signed-in user
+/// runs can read that without elevating, which makes the one component that
+/// cannot be attached to a console also the one whose log nobody can open. The
+/// first time the service did anything worth watching, neither of us could see
+/// whether it had.
+///
+/// The agent has the opposite problem and it is worse. It runs as the console
+/// user, so it lands on exactly the `tain.log` the application uses — and that
+/// file is truncated at startup, so an agent and a window opened in either
+/// order quietly destroy each other's evidence.
+///
+/// `%ProgramData%\Tain` is the answer to both: one place, writable by Local
+/// System, readable by the user without elevating, and one file per component
+/// so nothing shares. Named per desktop for the agent, because there can be an
+/// agent on `Default` and another on `Winlogon` within the same second and
+/// which one said what is the entire question.
+pub fn component_log_path(component: &str) -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("TAIN_LOG_FILE") {
+        let path = PathBuf::from(explicit);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_STATE_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    // Sanitised because it reaches here as a desktop name, which is chosen by
+    // whoever created the desktop rather than by us.
+    let safe: String = component
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    Some(base.join("Tain").join(format!("{safe}.log")))
+}
+
 /// The decision, with the environment passed in rather than read.
 ///
 /// Split out so it can be tested without touching process-global state: two
@@ -123,6 +164,25 @@ mod tests {
         // log to a file with no name.
         let chosen = resolve_log_path(Some(std::ffi::OsString::new()));
         assert_ne!(chosen, Some(PathBuf::new()));
+    }
+
+    #[test]
+    fn a_component_log_is_named_after_the_component() {
+        let Some(path) = component_log_path("service") else {
+            eprintln!("no data directory on this machine — skipping");
+            return;
+        };
+        assert!(path.ends_with("Tain/service.log"), "got {}", path.display());
+    }
+
+    /// A desktop name arrives from the system, not from us.
+    #[test]
+    fn a_component_name_cannot_escape_its_directory() {
+        let Some(path) = component_log_path("../../evil") else {
+            eprintln!("no data directory on this machine — skipping");
+            return;
+        };
+        assert!(path.ends_with("Tain/______evil.log"), "got {}", path.display());
     }
 
     #[test]
