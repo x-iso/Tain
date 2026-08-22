@@ -299,12 +299,13 @@ impl Immersive {
             // waiting for it. Anything near 300ms means that is what happened.
             tracing::info!(
                 "Immersive mode off — callback entered {} times, {} keys taken, \
-                 {} passed through, {} hook installs, slowest callback {:.1} ms",
+                 {} passed through, {} hook installs, slowest callback {:.1} ms ({})",
                 counts.entered,
                 counts.swallowed,
                 counts.passed,
                 counts.reinstalls,
                 counts.slowest_us as f32 / 1000.0,
+                platform::real_key_summary(),
             );
         }
     }
@@ -407,6 +408,36 @@ mod platform {
 
     /// [`now_ms`] when immersive mode was last switched on.
     static CAPTURE_AT: AtomicU32 = AtomicU32::new(0);
+
+    /// Keys typed by a person that reached the callback, and when the last one
+    /// did.
+    ///
+    /// # Why these two numbers settle it
+    ///
+    /// The hook is alive at startup and deaf by the time anything is done with
+    /// it, and every probe so far has been an injected keystroke — which tells
+    /// us the hook's state at the instant we ask, and nothing about when it
+    /// changed. The probes tick every five seconds at best, and the failing run
+    /// had eight minutes between the last pass and the first failure.
+    ///
+    /// A real keystroke is the one event that happens continuously while
+    /// somebody uses the machine, so the last one the callback saw *is* the
+    /// moment it went deaf, to within a keystroke. And the count says whether
+    /// typing was involved at all: zero real keys before going deaf means the
+    /// hook never saw a person type and the fault is unrelated to typing; a few
+    /// hundred and then silence means it died in the middle of ordinary use.
+    static REAL_KEYS: AtomicU32 = AtomicU32::new(0);
+    static LAST_REAL_MS: AtomicU32 = AtomicU32::new(0);
+
+    /// What the callback has seen of a person typing, as one line.
+    fn real_key_description() -> String {
+        let seen = REAL_KEYS.load(Ordering::Relaxed);
+        if seen == 0 {
+            return "no real keystroke has ever reached the callback".to_string();
+        }
+        let ago = now_ms().saturating_sub(LAST_REAL_MS.load(Ordering::Relaxed));
+        format!("{seen} real keystrokes seen, the last {:.1}s ago", ago as f32 / 1000.0)
+    }
 
     /// How long the mode has been on, in milliseconds.
     pub fn since_capture_ms() -> u32 {
@@ -689,6 +720,11 @@ mod platform {
         }
     }
 
+    /// What the callback has seen of a person typing.
+    pub fn real_key_summary() -> String {
+        real_key_description()
+    }
+
     /// What the hook has done so far.
     pub struct Counters {
         pub swallowed: u32,
@@ -781,6 +817,17 @@ mod platform {
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         let _timed = Timed(std::time::Instant::now());
         ENTERED.fetch_add(1, Ordering::Relaxed);
+
+        // Before every other test, and outside both modes, because the question
+        // this answers is when the callback stopped being called at all.
+        if code == HC_ACTION as i32 {
+            // SAFETY: for HC_ACTION the OS guarantees a KBDLLHOOKSTRUCT.
+            let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            if info.flags.0 & LLKHF_INJECTED.0 == 0 {
+                REAL_KEYS.fetch_add(1, Ordering::Relaxed);
+                LAST_REAL_MS.store(now_ms(), Ordering::Relaxed);
+            }
+        }
 
         // Recorded before any decision, so a rejected event is still visible.
         // `try_lock`, because a callback that waits on the UI thread is the
@@ -1375,10 +1422,8 @@ mod platform {
             // The self-test that just ran says whether the injection lands at
             // all, so this only has to add what it does not cover.
             tracing::warn!(
-                "Chain probe {stage}: none of the 4 injected events reached the hook. \
-                 Foreground: {}. Desktops: {}",
-                foreground_description(),
-                desktop_description(),
+                "Chain probe {stage}: none of the 4 injected events reached the hook. {}",
+                real_key_description(),
             );
         } else {
             tracing::warn!(
@@ -1403,8 +1448,9 @@ mod platform {
         match verdict {
             Verdict::Live => tracing::info!("Keyboard hook {what} — {}", verdict.describe()),
             _ => tracing::warn!(
-                "Keyboard hook {what} — {}. Foreground: {}. Desktops: {}",
+                "Keyboard hook {what} — {}. {}. Foreground: {}. Desktops: {}",
                 verdict.describe(),
+                real_key_description(),
                 foreground_description(),
                 desktop_description(),
             ),
@@ -1624,6 +1670,9 @@ mod platform {
         Vec::new()
     }
     pub fn clear_trace() {}
+    pub fn real_key_summary() -> String {
+        "not applicable".to_string()
+    }
     pub fn since_capture_ms() -> u32 {
         0
     }
