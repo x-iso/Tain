@@ -54,27 +54,31 @@ const VK_LWIN: u16 = 0x5B;
 
 /// Install the keyboard hook before the window system starts.
 ///
-/// # This ordering is load-bearing, and was found the hard way
+/// # The ordering is not what mattered, though it was blamed for a long time
 ///
-/// Installed *after* eframe is running, the hook is never invoked. Not on the
-/// UI thread, not on a thread of its own, and not for injected keys either —
-/// while an otherwise identical hook, in a standalone program on the same
-/// machine, works on both kinds of thread. `SendInput` confirmed the test
-/// keystrokes were genuinely being injected, so the events existed and this
-/// process simply did not receive them.
+/// This carried a long note saying the order was load-bearing: installed after
+/// eframe was running the hook was never invoked, installed before it worked,
+/// and something in the window system's initialisation decided it. The
+/// observations were real and the conclusion was wrong.
 ///
-/// Installed *before* `eframe::run_native`, it works. Something in the window
-/// system's initialisation is the difference; what exactly has not been
-/// established, only that the order decides it.
+/// What decided it was `RegisterRawInputDevices`, which winit calls when it
+/// builds its event loop — see
+/// [`platform::release_keyboard_raw_input`]. While that registration applies,
+/// this process's hook is not called, and being `DeviceEvents::WhenFocused` it
+/// applies exactly while one of our windows is in front. Every probe that ran
+/// before `run_native` found the hook alive because there was no window yet;
+/// every probe after it found the hook dead whenever the window happened to
+/// have the foreground. The order correlated with the answer without causing
+/// it.
 ///
-/// So this is called from `main`, and must stay there. Moving it back to the
-/// first time immersive mode is switched on would silently return the whole
-/// subsystem to doing nothing — which is what it did, undetected, through many
-/// rounds of fixes aimed at everything except this.
+/// Installing here is still the right thing — the hook is wanted for the life
+/// of the process and there is nothing to gain by waiting — but nothing depends
+/// on it any more.
 ///
-/// The startup self-test exists to catch exactly that regression: it says in
-/// one line whether the callback is live, without anyone having to press a
-/// key.
+/// The startup self-test stays as a regression canary. If a future winit
+/// re-registers raw keyboard input, or does it somewhere this does not undo,
+/// the hook goes silent again in exactly the way that cost this many rounds to
+/// find, and one line of log is the difference between noticing and not.
 pub fn start_hook_early() {
     platform::install_key_hook();
     // Nothing should be captured yet: this only proves the hook can be
@@ -1411,7 +1415,21 @@ mod platform {
     /// Four injected events. Four seen means the Win key reaches us; two means
     /// the Ctrl pair arrived and the Win pair was taken by somebody in front of
     /// us in the chain.
+    /// Only under `TAIN_HOOK_WATCH`.
+    ///
+    /// This injects Ctrl-down, Win-down, Win-up, Ctrl-up. That was worth it
+    /// while the question was whether a hook ahead of ours was taking the Win
+    /// key — it is not, and the fault turned out to be elsewhere entirely. What
+    /// remains is a probe that presses and releases a modifier behind the
+    /// user's back, and if they happen to be holding Ctrl when it runs, it
+    /// releases it out from under them on this machine. Not a trade worth
+    /// making for a question already answered.
+    ///
+    /// The F24 self-test has no such problem and stays on always.
     fn chain_test(stage: &str) {
+        if std::env::var_os("TAIN_HOOK_WATCH").is_none() {
+            return;
+        }
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
         };
