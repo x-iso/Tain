@@ -170,6 +170,11 @@ async fn main() -> Result<()> {
             // anything. See `gui::gl_interop`.
             #[cfg(target_os = "windows")]
             {
+                // The event loop exists by now, so winit has already registered
+                // for raw keyboard input. Undoing it here is what lets the
+                // keyboard hook be called while a Tain window is in front —
+                // see `gui::immersive::platform::release_keyboard_raw_input`.
+                gui::immersive::release_keyboard_raw_input();
                 gui::gl_interop::probe();
                 // Kept for the sessions that will want to draw through it. This
                 // is the only place eframe hands the context over.

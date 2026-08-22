@@ -43,7 +43,7 @@
 
 use tain_core::protocol::KeyEvent;
 
-pub use platform::{key_is_down, MODIFIER_VKS, MOD_ALT, MOD_CTRL, MOD_SHIFT};
+pub use platform::{key_is_down, release_keyboard_raw_input, MODIFIER_VKS, MOD_ALT, MOD_CTRL, MOD_SHIFT};
 
 /// Windows virtual-key codes for the left and right Win keys.
 ///
@@ -964,6 +964,59 @@ mod platform {
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 
+    /// Stop winit listening for raw keyboard input, which deafens our hook.
+    ///
+    /// # The whole fault, in one call
+    ///
+    /// winit registers for raw keyboard and mouse input when it creates its
+    /// event loop, with the default `DeviceEvents::WhenFocused`. That
+    /// registration only takes effect while one of our windows is in front —
+    /// and while it is in effect, this process's own `WH_KEYBOARD_LL` hook is
+    /// never called.
+    ///
+    /// Which is exactly the reported behaviour, and why it looked so strange:
+    /// the hook works right up until somebody clicks on Tain. Press Win once
+    /// and it leaks to this machine; the Start menu takes the foreground away
+    /// from us, the registration stops applying, and the second press is
+    /// captured and sent to the host. In the old Alt+Tab traces the key-*ups*
+    /// always arrived and the key-downs never did, for the same reason: the
+    /// downs happen while we are in front, the ups after the task switcher has
+    /// taken over.
+    ///
+    /// Measured rather than reasoned about, in a 130-line program with an
+    /// eframe window and nothing else: deaf with the window focused, live the
+    /// instant this call is made, with nothing else changed.
+    ///
+    /// The keyboard only. egui reads raw *mouse* motion through the same
+    /// mechanism for pointer locking, and there is no reason to take that away.
+    pub fn release_keyboard_raw_input() {
+        use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_REMOVE};
+
+        // Generic desktop controls, keyboard. `RIDEV_REMOVE` requires a null
+        // target window.
+        let devices = [RAWINPUTDEVICE {
+            usUsagePage: 0x01,
+            usUsage: 0x06,
+            dwFlags: RIDEV_REMOVE,
+            hwndTarget: Default::default(),
+        }];
+
+        // SAFETY: one well-formed entry in a slice that outlives the call, with
+        // the element size the API asks for.
+        let result = unsafe {
+            RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
+        };
+        match result {
+            Ok(()) => tracing::info!(
+                "Released the raw keyboard registration — the hook can be called while \
+                 this application is in front"
+            ),
+            // Not fatal on its own: it fails when nothing was registered, which
+            // is the state being asked for anyway.
+            Err(e) => tracing::debug!("Raw keyboard registration was not released: {e}"),
+        }
+    }
+
     /// Which desktop the hook thread is on, and which one is receiving input.
     ///
     /// # Why this is the question
@@ -1446,7 +1499,15 @@ mod platform {
         // Borrowed rather than 'static: the stage is formatted at the call.
         let verdict = self_test();
         match verdict {
-            Verdict::Live => tracing::info!("Keyboard hook {what} — {}", verdict.describe()),
+            // Reported on success as well as failure, because the question is
+            // no longer "is it alive" but "what is it alive *with*". Every
+            // failing probe so far named our own window as the foreground, and
+            // no passing one named anything at all.
+            Verdict::Live => tracing::info!(
+                "Keyboard hook {what} — {}. Foreground: {}",
+                verdict.describe(),
+                foreground_description(),
+            ),
             _ => tracing::warn!(
                 "Keyboard hook {what} — {}. {}. Foreground: {}. Desktops: {}",
                 verdict.describe(),
@@ -1570,6 +1631,8 @@ mod platform {
     }
 
     pub fn install_key_hook() {
+        // Cheap, and the one thing that decides whether any of the rest works.
+        release_keyboard_raw_input();
         // A hook installed a moment ago has just been probed already.
         if !ensure_hook_thread() {
             probe_hook(STAGE_IMMERSIVE);
@@ -1583,6 +1646,9 @@ mod platform {
 
     /// Turn plain-session forwarding on or off.
     pub fn set_forwarding(active: bool) {
+        if active {
+            release_keyboard_raw_input();
+        }
         if active && !ensure_hook_thread() {
             // Once per session window, and only the first time it opens —
             // `Immersive::set_forwarding` filters repeats.
@@ -1670,6 +1736,7 @@ mod platform {
         Vec::new()
     }
     pub fn clear_trace() {}
+    pub fn release_keyboard_raw_input() {}
     pub fn real_key_summary() -> String {
         "not applicable".to_string()
     }
