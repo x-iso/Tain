@@ -80,6 +80,9 @@ pub fn start_hook_early() {
     // Nothing should be captured yet: this only proves the hook can be
     // installed and called. Immersive mode turns capture on later.
     platform::set_capture(false);
+    // Off unless `TAIN_HOOK_WATCH` is set; see `platform::watch_hook`.
+    #[cfg(target_os = "windows")]
+    platform::watch_hook();
 }
 
 /// Immersive mode state, owned by the app.
@@ -976,13 +979,46 @@ mod platform {
     /// The moments worth measuring at, in the order they happen.
     const STAGE_SESSION: u32 = 1;
     const STAGE_IMMERSIVE: u32 = 2;
+    /// Anything above this is a watcher tick, carrying its own second count.
+    const STAGE_WATCH_BASE: u32 = 1000;
 
-    fn stage_name(stage: u32) -> &'static str {
+    fn stage_name(stage: u32) -> String {
         match stage {
-            STAGE_SESSION => "when a session window opened",
-            STAGE_IMMERSIVE => "on the way into immersive mode",
-            _ => "at an unnamed moment",
+            STAGE_SESSION => "when a session window opened".to_string(),
+            STAGE_IMMERSIVE => "on the way into immersive mode".to_string(),
+            s if s >= STAGE_WATCH_BASE => {
+                format!("{}s after startup", s - STAGE_WATCH_BASE)
+            }
+            _ => "at an unnamed moment".to_string(),
         }
+    }
+
+    /// Probe every few seconds, so the moment the hook goes deaf is visible.
+    ///
+    /// # Why this exists and why it is off by default
+    ///
+    /// The hook passes both probes at startup and has received nothing by the
+    /// time a session opens eight minutes later. Somewhere in between it stops
+    /// being called, and the two candidates — the ffmpeg runtime loading and
+    /// the window system starting — are 400ms apart in the log, which no
+    /// arrangement of the existing probes can separate.
+    ///
+    /// Ticking makes the answer a timestamp. It is behind `TAIN_HOOK_WATCH`
+    /// because it injects a keystroke every few seconds forever, which is not
+    /// something to leave running for people who are not chasing this.
+    pub fn watch_hook() {
+        if std::env::var_os("TAIN_HOOK_WATCH").is_none() {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("tain-hook-watch".into())
+            .spawn(|| {
+                for tick in 1..=180u32 {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    probe_hook(STAGE_WATCH_BASE + tick * 5);
+                }
+            })
+            .ok();
     }
 
     /// Ask the hook thread to report whether its hook is still being called.
@@ -1193,6 +1229,11 @@ mod platform {
         }
 
         let seen = ENTERED.load(Ordering::Relaxed).saturating_sub(before);
+        // What was in front matters here and nowhere else. The hook survives two
+        // minutes of an idle machine with every subsystem running, so whatever
+        // kills it is something somebody did, and the window they did it in is
+        // the first thing worth knowing.
+        //
         // Nothing at all is a dead hook, and it says nothing about the chain:
         // the Ctrl events are of no interest to anyone else and would have
         // arrived. Some but not all is the interesting case — the Ctrl pair
@@ -1200,7 +1241,8 @@ mod platform {
         if seen == 0 {
             tracing::warn!(
                 "Chain probe {stage}: none of the 4 injected events reached the hook — it \
-                 is not being called at all, so immersive mode cannot take keys."
+                 is not being called at all, so immersive mode cannot take keys. Foreground: {}",
+                foreground_description(),
             );
         } else {
             tracing::warn!(
@@ -1312,7 +1354,7 @@ mod platform {
                     // thread.
                     let stage = stage_name(msg.wParam.0 as u32);
                     self_test_and_report(&format!("checked {stage}"));
-                    chain_test(stage);
+                    chain_test(&stage);
                 }
 
                 // SAFETY: installed on this thread, removed once, here.
