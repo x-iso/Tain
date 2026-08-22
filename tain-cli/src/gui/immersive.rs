@@ -315,7 +315,8 @@ mod platform {
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, ClipCursor, GetCursorPos, WindowFromPoint, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-        SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+        PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT,
+        LLKHF_EXTENDED, PM_REMOVE,
         LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
@@ -788,6 +789,59 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
     /// `CallNextHookEx`, which is nothing.
     static HOOK_THREAD_STARTED: Mutex<bool> = Mutex::new(false);
 
+    /// Send one synthetic keystroke and report whether the hook saw it.
+    ///
+    /// Runs on the hook thread, just after installing and before the message
+    /// loop begins — which is exactly the arrangement being tested.
+    fn self_test() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+        };
+
+        /// F24. A real key, and one nothing in practice is bound to.
+        const PROBE_VK: u16 = 0x87;
+
+        let before = ENTERED.load(Ordering::Relaxed);
+        let key = |flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(PROBE_VK),
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let events = [key(Default::default()), key(KEYEVENTF_KEYUP)];
+        // SAFETY: two well-formed keyboard events from a slice that outlives
+        // the call.
+        unsafe {
+            SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+        }
+
+        // The hook is called during message retrieval, so this cannot simply
+        // read the counter — the loop has not started yet. A short wait with
+        // its own pump is enough for a keystroke this thread just sent.
+        let mut msg = MSG::default();
+        for _ in 0..20 {
+            // SAFETY: a non-blocking peek, discarding whatever it finds.
+            unsafe {
+                let _ = PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE);
+            }
+            if ENTERED.load(Ordering::Relaxed) > before {
+                tracing::info!("Keyboard hook self-test passed — the callback is live");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        tracing::warn!(
+            "Keyboard hook self-test FAILED — SetWindowsHookExW succeeded but the              callback is never invoked. Immersive mode cannot capture keys on this              machine; see task 48."
+        );
+    }
+
     /// Start the hook thread if it is not already running.
     ///
     /// Blocks until the hook is actually installed, so a caller that sets a
@@ -833,7 +887,22 @@ static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
                     }
                 };
 
-                // Nothing is dispatched here. The loop exists so the OS has a
+                // # Prove the hook is live, without needing anyone to type
+                //
+                // "callback entered 0 times" has two readings: the hook is dead,
+                // or nobody pressed a key while it was armed. Those need
+                // opposite responses — one is a rewrite onto Raw Input, the
+                // other is nothing at all — and several rounds have been spent
+                // unable to tell them apart from a log.
+                //
+                // Injecting one keystroke settles it. `SendInput` events do
+                // reach low-level hooks, marked with `LLKHF_INJECTED`; the
+                // callback counts every entry before it looks at that flag, and
+                // ignores injected events for every other purpose. F24 is a
+                // real virtual key that essentially nothing binds.
+                self_test();
+
+                // Nothing is dispatched below. The loop exists so the OS has a
                 // thread in a message wait to call the hook on, and this thread
                 // does nothing else, so it is always free to answer inside the
                 // deadline Windows allows.
