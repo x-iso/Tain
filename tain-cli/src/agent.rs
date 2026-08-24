@@ -25,13 +25,28 @@
 //! and the service is on the right side of it only because an administrator
 //! installed it.
 //!
+//! # One agent per desktop, not one that follows
+//!
+//! The first version had the service watch which desktop was receiving input
+//! and keep a single agent on it. A service cannot do that: `OpenInputDesktop`
+//! answers for the caller's own window station, and a service is in session
+//! zero's, which has no relation to the `WinSta0` the person at the keyboard is
+//! using. The call did not fail loudly — it returned nothing, so the supervisor
+//! asked an unanswerable question twice a second and silently did nothing, for
+//! an entire test.
+//!
+//! What a service *can* do is put a process on a named desktop inside another
+//! session. So there is now one agent per desktop that matters, both alive at
+//! once, and each works out for itself whether it currently owns the input.
+//! Only one ever does, and the answer costs two handle operations.
+//!
 //! # This is the first half
 //!
-//! Getting a process onto the input desktop, keeping exactly one, and moving it
-//! when the desktop changes is where all the platform difficulty lives, so it
-//! lands on its own and can be watched in a log before anything depends on it.
-//! What the agent then *does* — capture, injection, and a pipe back to whoever
-//! is hosting — attaches to a supervisor already known to work.
+//! Getting a process onto each desktop and keeping it there is where all the
+//! platform difficulty lives, so it lands on its own and can be watched in a
+//! log before anything depends on it. What the agent then *does* — capture,
+//! injection, and a pipe back to whoever is hosting — attaches to a supervisor
+//! already known to work.
 
 use anyhow::Result;
 
@@ -53,7 +68,7 @@ pub fn run(_desktop: Option<String>) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-pub use platform::{input_desktop_name as input_desktop_name_for_service, run};
+pub use platform::run;
 
 #[cfg(target_os = "windows")]
 mod platform {
@@ -69,13 +84,13 @@ mod platform {
 
     static RUNNING: AtomicBool = AtomicBool::new(true);
 
-    /// Run until the desktop this agent was started on stops receiving input.
+    /// Stay on this desktop, and keep track of whether it currently has input.
     ///
-    /// Exiting is the whole mechanism. The agent cannot follow a desktop
-    /// switch — no process can — so when one happens it leaves, and the
-    /// supervisor starts a replacement on the desktop that now has input. That
-    /// keeps the interesting decision in one place instead of splitting it
-    /// across two processes that would have to agree.
+    /// Does not exit when input moves elsewhere. An agent is cheap and a
+    /// desktop switch is common — locking the screen, a consent prompt, the
+    /// task switcher — so tearing one down and building another on every switch
+    /// would put a process launch in the path of something that has to be
+    /// instant. Both agents stay; only one is ever the live one.
     pub fn run(desktop: Option<String>) -> Result<()> {
         let started_on = desktop.or_else(current_desktop_name).unwrap_or_default();
         tracing::info!(
@@ -84,20 +99,34 @@ mod platform {
             if is_system() { "as SYSTEM" } else { "as the logged-in user" },
         );
 
+        // Logged on change rather than on a timer. The transition is the event
+        // worth seeing — a UAC prompt appearing is one line in the Winlogon
+        // agent's log and one in the other's — and a line every 300ms would
+        // bury it.
+        let mut had_input: Option<bool> = None;
         while RUNNING.load(Ordering::Relaxed) {
-            std::thread::sleep(WATCH);
+            // `None` means the input desktop cannot be opened from here, which
+            // is what the ordinary desktop sees while the secure one is up. It
+            // is an answer, not a failure.
+            let live = input_desktop_name();
+            let mine = live.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(&started_on));
 
-            let Some(live) = input_desktop_name() else {
-                // The input desktop cannot be opened from here, which is what
-                // it looks like from the ordinary desktop while the secure one
-                // is up. Somebody else's turn.
-                tracing::info!("Agent on {started_on} can no longer see the input desktop — exiting");
-                return Ok(());
-            };
-            if !live.eq_ignore_ascii_case(&started_on) {
-                tracing::info!("Input moved from {started_on} to {live} — agent exiting");
-                return Ok(());
+            if had_input != Some(mine) {
+                match (had_input.is_some(), mine) {
+                    (_, true) => tracing::info!("Desktop {started_on} now has the input"),
+                    (true, false) => tracing::info!(
+                        "Desktop {started_on} no longer has the input (it is on {})",
+                        live.as_deref().unwrap_or("a desktop this agent cannot open"),
+                    ),
+                    (false, false) => tracing::info!(
+                        "Desktop {started_on} does not have the input yet (it is on {})",
+                        live.as_deref().unwrap_or("a desktop this agent cannot open"),
+                    ),
+                }
+                had_input = Some(mine);
             }
+
+            std::thread::sleep(WATCH);
         }
         Ok(())
     }
