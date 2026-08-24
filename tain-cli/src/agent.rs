@@ -40,13 +40,25 @@
 //! once, and each works out for itself whether it currently owns the input.
 //! Only one ever does, and the answer costs two handle operations.
 //!
-//! # This is the first half
+//! # Capture is proved before it is plumbed
 //!
-//! Getting a process onto each desktop and keeping it there is where all the
-//! platform difficulty lives, so it lands on its own and can be watched in a
-//! log before anything depends on it. What the agent then *does* — capture,
-//! injection, and a pipe back to whoever is hosting — attaches to a supervisor
-//! already known to work.
+//! Placing the process is done and confirmed: both agents start in session one,
+//! and a consent prompt hands over between them in about fifty milliseconds.
+//! What is not yet known is whether a process on the secure desktop can capture
+//! it — Desktop Duplication has its own rules about which desktop and which
+//! session may open an output, and being SYSTEM does not automatically settle
+//! them.
+//!
+//! That answer decides the design of everything after it. If the secure desktop
+//! duplicates like any other, frames can travel to whoever is hosting and the
+//! remaining work is transport. If it refuses, no amount of transport will
+//! help and the approach has to change.
+//!
+//! So the agent tries it once, when it first finds itself holding the input,
+//! and writes down what happened. One frame, the size it came back, and how
+//! much of it is not black — because a duplication that succeeds and hands over
+//! an empty rectangle is a failure that looks like success, and this file has
+//! already spent a session on one of those.
 
 use anyhow::Result;
 
@@ -104,6 +116,9 @@ mod platform {
         // agent's log and one in the other's — and a line every 300ms would
         // bury it.
         let mut had_input: Option<bool> = None;
+        // Tried once, the first time this agent holds the input. See the note
+        // at the top of this file.
+        let mut capture_probed = false;
         while RUNNING.load(Ordering::Relaxed) {
             // `None` means the input desktop cannot be opened from here, which
             // is what the ordinary desktop sees while the secure one is up. It
@@ -126,9 +141,68 @@ mod platform {
                 had_input = Some(mine);
             }
 
+            if mine && !capture_probed {
+                capture_probed = true;
+                probe_capture(&started_on);
+            }
+
             std::thread::sleep(WATCH);
         }
         Ok(())
+    }
+
+    /// Try once to capture this desktop, and say what happened.
+    ///
+    /// Deliberately says more than "it worked". A duplication that starts, hands
+    /// back a rectangle of zeroes and reports success is indistinguishable from
+    /// a working one at the level of a return code, and would send the next
+    /// stage building transport for a black screen. So the frame is measured:
+    /// its size, and how many of its pixels are not black.
+    fn probe_capture(desktop: &str) {
+        use tain_core::screen_capture::{create_capturer, CaptureConfig};
+
+        let config = CaptureConfig::default();
+        let mut capturer = match create_capturer(config) {
+            Ok(capturer) => capturer,
+            Err(e) => {
+                tracing::warn!("Capture probe on {desktop}: could not start a capturer: {e:#}");
+                return;
+            }
+        };
+
+        let size = capturer.frame_size();
+        tracing::info!("Capture probe on {desktop}: capturer started, {}x{}", size.0, size.1);
+
+        // Desktop Duplication reports "no new frame" until something changes,
+        // which on a static consent prompt is most of the time. A handful of
+        // attempts over a second is enough to catch the first one.
+        for attempt in 1..=20 {
+            match capturer.capture_next() {
+                Ok(Some(frame)) => {
+                    let data = &frame.data;
+                    let lit = data.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+                    let total = (data.len() / 4).max(1);
+                    tracing::info!(
+                        "Capture probe on {desktop}: got a frame after {attempt} attempts — \
+                         {}x{}, {} bytes, {:.1}% of pixels not black",
+                        frame.width,
+                        frame.height,
+                        data.len(),
+                        lit as f32 * 100.0 / total as f32,
+                    );
+                    return;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => {
+                    tracing::warn!("Capture probe on {desktop}: capture failed: {e:#}");
+                    return;
+                }
+            }
+        }
+        tracing::warn!(
+            "Capture probe on {desktop}: the capturer started but produced no frame in a \
+             second. Nothing changed on screen, or this desktop does not duplicate."
+        );
     }
 
     /// The name of the desktop this thread is on.
