@@ -13,8 +13,7 @@
 //!
 //! The only way across is a new process started *on* the other desktop, and
 //! only something running as SYSTEM can start one there. Hence the service, and
-//! hence this: the service watches which desktop is receiving input and keeps
-//! exactly one agent alive on it, replacing the agent when that changes.
+//! hence this.
 //!
 //! # What runs where
 //!
@@ -27,8 +26,9 @@
 //!
 //! # One agent per desktop, not one that follows
 //!
-//! The first version had the service watch which desktop was receiving input
-//! and keep a single agent on it. A service cannot do that: `OpenInputDesktop`
+//! The obvious arrangement — have the service watch which desktop is receiving
+//! input and keep a single agent on it — was the first version, and it cannot
+//! work. A service cannot do that: `OpenInputDesktop`
 //! answers for the caller's own window station, and a service is in session
 //! zero's, which has no relation to the `WinSta0` the person at the keyboard is
 //! using. The call did not fail loudly — it returned nothing, so the supervisor
