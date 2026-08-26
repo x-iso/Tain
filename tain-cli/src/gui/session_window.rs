@@ -1092,6 +1092,24 @@ fn render_waiting(ui: &mut egui::Ui, session: &GuestSession) {
 ///
 /// Only sends on *change* — egui reports state every frame, and streaming a
 /// redundant event at the repaint rate would swamp the input channel.
+///
+/// # Every movement, not one a frame
+///
+/// This used to read `hover_pos()`, which is where the pointer finished the
+/// frame. Everything it passed through on the way was discarded, so a hand
+/// moving smoothly arrived as one jump per repaint — and on a link drawing at
+/// eight frames a second, that is one jump every 120ms.
+///
+/// For putting a cursor somewhere that is harmless: the position it lands on is
+/// the same either way. It is not harmless for anything reading *deltas*, which
+/// is what dragging a slider or a numeric field does. Pointer acceleration is
+/// superlinear, so one large delta travels considerably further than the same
+/// distance delivered in small ones — reported as the cursor moving far too
+/// fast while adjusting a value, and only while adjusting one.
+///
+/// So each movement egui saw is forwarded. That costs more messages, which used
+/// to mean queueing behind a keyframe; since video moved to its own stream it
+/// costs almost nothing.
 fn forward_pointer(
     session: &mut GuestSession,
     ui: &egui::Ui,
@@ -1103,16 +1121,51 @@ fn forward_pointer(
         return;
     }
 
-    if let Some(pos) = resp.hover_pos() {
+    if resp.hovered() {
+        // Collected before sending: `ui.input` holds a lock, and sending takes
+        // the session mutably.
+        let moved: Vec<egui::Pos2> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::PointerMoved(pos) => Some(*pos),
+                    _ => None,
+                })
+                .collect()
+        });
+
         // Wire coordinates are normalized to the whole screen, so scaling mode
         // and window size drop out of the calculation entirely.
-        let event = MouseEvent::from_fraction(
-            (pos.x - rect.left()) / rect.width(),
-            (pos.y - rect.top()) / rect.height(),
-        );
-        if session.last_pointer() != Some((event.x, event.y)) {
-            session.set_last_pointer((event.x, event.y));
-            session.send_input(InputEvent::MouseMove(event));
+        let to_event = |pos: egui::Pos2| {
+            MouseEvent::from_fraction(
+                (pos.x - rect.left()) / rect.width(),
+                (pos.y - rect.top()) / rect.height(),
+            )
+        };
+
+        for pos in moved {
+            // A movement that ended outside the video is not one to send: the
+            // host would put its cursor at the edge for a pointer that is over
+            // the toolbar.
+            if !rect.contains(pos) {
+                continue;
+            }
+            let event = to_event(pos);
+            if session.last_pointer() != Some((event.x, event.y)) {
+                session.set_last_pointer((event.x, event.y));
+                session.send_input(InputEvent::MouseMove(event));
+            }
+        }
+
+        // Where it finished, if that is somewhere the events did not already
+        // leave it. Covers the frame where the window itself moved under a
+        // still pointer, which produces no movement event and a new position.
+        if let Some(pos) = resp.hover_pos() {
+            let event = to_event(pos);
+            if session.last_pointer() != Some((event.x, event.y)) {
+                session.set_last_pointer((event.x, event.y));
+                session.send_input(InputEvent::MouseMove(event));
+            }
         }
     }
 
