@@ -3,9 +3,26 @@
 //! Provides `HostServer` (accepts incoming connections, manages sessions) and
 //! `GuestClient` (connects to a host via passcode-protected ticket).
 //!
-//! The ALPN protocol name is `"tain/1"` — every connection carrying this ALPN
+//! The ALPN protocol name is `"tain/2"` — every connection carrying this ALPN
 //! is routed through our handler. iroh handles NAT traversal automatically:
 //! direct QUIC connections when possible, relay fallback otherwise.
+//!
+//! ## Video has a stream to itself
+//!
+//! It was `tain/1` while everything shared one bidirectional stream: frames,
+//! input, cursor updates, grants, configuration. QUIC guarantees ordering
+//! *within* a stream, so a keyframe part-way out delayed everything queued
+//! behind it — and what queues behind a keyframe is the pointer, which is the
+//! one thing somebody watches continuously.
+//!
+//! So frames now go down a unidirectional stream of their own, and everything
+//! else keeps the bidirectional one. Head-of-line blocking between the two is
+//! gone; within video it remains, which is correct, because frames of an
+//! inter-frame codec have to arrive in order anyway.
+//!
+//! The version went up rather than negotiating both shapes. Nothing is
+//! deployed that this has to interoperate with, and a compatibility path for a
+//! protocol nobody is running would be code written to be deleted.
 //!
 //! ## Stream direction
 //!
@@ -56,7 +73,7 @@ use super::passcode::redact;
 pub use super::connection_code::ConnectionCode;
 
 /// Application-layer protocol name used in iroh ALPN negotiation.
-pub const ALPN: &[u8] = b"tain/1";
+pub const ALPN: &[u8] = b"tain/2";
 
 /// What the host decided about a guest that asked to connect.
 ///
@@ -695,10 +712,23 @@ impl HostServer {
         // Unidirectional because nothing comes back this way, and failure is
         // not fatal: `None` falls back to the main stream, which is how audio
         // worked before this and is merely worse rather than broken.
-        let audio_send = match conn.open_uni().await {
+        let audio_send = match open_tagged_stream(&conn, super::protocol::stream_kind::AUDIO).await
+        {
             Ok(stream) => Some(stream),
             Err(e) => {
-                debug!("No separate audio stream ({e}) — sharing the video stream");
+                debug!("No separate audio stream ({e}) — sharing the control stream");
+                None
+            }
+        };
+
+        // Frames get their own, for the reason at the top of this file. Failing
+        // is survivable in the same way audio's is: they fall back to the
+        // control stream, which is how this worked before and is merely worse.
+        let video_send = match open_tagged_stream(&conn, super::protocol::stream_kind::VIDEO).await
+        {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                debug!("No separate video stream ({e}) — sharing the control stream");
                 None
             }
         };
@@ -707,6 +737,7 @@ impl HostServer {
             send,
             recv,
             audio_send,
+            video_send,
             session_id,
             Arc::clone(&self.sessions),
             config,
@@ -787,13 +818,29 @@ impl HostServer {
 
 /// Drive one authenticated session to completion.
 ///
+/// Open a unidirectional stream and write the byte that says what it carries.
+///
+/// The tag goes out immediately rather than with the first message, so a guest
+/// can dispatch the stream before anything is on it. A stream that is opened
+/// and then silent — audio on a machine with no sound device — still announces
+/// itself, which is what stops it being mistaken for the other one.
+async fn open_tagged_stream(
+    conn: &iroh::endpoint::Connection,
+    kind: u8,
+) -> Result<iroh::endpoint::SendStream> {
+    let mut stream = conn.open_uni().await?;
+    stream.write_all(&[kind]).await?;
+    Ok(stream)
+}
+
 /// Generic over the stream halves so it can be exercised over `tokio::io::duplex`
 /// in tests without standing up an iroh endpoint.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_session<W, R, A>(
+pub async fn run_session<W, R, A, V>(
     mut send: W,
     recv: R,
     audio_send: Option<A>,
+    video_send: Option<V>,
     session_id: u32,
     sessions: Arc<SessionManager>,
     config: SessionConfig,
@@ -804,6 +851,7 @@ where
     W: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
     R: tokio::io::AsyncReadExt + Unpin + Send + 'static,
     A: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
+    V: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
 {
     info!("Session #{} running", session_id);
 
@@ -872,6 +920,13 @@ where
         cursor_tx,
     );
 
+    // Written from the select loop rather than handed to a task of its own,
+    // which audio can afford and video cannot. Awaiting the write *is* the
+    // backpressure: it stops the pipeline producing frames faster than the link
+    // carries them. A task behind an unbounded channel would accept every frame
+    // instantly and queue pictures that are stale before they leave.
+    let mut video_send = video_send;
+
     let result = loop {
         tokio::select! {
             // The session table also holds a clone of the outbound sender, so the
@@ -926,7 +981,15 @@ where
                     None => break Ok(()),
                 };
 
-                if let Err(e) = write_stream_message(&mut send, &msg).await {
+                // Frames down the video stream; status, codec changes and
+                // previews stay with the rest of the control traffic, because
+                // they are rare and ordering them against the session's other
+                // messages is worth more than the stream separation.
+                let sent = match (&mut video_send, &msg) {
+                    (Some(video), Message::Frame(_)) => write_stream_message(video, &msg).await,
+                    _ => write_stream_message(&mut send, &msg).await,
+                };
+                if let Err(e) = sent {
                     debug!("Session #{}: send failed: {}", session_id, e);
                     break Err(e);
                 }
@@ -940,6 +1003,9 @@ where
     }
     if let Some(writer) = audio_writer {
         writer.abort();
+    }
+    if let Some(mut video) = video_send {
+        let _ = video.shutdown().await;
     }
     // Dropping the receiver closes the channel, which is how the pipeline thread
     // is told to stop: its next send fails and it returns.
@@ -2638,11 +2704,13 @@ mod tests {
         let config = test_config();
         let capturer = crate::screen_capture::create_capturer(config.capture.clone()).unwrap();
         let handle =
-            // No separate audio stream in the duplex harness: audio falls back
-            // to the main one, which is the behaviour being exercised here.
+            // Neither side stream exists in the duplex harness: audio and
+            // video both fall back to the main one, which is the behaviour
+            // being exercised here and the fallback worth keeping covered.
             tokio::spawn(run_session(
                 host_w,
                 host_r,
+                None::<tokio::io::DuplexStream>,
                 None::<tokio::io::DuplexStream>,
                 session_id,
                 sessions,

@@ -496,6 +496,22 @@ pub struct AudioMessage {
 /// Maximum message size in bytes.
 ///
 /// Sized for a worst-case keyframe: uncompressed 4K BGRA is 33 MiB, and a
+/// What a unidirectional stream carries, sent as its first byte.
+///
+/// # Why the stream announces itself
+///
+/// There are two of them now — sound and pictures — and a guest accepting them
+/// cannot tell which is which. Arrival order would work until the day the host
+/// opens them in the other order, or one fails to open at all, and the symptom
+/// then is video decoded as audio: not an error, just noise and a black screen.
+/// One byte removes the question.
+pub mod stream_kind {
+    /// Encoded audio.
+    pub const AUDIO: u8 = 1;
+    /// Encoded video frames.
+    pub const VIDEO: u8 = 2;
+}
+
 /// compressed keyframe of a photographic desktop can be a large fraction of
 /// that. The old 10 MiB cap was fine for a 640×360 test pattern but would kill
 /// a session the moment real capture ran at native resolution.
@@ -543,6 +559,21 @@ mod tests {
         assert!(ControlGrants::ALL.allows(InputDevice::Mouse));
         assert!(ControlGrants::ALL.allows(InputDevice::Keyboard));
         assert_eq!(ControlGrants::default(), ControlGrants::NONE);
+    }
+
+    /// The whole point of the tags is that they differ.
+    ///
+    /// Equal tags would not fail: the guest would route one stream to the
+    /// other's handler and decode pictures as sound. Noise, a black screen, and
+    /// nothing anywhere saying why — which is worth one assertion to make
+    /// impossible.
+    #[test]
+    fn the_stream_kinds_are_distinct_and_never_zero() {
+        assert_ne!(stream_kind::AUDIO, stream_kind::VIDEO);
+        // Zero is what an uninitialised byte and a closed stream both look
+        // like, so neither kind may be it.
+        assert_ne!(stream_kind::AUDIO, 0);
+        assert_ne!(stream_kind::VIDEO, 0);
     }
 
     #[test]

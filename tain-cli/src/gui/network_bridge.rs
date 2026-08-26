@@ -594,30 +594,86 @@ pub async fn run_guest_session(
         //
         // A host that never opens one is an older build or one with no audio
         // device; this task simply waits forever and is aborted with the session.
-        let audio_reader = client.connection().map(|conn| {
-            let audio_state = shared.clone();
+        // Reader owns `recv` exclusively — read_stream_message is not cancel-safe.
+        // Acks travel back through the writer, which owns the send half.
+        //
+        // Declared before the side streams because video arrives on one of them
+        // now and acking is what keeps the host from running ahead of this
+        // decoder.
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u32>();
+
+        // Shared rather than moved: the picture can arrive on the main stream
+        // or on the video stream, and both have to be able to ask for a repaint.
+        let repaint = std::sync::Arc::new(repaint);
+
+        // # One acceptor for every side stream the host opens
+        //
+        // There are two now, sound and pictures, and which arrives first is not
+        // something to depend on: a host that opened them in the other order,
+        // or failed to open one, would have video decoded as audio. Not an
+        // error — noise and a black screen. So each stream says what it carries
+        // in its first byte and this dispatches on that.
+        //
+        // A host that opens neither is one with no sound device on a link that
+        // refused a second stream; this task simply waits, and everything falls
+        // back to the main stream as it did before there were any.
+        let side_streams = client.connection().map(|conn| {
+            let side_state = shared.clone();
+            let side_acks = ack_tx.clone();
+            let side_repaint = repaint.clone();
             tokio::spawn(async move {
-                let Ok(mut stream) = conn.accept_uni().await else {
-                    debug!("Host opened no audio stream");
-                    return;
-                };
-                // Nothing here acks or repaints: audio drives the speakers, not
-                // the screen, and a picture is not owed for a sound.
-                let (tx, _rx) = mpsc::unbounded_channel::<u32>();
-                // The audio stream carries no video, so a keyframe can never be
-                // requested from it; the sender goes nowhere on purpose.
-                let (audio_control_tx, _audio_control_rx) = mpsc::unbounded_channel::<Message>();
-                if let Err(e) =
-                    receive_loop(&mut stream, &audio_state, tx, audio_control_tx, || {}).await
-                {
-                    debug!("Guest audio stream ended: {e}");
+                loop {
+                    let Ok(mut stream) = conn.accept_uni().await else {
+                        debug!("No more side streams from the host");
+                        return;
+                    };
+
+                    let mut tag = [0u8; 1];
+                    if tokio::io::AsyncReadExt::read_exact(&mut stream, &mut tag).await.is_err() {
+                        debug!("A side stream closed before saying what it carried");
+                        continue;
+                    }
+
+                    let state = side_state.clone();
+                    let acks = side_acks.clone();
+                    let repaint = side_repaint.clone();
+                    match tag[0] {
+                        tain_core::protocol::stream_kind::AUDIO => {
+                            tokio::spawn(async move {
+                                // Nothing here acks or repaints: audio drives
+                                // the speakers, not the screen, and a picture is
+                                // not owed for a sound.
+                                let (tx, _rx) = mpsc::unbounded_channel::<u32>();
+                                let (control_tx, _rx) = mpsc::unbounded_channel::<Message>();
+                                if let Err(e) =
+                                    receive_loop(&mut stream, &state, tx, control_tx, || {}).await
+                                {
+                                    debug!("Guest audio stream ended: {e}");
+                                }
+                            });
+                        }
+                        tain_core::protocol::stream_kind::VIDEO => {
+                            tokio::spawn(async move {
+                                // A keyframe request cannot come from here —
+                                // the writer owns the control stream — so the
+                                // sender goes nowhere, as it does for audio.
+                                let (control_tx, _rx) = mpsc::unbounded_channel::<Message>();
+                                if let Err(e) =
+                                    receive_loop(&mut stream, &state, acks, control_tx, move || {
+                                        repaint()
+                                    })
+                                    .await
+                                {
+                                    debug!("Guest video stream ended: {e}");
+                                }
+                            });
+                        }
+                        other => debug!("Ignoring a side stream of unknown kind {other}"),
+                    }
                 }
             })
         });
 
-        // Reader owns `recv` exclusively — read_stream_message is not cancel-safe.
-        // Acks travel back through the writer, which owns the send half.
-        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u32>();
         // Control messages the receive side needs to send back — currently only
         // a keyframe request, which cannot go down the ack channel because that
         // one carries a sequence number rather than a message.
@@ -625,7 +681,7 @@ pub async fn run_guest_session(
         let reader_state = shared.clone();
         let reader = tokio::spawn(async move {
             if let Err(e) =
-                receive_loop(&mut recv, &reader_state, ack_tx, control_tx, repaint).await
+                receive_loop(&mut recv, &reader_state, ack_tx, control_tx, move || repaint()).await
             {
                 debug!("Guest receive loop ended: {e}");
             }
@@ -791,8 +847,8 @@ pub async fn run_guest_session(
         // The audio reader outlives the select, so it has to be stopped here or
         // it holds the stream — and the playback device behind it — open past
         // the end of the session.
-        if let Some(audio_reader) = audio_reader {
-            audio_reader.abort();
+        if let Some(side_streams) = side_streams {
+            side_streams.abort();
         }
         client.shutdown().await.ok();
         outcome
