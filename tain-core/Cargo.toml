@@ -70,6 +70,7 @@ windows = { version = "0.58", features = [
     # CreateEventW lives behind Threading but is typed against SECURITY_ATTRIBUTES.
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
     "Win32_System_RemoteDesktop",

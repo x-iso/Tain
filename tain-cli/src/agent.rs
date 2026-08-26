@@ -40,25 +40,20 @@
 //! once, and each works out for itself whether it currently owns the input.
 //! Only one ever does, and the answer costs two handle operations.
 //!
-//! # Capture is proved before it is plumbed
+//! # Capture was proved before it was plumbed
 //!
-//! Placing the process is done and confirmed: both agents start in session one,
-//! and a consent prompt hands over between them in about fifty milliseconds.
-//! What is not yet known is whether a process on the secure desktop can capture
-//! it — Desktop Duplication has its own rules about which desktop and which
-//! session may open an output, and being SYSTEM does not automatically settle
-//! them.
+//! Both were checked before anything was built on them, which on this feature
+//! has repeatedly been the difference between an afternoon and a week. Placing
+//! the process: both agents start in session one, and a consent prompt hands
+//! over between them in about fifty milliseconds. Capturing from there:
+//! 2560x1600, first attempt, 99.9% of pixels not black — a real consent prompt
+//! over a real dimmed desktop.
 //!
-//! That answer decides the design of everything after it. If the secure desktop
-//! duplicates like any other, frames can travel to whoever is hosting and the
-//! remaining work is transport. If it refuses, no amount of transport will
-//! help and the approach has to change.
-//!
-//! So the agent tries it once, when it first finds itself holding the input,
-//! and writes down what happened. One frame, the size it came back, and how
-//! much of it is not black — because a duplication that succeeds and hands over
-//! an empty rectangle is a failure that looks like success, and this file has
-//! already spent a session on one of those.
+//! The second of those was the one in doubt. Desktop Duplication has its own
+//! rules about which desktop and which session may open an output, and being
+//! SYSTEM does not automatically settle them. It turns out the secure desktop
+//! duplicates like any other, so the remaining work was transport and this file
+//! now does it: capture while a host is connected, and send.
 
 use anyhow::Result;
 
@@ -85,6 +80,7 @@ pub use platform::run;
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
+    use anyhow::Context;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// How often the agent checks that its desktop is still the live one.
@@ -119,6 +115,16 @@ mod platform {
         // Tried once, the first time this agent holds the input. See the note
         // at the top of this file.
         let mut capture_probed = false;
+
+        // The pipe waits on its own thread, because accepting a connection
+        // blocks and this loop has a desktop to watch.
+        let serving = {
+            let desktop = started_on.clone();
+            std::thread::Builder::new()
+                .name("tain-agent-pipe".into())
+                .spawn(move || serve_frames(desktop))
+                .context("could not start the agent's pipe thread")?
+        };
         while RUNNING.load(Ordering::Relaxed) {
             // `None` means the input desktop cannot be opened from here, which
             // is what the ordinary desktop sees while the secure one is up. It
@@ -148,7 +154,73 @@ mod platform {
 
             std::thread::sleep(WATCH);
         }
+        let _ = serving.join();
         Ok(())
+    }
+
+    /// Serve this desktop's frames for as long as a host wants them.
+    ///
+    /// # Capture starts and stops with the host
+    ///
+    /// A duplication is a GPU resource, and an agent on the secure desktop is
+    /// alive from boot to shutdown while the desktop it watches is up for a few
+    /// seconds a day. So nothing is captured until a host connects, and the
+    /// capturer is dropped the moment it goes.
+    ///
+    /// # Only while this desktop has the input
+    ///
+    /// Duplicating a desktop nobody is looking at produces nothing anyway —
+    /// Desktop Duplication reports no new frame when nothing changes — but it
+    /// would still hold the resource. Checking is two handle operations, and it
+    /// means the agent that is not in use costs precisely nothing.
+    fn serve_frames(desktop: String) {
+        use tain_core::agent_pipe::{serve_forever, PipeFrame};
+        use tain_core::screen_capture::{create_capturer, CaptureConfig};
+
+        let served = serve_forever(&desktop, &RUNNING, |writer| {
+            let mut capturer = create_capturer(CaptureConfig::default())
+                .context("could not start capturing for the host")?;
+            tracing::info!("Serving {desktop}: capture started for a connected host");
+
+            while RUNNING.load(Ordering::Relaxed) {
+                // The host asked for this desktop, so it wants it whether or
+                // not it currently has the input — but there is nothing to
+                // capture until it does, and asking is cheaper than duplicating.
+                if !owns_input(&desktop) {
+                    std::thread::sleep(WATCH);
+                    continue;
+                }
+
+                match capturer.capture_next() {
+                    // Desktop Duplication says nothing changed, which on a
+                    // consent prompt is most of the time. Not an error, and not
+                    // worth a frame.
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(16)),
+                    Ok(Some(frame)) => writer.send(&PipeFrame {
+                        width: frame.width,
+                        height: frame.height,
+                        format: frame.format as u8,
+                        data: frame.data.to_vec(),
+                    })?,
+                    Err(e) => {
+                        // A desktop switch invalidates a duplication, and the
+                        // next connection will make a fresh one. Ending the
+                        // session is how that is asked for.
+                        anyhow::bail!("capture failed: {e:#}");
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        if let Err(e) = served {
+            tracing::warn!("Serving {desktop}: the pipe could not be served: {e:#}");
+        }
+    }
+
+    /// Whether this desktop currently has the input.
+    fn owns_input(desktop: &str) -> bool {
+        input_desktop_name().is_some_and(|live| live.eq_ignore_ascii_case(desktop))
     }
 
     /// Try once to capture this desktop, and say what happened.

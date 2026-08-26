@@ -356,6 +356,13 @@ mod platform {
         pipe: Owned,
     }
 
+    // SAFETY: the handle inside is a kernel object, not a pointer into this
+    // process, and nothing here caches thread state. It is moved to a reader
+    // thread once and used only from there — see `capture_follow`, which reads
+    // frames off the capture thread so a still consent prompt cannot stall the
+    // session.
+    unsafe impl Send for AgentFrames {}
+
     /// Connect to the agent serving `desktop`.
     pub fn connect(desktop: &str) -> Result<AgentFrames> {
         let name = wide(&pipe_name(desktop));

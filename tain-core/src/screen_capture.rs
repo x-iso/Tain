@@ -540,7 +540,11 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
         {
             {
                 use anyhow::Context;
-                super::capture_shared::attach().context("could not start screen capture")?
+                let local =
+                    super::capture_shared::attach().context("could not start screen capture")?;
+                // Wrapped so a consent prompt does not end the picture. See
+                // `capture_follow`: everything above this sees one capturer.
+                Box::new(super::capture_follow::DesktopFollowing::new(local))
             }
         }
         #[cfg(not(target_os = "windows"))]

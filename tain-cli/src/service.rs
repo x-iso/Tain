@@ -181,13 +181,62 @@ mod windows_impl {
             .into_owned())
     }
 
+    /// Where the installed copy of this executable lives.
+    ///
+    /// # Why the service does not run the binary it was installed from
+    ///
+    /// It used to, and a running service holds its image open. So the service
+    /// pinned whatever file it was installed from, and on the machine this is
+    /// developed on that is the build output — every rebuild failed with
+    /// "Access is denied" until the service was stopped by hand, which needs
+    /// administrator rights, which means a prompt, several times an hour.
+    ///
+    /// Copying is also what an install *should* do. A service registered
+    /// against a file in someone's downloads folder, or a build directory, or a
+    /// removable disk, is a service that stops existing when that file moves.
+    /// `%ProgramData%\Tain` is where the service's own logs already live and it
+    /// survives the executable being moved, replaced or deleted.
+    ///
+    /// Reinstalling copies afresh, so picking up a new build is the same
+    /// gesture it always was.
+    fn installed_exe_path() -> Result<std::path::PathBuf> {
+        let base = std::env::var_os("ProgramData")
+            .map(std::path::PathBuf::from)
+            .context("no ProgramData directory on this machine")?;
+        Ok(base.join("Tain").join("tain-service.exe"))
+    }
+
+    /// Put a copy of this executable where the service will run it from.
+    fn install_binary() -> Result<std::path::PathBuf> {
+        let target = installed_exe_path()?;
+        let source = std::env::current_exe().context("could not find this executable")?;
+
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+
+        // Replacing a copy the service is still running fails, and should: the
+        // caller stops the service first. Reported plainly rather than left as
+        // a bare OS error, because "Access is denied" on an install is not
+        // self-explanatory.
+        std::fs::copy(&source, &target).with_context(|| {
+            format!(
+                "could not copy {} to {} — stop the service first if it is running",
+                source.display(),
+                target.display()
+            )
+        })?;
+        Ok(target)
+    }
+
     /// The command line the service manager should launch.
     ///
     /// Quoted because the path routinely contains spaces, and an unquoted path
     /// makes Windows launch the wrong file — the classic unquoted-service-path
     /// problem, which is a privilege-escalation hole and not merely a bug.
     fn service_command() -> Result<String> {
-        Ok(format!("\"{}\" {RUN_FLAG}", exe_path()?))
+        Ok(format!("\"{}\" {RUN_FLAG}", installed_exe_path()?.display()))
     }
 
     fn open_manager(access: u32) -> Result<ScHandle> {
@@ -249,7 +298,10 @@ mod windows_impl {
 
     /// Whether the registered binary path is the executable running now.
     fn registered_against_this_exe(handle: &ScHandle) -> bool {
-        let Ok(expected) = exe_path() else { return true };
+        // The installed copy, not the running file. See `installed_exe_path`.
+        let Ok(expected) = installed_exe_path().map(|p| p.display().to_string()) else {
+            return true;
+        };
 
         let mut needed = 0u32;
         // SAFETY: the documented two-call pattern — ask for the size, then
@@ -366,6 +418,11 @@ mod windows_impl {
             // service that points somewhere else.
             uninstall()?;
         }
+
+        // After the uninstall above, so the old service has released the copy
+        // it was running before this replaces it.
+        let installed = install_binary()?;
+        tracing::info!("Installed the service binary at {}", installed.display());
 
         let name = wide(SERVICE_NAME);
         let display = wide(DISPLAY_NAME);

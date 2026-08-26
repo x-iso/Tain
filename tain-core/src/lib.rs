@@ -66,6 +66,7 @@ pub mod audio_render;
 #[cfg(all(target_os = "windows", db_ffmpeg))]
 pub mod audio_output;
 pub mod agent_pipe;
+pub mod capture_follow;
 pub mod input_inject;
 pub mod session;
 
