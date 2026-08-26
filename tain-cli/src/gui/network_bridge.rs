@@ -1151,6 +1151,22 @@ where
 
     let mut tally = FrameTally::default();
     let mut tallied_at = std::time::Instant::now();
+    // # Why silence is only worth reporting from a stream that had video
+    //
+    // This loop reads whichever stream it was handed, and there are three of
+    // them: control, audio, and — since video moved to its own — video. Only
+    // one of them ever carries a frame, but all three kept a video tally and
+    // all three reported on it, so two of them said "nothing arrived" every
+    // window for the length of the session. In the log that prompted this fix
+    // that is thirteen hundred warnings, two thirds of them about streams that
+    // were never going to carry a frame, interleaved with the real report so
+    // that the same instant read as both healthy and silent.
+    //
+    // A stream that has carried video and then stops is the thing the warning
+    // was written for, and it still says exactly that. A session where video
+    // never starts at all is not lost with it: that is what the guest's own
+    // status shows, in the window, as "waiting for video".
+    let mut carried_video = false;
 
     while let Some(data) = read_stream_message(recv).await? {
         shared.health.lock().unwrap().last_message = Some(std::time::Instant::now());
@@ -1159,7 +1175,9 @@ where
         // failure is silence and this loop still wakes for telemetry and status
         // messages when no video is arriving at all.
         if tallied_at.elapsed() >= TALLY_INTERVAL {
-            report_tally(&tally, tallied_at.elapsed(), &decoder, &shared.health);
+            if carried_video {
+                report_tally(&tally, tallied_at.elapsed(), &decoder, &shared.health);
+            }
             tally = FrameTally::default();
             tallied_at = std::time::Instant::now();
         }
@@ -1310,6 +1328,7 @@ where
                 }
 
                 tally.arrived += 1;
+                carried_video = true;
                 tally.bytes += fm.data.len();
                 // Stamped by the host at encode time, read against this
                 // machine's clock corrected by the measured offset.
