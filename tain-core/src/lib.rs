@@ -40,6 +40,7 @@ pub mod audio_capture;
 #[cfg(target_os = "windows")]
 pub mod capture_dxgi;
 #[cfg(target_os = "windows")]
+pub mod capture_hdr;
 pub mod capture_nv12;
 #[cfg(target_os = "windows")]
 pub mod capture_shared;

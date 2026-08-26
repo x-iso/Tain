@@ -27,12 +27,16 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    IDXGIDevice, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
+use super::capture_hdr::{DisplayColour, HdrToSdr};
 use super::capture_nv12::Nv12Converter;
 use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, ScreenFrame};
 
@@ -69,6 +73,9 @@ struct Duplication {
     staging: ID3D11Texture2D,
     /// GPU colour conversion, when it was asked for and the driver has it.
     converter: Option<Nv12Converter>,
+    /// Brings a floating-point HDR desktop back to BGRA. `None` on an ordinary
+    /// SDR display, which is the usual case and needs nothing.
+    hdr: Option<HdrToSdr>,
     width: u16,
     height: u16,
     /// Pointer state since it was last taken. See [`Duplication::read_pointer`].
@@ -126,31 +133,50 @@ impl Duplication {
         }
 
         // SAFETY: each cast/query is checked; the COM objects outlive the calls.
-        let (output, width, height) = unsafe {
+        let (output, width, height, hdr) = unsafe {
             let dxgi_device: IDXGIDevice = device.cast().context("device is not a IDXGIDevice")?;
             let adapter = dxgi_device.GetAdapter().context("no DXGI adapter")?;
             let output = adapter.EnumOutputs(0).context("no display attached to adapter 0")?;
             let output1: IDXGIOutput1 = output.cast().context("output is not IDXGIOutput1")?;
 
-            let duplication = output1.DuplicateOutput(&device).map_err(|e| {
-                if e.code() == E_ACCESSDENIED {
-                    anyhow::anyhow!(
-                        "Screen capture was denied. This happens on the lock screen or while \
-                         a UAC prompt is up — both run on a desktop we cannot see."
-                    )
-                } else {
-                    anyhow::anyhow!("DuplicateOutput failed: {e}")
-                }
-            })?;
+            let colour = super::capture_hdr::probe(&output);
+            super::capture_hdr::log_display(colour);
+            let hdr_desktop = colour.is_some_and(DisplayColour::is_hdr);
 
+            let mut duplication = duplicate(&device, &output1, hdr_desktop)?;
             // Take the size from the duplication itself rather than the output:
             // it is what we actually capture, and it avoids pulling in the GDI
             // feature that `IDXGIOutput::GetDesc` needs for its HMONITOR field.
-            let mode = duplication.GetDesc().ModeDesc;
-            let width = mode.Width.clamp(1, u16::MAX as u32) as u16;
-            let height = mode.Height.clamp(1, u16::MAX as u32) as u16;
+            let mut size = duplication_size(&duplication);
 
-            (duplication, width, height)
+            // # Why the converter is built before the first frame
+            //
+            // The floating-point desktop is only worth asking for if there is
+            // something able to convert it. Discovering otherwise once frames
+            // are arriving would leave every path below holding a surface in a
+            // format it cannot read, and the recovery for that — tear the
+            // duplication down and build it again — is the same thing this does
+            // here, once, before anything depends on it.
+            //
+            // It needs the size, and the size comes from the duplication, which
+            // is why this is not simply asked first.
+            let mut converter = None;
+            if hdr_desktop {
+                match HdrToSdr::new(&device, &context, size.0, size.1) {
+                    Ok(ready) => converter = Some(ready),
+                    Err(e) => {
+                        warn!(
+                            "This GPU will not convert the floating-point HDR desktop \
+                             ({e:#}) — capturing it as eight-bit instead, which DXGI \
+                             will convert on its own terms and may look washed out"
+                        );
+                        duplication = duplicate(&device, &output1, false)?;
+                        size = duplication_size(&duplication);
+                    }
+                }
+            }
+
+            (duplication, size.0, size.1, converter)
         };
 
         let staging = create_staging_texture(&device, width, height)?;
@@ -161,6 +187,7 @@ impl Duplication {
             context,
             output,
             staging,
+            hdr,
             converter: None,
             width,
             height,
@@ -328,6 +355,15 @@ impl Duplication {
         let texture: ID3D11Texture2D =
             resource.cast().context("duplicated resource is not a texture")?;
 
+        // An HDR desktop arrives in floating point and has to be brought back
+        // into the range every path below this assumes. Decided from the format
+        // that actually turned up rather than from what the display said,
+        // because the surface is the thing that has to match.
+        let texture = match self.hdr.as_mut() {
+            Some(hdr) if is_floating_point(&texture) => hdr.convert(&texture)?,
+            _ => texture,
+        };
+
         if let Some(converter) = self.converter.as_mut() {
             // The whole point: the frame is converted and subsampled on the GPU,
             // so what crosses PCIe is 12 bits per pixel instead of 32 and the
@@ -370,6 +406,81 @@ unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16
         unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), row_bytes) };
     }
     out
+}
+
+/// Start duplication, asking for floating point when the desktop is in HDR.
+///
+/// # Two calls, and why the old one is kept
+///
+/// `DuplicateOutput1` is the only one that can be asked for a format, and
+/// asking is the whole point: told nothing, DXGI converts an HDR desktop down
+/// to eight bits on its own terms, which is where a washed-out capture comes
+/// from. It is also documented to fail with `E_INVALIDARG` for a process that
+/// is not DPI aware — measured, while writing this — and this process is aware
+/// only because its manifest says so.
+///
+/// The legacy call stays as the fallback for a Windows without `IDXGIOutput5`.
+/// It cannot deliver HDR, but for an SDR desktop it is exactly what shipped
+/// before any of this and there is no reason to prefer the newer one.
+fn duplicate(
+    device: &ID3D11Device,
+    output1: &IDXGIOutput1,
+    floating_point: bool,
+) -> Result<IDXGIOutputDuplication> {
+    let denied = |e: &windows::core::Error| e.code() == E_ACCESSDENIED;
+    let explain = |e: windows::core::Error| {
+        if denied(&e) {
+            anyhow::anyhow!(
+                "Screen capture was denied. This happens on the lock screen or while \
+                 a UAC prompt is up — both run on a desktop we cannot see."
+            )
+        } else {
+            anyhow::anyhow!("DuplicateOutput failed: {e}")
+        }
+    };
+
+    if floating_point && let Ok(output5) = output1.cast::<IDXGIOutput5>() {
+        let formats = [DXGI_FORMAT_R16G16B16A16_FLOAT];
+        // SAFETY: the format list outlives the call; the device is live.
+        match unsafe { output5.DuplicateOutput1(device, 0, &formats) } {
+            Ok(duplication) => return Ok(duplication),
+            // Access denied is about the desktop, not the format, and asking
+            // again in eight bits would be denied in exactly the same way.
+            Err(e) if denied(&e) => return Err(explain(e)),
+            Err(e) => warn!(
+                "DuplicateOutput1 would not give a floating-point desktop ({e}) — \
+                 falling back to eight-bit capture"
+            ),
+        }
+    }
+
+    // SAFETY: the device outlives the duplication it is asked for.
+    unsafe { output1.DuplicateOutput(device) }.map_err(explain)
+}
+
+/// The size duplication is actually handing over, clamped to what the wire
+/// carries.
+fn duplication_size(duplication: &IDXGIOutputDuplication) -> (u16, u16) {
+    // SAFETY: reads a descriptor from a live duplication.
+    let mode = unsafe { duplication.GetDesc() }.ModeDesc;
+    (
+        mode.Width.clamp(1, u16::MAX as u32) as u16,
+        mode.Height.clamp(1, u16::MAX as u32) as u16,
+    )
+}
+
+/// Whether an acquired surface is the floating-point kind an HDR desktop
+/// produces.
+///
+/// Asked of the surface rather than of the display, because the surface is what
+/// every stage below has to be able to read. If the two ever disagree — a
+/// driver ignoring the requested format, HDR switched on between one frame and
+/// the next — this is the one that is right.
+fn is_floating_point(texture: &ID3D11Texture2D) -> bool {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    // SAFETY: a documented read into a local, on a live texture.
+    unsafe { texture.GetDesc(&mut desc) };
+    desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
 }
 
 fn create_staging_texture(
