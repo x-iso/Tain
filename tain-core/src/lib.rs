@@ -68,6 +68,8 @@ pub mod audio_output;
 pub mod agent_pipe;
 pub mod capture_follow;
 pub mod input_inject;
+pub mod pipe_security;
+pub mod service_control;
 pub mod session;
 
 /// Get the ffmpeg runtime ready, off the startup path.

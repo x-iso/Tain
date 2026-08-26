@@ -213,11 +213,9 @@ mod platform {
     use anyhow::{bail, Context};
     use std::sync::atomic::{AtomicBool, Ordering};
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE};
-    use windows::Win32::Security::{
-        Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
-        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-    };
+    use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE};
+
+    use crate::pipe_security::{console_user_sid, wide, OwnedHandle as Owned, PipeSecurity};
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
         OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -226,107 +224,6 @@ mod platform {
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe,
         PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
-
-    /// Null-terminated UTF-16, which is what every call here wants.
-    fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    /// Closes a handle however the surrounding code exits.
-    struct Owned(HANDLE);
-
-    impl Drop for Owned {
-        fn drop(&mut self) {
-            if !self.0.is_invalid() {
-                // SAFETY: owned by this type, closed once.
-                unsafe {
-                    let _ = CloseHandle(self.0);
-                }
-            }
-        }
-    }
-
-    /// The SID of the user this pipe is for, as a string.
-    ///
-    /// An agent on the secure desktop runs as SYSTEM and has to ask which user
-    /// is at the console. One on the ordinary desktop already *is* that user, so
-    /// it reads its own token — asking `WTSQueryUserToken` there would fail, and
-    /// the answer is the same.
-    fn console_user_sid() -> Result<String> {
-        use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
-        use windows::Win32::System::RemoteDesktop::{
-            WTSGetActiveConsoleSessionId, WTSQueryUserToken,
-        };
-        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-        // SAFETY: a documented read of global session state.
-        let session = unsafe { WTSGetActiveConsoleSessionId() };
-
-        // SAFETY: both paths produce a token this function then owns.
-        let token = unsafe {
-            let mut token = HANDLE::default();
-            if WTSQueryUserToken(session, &mut token).is_ok() {
-                Owned(token)
-            } else {
-                let mut own = HANDLE::default();
-                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut own)
-                    .context("could not open this process's token")?;
-                Owned(own)
-            }
-        };
-
-        // SAFETY: a two-call query into a buffer sized by the first call.
-        unsafe {
-            let mut needed = 0u32;
-            let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut needed);
-            let mut buffer = vec![0u8; needed as usize];
-            GetTokenInformation(
-                token.0,
-                TokenUser,
-                Some(buffer.as_mut_ptr().cast()),
-                needed,
-                &mut needed,
-            )
-            .context("could not read the user out of the token")?;
-
-            let user = &*(buffer.as_ptr() as *const TOKEN_USER);
-            let mut text = windows::core::PWSTR::null();
-            ConvertSidToStringSidW(user.User.Sid, &mut text)
-                .context("could not render the user's SID")?;
-            let owned = text.to_string().context("the SID was not valid text")?;
-            let _ = windows::Win32::Foundation::LocalFree(
-                windows::Win32::Foundation::HLOCAL(text.0 as *mut _),
-            );
-            Ok(owned)
-        }
-    }
-
-    /// A security descriptor letting only Local System and the console user in.
-    ///
-    /// `D:P` makes it protected, so nothing is inherited from anywhere: this is
-    /// the whole access list and not a starting point.
-    fn pipe_security(user_sid: &str) -> Result<(PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES)> {
-        let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{user_sid})"));
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: the string outlives the call; the descriptor is freed by the
-        // caller once the pipe that uses it is created.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(sddl.as_ptr()),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                None,
-            )
-        }
-        .context("could not build the pipe's access list")?;
-
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor.0,
-            bInheritHandle: false.into(),
-        };
-        Ok((descriptor, attributes))
-    }
 
     /// One connected host: frames out, input in.
     ///
@@ -417,7 +314,7 @@ mod platform {
         let sid = console_user_sid()?;
 
         while running.load(Ordering::Relaxed) {
-            let (descriptor, attributes) = pipe_security(&sid)?;
+            let security = PipeSecurity::for_console_user(&sid)?;
 
             // SAFETY: the name and attributes outlive the call.
             let pipe = unsafe {
@@ -430,15 +327,9 @@ mod platform {
                     1 << 20,
                     1 << 16,
                     0,
-                    Some(&attributes),
+                    Some(security.attributes()),
                 )
             };
-            // SAFETY: allocated by the conversion above, freed once here.
-            unsafe {
-                let _ = windows::Win32::Foundation::LocalFree(
-                    windows::Win32::Foundation::HLOCAL(descriptor.0),
-                );
-            }
             // `CreateNamedPipeW` reports failure with a sentinel rather than
             // a `Result`, so it is checked rather than unwrapped.
             if pipe.is_invalid() {
