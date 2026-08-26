@@ -1623,7 +1623,6 @@ fn spawn_capture_pipeline(
             // Frames a second actually leaving here, from the last completed
             // window. The window below is a duration, and this is what turns it
             // into a number of frames.
-            let mut observed_fps: f32 = 0.0;
             // One picture per session, from the first frame that arrives.
             let mut sent_preview = false;
 
@@ -1801,7 +1800,6 @@ fn spawn_capture_pipeline(
 
                 let guest = *telemetry.lock().unwrap();
                 let observation = window.observe(elapsed, guest);
-                observed_fps = observation.achieved_fps;
                 window.clear();
                 window_started = std::time::Instant::now();
 
