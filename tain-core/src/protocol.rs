@@ -264,7 +264,32 @@ pub struct GuestTelemetry {
     /// Median milliseconds to upload and draw a decoded frame.
     pub render_ms: f32,
     /// Frames actually presented per second over the reporting window.
+    ///
+    /// Capped by how often the guest's window repaints, which is its monitor's
+    /// refresh rate and not a property of the link. Judge the *link* by
+    /// [`Self::decoded_fps`]; this one says whether the guest can keep up with
+    /// drawing, which is a different question with a different answer.
     pub displayed_fps: f32,
+    /// Frames that arrived and decoded per second over the same window.
+    ///
+    /// # Why this exists separately
+    ///
+    /// The host used to compare what it sent against `displayed_fps` and call
+    /// the shortfall lost frames. It is not: a guest on a 60 Hz monitor cannot
+    /// present more than sixty a second however perfect the link, and it draws
+    /// one frame per repaint, so a host sending fifty-eight routinely sees
+    /// forty-something presented and concludes the network is dropping a fifth
+    /// of them.
+    ///
+    /// Measured on a 30 Mbit/s link: the host climbed to 58 fps and 7 Mbit/s
+    /// with the send path never once blocking, then read the guest's presented
+    /// rate as loss and spent ninety seconds collapsing to 17 fps and 933
+    /// kbit/s. Nothing was lost. The frames arrived, decoded, and were replaced
+    /// by newer ones before the window repainted, which is what should happen
+    /// when a host produces faster than a monitor refreshes.
+    ///
+    /// Frames that arrived and decoded is the honest measure of the link.
+    pub decoded_fps: f32,
     /// Round trip to the host in milliseconds, from the ping/pong pair.
     pub rtt_ms: f32,
 }

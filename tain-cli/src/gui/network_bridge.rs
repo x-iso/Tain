@@ -366,6 +366,13 @@ impl StreamHealth {
             } else {
                 0.0
             },
+            // Everything that arrived and decoded, whether or not a repaint
+            // came along in time to draw it. See `GuestTelemetry::decoded_fps`.
+            decoded_fps: if elapsed > 0.05 {
+                (self.displayed_frames + self.skipped_frames) as f32 / elapsed
+            } else {
+                0.0
+            },
             rtt_ms: self.rtt_ms,
         };
 

@@ -492,7 +492,9 @@ impl AdaptiveController {
         if let Some(guest) = obs.guest
             && obs.achieved_fps > 1.0
         {
-            let delivered = guest.displayed_fps / obs.achieved_fps;
+            // Against what decoded, not what was drawn: a guest that
+            // decoded every frame and painted half of them lost nothing.
+            let delivered = guest.decoded_fps / obs.achieved_fps;
             if delivered < 0.35 {
                 steps = steps.max(3);
             } else if delivered < 0.6 {
@@ -537,9 +539,12 @@ impl AdaptiveController {
             if guest.render_ms > budget {
                 set.insert(Bottleneck::SlowRender);
             }
-            // The guest displaying materially fewer frames than the host
-            // produced means they were lost or late in between.
-            if obs.achieved_fps > 1.0 && guest.displayed_fps < obs.achieved_fps * 0.8 {
+            // The guest *decoding* materially fewer frames than the host
+            // produced means they were lost or late in between. Comparing
+            // against what it drew instead reads a 60 Hz monitor as a lossy
+            // link — see `GuestTelemetry::decoded_fps` for the session that
+            // cost.
+            if obs.achieved_fps > 1.0 && guest.decoded_fps < obs.achieved_fps * 0.8 {
                 set.insert(Bottleneck::SlowNetwork);
             }
             if guest.rtt_ms > HIGH_LATENCY_MS {
@@ -703,6 +708,7 @@ mod tests {
                 decode_ms: 4.0,
                 render_ms: 2.0,
                 displayed_fps: 60.0,
+                decoded_fps: 60.0,
                 rtt_ms: 12.0,
             }),
         }
@@ -896,6 +902,7 @@ mod tests {
                 decode_ms: 50.0,
                 render_ms: 50.0,
                 displayed_fps: 5.0,
+                decoded_fps: 5.0,
                 rtt_ms: 300.0,
             }),
         };
@@ -1102,5 +1109,46 @@ mod tests {
             "patience {} did not grow past {base} after two failed recoveries",
             c.patience()
         );
+    }
+    /// A guest that draws slower than it decodes is not a slow link.
+    ///
+    /// The session this comes from: a host climbing to 58 fps on a 30 Mbit/s
+    /// link, send path never blocking, guest presenting what a 60 Hz monitor
+    /// can present. Judged on what was drawn that reads as a fifth of the
+    /// frames lost, and the controller spent ninety seconds collapsing to 17
+    /// fps and 933 kbit/s. Nothing was lost.
+    #[test]
+    fn a_guest_that_cannot_paint_fast_enough_is_not_a_slow_network() {
+        let mut obs = healthy();
+        obs.achieved_fps = 58.0;
+        if let Some(guest) = obs.guest.as_mut() {
+            // Every frame arrived and decoded...
+            guest.decoded_fps = 58.0;
+            // ...and the window painted rather fewer of them.
+            guest.displayed_fps = 44.0;
+        }
+
+        let mut controller = AdaptiveController::new(LatencyPriority::BALANCED, ceiling(), NATIVE);
+        drive(&mut controller, &obs, 6);
+        assert!(
+            !controller.bottlenecks().contains(Bottleneck::SlowNetwork),
+            "frames that decoded were not lost, whatever the repaint rate",
+        );
+    }
+
+    /// And frames that genuinely never arrive still say so.
+    #[test]
+    fn frames_that_never_decoded_are_still_a_slow_network() {
+        let mut obs = healthy();
+        obs.achieved_fps = 58.0;
+        if let Some(guest) = obs.guest.as_mut() {
+            // Half of what the host sent never turned up at all.
+            guest.decoded_fps = 25.0;
+            guest.displayed_fps = 25.0;
+        }
+
+        let mut controller = AdaptiveController::new(LatencyPriority::BALANCED, ceiling(), NATIVE);
+        drive(&mut controller, &obs, 6);
+        assert!(controller.bottlenecks().contains(Bottleneck::SlowNetwork));
     }
 }
