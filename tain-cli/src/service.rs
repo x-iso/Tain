@@ -149,6 +149,7 @@ mod windows_impl {
         SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
         SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     };
+    use std::sync::Arc;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::TerminateProcess;
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -832,6 +833,227 @@ mod windows_impl {
         }
     }
 
+    /// Whether the application has said it is hosting.
+    ///
+    /// Two hosts on one identity is worse than none: a guest reaches whichever
+    /// answers first, and which that is changes between attempts. So this
+    /// yields to the application whenever it is up.
+    static APPLICATION_HOSTING: AtomicBool = AtomicBool::new(false);
+
+    /// Take the control channel and keep the service's copy of the identity.
+    ///
+    /// Runs on its own thread for the life of the service: accepting a
+    /// connection blocks, and the supervisor loop has agents to watch.
+    fn serve_control() {
+        use tain_core::service_control::{serve, ControlMessage};
+
+        let secrets = crate::gui::secrets::HostSecrets::os();
+        let served = serve(&RUNNING, |message| match message {
+            ControlMessage::AdoptIdentity { secret_key, codes } => {
+                if !secrets.set_identity(&secret_key) {
+                    tracing::warn!("Could not store the host identity — unattended access \
+                                    will not survive a restart");
+                }
+                // Parsed rather than trusted. A code is base58check, so a
+                // damaged one fails here instead of being adopted as a
+                // passcode nobody can produce.
+                let mut kept = 0;
+                for code in &codes {
+                    match tain_core::ConnectionCode::parse(code) {
+                        Ok(parsed) => {
+                            if secrets.set_code(parsed.passcode_type, code) {
+                                kept += 1;
+                            }
+                        }
+                        Err(e) => tracing::warn!("The application sent an unreadable code: {e}"),
+                    }
+                }
+                tracing::info!(
+                    "Adopted the host identity and {kept} of {} codes — this machine can \
+                     answer with nobody signed in",
+                    codes.len()
+                );
+            }
+            ControlMessage::ForgetIdentity => {
+                secrets.forget_code(tain_core::PasscodeType::Master);
+                secrets.forget_code(tain_core::PasscodeType::Guest);
+                tracing::info!("Forgot the host identity — unattended access is off");
+            }
+            ControlMessage::ApplicationHosting(hosting) => {
+                let was = APPLICATION_HOSTING.swap(hosting, Ordering::Relaxed);
+                if was != hosting {
+                    tracing::info!(
+                        "The application is {} hosting",
+                        if hosting { "now" } else { "no longer" }
+                    );
+                }
+            }
+        });
+        if let Err(e) = served {
+            tracing::warn!("The service control channel stopped: {e:#}");
+        }
+    }
+
+    /// Hosts on this machine's behalf while nobody is signed in.
+    struct UnattendedHost {
+        /// The running host, and the flag that stops it.
+        running: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
+    }
+
+    impl UnattendedHost {
+        fn new() -> Self {
+            Self { running: None }
+        }
+
+        /// Start or stop hosting to match what the machine currently needs.
+        ///
+        /// # When the service should be the host
+        ///
+        /// Only when there is nobody to be one instead. A signed-in user has
+        /// the application, which owns the same identity and the same codes —
+        /// and answering alongside it would mean a guest reaching whichever
+        /// bound first.
+        ///
+        /// `WTSQueryUserToken` failing *is* the test for "nobody is signed in".
+        /// The console session exists at the sign-in screen; what it lacks is a
+        /// user, and asking for that user's token is how Windows says so.
+        fn poll(&mut self) {
+            let wanted = !APPLICATION_HOSTING.load(Ordering::Relaxed)
+                && console_user_token(console_session().unwrap_or(u32::MAX)).is_err();
+
+            // A host that stopped on its own — a bind that failed, a network
+            // that went away — is restarted by the next pass.
+            if let Some((_, handle)) = &self.running
+                && handle.is_finished()
+            {
+                self.stop();
+            }
+
+            match (wanted, self.running.is_some()) {
+                (true, false) => self.start(),
+                (false, true) => {
+                    tracing::info!("Somebody is signed in — handing hosting back");
+                    self.stop();
+                }
+                _ => {}
+            }
+        }
+
+        fn start(&mut self) {
+            let secrets = crate::gui::secrets::HostSecrets::os();
+            let Some(identity) = secrets.identity() else {
+                // Nothing adopted, so unattended access is off or was never
+                // configured. Not a failure and not worth a line every pass.
+                return;
+            };
+
+            tracing::info!("Nobody is signed in — hosting on this machine's behalf");
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let spawned = std::thread::Builder::new()
+                .name("tain-unattended-host".into())
+                .spawn(move || host_until_stopped(identity, &flag));
+
+            match spawned {
+                Ok(handle) => self.running = Some((stop, handle)),
+                Err(e) => tracing::warn!("Could not start the unattended host: {e}"),
+            }
+        }
+
+        fn stop(&mut self) {
+            let Some((stop, handle)) = self.running.take() else { return };
+            stop.store(true, Ordering::Relaxed);
+            // Not joined. The host is inside its own runtime and may be waiting
+            // on a socket; the flag ends it at the next tick, and blocking the
+            // service's own loop on that would delay a stop request.
+            drop(handle);
+        }
+    }
+
+    impl Drop for UnattendedHost {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    /// Run a host with the adopted identity until told to stop.
+    ///
+    /// On its own runtime rather than the application's: the service main runs
+    /// on a thread the control manager created, with no runtime of its own, and
+    /// borrowing one across that boundary is more machinery than a runtime
+    /// costs.
+    fn host_until_stopped(identity: [u8; 32], stop: &AtomicBool) {
+        // Session zero has no desktop, so every frame has to come from the
+        // agent on the secure desktop — which, with nobody signed in, is the
+        // sign-in screen and the only thing there is to show.
+        tain_core::capture_follow::use_agent_only();
+
+        let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                tracing::warn!("Could not start a runtime for the unattended host: {e}");
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            let server = match tain_core::HostServer::bind_with_identity(Some(identity)).await {
+                Ok(server) => Arc::new(server),
+                Err(e) => {
+                    tracing::warn!("The unattended host could not bind: {e:#}");
+                    return;
+                }
+            };
+
+            // Codes are restored rather than reissued. A new one would name the
+            // same endpoint and still be a code nobody has been given.
+            let secrets = crate::gui::secrets::HostSecrets::os();
+            let endpoint_id = server.endpoint_id_bytes();
+            for typ in [tain_core::PasscodeType::Master, tain_core::PasscodeType::Guest] {
+                let Some(saved) = secrets.code(typ) else { continue };
+                match tain_core::ConnectionCode::parse(&saved) {
+                    Ok(parsed) if parsed.endpoint_id == endpoint_id => {
+                        server.adopt_passcode(typ, parsed.secret).await;
+                    }
+                    // A code for a different endpoint is one the application
+                    // regenerated without telling us. Refusing it is right:
+                    // adopting it would answer to a secret whose code names
+                    // somewhere else.
+                    Ok(_) => tracing::warn!(
+                        "The stored {} code is for a different endpoint — ignoring it",
+                        typ.prefix()
+                    ),
+                    Err(e) => tracing::warn!("The stored {} code is unreadable: {e}", typ.prefix()),
+                }
+            }
+
+            // No approval channel, deliberately. Nobody is signed in to answer
+            // one, and `await_approval` refuses a guest that has no channel —
+            // so a MASTER code connects and a GUEST code is declined rather
+            // than hanging until it times out or, worse, being let through.
+            tracing::info!("Unattended host listening — master codes only");
+
+            let serving = server.clone().run();
+            tokio::pin!(serving);
+            loop {
+                tokio::select! {
+                    result = &mut serving => {
+                        if let Err(e) = result {
+                            tracing::warn!("The unattended host stopped: {e:#}");
+                        }
+                        return;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                        if stop.load(Ordering::Relaxed) {
+                            tracing::info!("The unattended host was asked to stop");
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     fn report(state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE) {
         let Ok(handle) = STATUS_HANDLE.lock() else { return };
         let Some(handle) = *handle else { return };
@@ -869,13 +1091,23 @@ mod windows_impl {
         report(SERVICE_RUNNING);
         tracing::info!("Tain service started");
 
+        // The application talks to this on its own thread, because accepting a
+        // connection blocks and this loop has work to do.
+        std::thread::Builder::new()
+            .name("tain-service-control".into())
+            .spawn(serve_control)
+            .ok();
+
         // One agent per desktop of the console session. See `AgentSupervisor`
         // for why it is not one that follows the input around.
         let mut agents = AgentSupervisor::new();
+        let mut unattended = UnattendedHost::new();
         while RUNNING.load(Ordering::Relaxed) {
             agents.poll();
+            unattended.poll();
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
+        drop(unattended);
         drop(agents);
 
         tracing::info!("Tain service stopping");

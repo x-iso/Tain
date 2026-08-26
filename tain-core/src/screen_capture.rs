@@ -538,7 +538,12 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
     } else {
         #[cfg(target_os = "windows")]
         {
-            {
+            // The service has no desktop to duplicate — session zero has
+            // nothing on it — so it takes every frame from an agent instead of
+            // wrapping a local backend that would refuse to start.
+            if super::capture_follow::capture_through_agent_only() {
+                Box::new(super::capture_follow::DesktopFollowing::agent_only())
+            } else {
                 use anyhow::Context;
                 let local =
                     super::capture_shared::attach().context("could not start screen capture")?;

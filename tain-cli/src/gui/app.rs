@@ -252,10 +252,54 @@ impl AppState {
         if self.on_disk {
             self.settings.lock().unwrap().save();
         }
+        // Whatever changed, the service's copy of the answer may now be stale.
+        // Cheap, and getting it wrong means a machine that answers to a code
+        // nobody holds any more.
+        sync_unattended(self);
     }
 
     pub fn settings(&self) -> Settings {
         self.settings.lock().unwrap().clone()
+    }
+}
+
+/// Tell the service whether to stand in for this machine, and with what.
+///
+/// # Nothing is sent until it is asked for
+///
+/// The identity is only handed over while the setting is on. Local System can
+/// already read every user's credential store, so this grants no access that
+/// was not there — but it does put the host key in a second place, and a
+/// machine whose owner declined unattended access should not pay that. Turning
+/// it off sends the opposite message rather than merely stopping: leaving the
+/// key behind after somebody said no would keep the cost of a feature they
+/// refused.
+///
+/// Failure is ordinary and quiet. Most machines have no service installed, and
+/// "the pipe is not there" is the expected answer rather than a fault.
+pub fn sync_unattended(state: &AppState) {
+    use tain_core::service_control::{send, ControlMessage};
+
+    let message = if state.settings().unattended_access {
+        let Some(secret_key) = state.host.secrets.identity() else {
+            // No credential store, so there is no stable identity to hand over
+            // — and a service adopting a key that changes next launch would
+            // answer to codes nobody has.
+            tracing::debug!("No stored identity yet — nothing to hand the service");
+            return;
+        };
+        let codes = [tain_core::PasscodeType::Master, tain_core::PasscodeType::Guest]
+            .into_iter()
+            .filter_map(|typ| state.host.secrets.code(typ))
+            .collect();
+        ControlMessage::AdoptIdentity { secret_key, codes }
+    } else {
+        ControlMessage::ForgetIdentity
+    };
+
+    match send(&message) {
+        Ok(()) => tracing::debug!("Told the service about unattended access"),
+        Err(e) => tracing::debug!("The service is not listening ({e:#})"),
     }
 }
 
@@ -510,6 +554,22 @@ pub async fn init_host_server(state: &AppState) -> anyhow::Result<HostHandles> {
     if restored_identity.is_none() && !secrets.set_identity(&server.identity_bytes()) {
         warn!("No credential store — this machine's codes will change every launch");
     }
+
+    // The identity exists by now, which it did not when the settings were last
+    // saved on a first run. See `sync_unattended`.
+    sync_unattended(state);
+
+    // And say plainly that this machine already has a host. The service yields
+    // to it: two hosts on one identity would have a guest reach whichever
+    // answered first, which is worse than either alone.
+    //
+    // Belt and braces rather than the main mechanism — the service also checks
+    // whether anybody is signed in, and if this is running then somebody is.
+    // It closes the window around signing out, where the token disappears
+    // before this process does.
+    let _ = tain_core::service_control::send(
+        &tain_core::service_control::ControlMessage::ApplicationHosting(true),
+    );
 
     // Start from the saved preferences rather than the library defaults.
     server.set_session_config(state.settings().to_session_config());

@@ -106,6 +106,178 @@ pub fn length_is_plausible(len: usize) -> bool {
     len > 0 && len <= MAX_CONTROL_MESSAGE
 }
 
+#[cfg(target_os = "windows")]
+pub use platform::{send, serve};
+
+/// Ask the service to do something. No-op where there is no service.
+#[cfg(not(target_os = "windows"))]
+pub fn send(_message: &ControlMessage) -> Result<()> {
+    anyhow::bail!("the Tain service is Windows-only")
+}
+
+#[cfg(target_os = "windows")]
+mod platform {
+    use super::*;
+    use anyhow::{bail, Context};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    };
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+
+    use crate::pipe_security::{console_user_sid, wide, OwnedHandle, PipeSecurity};
+
+    /// Listen for the application until `running` goes false.
+    ///
+    /// One client at a time, which is all there is: the application on this
+    /// machine. `handle` is called for each message and may be called from this
+    /// thread only, so it is free to touch whatever the service owns.
+    ///
+    /// A message that cannot be understood ends that connection rather than the
+    /// server. The application reconnects, and a service that stopped listening
+    /// because of one bad frame would need a reboot to recover.
+    pub fn serve(running: &AtomicBool, mut handle: impl FnMut(ControlMessage)) -> Result<()> {
+        let name = wide(CONTROL_PIPE);
+        let sid = console_user_sid()?;
+
+        while running.load(Ordering::Relaxed) {
+            let security = PipeSecurity::for_console_user(&sid)?;
+
+            // SAFETY: the name and attributes outlive the call.
+            let pipe = unsafe {
+                CreateNamedPipeW(
+                    PCWSTR(name.as_ptr()),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,
+                    // Control messages are tiny; this is generous.
+                    64 * 1024,
+                    64 * 1024,
+                    0,
+                    Some(security.attributes()),
+                )
+            };
+            if pipe.is_invalid() {
+                bail!(
+                    "could not create the service control pipe: {}",
+                    windows::core::Error::from_win32()
+                );
+            }
+            let pipe = OwnedHandle(pipe);
+
+            // SAFETY: a pipe this function owns and has not connected yet.
+            let connected = unsafe { ConnectNamedPipe(pipe.0, None) };
+            if let Err(e) = &connected
+                && e.code() != ERROR_PIPE_CONNECTED.to_hresult()
+            {
+                tracing::debug!("Service control pipe: waiting: {e}");
+                continue;
+            }
+
+            tracing::debug!("Service control pipe: the application connected");
+            while running.load(Ordering::Relaxed) {
+                match read_message(pipe.0) {
+                    Ok(Some(message)) => handle(message),
+                    // A clean disconnect. The application closes the pipe after
+                    // saying what it came to say.
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!("Service control pipe: {e:#}");
+                        break;
+                    }
+                }
+            }
+            // SAFETY: connected immediately above.
+            unsafe {
+                let _ = DisconnectNamedPipe(pipe.0);
+            }
+        }
+        Ok(())
+    }
+
+    /// One message, or `None` when the far end has gone.
+    fn read_message(pipe: HANDLE) -> Result<Option<ControlMessage>> {
+        let mut header = [0u8; 4];
+        if !read_exact(pipe, &mut header)? {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes(header) as usize;
+
+        // Checked before allocating. The length arrives from another process,
+        // and `vec![0; n]` on an unchecked one is how a stray write becomes an
+        // out-of-memory abort in a service.
+        if !length_is_plausible(len) {
+            bail!("the application sent a {len}-byte message, which is not one");
+        }
+
+        let mut body = vec![0u8; len];
+        if !read_exact(pipe, &mut body)? {
+            return Ok(None);
+        }
+        Ok(Some(decode(&body)?))
+    }
+
+    /// Fill `into`, or report that the far end closed first.
+    fn read_exact(pipe: HANDLE, into: &mut [u8]) -> Result<bool> {
+        let mut filled = 0usize;
+        while filled < into.len() {
+            let mut read = 0u32;
+            // SAFETY: a live pipe handle and a slice that outlives the call.
+            let got = unsafe { ReadFile(pipe, Some(&mut into[filled..]), Some(&mut read), None) };
+            if got.is_err() || read == 0 {
+                return Ok(false);
+            }
+            filled += read as usize;
+        }
+        Ok(true)
+    }
+
+    /// Say one thing to the service and hang up.
+    ///
+    /// Connect-per-message rather than a held connection: these are sent a
+    /// handful of times a session, and a channel kept open for hours is a
+    /// channel that has to be noticed when it breaks. Failing is normal — the
+    /// service may not be installed — so the caller decides whether to care.
+    pub fn send(message: &ControlMessage) -> Result<()> {
+        let framed = encode(message)?;
+        let name = wide(CONTROL_PIPE);
+
+        // SAFETY: the name outlives the call.
+        let pipe = unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                windows::Win32::Foundation::GENERIC_WRITE.0,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            )
+        }
+        .context("the Tain service is not listening")?;
+        let pipe = OwnedHandle(pipe);
+
+        let mut sent = 0usize;
+        while sent < framed.len() {
+            let mut wrote = 0u32;
+            // SAFETY: a live pipe handle and a slice that outlives the call.
+            unsafe { WriteFile(pipe.0, Some(&framed[sent..]), Some(&mut wrote), None) }
+                .context("the service stopped reading")?;
+            if wrote == 0 {
+                bail!("the service stopped reading");
+            }
+            sent += wrote as usize;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

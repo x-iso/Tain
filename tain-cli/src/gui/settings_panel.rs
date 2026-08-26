@@ -61,7 +61,7 @@ pub fn show(
                     ui.add_space(10.0);
                     security_section(ui, settings);
                     ui.add_space(18.0);
-                    unattended_section(ui);
+                    unattended_section(ui, settings);
                     ui.add_space(10.0);
                     shortcut_section(ui, settings, panel);
                 });
@@ -684,12 +684,16 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
 ///
 /// Nothing here is required. Tain runs exactly as it always has with no service
 /// installed — that is the whole point of it being opt-in.
-fn unattended_section(ui: &mut egui::Ui) {
+fn unattended_section(ui: &mut egui::Ui, settings: &mut Settings) {
     use crate::service::{self, ServiceState};
 
     heading(ui, "Unattended access");
 
     let state = service::state();
+    let installed = matches!(
+        state,
+        ServiceState::Running | ServiceState::Stopped | ServiceState::Mismatched
+    );
 
     ui.label(
         RichText::new(
@@ -750,6 +754,28 @@ fn unattended_section(ui: &mut egui::Ui) {
             tracing::warn!("Could not start the service uninstaller: {e:#}");
         }
     });
+
+    ui.add_space(8.0);
+
+    // Greyed rather than hidden when there is no service: the setting is what
+    // the section is named for, and a checkbox that appears only after an
+    // unrelated button is pressed is a setting nobody finds.
+    ui.add_enabled_ui(installed, |ui| {
+        ui.checkbox(
+            &mut settings.unattended_access,
+            "Answer when nobody is signed in",
+        )
+        .on_hover_text(
+            "Hands this machine's identity to the service, so the same connection \
+             code reaches it at the sign-in screen. Off, the service still covers \
+             consent prompts and the lock screen while somebody is signed in.",
+        );
+    });
+    if !installed {
+        ui.label(
+            RichText::new("Needs the service installed.").size(11.0).color(TEXT_DIM),
+        );
+    }
 
     ui.add_space(8.0);
     ui.label(

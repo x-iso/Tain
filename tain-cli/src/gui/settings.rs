@@ -253,6 +253,15 @@ pub struct Settings {
     /// frame is not a trade worth making for someone who just wants to connect.
     #[serde(default)]
     pub gpu_present: bool,
+    /// Whether this machine may be reached with nobody signed in.
+    ///
+    /// Off by default, and separate from installing the service on purpose.
+    /// Installing it buys consent prompts and the lock screen — things that
+    /// happen while somebody is already at the machine using it. Answering when
+    /// nobody is there is a different proposition with a different risk, and
+    /// folding the two into one decision would mean anybody who wanted the
+    /// first silently got the second.
+    pub unattended_access: bool,
     #[serde(deserialize_with = "lenient")]
     pub rate_control: RateControlSetting,
     /// What to give up first if the stream cannot keep up, 0-100.
@@ -351,6 +360,7 @@ impl Default for Settings {
             preferred_encoder: String::new(),
             h264_profile: ProfileSetting::default(),
             gpu_present: false,
+            unattended_access: false,
             rate_control: RateControlSetting::default(),
             latency_priority: LatencyPriority::default().value(),
             // 60, not 30: with the hardware encoder a native-resolution frame

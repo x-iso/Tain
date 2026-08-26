@@ -55,7 +55,13 @@ use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, Scr
 pub const SECURE_DESKTOP: &str = "Winlogon";
 
 #[cfg(target_os = "windows")]
-pub use platform::{send_input_to_agent, DesktopFollowing};
+pub use platform::{capture_through_agent_only, send_input_to_agent, use_agent_only, DesktopFollowing};
+
+/// Whether this process has no desktop of its own to capture.
+#[cfg(not(target_os = "windows"))]
+pub fn capture_through_agent_only() -> bool {
+    false
+}
 
 /// Whether input should be going to an agent rather than injected locally.
 #[cfg(not(target_os = "windows"))]
@@ -68,6 +74,38 @@ mod platform {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// Whether this process must get every frame from an agent.
+    ///
+    /// # Why a process-wide mode rather than a parameter
+    ///
+    /// The service has no desktop. It runs in session zero, where Desktop
+    /// Duplication has nothing to duplicate, so the local capturer it would
+    /// normally wrap does not merely return black — it refuses to start, and
+    /// the session fails before a frame is asked for.
+    ///
+    /// This is not a property of one session or one configuration. It is a fact
+    /// about the process: the service is *always* in that position and the
+    /// application never is. Threading it through every constructor between
+    /// here and where a session is built would be plumbing a constant, so the
+    /// service states it once at startup and nothing below has to carry it.
+    static AGENT_ONLY: AtomicBool = AtomicBool::new(false);
+
+    /// Say that this process cannot capture anything itself.
+    ///
+    /// Called by the service before it hosts, and by nothing else.
+    pub fn use_agent_only() {
+        AGENT_ONLY.store(true, Ordering::Relaxed);
+        tracing::info!(
+            "This process has no desktop of its own — every frame will come from the \
+             {SECURE_DESKTOP} agent"
+        );
+    }
+
+    /// Whether [`use_agent_only`] was called.
+    pub fn capture_through_agent_only() -> bool {
+        AGENT_ONLY.load(Ordering::Relaxed)
+    }
 
     /// The link to the secure desktop's agent, while there is one.
     ///
@@ -102,7 +140,8 @@ mod platform {
 
     /// Wraps a local capturer and falls back to an agent's frames.
     pub struct DesktopFollowing {
-        local: Box<dyn ScreenCaptureBackend>,
+        /// `None` in the service, which has no desktop to capture.
+        local: Option<Box<dyn ScreenCaptureBackend>>,
         /// Running only while the input is somewhere this process cannot see.
         agent: Option<AgentReader>,
         /// Whether the last look found the input on a desktop we can capture.
@@ -118,7 +157,17 @@ mod platform {
 
     impl DesktopFollowing {
         pub fn new(local: Box<dyn ScreenCaptureBackend>) -> Self {
-            Self { local, agent: None, had_local_input: true, from_agent: 0 }
+            Self { local: Some(local), agent: None, had_local_input: true, from_agent: 0 }
+        }
+
+        /// A capturer with no desktop of its own, for the service.
+        ///
+        /// Every frame comes from the agent. There is no local backend to fall
+        /// back to and no question about which desktop to ask: with nobody
+        /// signed in, the sign-in screen *is* the secure desktop, and it is the
+        /// only thing there is to show.
+        pub fn agent_only() -> Self {
+            Self { local: None, agent: None, had_local_input: false, from_agent: 0 }
         }
 
         /// Whether this process can still see the desktop receiving input.
@@ -128,6 +177,11 @@ mod platform {
         /// being turned away is precisely how it learns the secure desktop is
         /// up. There is no positive notification of this anywhere in Windows.
         fn local_has_input() -> bool {
+            // A process with no desktop never has the input, whatever Windows
+            // would say about session zero's own.
+            if capture_through_agent_only() {
+                return false;
+            }
             use windows::Win32::System::StationsAndDesktops::{
                 CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
             };
@@ -172,8 +226,8 @@ mod platform {
                 }
             }
 
-            if local {
-                return self.local.capture_next();
+            if local && let Some(local) = self.local.as_mut() {
+                return local.capture_next();
             }
 
             // Connecting is retried on each call rather than once, because the
@@ -221,15 +275,24 @@ mod platform {
             // Only from the local backend. The agent's pointer is drawn into
             // its own frames, and reporting a second one would put two on the
             // guest's screen.
-            self.had_local_input.then(|| self.local.take_cursor()).flatten()
+            self.local
+                .as_mut()
+                .filter(|_| self.had_local_input)
+                .and_then(|local| local.take_cursor())
         }
 
         fn frame_size(&self) -> (u16, u16) {
-            self.local.frame_size()
+            // Without a local backend the size is whatever the agent sends, and
+            // nothing has arrived yet. The primary display's size is the right
+            // guess: the agent is capturing the same screen.
+            self.local.as_ref().map_or_else(
+                super::super::screen_capture::primary_display_size,
+                |local| local.frame_size(),
+            )
         }
 
         fn set_scale(&mut self, scale: QualityScale) -> bool {
-            self.local.set_scale(scale)
+            self.local.as_mut().is_some_and(|local| local.set_scale(scale))
         }
 
         fn request_format(&mut self, format: PixelFormat) -> bool {
@@ -239,11 +302,14 @@ mod platform {
             if format != PixelFormat::Bgra {
                 return false;
             }
-            self.local.request_format(format)
+            self.local.as_mut().is_some_and(|local| local.request_format(format))
         }
 
         fn is_real(&self) -> bool {
-            self.local.is_real()
+            // Agent frames are a real screen even though this process cannot
+            // see one. Reporting otherwise would have the session treat them
+            // as a test pattern.
+            self.local.as_ref().is_none_or(|local| local.is_real())
         }
     }
 
