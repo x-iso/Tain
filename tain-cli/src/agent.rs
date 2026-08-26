@@ -180,9 +180,24 @@ mod platform {
         let served = serve_forever(&desktop, &RUNNING, |writer| {
             let mut capturer = create_capturer(CaptureConfig::default())
                 .context("could not start capturing for the host")?;
+            // Injection belongs to this process because `SendInput` reaches the
+            // desktop of the thread that calls it, and this is the only process
+            // on that desktop. It is also why the host cannot simply do it
+            // itself while a consent prompt is up.
+            let injector = tain_core::input_inject::create_injector();
             tracing::info!("Serving {desktop}: capture started for a connected host");
 
             while RUNNING.load(Ordering::Relaxed) {
+                // Drained every pass, including the ones where nothing is
+                // captured. A guest moving the pointer over a still prompt
+                // produces input and no frames, and holding those until the
+                // picture changed would make the pointer lag behind the hand.
+                for event in writer.take_input() {
+                    if let Err(e) = tain_core::network::inject_input(&*injector, &event) {
+                        tracing::debug!("Serving {desktop}: could not inject: {e:#}");
+                    }
+                }
+
                 // The host asked for this desktop, so it wants it whether or
                 // not it currently has the input — but there is nothing to
                 // capture until it does, and asking is cheaper than duplicating.

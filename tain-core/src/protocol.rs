@@ -34,7 +34,7 @@ pub struct FrameMessage {
 /// on the wire decouples input from the capture resolution — changing capture
 /// size, or scaling the guest's window, cannot desync the pointer — and it maps
 /// directly onto the Windows `MOUSEEVENTF_ABSOLUTE` range with no conversion.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MouseEvent {
     pub x: u16,
     pub y: u16,
@@ -52,7 +52,7 @@ impl MouseEvent {
 }
 
 /// Mouse button press or release.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MouseButtonEvent {
     /// Which mouse button (0=left, 1=right, 2=middle).
     pub button: u8,
@@ -65,7 +65,7 @@ pub struct MouseButtonEvent {
 /// 120 is the Windows `WHEEL_DELTA` convention; using it on the wire means the
 /// injector passes the value straight through, and high-resolution wheels can
 /// send fractions of a detent without a separate protocol.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScrollEvent {
     /// Horizontal delta (positive = right).
     pub dx: i16,
@@ -81,7 +81,7 @@ pub const WHEEL_DELTA: i16 = 120;
 /// `keycode` is always a **Windows virtual-key code**, on every platform. Picking
 /// one canonical space keeps the translation on the injector side, where the OS
 /// is already known, instead of making every guest guess what the host expects.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyEvent {
     pub keycode: u16,
     /// True for press, false for release.
@@ -130,7 +130,7 @@ pub mod modifier {
 }
 
 /// Composite input event message sent from guest to host.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputEvent {
     MouseMove(MouseEvent),
     MouseButton(MouseButtonEvent),

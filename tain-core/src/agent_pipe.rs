@@ -127,6 +127,83 @@ pub fn length_is_consistent(width: u16, height: u16, len: usize) -> bool {
     len == pixels * 4 || len == pixels * 3 / 2
 }
 
+/// One input event, travelling the other way.
+///
+/// # A fixed eight bytes, not a length-prefixed message
+///
+/// Every event fits: the largest is a key, at six bytes of payload. A fixed
+/// record means the reader can never be told to wait for bytes that are not
+/// coming, which for the side running as SYSTEM on the secure desktop is worth
+/// more than the two bytes it wastes on a mouse move.
+pub const INPUT_LEN: usize = 8;
+
+/// Turn an event into its eight bytes.
+///
+/// Coordinates are the normalised space [`crate::protocol::MouseEvent`] already
+/// uses, so nothing here has to know the size of a screen — which matters,
+/// because the desktop the event is bound for may not be the one the guest was
+/// looking at when it was made.
+pub fn encode_input(event: &crate::protocol::InputEvent) -> [u8; INPUT_LEN] {
+    use crate::protocol::InputEvent;
+
+    let mut out = [0u8; INPUT_LEN];
+    match event {
+        InputEvent::MouseMove(m) => {
+            out[0] = 1;
+            out[1..3].copy_from_slice(&m.x.to_le_bytes());
+            out[3..5].copy_from_slice(&m.y.to_le_bytes());
+        }
+        InputEvent::MouseButton(b) => {
+            out[0] = 2;
+            out[1] = b.button;
+            out[2] = b.pressed as u8;
+        }
+        InputEvent::Scroll(s) => {
+            out[0] = 3;
+            out[1..3].copy_from_slice(&s.dx.to_le_bytes());
+            out[3..5].copy_from_slice(&s.dy.to_le_bytes());
+        }
+        InputEvent::Key(k) => {
+            out[0] = 4;
+            out[1..3].copy_from_slice(&k.keycode.to_le_bytes());
+            out[3..5].copy_from_slice(&k.scancode.to_le_bytes());
+            out[5] = k.pressed as u8;
+            out[6] = k.extended as u8;
+        }
+    }
+    out
+}
+
+/// Read one back. `None` for a record this version does not know.
+pub fn decode_input(bytes: &[u8; INPUT_LEN]) -> Option<crate::protocol::InputEvent> {
+    use crate::protocol::{
+        InputEvent, KeyEvent, MouseButtonEvent, MouseEvent, ScrollEvent,
+    };
+
+    let pair = |a: usize| u16::from_le_bytes([bytes[a], bytes[a + 1]]);
+    let signed = |a: usize| i16::from_le_bytes([bytes[a], bytes[a + 1]]);
+
+    Some(match bytes[0] {
+        1 => InputEvent::MouseMove(MouseEvent { x: pair(1), y: pair(3) }),
+        2 => InputEvent::MouseButton(MouseButtonEvent {
+            button: bytes[1],
+            pressed: bytes[2] != 0,
+        }),
+        3 => InputEvent::Scroll(ScrollEvent { dx: signed(1), dy: signed(3) }),
+        4 => InputEvent::Key(KeyEvent {
+            keycode: pair(1),
+            pressed: bytes[5] != 0,
+            modifiers: 0,
+            scancode: pair(3),
+            extended: bytes[6] != 0,
+        }),
+        // An event kind added by a newer build on the other side. Skipping one
+        // beats refusing the whole stream: the connection stays up and the
+        // events both ends do understand keep working.
+        _ => return None,
+    })
+}
+
 #[cfg(target_os = "windows")]
 pub use platform::{connect, serve_forever, AgentFrames, PipeWriter};
 
@@ -146,8 +223,8 @@ mod platform {
         OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe,
+        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
 
     /// Null-terminated UTF-16, which is what every call here wants.
@@ -251,12 +328,57 @@ mod platform {
         Ok((descriptor, attributes))
     }
 
-    /// Writes frames to a connected host. Handed to the session callback.
+    /// One connected host: frames out, input in.
+    ///
+    /// Handed to the session callback, which owns the loop. Input is drained
+    /// rather than waited on — see [`Self::take_input`].
     pub struct PipeWriter {
         pipe: HANDLE,
     }
 
     impl PipeWriter {
+        /// Every input event the host has sent since the last call.
+        ///
+        /// # Why this peeks rather than reads
+        ///
+        /// A read on a pipe blocks until something arrives, and this is called
+        /// from the same loop that captures. Blocking here would mean the
+        /// picture stops whenever the guest stops moving the mouse, which is
+        /// most of the time somebody is looking at a consent prompt deciding
+        /// what to do. Asking how much is waiting first costs one call and
+        /// cannot block at all.
+        ///
+        /// Partial records are left in the pipe. Input arrives in whole
+        /// eight-byte units and a short read would mean the next event is
+        /// assembled from the tail of one and the head of another — a click at
+        /// coordinates nobody asked for.
+        pub fn take_input(&mut self) -> Vec<crate::protocol::InputEvent> {
+            let mut events = Vec::new();
+            loop {
+                let mut available = 0u32;
+                // SAFETY: a live pipe handle; every out parameter is a local.
+                let peeked = unsafe {
+                    PeekNamedPipe(self.pipe, None, 0, None, Some(&mut available), None)
+                };
+                if peeked.is_err() || (available as usize) < INPUT_LEN {
+                    return events;
+                }
+
+                let mut record = [0u8; INPUT_LEN];
+                let mut read = 0u32;
+                // SAFETY: as above, into a local buffer.
+                let got = unsafe {
+                    ReadFile(self.pipe, Some(&mut record), Some(&mut read), None)
+                };
+                if got.is_err() || read as usize != INPUT_LEN {
+                    return events;
+                }
+                // An unknown kind is skipped, not fatal. See `decode_input`.
+                if let Some(event) = decode_input(&record) {
+                    events.push(event);
+                }
+            }
+        }
         /// Send one frame. An error means the host has gone.
         pub fn send(&mut self, frame: &PipeFrame) -> Result<()> {
             self.write_all(&frame.header())?;
@@ -351,17 +473,51 @@ mod platform {
         Ok(())
     }
 
-    /// Frames arriving from an agent on another desktop.
+    /// Frames arriving from an agent on another desktop, and input going back.
     pub struct AgentFrames {
         pipe: Owned,
+        /// Held for the length of one input record. See [`Self::send_input`].
+        writing: std::sync::Mutex<()>,
+        /// Held for the length of one frame. See [`Self::next_frame`].
+        reading: std::sync::Mutex<()>,
     }
 
     // SAFETY: the handle inside is a kernel object, not a pointer into this
-    // process, and nothing here caches thread state. It is moved to a reader
-    // thread once and used only from there — see `capture_follow`, which reads
-    // frames off the capture thread so a still consent prompt cannot stall the
-    // session.
+    // process, and nothing here caches thread state. Reading and writing happen
+    // on different threads, which a duplex pipe supports directly, and the
+    // write side is serialised by the mutex below.
     unsafe impl Send for AgentFrames {}
+    // SAFETY: as above. `send_input` takes `&self` and holds `writing` for the
+    // whole of each record, so two threads cannot interleave halves of one.
+    unsafe impl Sync for AgentFrames {}
+
+    impl AgentFrames {
+        /// Send one input event to the agent, to inject on its own desktop.
+        ///
+        /// The lock covers a whole record. Half of one event followed by half
+        /// of another is not a dropped click, it is a click somewhere else.
+        pub fn send_input(&self, event: &crate::protocol::InputEvent) -> Result<()> {
+            let record = encode_input(event);
+            let _serialised = self.writing.lock().map_err(|_| {
+                anyhow::anyhow!("the input channel to the agent was poisoned")
+            })?;
+
+            let mut sent = 0usize;
+            while sent < record.len() {
+                let mut wrote = 0u32;
+                // SAFETY: a live pipe handle and a slice that outlives the call.
+                unsafe {
+                    WriteFile(self.pipe.0, Some(&record[sent..]), Some(&mut wrote), None)
+                }
+                .context("the agent stopped accepting input")?;
+                if wrote == 0 {
+                    bail!("the agent stopped accepting input");
+                }
+                sent += wrote as usize;
+            }
+            Ok(())
+        }
+    }
 
     /// Connect to the agent serving `desktop`.
     pub fn connect(desktop: &str) -> Result<AgentFrames> {
@@ -370,7 +526,9 @@ mod platform {
         let pipe = unsafe {
             CreateFileW(
                 PCWSTR(name.as_ptr()),
-                windows::Win32::Foundation::GENERIC_READ.0,
+                // Both ways: frames come back, input goes out.
+                windows::Win32::Foundation::GENERIC_READ.0
+                    | windows::Win32::Foundation::GENERIC_WRITE.0,
                 FILE_SHARE_MODE(0),
                 None,
                 OPEN_EXISTING,
@@ -379,12 +537,24 @@ mod platform {
             )
         }
         .with_context(|| format!("no agent is serving {desktop}"))?;
-        Ok(AgentFrames { pipe: Owned(pipe) })
+        Ok(AgentFrames {
+            pipe: Owned(pipe),
+            writing: std::sync::Mutex::new(()),
+            reading: std::sync::Mutex::new(()),
+        })
     }
 
     impl AgentFrames {
         /// Read the next frame. Blocks until one arrives or the agent goes.
-        pub fn next_frame(&mut self) -> Result<PipeFrame> {
+        ///
+        /// Takes `&self` because the link is shared with the input path — see
+        /// `capture_follow`. Only one thread ever reads, and the guard says so
+        /// rather than leaving it to be true by accident.
+        pub fn next_frame(&self) -> Result<PipeFrame> {
+            let _serialised = self
+                .reading
+                .lock()
+                .map_err(|_| anyhow::anyhow!("the frame channel from the agent was poisoned"))?;
             let mut header = [0u8; HEADER_LEN];
             self.read_exact(&mut header)?;
             let (width, height, format, len) =
@@ -402,7 +572,7 @@ mod platform {
             Ok(PipeFrame { width, height, format, data })
         }
 
-        fn read_exact(&mut self, mut into: &mut [u8]) -> Result<()> {
+        fn read_exact(&self, mut into: &mut [u8]) -> Result<()> {
             while !into.is_empty() {
                 let mut read = 0u32;
                 // SAFETY: a live pipe handle and a slice that outlives the call.
@@ -426,6 +596,43 @@ pub fn serve(_desktop: &str, _frames: impl FnMut() -> Option<PipeFrame>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every event shape survives the trip, including the signs and the flags
+    /// that are easy to drop.
+    #[test]
+    fn every_input_event_survives_the_round_trip() {
+        use crate::protocol::{
+            InputEvent, KeyEvent, MouseButtonEvent, MouseEvent, ScrollEvent,
+        };
+
+        let events = [
+            InputEvent::MouseMove(MouseEvent { x: 40000, y: 65535 }),
+            InputEvent::MouseButton(MouseButtonEvent { button: 2, pressed: true }),
+            InputEvent::MouseButton(MouseButtonEvent { button: 0, pressed: false }),
+            InputEvent::Scroll(ScrollEvent { dx: -120, dy: 240 }),
+            InputEvent::Key(KeyEvent {
+                keycode: 0x5B,
+                pressed: true,
+                modifiers: 0,
+                scancode: 0x5B,
+                extended: true,
+            }),
+        ];
+
+        for event in events {
+            let decoded = decode_input(&encode_input(&event)).expect("our own encoding");
+            assert_eq!(decoded, event, "round trip changed the event");
+        }
+    }
+
+    /// A newer build sending something this one does not know must not take the
+    /// connection down with it.
+    #[test]
+    fn an_unknown_event_kind_is_skipped_rather_than_fatal() {
+        let mut bytes = [0u8; INPUT_LEN];
+        bytes[0] = 200;
+        assert!(decode_input(&bytes).is_none());
+    }
 
     #[test]
     fn a_header_survives_the_round_trip() {

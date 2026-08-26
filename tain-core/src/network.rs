@@ -2076,12 +2076,30 @@ fn sanitize_telemetry(
 }
 
 /// Translate a protocol input event into an OS injection call.
-fn inject_input(
+///
+/// # The secure desktop takes its own input
+///
+/// `SendInput` reaches the desktop of the thread that calls it, so while a
+/// consent prompt is up this process cannot deliver anything: the guest would
+/// watch a prompt it could not answer, which is barely better than not seeing
+/// it. When an agent is supplying frames it takes the clicks too, and the two
+/// are deliberately the same decision — input following frames is the only
+/// arrangement where a click cannot land on a desktop the guest is not looking
+/// at.
+///
+/// The check costs a mutex and answers `false` everywhere else, including in
+/// the agent itself, which reuses this function and never has a link of its
+/// own.
+pub fn inject_input(
     injector: &dyn super::input_inject::InputInjector,
     event: &super::protocol::InputEvent,
 ) -> Result<()> {
     use super::input_inject::{KeyInput, MouseButtonInput, MousePosition, ScrollInput};
     use super::protocol::InputEvent;
+
+    if super::capture_follow::send_input_to_agent(event) {
+        return Ok(());
+    }
 
     match event {
         InputEvent::MouseMove(m) => injector.move_mouse(MousePosition { x: m.x, y: m.y }),

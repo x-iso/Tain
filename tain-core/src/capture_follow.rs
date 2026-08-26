@@ -20,6 +20,21 @@
 //! idea, and everything above it keeps working unchanged: the same frames, the
 //! same format, the same size. The switch is invisible past this file.
 //!
+//! # Input goes back the same way
+//!
+//! Seeing a consent prompt is half of it. `SendInput` from a process on the
+//! ordinary desktop cannot reach the secure one either, so while the agent is
+//! supplying frames it must also be the one injecting — otherwise the guest
+//! watches a prompt it cannot answer, which is barely better than not seeing
+//! it.
+//!
+//! The connection is shared rather than opened twice. The pipe accepts one
+//! client, and more importantly the two directions have to agree about *when*
+//! they are in use: frames arriving from the agent and clicks going anywhere
+//! else would put the pointer on the wrong desktop. One link, opened by
+//! whichever side needs it first, is the only arrangement where that cannot
+//! come apart.
+//!
 //! # It only reaches for the agent when it has to
 //!
 //! The local backend is used whenever this desktop has the input, which is
@@ -40,13 +55,50 @@ use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, Scr
 pub const SECURE_DESKTOP: &str = "Winlogon";
 
 #[cfg(target_os = "windows")]
-pub use platform::DesktopFollowing;
+pub use platform::{send_input_to_agent, DesktopFollowing};
+
+/// Whether input should be going to an agent rather than injected locally.
+#[cfg(not(target_os = "windows"))]
+pub fn send_input_to_agent(_event: &crate::protocol::InputEvent) -> bool {
+    false
+}
 
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// The link to the secure desktop's agent, while there is one.
+    ///
+    /// # Why this is shared state and not a field
+    ///
+    /// The capturer and the injector are built separately, by different parts
+    /// of the session, and neither owns the other. They still have to use the
+    /// same connection: the pipe accepts one client, and clicks must go
+    /// wherever the frames are coming from. A value both can reach is the
+    /// honest way to say that, and there is exactly one secure desktop per
+    /// machine so there is nothing to key it by.
+    static LINK: Mutex<Option<Arc<super::super::agent_pipe::AgentFrames>>> = Mutex::new(None);
+
+    /// Send an event to the agent, if one is currently supplying frames.
+    ///
+    /// Returns whether it went. `false` means inject locally as usual — there
+    /// is no agent involved, which is the ordinary case.
+    pub fn send_input_to_agent(event: &crate::protocol::InputEvent) -> bool {
+        let Ok(link) = LINK.lock() else { return false };
+        let Some(agent) = link.as_ref() else { return false };
+        match agent.send_input(event) {
+            Ok(()) => true,
+            Err(e) => {
+                // Not retried and not fatal. The capturer notices the same
+                // failure on its next frame and drops the link; until then,
+                // losing a click beats injecting it on the wrong desktop.
+                tracing::debug!("Could not send input to the agent: {e:#}");
+                false
+            }
+        }
+    }
 
     /// Wraps a local capturer and falls back to an agent's frames.
     pub struct DesktopFollowing {
@@ -95,7 +147,11 @@ mod platform {
                 if local {
                     tracing::info!("The input is back on this desktop — capturing here again");
                     // Dropping it closes the pipe, which is what tells the
-                    // agent to stop capturing.
+                    // agent to stop capturing. The link goes first, so no
+                    // click can be sent down a pipe that is about to close.
+                    if let Ok(mut link) = LINK.lock() {
+                        *link = None;
+                    }
                     self.agent = None;
                 } else {
                     tracing::info!(
@@ -130,6 +186,9 @@ mod platform {
                 Some(frame) => Ok(Some(frame)),
                 None if reader.finished() => {
                     tracing::info!("The {SECURE_DESKTOP} agent stopped sending");
+                    if let Ok(mut link) = LINK.lock() {
+                        *link = None;
+                    }
                     self.agent = None;
                     Ok(None)
                 }
@@ -182,17 +241,24 @@ mod platform {
 
     impl AgentReader {
         fn start(desktop: &str) -> Result<Self> {
-            let mut frames = super::super::agent_pipe::connect(desktop)?;
+            let frames = Arc::new(super::super::agent_pipe::connect(desktop)?);
             let latest = Arc::new(Mutex::new(None));
             let done = Arc::new(AtomicBool::new(false));
 
+            // Published before the reader starts, so the first click cannot
+            // arrive before there is anywhere to send it.
+            if let Ok(mut link) = LINK.lock() {
+                *link = Some(frames.clone());
+            }
+
             let into = latest.clone();
             let finished = done.clone();
+            let reading = frames.clone();
             std::thread::Builder::new()
                 .name("tain-agent-frames".into())
                 .spawn(move || {
                     loop {
-                        match frames.next_frame() {
+                        match reading.next_frame() {
                             Ok(frame) => {
                                 let screen = ScreenFrame::with_format(
                                     frame.width,
