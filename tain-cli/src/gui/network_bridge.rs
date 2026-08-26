@@ -631,6 +631,27 @@ pub async fn run_guest_session(
         // or on the video stream, and both have to be able to ask for a repaint.
         let repaint = std::sync::Arc::new(repaint);
 
+        // # Declared here so the side streams can reach it
+        //
+        // This carries messages a *reader* needs the writer to send, and the
+        // only one is a keyframe request. It used to be created below, after
+        // the side streams were already spawned, so those readers were handed a
+        // channel whose receiving end was dropped on the spot:
+        //
+        //     let (control_tx, _rx) = mpsc::unbounded_channel::<Message>();
+        //
+        // Video moved onto a side stream, and decode failures with it. So the
+        // one message that recovers a broken picture was being sent, from the
+        // one reader that can tell it is needed, into a channel nobody was
+        // listening to. The host is the only side that can send a keyframe and
+        // it no longer sends them on a timer — it waits to be asked — so a
+        // decoder that lost its references stayed lost, decoding every
+        // subsequent frame against nothing. That is what a picture smeared into
+        // its own history looks like, and no log on either machine would show
+        // it: the guest recorded the failure and asked, and the request was
+        // dropped between two lines of its own code.
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Message>();
+
         // # One acceptor for every side stream the host opens
         //
         // There are two now, sound and pictures, and which arrives first is not
@@ -646,55 +667,79 @@ pub async fn run_guest_session(
             let side_state = shared.clone();
             let side_acks = ack_tx.clone();
             let side_repaint = repaint.clone();
+            let side_control = control_tx.clone();
             tokio::spawn(async move {
                 loop {
-                    let Ok(mut stream) = conn.accept_uni().await else {
+                    let Ok(stream) = conn.accept_uni().await else {
                         debug!("No more side streams from the host");
                         return;
                     };
 
-                    let mut tag = [0u8; 1];
-                    if tokio::io::AsyncReadExt::read_exact(&mut stream, &mut tag).await.is_err() {
-                        debug!("A side stream closed before saying what it carried");
-                        continue;
-                    }
-
                     let state = side_state.clone();
                     let acks = side_acks.clone();
                     let repaint = side_repaint.clone();
-                    match tag[0] {
-                        tain_core::protocol::stream_kind::AUDIO => {
-                            tokio::spawn(async move {
-                                // Nothing here acks or repaints: audio drives
-                                // the speakers, not the screen, and a picture is
-                                // not owed for a sound.
+                    let control = side_control.clone();
+
+                    // # Nothing about one stream may hold up the next
+                    //
+                    // The tag used to be read here, in the accept loop. QUIC
+                    // hands a unidirectional stream over when the peer opens it,
+                    // which is not the same moment its first byte arrives — so
+                    // a stream whose tag was slow left this loop parked in
+                    // `read_exact`, and every stream opened after it was never
+                    // accepted at all.
+                    //
+                    // The reported shape of that is audio playing while the
+                    // picture never appears: sound is the stream that got
+                    // through, video is the one still waiting to be accepted,
+                    // and because acks travel with the video reader the host
+                    // sees `last ack never` and fills the link with frames
+                    // nobody is reading — which it then reads as congestion and
+                    // answers by shrinking a picture that was never arriving.
+                    //
+                    // Reading the tag inside the task removes the coupling
+                    // entirely: this loop does nothing but accept.
+                    tokio::spawn(async move {
+                        let mut stream = stream;
+                        let mut tag = [0u8; 1];
+                        if tokio::io::AsyncReadExt::read_exact(&mut stream, &mut tag)
+                            .await
+                            .is_err()
+                        {
+                            debug!("A side stream closed before saying what it carried");
+                            return;
+                        }
+
+                        match tag[0] {
+                            tain_core::protocol::stream_kind::AUDIO => {
+                                // Nothing here acks or repaints: audio drives the
+                                // speakers, not the screen, and a picture is not
+                                // owed for a sound. It still gets the real control
+                                // channel — a reader that cannot be heard is the
+                                // bug the line here used to be.
                                 let (tx, _rx) = mpsc::unbounded_channel::<u32>();
-                                let (control_tx, _rx) = mpsc::unbounded_channel::<Message>();
                                 if let Err(e) =
-                                    receive_loop(&mut stream, &state, tx, control_tx, || {}).await
+                                    receive_loop(&mut stream, &state, tx, control, || {}).await
                                 {
                                     debug!("Guest audio stream ended: {e}");
                                 }
-                            });
-                        }
-                        tain_core::protocol::stream_kind::VIDEO => {
-                            tokio::spawn(async move {
-                                // A keyframe request cannot come from here —
-                                // the writer owns the control stream — so the
-                                // sender goes nowhere, as it does for audio.
-                                let (control_tx, _rx) = mpsc::unbounded_channel::<Message>();
+                            }
+                            tain_core::protocol::stream_kind::VIDEO => {
+                                // The writer owns the control stream, so a
+                                // keyframe request travels to it through the
+                                // channel rather than being written from here.
                                 if let Err(e) =
-                                    receive_loop(&mut stream, &state, acks, control_tx, move || {
+                                    receive_loop(&mut stream, &state, acks, control, move || {
                                         repaint()
                                     })
                                     .await
                                 {
                                     debug!("Guest video stream ended: {e}");
                                 }
-                            });
+                            }
+                            other => debug!("Ignoring a side stream of unknown kind {other}"),
                         }
-                        other => debug!("Ignoring a side stream of unknown kind {other}"),
-                    }
+                    });
                 }
             })
         });
@@ -702,7 +747,6 @@ pub async fn run_guest_session(
         // Control messages the receive side needs to send back — currently only
         // a keyframe request, which cannot go down the ack channel because that
         // one carries a sequence number rather than a message.
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Message>();
         let reader_state = shared.clone();
         let reader = tokio::spawn(async move {
             if let Err(e) =

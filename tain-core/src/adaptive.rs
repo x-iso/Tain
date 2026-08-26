@@ -323,6 +323,9 @@ pub struct AdaptiveController {
     last_change: Instant,
     /// What the round trip costs when nothing is queued in it. See [`RttFloor`].
     rtt_floor: RttFloor,
+    /// While set, the last change was made because of a queue and the queue has
+    /// not had time to drain. See [`QUEUE_DRAIN`].
+    queue_hold_until: Option<Instant>,
 }
 
 /// The shortest round trip this link has shown lately.
@@ -421,6 +424,7 @@ impl AdaptiveController {
             clean_windows: 0,
             last_change: Instant::now(),
             rtt_floor: RttFloor::default(),
+            queue_hold_until: None,
         }
     }
 
@@ -499,7 +503,39 @@ impl AdaptiveController {
         }
 
         let before = self.plan();
-        self.active = self.detect(obs, &before);
+
+        // # Wait for a queue to drain before charging for it again
+        //
+        // A round trip carrying a queue keeps reporting one until the queue is
+        // gone, and lowering the bitrate does not empty it instantly — the
+        // frames already in flight still have to arrive. So every window
+        // between the decision and the drain repeats the same evidence, and a
+        // controller that believes each of them backs off again, and again.
+        //
+        // Measured, on the session that prompted this: five steps in thirteen
+        // seconds, from full resolution at 60 fps down to 852x480 at 8. Every
+        // step after the first answered a queue the step before it had already
+        // dealt with.
+        //
+        // Only the queue is discounted. Blocking on the send path and a slow
+        // encoder are measured afresh each window and remain evidence in their
+        // own right — this is about not reading one fact twice, not about
+        // ignoring the link.
+        let draining = self.queue_hold_until.is_some_and(|until| now < until);
+        if !draining {
+            self.queue_hold_until = None;
+        }
+        let queued =
+            !draining && obs.guest.is_some_and(|g| self.rtt_floor.is_queued(g.rtt_ms));
+        self.active = self.detect(obs, &before, queued);
+
+        // A quiet window during the drain is not yet evidence either: it may
+        // only mean the queue has not finished arriving.
+        if draining && !self.active.any_actionable() {
+            self.strained_windows = 0;
+            self.clean_windows = 0;
+            return None;
+        }
 
         if self.active.any_actionable() {
             self.strained_windows += 1;
@@ -532,6 +568,9 @@ impl AdaptiveController {
                 self.back_off();
             }
             self.strained_windows = 0;
+            if queued {
+                self.queue_hold_until = Some(now + QUEUE_DRAIN);
+            }
 
             // Backing off shortly after taking quality back means the recovery
             // was wrong. Without noticing that, a marginal link spends its whole
@@ -600,7 +639,7 @@ impl AdaptiveController {
     }
 
     /// Decide which stages are behind, given the budget the current plan implies.
-    fn detect(&self, obs: &Observation, plan: &StreamPlan) -> BottleneckSet {
+    fn detect(&self, obs: &Observation, plan: &StreamPlan, queued: bool) -> BottleneckSet {
         let budget = plan.frame_budget_ms();
         let mut set = BottleneckSet::NONE;
 
@@ -651,7 +690,7 @@ impl AdaptiveController {
             // floor that is unambiguous, and unlike distance it is something
             // sending less will actually relieve — so it is reported as the
             // link being unable to carry the stream, which is what it is.
-            if self.rtt_floor.is_queued(guest.rtt_ms) {
+            if queued {
                 set.insert(Bottleneck::SlowNetwork);
             }
         }
@@ -805,6 +844,18 @@ const RTT_FLOOR_WINDOW: Duration = Duration::from_secs(30);
 const QUEUE_RTT_RATIO: f32 = 1.5;
 const QUEUE_RTT_MARGIN_MS: f32 = 50.0;
 
+/// How long a queue is left alone after being acted on.
+///
+/// Comfortably longer than [`MIN_DWELL`], which is the point: the dwell spaces
+/// decisions out, but a queue outlives several of them, so a dwell alone still
+/// lets one congested moment be charged for four or five times over.
+///
+/// Long enough for frames already in flight to arrive and for the round trip to
+/// mean something again; short enough that a change which did not help is
+/// noticed while the session is still worth saving. Other bottlenecks are not
+/// held off by it at all.
+const QUEUE_DRAIN: Duration = Duration::from_secs(10);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,19 +996,97 @@ mod tests {
         assert_eq!(c.plan(), ceiling(), "nothing wrong yet");
 
         // Then the queue the ceiling put there: the same session's own spikes.
+        // Recorded as it goes, because once the controller has acted the queue
+        // is deliberately discounted while it drains — see `QUEUE_DRAIN`.
         let mut changes = Vec::new();
+        let mut ever_blamed_the_link = false;
         for rtt in [855.0f32, 721.0, 932.0, 800.0].repeat(4) {
             clock += MIN_DWELL + Duration::from_millis(1);
             if let Some(plan) = c.observe_at(&at(rtt), clock) {
                 changes.push(plan);
             }
+            ever_blamed_the_link |= c.bottlenecks().contains(Bottleneck::SlowNetwork);
         }
 
-        assert!(c.bottlenecks().contains(Bottleneck::SlowNetwork), "the queue is the link");
+        assert!(ever_blamed_the_link, "the queue is the link");
         let first = changes.first().expect("a queue that deep must produce a response");
         assert!(
             first.bitrate_kbps < ceiling().bitrate_kbps,
             "bitrate is the axis a saturated uplink binds on, got {first:?}"
+        );
+    }
+
+    /// A queue must not be paid for more than once.
+    ///
+    /// Measured on the session that prompted this: five steps in thirteen
+    /// seconds, from full resolution at 60 fps down to 852x480 at 8. A round
+    /// trip carrying a queue keeps reporting one until the queue drains, and
+    /// lowering the bitrate does not empty it instantly — so every window
+    /// between the decision and the drain says the same thing, and each step
+    /// after the first answered a queue the step before it had already dealt
+    /// with.
+    #[test]
+    fn a_queue_is_not_paid_for_twice_while_it_drains() {
+        let at = |rtt: f32| Observation {
+            guest: Some(GuestTelemetry { rtt_ms: rtt, ..healthy().guest.unwrap() }),
+            ..healthy()
+        };
+
+        let mut c = AdaptiveController::new(LatencyPriority::BALANCED, ceiling(), NATIVE);
+        let mut clock = Instant::now();
+        for _ in 0..6 {
+            clock += MIN_DWELL + Duration::from_millis(1);
+            c.observe_at(&at(110.0), clock);
+        }
+
+        // The queue arrives and stays, exactly as a real one does. Thirteen
+        // seconds of it — the span that cost five steps in the report.
+        let mut changes = Vec::new();
+        let deadline = clock + Duration::from_secs(13);
+        while clock < deadline {
+            clock += MIN_DWELL + Duration::from_millis(1);
+            if let Some(plan) = c.observe_at(&at(900.0), clock) {
+                changes.push(plan);
+            }
+        }
+
+        assert_eq!(
+            changes.len(),
+            1,
+            "one queue, one response — got {} steps down to {:?}",
+            changes.len(),
+            c.plan()
+        );
+        assert_eq!(c.plan().scale, QualityScale::Native, "the picture was not shrunk for it");
+    }
+
+    /// A change that did not help is still noticed, once the queue has had its
+    /// chance to drain.
+    #[test]
+    fn a_queue_that_survives_the_drain_is_acted_on_again() {
+        let at = |rtt: f32| Observation {
+            guest: Some(GuestTelemetry { rtt_ms: rtt, ..healthy().guest.unwrap() }),
+            ..healthy()
+        };
+
+        let mut c = AdaptiveController::new(LatencyPriority::BALANCED, ceiling(), NATIVE);
+        let mut clock = Instant::now();
+        for _ in 0..6 {
+            clock += MIN_DWELL + Duration::from_millis(1);
+            c.observe_at(&at(110.0), clock);
+        }
+
+        let mut changes = Vec::new();
+        // Well past the drain each time, so every window is fresh evidence.
+        for _ in 0..12 {
+            clock += QUEUE_DRAIN + MIN_DWELL + Duration::from_millis(1);
+            if let Some(plan) = c.observe_at(&at(900.0), clock) {
+                changes.push(plan);
+            }
+        }
+        assert!(
+            changes.len() > 1,
+            "a queue that outlives the drain has to keep costing something"
         );
     }
 
