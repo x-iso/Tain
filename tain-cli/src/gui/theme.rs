@@ -340,12 +340,26 @@ pub fn scaled_rect(
     avail: Rect,
     src: Vec2,
     pan: Vec2,
+    pixels_per_point: f32,
 ) -> Rect {
     use super::settings::ScalingMode;
 
     if src.x <= 0.0 || src.y <= 0.0 {
         return Rect::from_center_size(avail.center(), Vec2::ZERO);
     }
+
+    // # One host pixel per guest pixel, which is not one per point
+    //
+    // `src` is the host's framebuffer in *pixels*; `avail` is egui's rectangle
+    // in *points*. Drawing `src` points wide asks for `src * pixels_per_point`
+    // physical pixels, so on a display at 175% a 1920-wide desktop was painted
+    // 3360 pixels across — magnified by the guest's scaling, in the one mode
+    // whose entire purpose is not to scale.
+    //
+    // Nothing about the host's own DPI enters this. The host captures pixels
+    // and the guest draws pixels; what sits between them is the guest's own
+    // point-to-pixel ratio, and that is the whole of the conversion.
+    let src = if pixels_per_point > 0.0 { src / pixels_per_point } else { src };
 
     match mode {
         ScalingMode::Fit => {
@@ -572,7 +586,9 @@ mod tests {
 
         /// Most cases don't care about panning.
         fn scaled_rect(mode: ScalingMode, avail: Rect, src: Vec2) -> Rect {
-            super::super::scaled_rect(mode, avail, src, Vec2::ZERO)
+            // One point per pixel, so the existing expectations still describe
+            // what they always did.
+            super::super::scaled_rect(mode, avail, src, Vec2::ZERO, 1.0)
         }
 
         #[test]
@@ -611,6 +627,7 @@ mod tests {
                 avail(),
                 big,
                 Vec2::new(200.0, 100.0),
+                1.0,
             );
             // Panning right by 200 moves the image 200 to the left.
             assert_eq!(panned.left(), avail().left() - 200.0);
@@ -627,6 +644,7 @@ mod tests {
                 avail(),
                 big,
                 Vec2::splat(99_999.0),
+                1.0,
             );
             assert_eq!(far.right(), avail().right(), "the far edge should stop flush");
             assert_eq!(far.bottom(), avail().bottom());
@@ -636,6 +654,7 @@ mod tests {
                 avail(),
                 big,
                 Vec2::splat(-500.0),
+                1.0,
             );
             assert_eq!(negative.min, avail().min);
         }
@@ -650,9 +669,51 @@ mod tests {
                 avail(),
                 src,
                 Vec2::new(300.0, 300.0),
+                1.0,
             );
             assert_eq!(r.left(), avail().left() - 300.0);
             assert_eq!(r.center().y, avail().center().y);
+        }
+
+        /// 1:1 means one host pixel per guest pixel, not one per point.
+        ///
+        /// A display at 175% has 1.75 physical pixels to a point. Drawing the
+        /// host's 1920-pixel desktop as 1920 *points* asks for 3360 pixels —
+        /// magnifying it, in the one mode whose whole purpose is not to.
+        #[test]
+        fn one_to_one_is_pixels_not_points() {
+            let src = Vec2::new(1920.0, 1080.0);
+            // A window big enough that neither axis has to pan.
+            let room = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(4000.0, 3000.0));
+
+            let unscaled = super::super::scaled_rect(
+                ScalingMode::Actual,
+                room,
+                src,
+                Vec2::ZERO,
+                1.0,
+            );
+            assert_eq!(unscaled.size(), src, "at 100% a point is a pixel");
+
+            let scaled = super::super::scaled_rect(
+                ScalingMode::Actual,
+                room,
+                src,
+                Vec2::ZERO,
+                1.75,
+            );
+            // Compared with a tolerance: these are divisions, and the last
+            // bits of a float are not what the assertion is about.
+            let close = |a: Vec2, b: Vec2| (a - b).abs().max_elem() < 0.01;
+            assert!(
+                close(scaled.size(), src / 1.75),
+                "at 175% the same pixels occupy fewer points: {:?}",
+                scaled.size(),
+            );
+
+            // Which is the point: both cover the same number of physical
+            // pixels once egui multiplies back up.
+            assert!(close(scaled.size() * 1.75, unscaled.size()));
         }
 
         #[test]
@@ -660,7 +721,7 @@ mod tests {
             let src = Vec2::new(1600.0, 900.0);
             let still = scaled_rect(ScalingMode::Fit, avail(), src);
             let panned =
-                super::super::scaled_rect(ScalingMode::Fit, avail(), src, Vec2::splat(400.0));
+                super::super::scaled_rect(ScalingMode::Fit, avail(), src, Vec2::splat(400.0), 1.0);
             assert_eq!(still, panned, "there is nothing hidden to pan to when it all fits");
         }
 

@@ -37,6 +37,27 @@ pub fn show(
 ) -> bool {
     let before = settings.clone();
 
+    // # The window has to fit the window it is in
+    //
+    // The body was capped at a fixed 620 points, and the whole thing anchored
+    // to the centre. On a window shorter than the settings needed, the overflow
+    // went equally in both directions — so the title bar went off the top,
+    // taking the close button with it, and the only way out was Escape or
+    // resizing the application.
+    //
+    // Sized against what is actually there instead. The cap stays for a large
+    // display, where a settings window the height of the screen would be worse
+    // than one that scrolls.
+
+    /// Title bar, footer, separators and the window's own margins.
+    const CHROME: f32 = 170.0;
+    /// Below this a scroll area is not worth having; the window may then
+    /// overflow, but a settings panel four rows tall is its own problem.
+    const MIN_BODY: f32 = 180.0;
+
+    let available = ctx.screen_rect().height() - CHROME;
+    let body_height = available.clamp(MIN_BODY, 620.0);
+
     egui::Window::new("Settings")
         .open(open)
         .collapsible(false)
@@ -48,7 +69,7 @@ pub fn show(
             // widest child and the scrollbar floats there instead of sitting on
             // the window edge — which reads as a rendering bug.
             egui::ScrollArea::vertical()
-                .max_height(620.0)
+                .max_height(body_height)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     identity_section(ui, settings);

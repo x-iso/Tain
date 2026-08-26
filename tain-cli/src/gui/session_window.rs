@@ -332,7 +332,8 @@ impl SessionWindow {
                         let panning = session.scaling == ScalingMode::Actual
                             && theme::pan_limit(viewport.size(), src) != egui::Vec2::ZERO;
 
-                        let rect = theme::scaled_rect(session.scaling, viewport, src, session.pan);
+                        let rect =
+                            theme::scaled_rect(session.scaling, viewport, src, session.pan, ctx.pixels_per_point());
                         let painter = ui.painter_at(viewport);
                         match texture_id {
                             Some(texture_id) => {

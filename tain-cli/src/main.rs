@@ -26,6 +26,25 @@ use tracing::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // # Before anything else touches the window manager
+    //
+    // Windows decides a process's DPI awareness the first time it is asked to
+    // do something that depends on it, and once decided it cannot be changed —
+    // `SetProcessDpiAwarenessContext` simply fails.
+    //
+    // winit declares per-monitor awareness, but not until it builds its event
+    // loop, and by then this process has installed a keyboard hook and called
+    // into user32 several times. Whatever those settled on is what the process
+    // is stuck with, and if that is "unaware" the whole application is
+    // bitmap-stretched by Windows and never learns that a monitor changed —
+    // which is the reported fault: dragging a window to a display at a
+    // different scale leaves the interface at the old one.
+    //
+    // Declaring it here, first, means the answer is ours rather than an
+    // accident of which call happened to come first.
+    #[cfg(target_os = "windows")]
+    declare_dpi_awareness();
+
     let args: Vec<String> = std::env::args().collect();
     let has_console = console::attach(console::requested(&args));
 
@@ -239,3 +258,21 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+/// Ask for per-monitor DPI awareness, before anything decides for us.
+///
+/// Failure is not worth reporting: the usual cause is that something already
+/// settled it, which is exactly the case this exists to get in front of and
+/// nothing here can undo.
+#[cfg(target_os = "windows")]
+fn declare_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+
+    // SAFETY: a documented call taking a constant, with no resources involved.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
