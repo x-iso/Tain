@@ -70,6 +70,11 @@ windows = { version = "0.58", features = [
     # CreateEventW lives behind Threading but is typed against SECURITY_ATTRIBUTES.
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Pipes",
+    "Win32_Security_Authorization",
     # LoadLibraryW, to probe for a delay-loaded ffmpeg before calling into it.
     "Win32_System_LibraryLoader",
     "Win32_System_Com",
