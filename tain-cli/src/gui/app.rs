@@ -2495,7 +2495,33 @@ impl GuestApp {
     ///
     /// A change from the keyboard is adopted into the settings, so it is saved
     /// and the slider agrees with what is on screen.
-    /// Say what scale this window is being drawn at, whenever that changes.
+    /// Say what scale this window is being drawn at, whenever that changes,
+    /// and throw away pictures that were drawn for the old one.
+    ///
+    /// # Why the icons have to be forgotten
+    ///
+    /// They are SVGs, and both halves of the machinery that draws them look
+    /// like they handle a change of scale. egui asks its image loaders for
+    /// `size * pixels_per_point`, and `egui_extras`' SVG loader caches on
+    /// `(uri, size hint)`, so a new scale is a new entry and a fresh
+    /// rasterisation.
+    ///
+    /// The layer between them does not. `DefaultTextureLoader` caches on
+    /// `(uri, texture options)` with the size hint left out of the key, so once
+    /// an icon has been uploaded at one resolution every later draw is handed
+    /// that same texture whatever it asked for. The loader that would happily
+    /// re-render is never reached. The picture is then stretched to whatever
+    /// size the new scale wants, which is the soft, smeared look reported after
+    /// changing the interface scale.
+    ///
+    /// Forgetting them makes the next draw go all the way down and rasterise
+    /// again. It costs re-rendering a couple of dozen small SVGs, at the moment
+    /// somebody deliberately changes the scale or drags the window to a screen
+    /// with a different DPI — not per frame, and not on an ordinary resize.
+    ///
+    /// Textures the application loaded itself — the connection previews — are
+    /// held by their own handles and are not in these caches, so they are not
+    /// disturbed.
     ///
     /// # Why this is worth a log line
     ///
@@ -2509,7 +2535,7 @@ impl GuestApp {
     /// One line per change makes the same measurement available from the log:
     /// drag the window to another screen, and either the monitor figure moves
     /// or it does not.
-    fn log_scale(&mut self, ctx: &egui::Context) {
+    fn note_scale_change(&mut self, ctx: &egui::Context) {
         let native = ctx.native_pixels_per_point().unwrap_or(f32::NAN);
         let drawn = ctx.pixels_per_point();
         let size = ctx.screen_rect().size();
@@ -2528,6 +2554,16 @@ impl GuestApp {
         if !changed {
             return;
         }
+
+        // Only the drawing scale invalidates them. A window that merely got
+        // bigger is drawing the same icons at the same resolution.
+        let rescaled = self
+            .last_reported_scale
+            .is_some_and(|(_, was_drawn, _)| (was_drawn - drawn).abs() > SCALE_EPSILON);
+        if rescaled {
+            ctx.forget_all_images();
+        }
+
         self.last_reported_scale = Some((native, drawn, size));
         info!(
             "Interface scale: monitor asks {native:.2}x, drawing at {drawn:.2}x \
@@ -2609,7 +2645,7 @@ impl eframe::App for GuestApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_ui_scale(ctx);
-        self.log_scale(ctx);
+        self.note_scale_change(ctx);
         let mut t = self.frametime.begin();
         // The endpoint may have finished binding since the last frame; see
         // `attach_when_ready`.

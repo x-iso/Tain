@@ -431,6 +431,102 @@ pub fn dashed_rect(ui: &Ui, rect: Rect, color: Color32) {
 }
 
 #[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    /// Draw one icon at `zoom` and report the size of the texture it used.
+    ///
+    /// The size comes from the texture manager rather than from anything the
+    /// drawing code says, because what is being checked is exactly whether the
+    /// two agree.
+    fn icon_texture_size(ctx: &egui::Context, zoom: f32) -> [usize; 2] {
+        ctx.set_zoom_factor(zoom);
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut id = None;
+        // More than one pass: a zoom set now applies from the next pass, and
+        // the first draw is what starts the load.
+        for _ in 0..4 {
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    icon(ui, 16.0, egui::include_image!("../../assets/settings.svg"));
+                });
+            });
+            for clipped in ctx.tessellate(output.shapes, output.pixels_per_point) {
+                if let egui::epaint::Primitive::Mesh(mesh) = clipped.primitive {
+                    // Managed(0) is the font atlas, which every frame carries.
+                    if !matches!(mesh.texture_id, egui::TextureId::Managed(0)) {
+                        id = Some(mesh.texture_id);
+                    }
+                }
+            }
+        }
+
+        let id = id.expect("the icon should have been drawn from a texture");
+        ctx.tex_manager().read().meta(id).expect("the texture should still exist").size
+    }
+
+    /// An icon must be rasterised again when the interface scale changes.
+    ///
+    /// # What this is guarding
+    ///
+    /// Everything about this looks handled. The assets are SVG, egui asks its
+    /// image loaders for `size * pixels_per_point`, and the SVG loader caches
+    /// on `(uri, size hint)` — so a new scale should mean a new rasterisation.
+    ///
+    /// Between them sits `DefaultTextureLoader`, whose cache key is
+    /// `(uri, texture options)` with the size hint left out. Once an icon has
+    /// been uploaded at one resolution, every later draw gets that texture back
+    /// whatever resolution it asked for, and the SVG loader is never reached.
+    /// The result is an icon stretched from its original raster: soft, and
+    /// softer the further the scale has moved.
+    ///
+    /// Nothing in this application's own code looks wrong when that happens,
+    /// which is why it is worth a test rather than a comment. The fix is a
+    /// single call in `app::GuestApp::note_scale_change`, and exactly the kind
+    /// of line that reads as redundant to whoever finds it next.
+    #[test]
+    fn an_icon_is_rasterised_again_when_the_scale_changes() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+
+        let small = icon_texture_size(&ctx, 1.0);
+
+        // What the application does on noticing the scale moved.
+        ctx.forget_all_images();
+        let large = icon_texture_size(&ctx, 2.0);
+
+        assert!(
+            large[0] > small[0] && large[1] > small[1],
+            "a 16-point icon was {small:?} pixels at 100% and {large:?} at 200%; \
+             it should have been rasterised again, not stretched"
+        );
+    }
+
+    /// And the same drawing at the same scale must not be re-rendered.
+    ///
+    /// The cache is what stops every frame rasterising every icon, so a fix
+    /// that forgot them unconditionally would trade a soft icon for a
+    /// permanent cost.
+    #[test]
+    fn an_unchanged_scale_reuses_what_was_already_rasterised() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+
+        let first = icon_texture_size(&ctx, 1.0);
+        let again = icon_texture_size(&ctx, 1.0);
+        assert_eq!(first, again);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     /// Icons must be asked for at physical pixels, not points.
     ///
