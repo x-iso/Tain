@@ -321,6 +321,88 @@ pub struct AdaptiveController {
     strained_windows: u32,
     clean_windows: u32,
     last_change: Instant,
+    /// What the round trip costs when nothing is queued in it. See [`RttFloor`].
+    rtt_floor: RttFloor,
+}
+
+/// The shortest round trip this link has shown lately.
+///
+/// # Why a floor and not a threshold
+///
+/// A fixed threshold cannot tell distance from congestion, and the two want
+/// opposite responses. A link to another continent sits at 110 ms because that
+/// is how far away it is; shrinking the picture will not shorten it, which is
+/// why [`Bottleneck::HighLatency`] is not actionable. The same link at 900 ms is
+/// not further away — it is the same distance with most of a second of our own
+/// frames queued in front of the one being timed, and sending less is exactly
+/// what relieves it.
+///
+/// Measured against its own floor, those are trivially different: 110 against a
+/// floor of 110, and 900 against a floor of 110. Measured against 80 ms, they
+/// are both simply "high", which is what a controller learned nothing from
+/// while it walked the bitrate up from 5 to 23 Mbit/s on a link that could
+/// carry about ten.
+///
+/// # Why two windows
+///
+/// The floor has to be able to rise. A route that genuinely changes — a direct
+/// connection dropping back to a relay — is a new distance, not a queue, and a
+/// floor that only ever fell would read it as permanent congestion and hold the
+/// stream down for the rest of the session.
+///
+/// So the minimum is kept over a window that is periodically retired. A lower
+/// round trip is adopted at once, because a shorter path is news immediately; a
+/// longer one has to survive a whole window before it becomes the floor, by
+/// which time a queue would have drained.
+#[derive(Debug, Default)]
+struct RttFloor {
+    /// Minimum over the window currently in force.
+    settled: Option<f32>,
+    /// Minimum over the window being collected, which will replace it.
+    collecting: Option<f32>,
+    window_started: Option<Instant>,
+}
+
+impl RttFloor {
+    /// Fold in one measurement.
+    fn observe(&mut self, rtt_ms: f32, now: Instant) {
+        // A round trip of zero or worse is not a measurement. It is what an
+        // unanswered ping reports.
+        if !(rtt_ms.is_finite() && rtt_ms > 0.0) {
+            return;
+        }
+
+        let started = *self.window_started.get_or_insert(now);
+        if now.duration_since(started) >= RTT_FLOOR_WINDOW {
+            self.settled = self.collecting.take();
+            self.window_started = Some(now);
+        }
+
+        self.collecting = Some(self.collecting.map_or(rtt_ms, |c| c.min(rtt_ms)));
+        // Downwards immediately: a shorter path is a better answer to the same
+        // question, and waiting a window to believe it would read the improvement
+        // as congestion relative to a floor that is now wrong.
+        self.settled = Some(self.settled.map_or(rtt_ms, |f| f.min(rtt_ms)));
+    }
+
+    /// The floor, once there is one. Used by the tests, which are where the
+    /// two-window behaviour is pinned down.
+    #[cfg(test)]
+    fn get(&self) -> Option<f32> {
+        self.settled
+    }
+
+    /// Whether `rtt_ms` is far enough above the floor to be our own queue.
+    ///
+    /// Both a ratio and an absolute margin have to be exceeded, and each covers
+    /// what the other gets wrong. On a link across a city the floor is a couple
+    /// of milliseconds, where a ratio alone would call ordinary jitter
+    /// congestion; across an ocean it is over a hundred, where a fixed margin
+    /// alone would trip on the normal spread between one sample and the next.
+    fn is_queued(&self, rtt_ms: f32) -> bool {
+        let Some(floor) = self.settled else { return false };
+        rtt_ms > floor * QUEUE_RTT_RATIO && rtt_ms > floor + QUEUE_RTT_MARGIN_MS
+    }
 }
 
 impl AdaptiveController {
@@ -338,6 +420,7 @@ impl AdaptiveController {
             strained_windows: 0,
             clean_windows: 0,
             last_change: Instant::now(),
+            rtt_floor: RttFloor::default(),
         }
     }
 
@@ -411,6 +494,10 @@ impl AdaptiveController {
     /// As [`Self::observe`], with the clock supplied — which is what makes the
     /// dwell and hysteresis logic testable without sleeping.
     pub fn observe_at(&mut self, obs: &Observation, now: Instant) -> Option<StreamPlan> {
+        if let Some(guest) = obs.guest {
+            self.rtt_floor.observe(guest.rtt_ms, now);
+        }
+
         let before = self.plan();
         self.active = self.detect(obs, &before);
 
@@ -550,6 +637,23 @@ impl AdaptiveController {
             if guest.rtt_ms > HIGH_LATENCY_MS {
                 set.insert(Bottleneck::HighLatency);
             }
+            // # The signal the other two miss
+            //
+            // A link being over-driven does not have to block the sender or
+            // lose a frame. QUIC accepts the write and queues it, so
+            // `send_blocked_ms` stays near zero — measured at 2 to 5 ms per
+            // second on a link carrying half again what it could — and every
+            // frame does eventually arrive and decode, so the delivered-frame
+            // check is quiet too. Both of the existing network signals look
+            // clean while the queue grows.
+            //
+            // What grows with it is the round trip. Against this link's own
+            // floor that is unambiguous, and unlike distance it is something
+            // sending less will actually relieve — so it is reported as the
+            // link being unable to carry the stream, which is what it is.
+            if self.rtt_floor.is_queued(guest.rtt_ms) {
+                set.insert(Bottleneck::SlowNetwork);
+            }
         }
 
         set
@@ -684,6 +788,23 @@ impl AdaptiveController {
 /// under it, frame rate dominates the experience instead.
 const HIGH_LATENCY_MS: f32 = 80.0;
 
+/// How long a round-trip floor stays authoritative before being re-measured.
+///
+/// Long enough that a queue cannot outlast it and become the new floor — a
+/// stream is backed off within a few seconds of being detected — and short
+/// enough that a genuine change of route is picked up while the session is
+/// still worth adapting.
+const RTT_FLOOR_WINDOW: Duration = Duration::from_secs(30);
+
+/// How far above its floor a round trip has to be before it counts as queued.
+///
+/// Both apply; see [`RttFloor::is_queued`]. A link at 110 ms therefore has to
+/// reach 165 ms, which the reported session did — repeatedly, to 700 and 900 —
+/// while sitting comfortably under any fixed threshold that 110 ms itself did
+/// not already trip.
+const QUEUE_RTT_RATIO: f32 = 1.5;
+const QUEUE_RTT_MARGIN_MS: f32 = 50.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,6 +879,166 @@ mod tests {
             );
             assert_eq!(c.plan().fps, 60);
         }
+    }
+
+    /// A distant link, sitting at its own floor, is not congested.
+    ///
+    /// This is the case that must not regress: 110 ms across an ocean is
+    /// distance, and the whole reason [`Bottleneck::HighLatency`] is not
+    /// actionable is that no amount of shrinking the picture shortens it.
+    #[test]
+    fn a_link_that_is_merely_far_away_is_left_alone() {
+        let distant = |rtt: f32| Observation {
+            guest: Some(GuestTelemetry { rtt_ms: rtt, ..healthy().guest.unwrap() }),
+            ..healthy()
+        };
+
+        let mut c = AdaptiveController::new(LatencyPriority::BALANCED, ceiling(), NATIVE);
+        let mut clock = Instant::now();
+        let mut changes = Vec::new();
+        // The spread a real transatlantic link showed while behaving: 107 to 131.
+        for rtt in [110.0f32, 119.0, 107.0, 131.0, 112.0, 125.0, 118.0].repeat(8) {
+            clock += MIN_DWELL + Duration::from_millis(1);
+            if let Some(plan) = c.observe_at(&distant(rtt), clock) {
+                changes.push(plan);
+            }
+        }
+
+        assert!(changes.is_empty(), "distance was treated as something to fix: {changes:?}");
+        assert!(c.bottlenecks().contains(Bottleneck::HighLatency), "it is still high");
+        assert!(
+            !c.bottlenecks().contains(Bottleneck::SlowNetwork),
+            "and being far away is not the link failing to carry the stream"
+        );
+    }
+
+    /// The failure this was written for.
+    ///
+    /// Reported: a host on roughly a 10 Mbit/s uplink, 110 ms away, whose
+    /// controller walked the bitrate from 5 Mbit/s to its 23 Mbit/s ceiling and
+    /// stayed there while the picture fell apart. Every window looked clean,
+    /// because the only signal that reflected the queue was the round trip and
+    /// the round trip was written off as distance.
+    ///
+    /// Neither existing network signal catches it. The sender does not block —
+    /// QUIC takes the write and queues it, measured at 2 to 5 ms per second —
+    /// and every frame eventually arrives and decodes, so the delivered-frame
+    /// check is quiet as well.
+    #[test]
+    fn a_queue_growing_on_a_distant_link_is_recognised_as_the_link() {
+        let at = |rtt: f32| Observation {
+            // Exactly what the reported host measured: nothing blocking, every
+            // frame arriving, and the queue visible only in the round trip.
+            send_blocked_ms: 4.0 / 1000.0,
+            guest: Some(GuestTelemetry { rtt_ms: rtt, ..healthy().guest.unwrap() }),
+            ..healthy()
+        };
+
+        let mut c = AdaptiveController::new(LatencyPriority::BALANCED, ceiling(), NATIVE);
+        let mut clock = Instant::now();
+
+        // Settle the floor at this link's real distance.
+        for _ in 0..10 {
+            clock += MIN_DWELL + Duration::from_millis(1);
+            c.observe_at(&at(110.0), clock);
+        }
+        assert_eq!(c.plan(), ceiling(), "nothing wrong yet");
+
+        // Then the queue the ceiling put there: the same session's own spikes.
+        let mut changes = Vec::new();
+        for rtt in [855.0f32, 721.0, 932.0, 800.0].repeat(4) {
+            clock += MIN_DWELL + Duration::from_millis(1);
+            if let Some(plan) = c.observe_at(&at(rtt), clock) {
+                changes.push(plan);
+            }
+        }
+
+        assert!(c.bottlenecks().contains(Bottleneck::SlowNetwork), "the queue is the link");
+        let first = changes.first().expect("a queue that deep must produce a response");
+        assert!(
+            first.bitrate_kbps < ceiling().bitrate_kbps,
+            "bitrate is the axis a saturated uplink binds on, got {first:?}"
+        );
+    }
+
+    /// On a fast link the floor is a millisecond or two, where a ratio alone
+    /// would call every ordinary sample congestion.
+    #[test]
+    fn ordinary_jitter_on_a_fast_link_is_not_a_queue() {
+        let mut floor = RttFloor::default();
+        let start = Instant::now();
+        floor.observe(2.0, start);
+
+        // Ten times the floor, and still only 20 ms.
+        assert!(!floor.is_queued(20.0), "20 ms on a LAN is not a queue");
+        // Half a second on the same link plainly is.
+        assert!(floor.is_queued(500.0));
+    }
+
+    /// And across an ocean the floor is over a hundred, where a fixed margin
+    /// alone would trip on the normal spread between samples.
+    #[test]
+    fn the_spread_of_a_distant_link_is_not_a_queue() {
+        let mut floor = RttFloor::default();
+        let start = Instant::now();
+        for rtt in [110.0f32, 119.0, 107.0, 131.0] {
+            floor.observe(rtt, start);
+        }
+        assert_eq!(floor.get(), Some(107.0));
+
+        for ordinary in [110.0f32, 119.0, 131.0, 140.0, 155.0] {
+            assert!(!floor.is_queued(ordinary), "{ordinary} ms is within this link's spread");
+        }
+        for queued in [200.0f32, 721.0, 932.0] {
+            assert!(floor.is_queued(queued), "{queued} ms is a queue");
+        }
+    }
+
+    /// A route that genuinely lengthens is a new distance, not a queue.
+    ///
+    /// A direct connection dropping back to a relay is the case. A floor that
+    /// only ever fell would read the new distance as permanent congestion and
+    /// hold the stream down for the rest of the session.
+    #[test]
+    fn a_longer_route_becomes_the_new_floor() {
+        let mut floor = RttFloor::default();
+        let start = Instant::now();
+        floor.observe(20.0, start);
+        assert!(floor.is_queued(200.0), "at first this is far above the floor");
+
+        // The relay is now the path, and stays the path.
+        let mut clock = start;
+        for _ in 0..4 {
+            clock += RTT_FLOOR_WINDOW + Duration::from_secs(1);
+            floor.observe(200.0, clock);
+        }
+        assert_eq!(floor.get(), Some(200.0), "the longer path is the distance now");
+        assert!(!floor.is_queued(200.0), "and sitting at it is not congestion");
+        assert!(floor.is_queued(700.0), "while a queue on top of it still is");
+    }
+
+    /// A shorter path is believed at once — it answers the same question better.
+    #[test]
+    fn a_shorter_route_is_adopted_immediately() {
+        let mut floor = RttFloor::default();
+        let start = Instant::now();
+        floor.observe(200.0, start);
+        floor.observe(20.0, start);
+        assert_eq!(floor.get(), Some(20.0));
+    }
+
+    /// An unanswered ping is not a measurement.
+    #[test]
+    fn a_round_trip_of_zero_does_not_become_the_floor() {
+        let mut floor = RttFloor::default();
+        let start = Instant::now();
+        floor.observe(110.0, start);
+        for nonsense in [0.0f32, -5.0, f32::NAN, f32::INFINITY] {
+            floor.observe(nonsense, start);
+        }
+        assert_eq!(floor.get(), Some(110.0));
+        // A floor of zero would make every sample infinitely above it.
+        assert!(!floor.is_queued(120.0));
     }
 
     #[test]
