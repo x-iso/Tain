@@ -14,15 +14,48 @@
 //! So the log is always written to disk, and additionally to the console when
 //! there is one.
 //!
-//! ## Why it is truncated rather than rolled
+//! ## How many previous runs are kept
 //!
-//! One previous run is kept alongside the current one. A session that goes wrong
-//! is diagnosed from the run it went wrong in, or the one before it if the user
-//! restarted before asking — beyond that, older logs are just disk. Rolling by
-//! size or date would mean a dependency and a retention policy for no gain.
+//! Eight. It was one, on the reasoning that a session which goes wrong is
+//! diagnosed from the run it went wrong in, or the one before it.
+//!
+//! That reasoning does not survive contact with how this is actually used.
+//! Noticing a problem and asking about it are not the same event: a laggy
+//! session gets reported after it ends, and by then the application has been
+//! restarted to try again, or to install the service, or because it was
+//! closed for the night. Each of those is a launch, and with one slot every
+//! launch destroys the evidence one further back.
+//!
+//! It has happened repeatedly, and cost a whole investigation the day this
+//! was changed — the log of the session being asked about had already been
+//! overwritten by the relaunch that followed it. Eight runs of a log that is
+//! tens of kilobytes is nothing; losing the one run somebody is asking about
+//! is expensive every time.
 
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
+
+/// How many previous runs to keep beside the current log.
+const KEEP: u32 = 8;
+
+/// Shuffle the previous runs along, oldest falling off the end.
+///
+/// Renaming from the oldest backwards means each slot is free before anything
+/// moves into it. Going the other way would overwrite `log.2` with `log.1`
+/// before `log.2` had moved, and quietly keep two copies of the same run.
+///
+/// Every failure here is ignored on purpose: the usual one is "there was no
+/// previous log", which is what a first run looks like, and none of them are
+/// worth refusing to start over.
+fn rotate(path: &std::path::Path) {
+    let slot = |n: u32| path.with_extension(format!("log.{n}"));
+
+    let _ = std::fs::remove_file(slot(KEEP));
+    for n in (1..KEEP).rev() {
+        let _ = std::fs::rename(slot(n), slot(n + 1));
+    }
+    let _ = std::fs::rename(path, slot(1));
+}
 
 /// Install the subscriber. Returns the log file's path, if there is one.
 ///
@@ -42,9 +75,7 @@ pub fn init(console: bool) -> Option<PathBuf> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // Keep exactly one previous run. Failure is not worth reporting: it means
-    // there was no previous log, which is the normal first-run case.
-    let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    rotate(&path);
 
     let Ok(file) = std::fs::File::create(&path) else {
         if console {
@@ -164,6 +195,32 @@ mod tests {
         // log to a file with no name.
         let chosen = resolve_log_path(Some(std::ffi::OsString::new()));
         assert_ne!(chosen, Some(PathBuf::new()));
+    }
+
+    /// Eight runs are kept, and the oldest falls off rather than surviving
+    /// forever or being overwritten by a younger one.
+    #[test]
+    fn rotation_shuffles_the_previous_runs_along() {
+        let dir = std::env::temp_dir().join(format!("tain-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let path = dir.join("tain.log");
+
+        // Nine launches, each writing which run it was.
+        for run in 1..=9 {
+            std::fs::write(&path, format!("run {run}")).expect("writable");
+            rotate(&path);
+        }
+
+        // `log.1` is the run before last, and `log.8` the oldest kept.
+        for (slot, run) in (1..=KEEP).zip((1..=9).rev().skip(0)) {
+            let found = std::fs::read_to_string(path.with_extension(format!("log.{slot}")))
+                .unwrap_or_default();
+            assert_eq!(found, format!("run {run}"), "slot {slot} holds the wrong run");
+        }
+        // Nine launches, eight slots: the first run is gone rather than kept.
+        assert!(!path.with_extension(format!("log.{}", KEEP + 1)).exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

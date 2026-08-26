@@ -635,7 +635,9 @@ pub async fn run_guest_session(
         // or the reader stops.
         let writer_state = shared.clone();
         let started = std::time::Instant::now();
-        let mut warned_about_relay = false;
+        // One line per session describing how it is actually reaching the other
+        // machine, said once hole punching has had time to settle.
+        let mut reported_path = false;
         let outcome = tokio::select! {
             _ = async {
                 let mut heartbeat = tokio::time::interval(TELEMETRY_INTERVAL);
@@ -703,17 +705,50 @@ pub async fn run_guest_session(
                                     health.rtt_ms = path.rtt_ms();
                                 }
                                 let relayed = !path.is_direct();
+                                let tunnelled = path.is_direct() && path.looks_tunnelled();
+                                let summary = format!(
+                                    "{} to {}, {:.0} ms round trip{}",
+                                    path.label(),
+                                    path.remote(),
+                                    path.rtt_ms(),
+                                    if tunnelled {
+                                        " — that is a private address, so the packets are \
+                                         going through a tunnel and the round trip is the \
+                                         tunnel's rather than the distance's"
+                                    } else {
+                                        ""
+                                    },
+                                );
                                 health.path = Some(path);
                                 drop(health);
 
                                 // Said once, and only after hole punching has
                                 // had time to work — see the note where the path
                                 // is first read.
-                                if relayed && !warned_about_relay && started.elapsed() >= DIRECT_GRACE
-                                {
-                                    warned_about_relay = true;
-                                    if let Some(path) = client.connection_path() {
-                                        warn!("{}", path.advice());
+                                //
+                                // # Logged whatever the answer is
+                                //
+                                // This used to speak up only when the path was
+                                // relayed, which left the case people actually
+                                // ask about silent: "direct" with a round trip
+                                // far too long for the distance. That is what
+                                // two machines on a VPN look like — a direct
+                                // path to each other's tunnel addresses — and
+                                // the log said nothing, so the first
+                                // investigation of it had no evidence at all
+                                // and the session it concerned had already been
+                                // overwritten.
+                                if !reported_path && started.elapsed() >= DIRECT_GRACE {
+                                    reported_path = true;
+                                    if relayed || tunnelled {
+                                        warn!("Connection path: {summary}");
+                                        if let Some(path) = client.connection_path()
+                                            && relayed
+                                        {
+                                            warn!("{}", path.advice());
+                                        }
+                                    } else {
+                                        info!("Connection path: {summary}");
                                     }
                                 }
                             }
