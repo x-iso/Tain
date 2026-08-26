@@ -530,6 +530,7 @@ fn now_ms() -> u64 {
 /// aborting the task — dropping the connection is a clean disconnect.
 pub async fn run_guest_session(
     code: ConnectionCode,
+    known_addrs: Vec<std::net::SocketAddr>,
     client_name: Option<String>,
     shared: GuestSessionState,
     mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
@@ -538,7 +539,7 @@ pub async fn run_guest_session(
     shared.set_status(GuestStatus::Connecting);
 
     let result = async {
-        let mut client = GuestClient::connect_with_code(&code)
+        let mut client = GuestClient::connect_with_code(&code, &known_addrs)
             .await
             .context("Could not reach that host")?;
 
@@ -1625,6 +1626,9 @@ mod tests {
         let (_input_tx, input_rx) = mpsc::unbounded_channel();
         let session = tokio::spawn(run_guest_session(
             code,
+            // Nothing remembered in a test: the harness connects to a host it
+            // just started, so there is no previous address to reuse.
+            Vec::new(),
             Some("Test Guest".into()),
             state.clone(),
             input_rx,

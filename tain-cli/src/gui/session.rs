@@ -127,6 +127,7 @@ impl GuestSession {
     /// Dial the host a code addresses and start streaming.
     pub fn start(
         code: ConnectionCode,
+        known_addrs: Vec<std::net::SocketAddr>,
         settings: &Settings,
         loopback: bool,
         repaint: impl Fn() + Send + Sync + 'static,
@@ -153,6 +154,7 @@ impl GuestSession {
             .store(settings.priority().value(), Ordering::Relaxed);
         let task = tokio::spawn(run_guest_session(
             code,
+            known_addrs,
             client_name,
             shared.clone(),
             input_rx,
@@ -754,6 +756,17 @@ impl GuestSession {
         self.preview.clone()
     }
 
+    /// Where this host answered, once a direct path has been established.
+    ///
+    /// `None` while the session is relayed, which is the case worth *not*
+    /// remembering: a relay's address is the relay's, and dialling it next time
+    /// would reach a server that has never heard of this host.
+    pub fn direct_addr(&self) -> Option<String> {
+        let health = self.shared.health.lock().unwrap();
+        let path = health.path.as_ref()?;
+        path.is_direct().then(|| path.remote().to_string())
+    }
+
     pub fn last_pointer(&self) -> Option<(u16, u16)> {
         self.last_pointer
     }
@@ -1022,15 +1035,15 @@ mod tests {
     #[tokio::test]
     async fn tab_ids_are_unique_across_sessions() {
         let settings = Settings::default();
-        let a = GuestSession::start(code([1; 32]), &settings, true, || {});
-        let b = GuestSession::start(code([1; 32]), &settings, true, || {});
+        let a = GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {});
+        let b = GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {});
         assert_ne!(a.tab_id, b.tab_id, "two tabs to the same host must be distinguishable");
     }
 
     #[tokio::test]
     async fn loopback_sessions_never_forward_input() {
         let settings = Settings::default();
-        let mut session = GuestSession::start(code([1; 32]), &settings, true, || {});
+        let mut session = GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {});
         let (tx, mut rx) = mpsc::unbounded_channel();
         session.input_tx = Some(tx);
 
@@ -1057,7 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_releases_every_held_input() {
         let settings = Settings::default();
-        let mut session = GuestSession::start(code([1; 32]), &settings, false, || {});
+        let mut session = GuestSession::start(code([1; 32]), Vec::new(), &settings, false, || {});
         let (tx, mut rx) = mpsc::unbounded_channel();
         session.input_tx = Some(tx);
 
@@ -1100,7 +1113,7 @@ mod tests {
     /// A 1:1 session on a remote screen larger than the window.
     async fn panning_session() -> GuestSession {
         let settings = Settings { scaling_mode: ScalingMode::Actual, ..Settings::default() };
-        GuestSession::start(code([1; 32]), &settings, true, || {})
+        GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {})
     }
 
     #[test]
@@ -1153,7 +1166,7 @@ mod tests {
     #[tokio::test]
     async fn fit_mode_never_pans() {
         let settings = Settings { scaling_mode: ScalingMode::Fit, ..Settings::default() };
-        let mut session = GuestSession::start(code([1; 32]), &settings, true, || {});
+        let mut session = GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {});
 
         session.auto_pan(viewport(), egui::vec2(1920.0, 1080.0), Some(egui::pos2(799.0, 599.0)), 1.0);
         assert_eq!(session.pan, egui::Vec2::ZERO);
@@ -1193,14 +1206,14 @@ mod tests {
     #[tokio::test]
     async fn a_session_knows_which_saved_connection_it_belongs_to() {
         let settings = Settings::default();
-        let session = GuestSession::start(code([0xAB; 32]), &settings, false, || {});
+        let session = GuestSession::start(code([0xAB; 32]), Vec::new(), &settings, false, || {});
         assert_eq!(session.endpoint_hex, "ab".repeat(32));
     }
 
     #[tokio::test]
     async fn win_key_tracking_does_not_duplicate() {
         let settings = Settings::default();
-        let mut session = GuestSession::start(code([1; 32]), &settings, false, || {});
+        let mut session = GuestSession::start(code([1; 32]), Vec::new(), &settings, false, || {});
         session.note_held_key(0x5B, true);
         session.note_held_key(0x5B, true);
         assert_eq!(session.keys_down.len(), 1);

@@ -1414,11 +1414,23 @@ impl GuestApp {
             .previous_connections
             .lock()
             .unwrap()
-            .record(endpoint_hex, code.encode(), &placeholder);
+            .record(endpoint_hex.clone(), code.encode(), &placeholder);
+
+        // Where this host answered last time, if it ever has. Offered as one
+        // more candidate; see `SavedConnection::last_direct_addr` for why a
+        // stale one costs nothing.
+        let known_addrs: Vec<std::net::SocketAddr> = self
+            .state
+            .previous_connections
+            .lock()
+            .unwrap()
+            .direct_addr(&endpoint_hex)
+            .into_iter()
+            .collect();
 
         let settings = self.state.settings();
         let repaint_ctx = ctx.clone();
-        let session = GuestSession::start(code, &settings, loopback, move || {
+        let session = GuestSession::start(code, known_addrs, &settings, loopback, move || {
             repaint_ctx.request_repaint()
         });
 
@@ -1452,8 +1464,20 @@ impl GuestApp {
     /// would rewrite the file repeatedly to no purpose.
     fn remember_preview(&mut self, index: usize) {
         let Some(session) = self.sessions.get(index) else { return };
-        let Some(pixels) = session.preview() else { return };
         let endpoint = session.endpoint_hex.clone();
+
+        // Where it answered, so the next connection can skip finding out. Kept
+        // even when there is no picture — a session that drew every frame on
+        // the GPU has no preview and still had a route worth remembering.
+        if let Some(addr) = session.direct_addr() {
+            self.state
+                .previous_connections
+                .lock()
+                .unwrap()
+                .set_direct_addr(&endpoint, &addr);
+        }
+
+        let Some(pixels) = session.preview() else { return };
         self.state
             .previous_connections
             .lock()

@@ -2194,7 +2194,7 @@ pub struct GuestClient {
 impl GuestClient {
     /// Connect to the host identified by its PublicKey (EndpointId).
     pub async fn connect(host_public_key: &iroh::PublicKey) -> Result<Self> {
-        Self::connect_via(host_public_key, None).await
+        Self::connect_via(host_public_key, None, &[]).await
     }
 
     /// Connect, using a relay the code supplied rather than looking one up.
@@ -2212,6 +2212,7 @@ impl GuestClient {
     pub async fn connect_via(
         host_public_key: &iroh::PublicKey,
         relay_url: Option<&str>,
+        known_addrs: &[std::net::SocketAddr],
     ) -> Result<Self> {
         /// How long to wait for the endpoint to report itself online.
         ///
@@ -2253,6 +2254,25 @@ impl GuestClient {
                 Err(e) => warn!("Ignoring the relay address in this code ({e}) — looking it up"),
             },
             None => info!("Connecting to host (no relay in the code — looking it up)"),
+        }
+
+        // # Where this host answered last time
+        //
+        // An address that worked once is worth trying again, and trying it
+        // costs nothing: iroh races every candidate it is given and keeps
+        // whichever answers first. A stale one loses the race and is forgotten;
+        // it cannot reach the wrong machine, because the endpoint id is a
+        // public key and the handshake checks it.
+        //
+        // What it buys is a connection that needs no relay at all. On a link
+        // where the relays are unreachable — which is the whole reason there is
+        // a tunnel in the first place — that is the difference between
+        // connecting and not.
+        for known in known_addrs {
+            addr.addrs.insert(iroh::TransportAddr::Ip(*known));
+        }
+        if !known_addrs.is_empty() {
+            info!("Also trying {} address(es) this host answered on before", known_addrs.len());
         }
 
         let conn = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN))
@@ -2299,13 +2319,17 @@ impl GuestClient {
     ///
     /// This is the whole point of the code format: the guest needs no separate
     /// ticket, because the address travels with the secret.
-    pub async fn connect_with_code(code: &ConnectionCode) -> Result<Self> {
+    pub async fn connect_with_code(
+        code: &ConnectionCode,
+        known_addrs: &[std::net::SocketAddr],
+    ) -> Result<Self> {
         let public_key =
             iroh::PublicKey::from_bytes(&code.endpoint_id).context("Invalid endpoint ID bytes")?;
         // The relay the host put in the code, so no lookup is needed to find
         // it. Codes issued before this existed carry none, and fall back to the
-        // lookup path.
-        Self::connect_via(&public_key, code.relay_url.as_deref()).await
+        // lookup path. `known_addrs` is where this host answered last time,
+        // which can remove the relay from the path entirely.
+        Self::connect_via(&public_key, code.relay_url.as_deref(), known_addrs).await
     }
 
     /// Take ownership of the underlying connection's stream pair, authenticating first.

@@ -144,6 +144,25 @@ pub struct SavedConnection {
     /// did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// Where this host answered last time, if a direct path was established.
+    ///
+    /// # Why remembering an address is worth the line
+    ///
+    /// Finding a host normally needs a relay: an endpoint id is a public key,
+    /// not a route, and something has to translate one into the other. On a
+    /// connection where the relays are unreachable — which is the whole reason
+    /// anyone is running a tunnel — that step is where connecting fails.
+    ///
+    /// An address that worked once removes the step. It costs nothing to offer:
+    /// iroh races every candidate and keeps whichever answers first, so a stale
+    /// one simply loses. It cannot reach the wrong machine either, because the
+    /// endpoint id is checked cryptographically during the handshake — the
+    /// worst a wrong address does is fail.
+    ///
+    /// Stored as text rather than parsed, because this file is written by hand
+    /// often enough and a malformed entry should be ignored rather than fatal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_direct_addr: Option<String>,
     /// Plaintext code written by an older build. Only ever read, to migrate it
     /// into the credential store; never written back.
     #[serde(default, skip_serializing)]
@@ -172,6 +191,7 @@ impl SavedConnection {
             display_name,
             last_connected: now_secs(),
             preview: None,
+            last_direct_addr: None,
             legacy_code: None,
             has_code: false,
             status: ConnectionStatus::default(),
@@ -390,6 +410,36 @@ impl ConnectionStore {
     /// session is running and the file would otherwise be rewritten on a timer
     /// for no reason. Silently does nothing for a host with no row — a preview
     /// is not a reason to remember a machine.
+    /// Remember where this host answered, for the next connection.
+    ///
+    /// Returns whether anything changed, so a caller can avoid writing the file
+    /// when a session reports the same address every few seconds.
+    pub fn set_direct_addr(&mut self, endpoint_id: &str, addr: &str) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|e| e.endpoint_id == endpoint_id) else {
+            return false;
+        };
+        if entry.last_direct_addr.as_deref() == Some(addr) {
+            return false;
+        }
+        entry.last_direct_addr = Some(addr.to_string());
+        true
+    }
+
+    /// Where this host answered last time, if it parses as an address.
+    ///
+    /// A malformed entry is dropped rather than reported: it came from a file
+    /// somebody may have edited, and the cost of ignoring it is one relay
+    /// lookup.
+    pub fn direct_addr(&self, endpoint_id: &str) -> Option<std::net::SocketAddr> {
+        self.entries
+            .iter()
+            .find(|e| e.endpoint_id == endpoint_id)?
+            .last_direct_addr
+            .as_deref()?
+            .parse()
+            .ok()
+    }
+
     pub fn set_preview(&mut self, endpoint_id: &str, pixels: &[u8]) -> bool {
         let encoded = super::preview::encode(pixels);
         let Some(entry) = self.entries.iter_mut().find(|c| c.endpoint_id == endpoint_id) else {
@@ -488,6 +538,42 @@ pub fn placeholder_name(endpoint_hex: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The address is remembered per host and read back as an address.
+    #[test]
+    fn a_direct_address_is_remembered_and_parsed_back() {
+        let mut store = ConnectionStore::new();
+        store.record("aa".into(), "MASTER-x".into(), "Host");
+
+        assert_eq!(store.direct_addr("aa"), None, "nothing known yet");
+        assert!(store.set_direct_addr("aa", "203.0.113.9:41641"));
+        assert_eq!(
+            store.direct_addr("aa"),
+            Some("203.0.113.9:41641".parse().unwrap()),
+        );
+
+        // Writing the same one again is not a change, so a session reporting it
+        // every few seconds does not rewrite the file.
+        assert!(!store.set_direct_addr("aa", "203.0.113.9:41641"));
+        assert!(store.set_direct_addr("aa", "203.0.113.9:5000"));
+    }
+
+    /// A hand-edited file must not take the connection down with it.
+    #[test]
+    fn an_unparseable_address_is_ignored_rather_than_fatal() {
+        let mut store = ConnectionStore::new();
+        store.record("bb".into(), "MASTER-y".into(), "Host");
+        store.set_direct_addr("bb", "not an address");
+        assert_eq!(store.direct_addr("bb"), None);
+    }
+
+    /// An address for a host that is not saved goes nowhere.
+    #[test]
+    fn remembering_an_address_for_an_unknown_host_does_nothing() {
+        let mut store = ConnectionStore::new();
+        assert!(!store.set_direct_addr("missing", "203.0.113.9:41641"));
+        assert_eq!(store.direct_addr("missing"), None);
+    }
+
     use super::*;
 
     /// Ids are arbitrary here: the store's secret backend is in-memory, so
@@ -501,6 +587,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (id, name))| SavedConnection {
+                last_direct_addr: None,
                 preview: None,
                 endpoint_id: (*id).to_string(),
                 display_name: (*name).to_string(),
@@ -679,6 +766,7 @@ mod tests {
     fn a_row_without_a_code_says_so_rather_than_looking_connectable() {
         let mut store = ConnectionStore::new();
         store.entries.push(SavedConnection {
+            last_direct_addr: None,
             preview: None,
             endpoint_id: "abc".into(),
             display_name: "Old PC".into(),

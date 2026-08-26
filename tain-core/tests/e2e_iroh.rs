@@ -182,7 +182,7 @@ async fn a_connection_code_alone_is_enough_to_reach_the_host() -> Result<()> {
         "code must address the host that issued it"
     );
 
-    let mut guest = GuestClient::connect_with_code(&code).await?;
+    let mut guest = GuestClient::connect_with_code(&code, &[]).await?;
     let (_send, mut recv) = guest.authenticate(&code_string, None).await?;
 
     let bytes = tokio::time::timeout(Duration::from_secs(30), read_stream_message(&mut recv))
