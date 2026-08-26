@@ -234,6 +234,11 @@ mod platform {
                             }
                         }
                         tain_core::agent_pipe::PipeRequest::FramesWanted(true) => {}
+                        tain_core::agent_pipe::PipeRequest::ReleaseTouches => {
+                            if let Err(e) = injector.release_touches() {
+                                tracing::debug!("Serving {desktop}: {e:#}");
+                            }
+                        }
                     }
                 }
 

@@ -144,7 +144,7 @@ pub const INPUT_LEN: usize = 8;
 /// because the desktop the event is bound for may not be the one the guest was
 /// looking at when it was made.
 pub fn encode_input(event: &crate::protocol::InputEvent) -> [u8; INPUT_LEN] {
-    use crate::protocol::InputEvent;
+    use crate::protocol::{InputEvent, TouchPhase};
 
     let mut out = [0u8; INPUT_LEN];
     match event {
@@ -170,6 +170,19 @@ pub fn encode_input(event: &crate::protocol::InputEvent) -> [u8; INPUT_LEN] {
             out[5] = k.pressed as u8;
             out[6] = k.extended as u8;
         }
+        InputEvent::Touch(t) => {
+            out[0] = 6;
+            out[1] = t.id;
+            out[2] = match t.phase {
+                TouchPhase::Start => 0,
+                TouchPhase::Move => 1,
+                TouchPhase::End => 2,
+                TouchPhase::Cancel => 3,
+            };
+            out[3..5].copy_from_slice(&t.x.to_le_bytes());
+            out[5..7].copy_from_slice(&t.y.to_le_bytes());
+            out[7] = t.pressure;
+        }
     }
     out
 }
@@ -186,6 +199,18 @@ pub fn encode_frames_wanted(wanted: bool) -> [u8; INPUT_LEN] {
     out
 }
 
+/// Tell the agent to drop every contact it is holding.
+///
+/// Sent when touch stops being routed through it mid-gesture, which happens
+/// when the elevated window that made it necessary goes away while a finger is
+/// still down. Without this the agent keeps re-asserting contacts nothing will
+/// ever lift, and they stay pressed against the host's screen.
+pub fn encode_release_touches() -> [u8; INPUT_LEN] {
+    let mut out = [0u8; INPUT_LEN];
+    out[0] = 7;
+    out
+}
+
 /// What a record turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipeRequest {
@@ -193,6 +218,8 @@ pub enum PipeRequest {
     Input(crate::protocol::InputEvent),
     /// Start or stop capturing.
     FramesWanted(bool),
+    /// Lift every touch contact currently held.
+    ReleaseTouches,
 }
 
 /// Read one record, whatever kind it is.
@@ -200,13 +227,16 @@ pub fn decode_request(bytes: &[u8; INPUT_LEN]) -> Option<PipeRequest> {
     if bytes[0] == 5 {
         return Some(PipeRequest::FramesWanted(bytes[1] != 0));
     }
+    if bytes[0] == 7 {
+        return Some(PipeRequest::ReleaseTouches);
+    }
     decode_input(bytes).map(PipeRequest::Input)
 }
 
 /// Read one back. `None` for a record this version does not know.
 pub fn decode_input(bytes: &[u8; INPUT_LEN]) -> Option<crate::protocol::InputEvent> {
     use crate::protocol::{
-        InputEvent, KeyEvent, MouseButtonEvent, MouseEvent, ScrollEvent,
+        InputEvent, KeyEvent, MouseButtonEvent, MouseEvent, ScrollEvent, TouchEvent, TouchPhase,
     };
 
     let pair = |a: usize| u16::from_le_bytes([bytes[a], bytes[a + 1]]);
@@ -225,6 +255,23 @@ pub fn decode_input(bytes: &[u8; INPUT_LEN]) -> Option<crate::protocol::InputEve
             modifiers: 0,
             scancode: pair(3),
             extended: bytes[6] != 0,
+        }),
+        6 => InputEvent::Touch(TouchEvent {
+            id: bytes[1],
+            phase: match bytes[2] {
+                0 => TouchPhase::Start,
+                1 => TouchPhase::Move,
+                2 => TouchPhase::End,
+                3 => TouchPhase::Cancel,
+                // A phase this build does not know. Dropping the contact is
+                // wrong in a way the others are not: a finger stuck down on the
+                // secure desktop stays down. Cancel is the honest reading of
+                // "something happened to this contact and we cannot say what".
+                _ => TouchPhase::Cancel,
+            },
+            x: pair(3),
+            y: pair(5),
+            pressure: bytes[7],
         }),
         // An event kind added by a newer build on the other side. Skipping one
         // beats refusing the whole stream: the connection stays up and the
@@ -425,6 +472,11 @@ mod platform {
             self.send_record(encode_frames_wanted(wanted))
         }
 
+        /// Tell the agent to lift every contact it is holding.
+        pub fn send_release_touches(&self) -> Result<()> {
+            self.send_record(encode_release_touches())
+        }
+
         fn send_record(&self, record: [u8; INPUT_LEN]) -> Result<()> {
             let _serialised = self.writing.lock().map_err(|_| {
                 anyhow::anyhow!("the input channel to the agent was poisoned")
@@ -530,7 +582,7 @@ mod tests {
     #[test]
     fn every_input_event_survives_the_round_trip() {
         use crate::protocol::{
-            InputEvent, KeyEvent, MouseButtonEvent, MouseEvent, ScrollEvent,
+            InputEvent, KeyEvent, MouseButtonEvent, MouseEvent, ScrollEvent, TouchEvent, TouchPhase,
         };
 
         let events = [
@@ -545,12 +597,92 @@ mod tests {
                 scancode: 0x5B,
                 extended: true,
             }),
+            InputEvent::Touch(TouchEvent {
+                id: 9,
+                phase: TouchPhase::Start,
+                x: 65535,
+                y: 1,
+                pressure: 255,
+            }),
+            InputEvent::Touch(TouchEvent {
+                id: 0,
+                phase: TouchPhase::Move,
+                x: 12345,
+                y: 54321,
+                pressure: 0,
+            }),
+            InputEvent::Touch(TouchEvent {
+                id: 3,
+                phase: TouchPhase::End,
+                x: 0,
+                y: 0,
+                pressure: 0,
+            }),
+            InputEvent::Touch(TouchEvent {
+                id: 3,
+                phase: TouchPhase::Cancel,
+                x: 7,
+                y: 8,
+                pressure: 128,
+            }),
         ];
 
         for event in events {
             let decoded = decode_input(&encode_input(&event)).expect("our own encoding");
             assert_eq!(decoded, event, "round trip changed the event");
         }
+    }
+
+    /// The three record kinds share eight bytes and must stay distinguishable.
+    ///
+    /// They are told apart by the first byte alone, so a kind added later that
+    /// reused a number would be read as whichever one got there first — a
+    /// "let go of everything" arriving as a click at the top-left corner.
+    #[test]
+    fn each_record_kind_decodes_as_itself() {
+        use crate::protocol::{InputEvent, MouseEvent, TouchEvent, TouchPhase};
+
+        let input = InputEvent::MouseMove(MouseEvent { x: 1, y: 2 });
+        let touch = InputEvent::Touch(TouchEvent {
+            id: 1,
+            phase: TouchPhase::Move,
+            x: 3,
+            y: 4,
+            pressure: 5,
+        });
+
+        assert_eq!(decode_request(&encode_input(&input)), Some(PipeRequest::Input(input)));
+        assert_eq!(decode_request(&encode_input(&touch)), Some(PipeRequest::Input(touch)));
+        assert_eq!(
+            decode_request(&encode_frames_wanted(true)),
+            Some(PipeRequest::FramesWanted(true))
+        );
+        assert_eq!(decode_request(&encode_release_touches()), Some(PipeRequest::ReleaseTouches));
+
+        // And releasing is not readable as any kind of input.
+        assert_eq!(decode_input(&encode_release_touches()), None);
+    }
+
+    /// A touch phase this build does not know must not leave a finger down.
+    ///
+    /// Everything else unrecognised is dropped, which is right for a click and
+    /// wrong for a contact: dropping the record that says "this finger is done"
+    /// pins it to the host's screen for the rest of the session. Cancel is the
+    /// reading that cannot get stuck.
+    #[test]
+    fn an_unknown_touch_phase_lifts_the_contact_rather_than_dropping_it() {
+        use crate::protocol::{InputEvent, TouchPhase};
+
+        let mut record = [0u8; INPUT_LEN];
+        record[0] = 6;
+        record[1] = 4;
+        record[2] = 200; // A phase from some later version.
+
+        let Some(InputEvent::Touch(touch)) = decode_input(&record) else {
+            panic!("a touch record should still decode as a touch");
+        };
+        assert_eq!(touch.phase, TouchPhase::Cancel);
+        assert_eq!(touch.id, 4, "the contact it refers to must survive");
     }
 
     /// The two record kinds share eight bytes and must not be read as each

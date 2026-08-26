@@ -55,7 +55,10 @@ use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, Scr
 pub const SECURE_DESKTOP: &str = "Winlogon";
 
 #[cfg(target_os = "windows")]
-pub use platform::{capture_through_agent_only, send_input_to_agent, use_agent_only, DesktopFollowing};
+pub use platform::{
+    capture_through_agent_only, release_agent_touches, send_input_to_agent, touch_route_changed,
+    use_agent_only, DesktopFollowing,
+};
 
 /// Whether this process has no desktop of its own to capture.
 #[cfg(not(target_os = "windows"))]
@@ -68,6 +71,16 @@ pub fn capture_through_agent_only() -> bool {
 pub fn send_input_to_agent(_event: &crate::protocol::InputEvent) -> bool {
     false
 }
+
+/// Whether touch has changed which side is injecting it. Never, without agents.
+#[cfg(not(target_os = "windows"))]
+pub fn touch_route_changed(_via_agent: bool) -> bool {
+    false
+}
+
+/// Nothing to ask: there is no agent holding contacts.
+#[cfg(not(target_os = "windows"))]
+pub fn release_agent_touches() {}
 
 #[cfg(target_os = "windows")]
 mod platform {
@@ -126,6 +139,36 @@ mod platform {
     /// the secure desktop. This one carries no frames at all.
     static INPUT_LINK: Mutex<Option<Arc<super::super::agent_pipe::AgentFrames>>> =
         Mutex::new(None);
+
+    /// Where touch contacts were last injected: here, or by the agent.
+    ///
+    /// Only touch needs this. A click or a keystroke that goes one way and then
+    /// the other is two independent events, and neither side is left holding
+    /// anything. A contact is state — somebody is holding it down until they
+    /// are told otherwise — so when the route changes mid-gesture the side
+    /// being left has to be told to let go.
+    static TOUCH_VIA_AGENT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Record where touch is going now, and say whether that is a change.
+    pub fn touch_route_changed(via_agent: bool) -> bool {
+        TOUCH_VIA_AGENT.swap(via_agent, std::sync::atomic::Ordering::Relaxed) != via_agent
+    }
+
+    /// Ask whichever agent has been injecting touch to drop its contacts.
+    ///
+    /// Nothing to report on failure: the agent is gone, which is the same
+    /// outcome as it letting go.
+    pub fn release_agent_touches() {
+        for held in [&LINK, &INPUT_LINK] {
+            if let Ok(link) = held.lock()
+                && let Some(agent) = link.as_ref()
+                && let Err(e) = agent.send_release_touches()
+            {
+                tracing::debug!("Could not ask the agent to release touches: {e:#}");
+            }
+        }
+    }
 
     /// Send an event to an agent, if one has to deliver it.
     ///
@@ -574,5 +617,30 @@ mod platform {
         fn finished(&self) -> bool {
             self.done.load(Ordering::Relaxed)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a *change* of route may release contacts.
+    ///
+    /// It is asked once per touch event, which during a drag is every few
+    /// milliseconds. If a steady route reported a change, every one of those
+    /// would cancel the gesture it was in the middle of.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_steady_touch_route_reports_no_change() {
+        // Whatever the process was doing, start from a known side.
+        touch_route_changed(false);
+
+        assert!(!touch_route_changed(false), "staying local is not a change");
+        assert!(touch_route_changed(true), "moving to the agent is");
+        assert!(!touch_route_changed(true), "and then staying there is not");
+        assert!(touch_route_changed(false), "coming back is a change again");
+
+        // Left as found, since this is process-wide state.
+        touch_route_changed(false);
     }
 }

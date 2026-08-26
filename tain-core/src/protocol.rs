@@ -121,6 +121,74 @@ pub struct KeyEvent {
     pub extended: bool,
 }
 
+/// One finger, at one moment.
+///
+/// # Why one contact per message rather than a whole frame
+///
+/// Windows injects touch as a *set*: every call to `InjectTouchInput` must
+/// carry every contact currently down, including the ones that have not moved.
+/// The obvious wire shape is therefore a frame — a list of contacts — and it is
+/// the wrong one.
+///
+/// The host has to keep that set anyway. It is the thing that knows which
+/// contacts are live, because it is the thing being asked to hold them down
+/// between updates. Once it keeps the set, a message describing one finger is
+/// enough, and it buys three things: it fits the agent pipe's fixed eight-byte
+/// record with no second framing scheme; it goes through the same per-event
+/// permission gate as every other input; and a guest that sends nothing while a
+/// finger rests costs nothing, where a frame-per-tick protocol would repeat the
+/// whole set forever.
+///
+/// egui reports touches one contact at a time as well, so nothing is being
+/// taken apart to fit — this is the shape it already arrives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TouchEvent {
+    /// Which finger. Stable from [`TouchPhase::Start`] to its end.
+    ///
+    /// A small dense index, not the sender's own identifier: the guest's are
+    /// arbitrary 64-bit values, and Windows wants a contact id it can hold in
+    /// an array of the size it was told to expect.
+    pub id: u8,
+    pub phase: TouchPhase,
+    /// Normalized exactly as [`MouseEvent`] is, and for the same reason.
+    pub x: u16,
+    pub y: u16,
+    /// How hard, `1..=255`. `0` means the sender did not know.
+    ///
+    /// Zero rather than an `Option` because this has to fit eight bytes on the
+    /// pipe, and no real digitizer reports a contact with no pressure at all.
+    pub pressure: u8,
+}
+
+/// How many fingers may be down at once.
+///
+/// What a Windows digitizer reports and what `InitializeTouchInjection` is set
+/// up for, so a guest that tracked more would only be sending contacts the host
+/// has nowhere to put.
+pub const MAX_TOUCH_CONTACTS: u8 = 10;
+
+/// Where a contact is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TouchPhase {
+    /// Went down. The id was not in use before this.
+    Start,
+    /// Moved, or is simply still there.
+    Move,
+    /// Lifted normally.
+    End,
+    /// Taken away — a palm rejected, a gesture claimed by the system, a window
+    /// losing focus mid-touch. Distinct from [`Self::End`] because the
+    /// application under it should undo rather than complete.
+    Cancel,
+}
+
+impl TouchPhase {
+    /// Whether the contact still exists after this.
+    pub fn is_down(self) -> bool {
+        matches!(self, Self::Start | Self::Move)
+    }
+}
+
 /// Bit values for [`KeyEvent::modifiers`].
 pub mod modifier {
     pub const CTRL: u8 = 1;
@@ -136,13 +204,21 @@ pub enum InputEvent {
     MouseButton(MouseButtonEvent),
     Scroll(ScrollEvent),
     Key(KeyEvent),
+    Touch(TouchEvent),
 }
 
 impl InputEvent {
     /// Which device this event needs permission for.
     pub fn device(&self) -> InputDevice {
         match self {
-            Self::MouseMove(_) | Self::MouseButton(_) | Self::Scroll(_) => InputDevice::Mouse,
+            Self::MouseMove(_)
+            | Self::MouseButton(_)
+            | Self::Scroll(_)
+            // Touch counts as the pointer, deliberately. It is the same act —
+            // pointing at something on the far screen and acting on it — and a
+            // host that has withheld the mouse has withheld exactly that. A
+            // separate grant would be a way to hand it back by accident.
+            | Self::Touch(_) => InputDevice::Mouse,
             Self::Key(_) => InputDevice::Keyboard,
         }
     }
@@ -557,6 +633,17 @@ mod tests {
             InputDevice::Mouse
         );
         assert_eq!(InputEvent::Scroll(ScrollEvent { dx: 0, dy: 1 }).device(), InputDevice::Mouse);
+        // Touch is the pointer: a host that withheld the mouse withheld this.
+        let touch = InputEvent::Touch(TouchEvent {
+            id: 0,
+            phase: TouchPhase::Start,
+            x: 1,
+            y: 2,
+            pressure: 0,
+        });
+        assert_eq!(touch.device(), InputDevice::Mouse);
+        assert!(!ControlGrants::new(false, true).allows(touch.device()));
+        assert!(ControlGrants::new(true, false).allows(touch.device()));
         assert_eq!(
             InputEvent::Key(KeyEvent {
                 keycode: 65,

@@ -2054,6 +2054,18 @@ fn spawn_capture_thread(
         .expect("failed to spawn capture thread")
 }
 
+/// Let go of every touch contact, wherever it is being held.
+///
+/// Both sides, because a gesture can have been handed to an agent partway
+/// through and each end holds only what it injected itself. Both are no-ops
+/// when nothing is down, which is the ordinary case.
+fn release_all_touches(injector: &dyn super::input_inject::InputInjector) {
+    super::capture_follow::release_agent_touches();
+    if let Err(e) = injector.release_touches() {
+        debug!("Could not release touch contacts: {e:#}");
+    }
+}
+
 /// Read and dispatch inbound messages until the stream closes.
 ///
 /// Owns `recv` exclusively — see the module docs on cancel-safety.
@@ -2071,6 +2083,11 @@ async fn run_reader<R>(
     R: tokio::io::AsyncReadExt + Unpin + Send + 'static,
 {
     let injector = super::input_inject::create_injector();
+    // Whether the last touch to arrive was refused. A gesture in progress when
+    // the guest's control is withdrawn has to be let go of here: the guest
+    // cannot lift those contacts, because the message that would do it is the
+    // one being refused.
+    let mut touch_refused = false;
 
     loop {
         let data = match read_stream_message(&mut recv).await {
@@ -2098,9 +2115,17 @@ async fn run_reader<R>(
                 // Re-read grants per event: they can change at any point during
                 // the session, and mouse/keyboard are permitted independently.
                 let device = event.device();
+                let touch = matches!(event, super::protocol::InputEvent::Touch(_));
                 if !sessions.grants(session_id).is_some_and(|g| g.allows(device)) {
                     trace!("Session #{}: {:?} input dropped — not granted", session_id, device);
+                    if touch && !touch_refused {
+                        touch_refused = true;
+                        release_all_touches(injector.as_ref());
+                    }
                     continue;
+                }
+                if touch {
+                    touch_refused = false;
                 }
                 if let Err(e) = inject_input(injector.as_ref(), &event) {
                     warn!("Session #{}: input injection failed: {}", session_id, e);
@@ -2177,10 +2202,36 @@ pub fn inject_input(
     injector: &dyn super::input_inject::InputInjector,
     event: &super::protocol::InputEvent,
 ) -> Result<()> {
-    use super::input_inject::{KeyInput, MouseButtonInput, MousePosition, ScrollInput};
+    use super::input_inject::{
+        KeyInput, MouseButtonInput, MousePosition, ScrollInput, TouchInput,
+    };
     use super::protocol::InputEvent;
 
-    if super::capture_follow::send_input_to_agent(event) {
+    let via_agent = super::capture_follow::send_input_to_agent(event);
+
+    // # A gesture that changes hands mid-way
+    //
+    // Touch is the one input that leaves something behind. An elevated window
+    // arriving while a finger is down moves the route to the agent, and the
+    // contacts this process is holding then have nothing left to lift them —
+    // they stay pressed against the screen until something resets the
+    // injection. The same in reverse when that window goes away.
+    //
+    // So on a change of route, the side being left is told to let go. The
+    // events that follow arrive as movement for a contact the new side does
+    // not know, which it reads as a press: the gesture continues rather than
+    // being cut in half.
+    if matches!(event, InputEvent::Touch(_))
+        && super::capture_follow::touch_route_changed(via_agent)
+    {
+        if via_agent {
+            let _ = injector.release_touches();
+        } else {
+            super::capture_follow::release_agent_touches();
+        }
+    }
+
+    if via_agent {
         return Ok(());
     }
 
@@ -2196,6 +2247,13 @@ pub fn inject_input(
             extended: k.extended,
             keycode: k.keycode,
             pressed: k.pressed,
+        }),
+        InputEvent::Touch(t) => injector.touch(TouchInput {
+            id: t.id,
+            phase: t.phase,
+            x: t.x,
+            y: t.y,
+            pressure: t.pressure,
         }),
     }
 }

@@ -15,7 +15,8 @@
 use egui::{Context, RichText, ViewportId};
 
 use tain_core::protocol::{
-    InputEvent, KeyEvent, MouseButtonEvent, MouseEvent, ScrollEvent, WHEEL_DELTA,
+    InputEvent, KeyEvent, MouseButtonEvent, MouseEvent, ScrollEvent, TouchEvent, TouchPhase,
+    WHEEL_DELTA,
 };
 
 use super::immersive::Immersive;
@@ -395,6 +396,13 @@ impl SessionWindow {
                         }
                         if session.sends_mouse() && !over_toolbar {
                             forward_pointer(session, ui, &resp, rect);
+                        } else {
+                            // Whatever stopped the forwarding — the host
+                            // withdrawing control, a finger sliding onto the
+                            // toolbar — the contacts it already sent are still
+                            // pressed against the host's screen, and this is
+                            // the last chance to lift them.
+                            release_touches(session);
                         }
 
                         // Panning is driven by the pointer, not by frames, so a
@@ -1117,10 +1125,38 @@ fn forward_pointer(
     resp: &egui::Response,
     rect: egui::Rect,
 ) {
-    // Don't bother sending what the host would only drop.
+    // Don't bother sending what the host would only drop — but do let go of
+    // any contacts first, so the slot table does not carry fingers that will
+    // never be lifted into the next gesture.
     if !session.grants().mouse {
+        release_touches(session);
         return;
     }
+
+    // # Touch instead of the pointer, not as well as it
+    //
+    // egui synthesises pointer events from a single contact so that ordinary
+    // widgets work under a finger. Forwarding both would send every tap twice:
+    // once as a touch and once as a click.
+    //
+    // Touch is the one to keep. It is what actually happened, it carries the
+    // other fingers, and Windows promotes it to a click by itself for any
+    // window that does not handle touch — so nothing is lost by sending it,
+    // and pinch and two-finger gestures are gained.
+    //
+    // `any_touches` alone is not the question. egui drops a contact while
+    // processing the very event that ends it, so on the frame a finger lifts it
+    // already reports none — and taking the mouse path there would cancel the
+    // gesture instead of finishing it, turning every tap into an abort. The
+    // events still sitting in the queue are the other half of the answer.
+    let touching = ui.input(|i| {
+        i.any_touches() || i.events.iter().any(|e| matches!(e, egui::Event::Touch { .. }))
+    });
+    if touching {
+        forward_touch(session, ui, rect);
+        return;
+    }
+    release_touches(session);
 
     if resp.hovered() {
         // Collected before sending: `ui.input` holds a lock, and sending takes
@@ -1193,6 +1229,116 @@ fn forward_pointer(
         if delta != egui::Vec2::ZERO {
             session.send_input(InputEvent::Scroll(scroll_to_wheel(delta)));
         }
+    }
+}
+
+/// Forward every contact egui saw this frame.
+///
+/// # Why each finger travels on its own
+///
+/// The host has to keep the set of live contacts regardless, because the
+/// Windows call that injects them wants all of them on every update. Given
+/// that, one finger per message is the smaller protocol, it fits the fixed
+/// record the agent pipe carries to the secure desktop, and it passes the same
+/// per-event permission check as a click. See `protocol::TouchEvent`.
+fn forward_touch(session: &mut GuestSession, ui: &egui::Ui, rect: egui::Rect) {
+    // Collected before sending: `ui.input` holds a lock and sending takes the
+    // session mutably.
+    let touches: Vec<(u64, egui::TouchPhase, egui::Pos2, Option<f32>)> = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Touch { id, phase, pos, force, .. } => {
+                    Some((id.0, *phase, *pos, *force))
+                }
+                _ => None,
+            })
+            .collect()
+    });
+
+    for (id, phase, pos, force) in touches {
+        let (x, y) = normalized_in(pos, rect);
+        match phase {
+            egui::TouchPhase::Start => {
+                // A touch that began off the video belongs to the toolbar or
+                // the window edge, and claims no slot.
+                if !rect.contains(pos) {
+                    continue;
+                }
+                let Some(slot) = session.touch_slot(id) else { continue };
+                session.send_input(InputEvent::Touch(TouchEvent {
+                    id: slot,
+                    phase: TouchPhase::Start,
+                    x,
+                    y,
+                    pressure: to_pressure(force),
+                }));
+            }
+            // Not gated on the rect: a finger that drifts past the edge of the
+            // video is still part of the gesture that started inside it, and
+            // dropping it would strand the contact on the host.
+            egui::TouchPhase::Move => {
+                let Some(slot) = session.touch_slot_if_live(id) else { continue };
+                session.send_input(InputEvent::Touch(TouchEvent {
+                    id: slot,
+                    phase: TouchPhase::Move,
+                    x,
+                    y,
+                    pressure: to_pressure(force),
+                }));
+            }
+            egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                let Some(slot) = session.release_touch_slot(id) else { continue };
+                session.send_input(InputEvent::Touch(TouchEvent {
+                    id: slot,
+                    phase: if matches!(phase, egui::TouchPhase::End) {
+                        TouchPhase::End
+                    } else {
+                        TouchPhase::Cancel
+                    },
+                    x,
+                    y,
+                    pressure: 0,
+                }));
+            }
+        }
+    }
+}
+
+/// Lift every contact the host still believes is down.
+///
+/// Cheap when there are none, which is almost always: it is a scan of ten
+/// `Option`s that usually finds nothing and sends nothing.
+fn release_touches(session: &mut GuestSession) {
+    for slot in session.take_touch_slots() {
+        session.send_input(InputEvent::Touch(TouchEvent {
+            id: slot,
+            phase: TouchPhase::Cancel,
+            // Where it was is not known here and does not matter: the host
+            // lifts the contact from wherever it last put it.
+            x: 0,
+            y: 0,
+            pressure: 0,
+        }));
+    }
+}
+
+/// A point in the video, as the fraction of the screen the wire carries.
+fn normalized_in(pos: egui::Pos2, rect: egui::Rect) -> (u16, u16) {
+    let event = MouseEvent::from_fraction(
+        (pos.x - rect.left()) / rect.width(),
+        (pos.y - rect.top()) / rect.height(),
+    );
+    (event.x, event.y)
+}
+
+/// egui's `0.0..=1.0` force as the wire's `1..=255`.
+///
+/// `0` means the digitizer did not report any, which most do not.
+fn to_pressure(force: Option<f32>) -> u8 {
+    match force {
+        Some(force) if force > 0.0 => (force.clamp(0.0, 1.0) * 255.0).round().max(1.0) as u8,
+        _ => 0,
     }
 }
 

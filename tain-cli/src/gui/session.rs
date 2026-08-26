@@ -113,6 +113,17 @@ pub struct GuestSession {
     empty_frames: u32,
     last_pointer: Option<(u16, u16)>,
     buttons_down: [bool; 3],
+    /// Which of the wire's contact slots each live finger is using.
+    ///
+    /// egui identifies a contact with an arbitrary 64-bit number, and the wire
+    /// carries a byte — because the host's injector holds its contacts in an
+    /// array of a size it declared up front. So the mapping is made here, at
+    /// the only place that sees a finger arrive and leave.
+    ///
+    /// The lowest free slot is taken on `Start` and returned on `End`, which
+    /// keeps a two-finger gesture on slots 0 and 1 no matter how many fingers
+    /// have been and gone before it.
+    touch_slots: [Option<u64>; tain_core::protocol::MAX_TOUCH_CONTACTS as usize],
     modifiers: ModifierTracker,
     keys_down: Vec<u16>,
     /// The most recent picture of this host, and when it was taken.
@@ -191,6 +202,7 @@ impl GuestSession {
             empty_frames: 0,
             last_pointer: None,
             buttons_down: [false; 3],
+            touch_slots: [None; tain_core::protocol::MAX_TOUCH_CONTACTS as usize],
             modifiers: ModifierTracker::default(),
             keys_down: Vec::new(),
             preview: None,
@@ -278,6 +290,7 @@ impl GuestSession {
             empty_frames: 0,
             last_pointer: None,
             buttons_down: [false; 3],
+            touch_slots: [None; tain_core::protocol::MAX_TOUCH_CONTACTS as usize],
             modifiers: ModifierTracker::default(),
             keys_down: Vec::new(),
             preview: None,
@@ -775,6 +788,54 @@ impl GuestSession {
         self.last_pointer = Some(point);
     }
 
+    /// The wire slot for a finger that is down, allocating one if it is new.
+    ///
+    /// `None` when every slot is taken — an eleventh finger, which the host
+    /// could not inject anyway.
+    pub fn touch_slot(&mut self, id: u64) -> Option<u8> {
+        if let Some(slot) = self.touch_slots.iter().position(|s| *s == Some(id)) {
+            return Some(slot as u8);
+        }
+        let free = self.touch_slots.iter().position(Option::is_none)?;
+        self.touch_slots[free] = Some(id);
+        Some(free as u8)
+    }
+
+    /// The slot a finger already holds, without handing out a new one.
+    ///
+    /// For movement, which must not start a gesture: a contact that began
+    /// outside the video was never forwarded, and its first `Move` inside is
+    /// not a press.
+    pub fn touch_slot_if_live(&self, id: u64) -> Option<u8> {
+        self.touch_slots.iter().position(|s| *s == Some(id)).map(|slot| slot as u8)
+    }
+
+    /// Give a slot back, returning the one that was in use.
+    ///
+    /// `None` for a finger that was never allocated one, which is a lift for a
+    /// touch that started somewhere it was not being forwarded from.
+    pub fn release_touch_slot(&mut self, id: u64) -> Option<u8> {
+        let slot = self.touch_slots.iter().position(|s| *s == Some(id))?;
+        self.touch_slots[slot] = None;
+        Some(slot as u8)
+    }
+
+    /// Every slot currently held, and clear them.
+    ///
+    /// For the cases where forwarding stops with fingers still down — the host
+    /// withdrawing the mouse grant, the pointer moving onto the toolbar. The
+    /// caller has to tell the host those contacts are gone, or they stay
+    /// pressed against its screen with nothing left to lift them.
+    pub fn take_touch_slots(&mut self) -> Vec<u8> {
+        let mut held = Vec::new();
+        for (slot, id) in self.touch_slots.iter_mut().enumerate() {
+            if id.take().is_some() {
+                held.push(slot as u8);
+            }
+        }
+        held
+    }
+
     pub fn button_state(&self, index: usize) -> bool {
         self.buttons_down[index]
     }
@@ -858,6 +919,7 @@ impl GuestSession {
         self.input_tx = None;
         self.texture = None;
         self.last_pointer = None;
+        self.touch_slots = [None; tain_core::protocol::MAX_TOUCH_CONTACTS as usize];
         self.shared.reset();
         debug!("Session tab {} closed", self.tab_id);
     }
@@ -1013,6 +1075,62 @@ mod tests {
         session.set_test_grants(true, true);
         session.seed_input_toggles();
         assert!(session.want_mouse, "grants arriving late must still seed the toggles");
+    }
+
+    /// Two fingers must keep the two lowest slots, however many have been
+    /// and gone before them.
+    ///
+    /// The host holds its contacts in an array sized once, up front. Slots that
+    /// climbed with every touch would walk off the end of it during any long
+    /// session on a touchscreen.
+    #[test]
+    fn contact_slots_are_reused_rather_than_climbing() {
+        let mut session = GuestSession::test_stub();
+
+        for finger in 0..40u64 {
+            assert_eq!(session.touch_slot(finger), Some(0), "a lone finger is slot zero");
+            assert_eq!(session.release_touch_slot(finger), Some(0));
+        }
+
+        // Two at once take the two lowest, and the lower is freed first.
+        assert_eq!(session.touch_slot(100), Some(0));
+        assert_eq!(session.touch_slot(101), Some(1));
+        assert_eq!(session.release_touch_slot(100), Some(0));
+        assert_eq!(session.touch_slot(102), Some(0), "the freed slot is the next one out");
+    }
+
+    /// A finger already down keeps its slot rather than taking another.
+    #[test]
+    fn asking_twice_for_a_live_contact_gives_the_same_slot() {
+        let mut session = GuestSession::test_stub();
+        let first = session.touch_slot(7).expect("a free slot");
+        assert_eq!(session.touch_slot(7), Some(first));
+        assert_eq!(session.touch_slot_if_live(7), Some(first));
+        assert_eq!(session.touch_slot_if_live(8), None, "movement must not start a gesture");
+    }
+
+    /// More fingers than the host can inject are refused, not wrapped around.
+    #[test]
+    fn contacts_beyond_the_hosts_capacity_are_refused() {
+        let mut session = GuestSession::test_stub();
+        let capacity = tain_core::protocol::MAX_TOUCH_CONTACTS as u64;
+        for finger in 0..capacity {
+            assert!(session.touch_slot(finger).is_some(), "finger {finger} should fit");
+        }
+        assert_eq!(session.touch_slot(capacity), None, "one finger too many gets no slot");
+    }
+
+    /// Every contact has to be lift-able when forwarding stops mid-gesture.
+    #[test]
+    fn taking_the_held_slots_reports_them_all_and_leaves_none() {
+        let mut session = GuestSession::test_stub();
+        for finger in 0..3u64 {
+            session.touch_slot(finger);
+        }
+        assert_eq!(session.take_touch_slots(), vec![0, 1, 2]);
+        assert!(session.take_touch_slots().is_empty(), "a second call has nothing left to lift");
+        // And the slots are genuinely free again.
+        assert_eq!(session.touch_slot(99), Some(0));
     }
 
     use super::*;
