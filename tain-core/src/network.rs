@@ -1273,12 +1273,18 @@ impl Window {
         values[values.len() / 2]
     }
 
-    fn observe(&mut self, elapsed: Duration, guest: Option<super::protocol::GuestTelemetry>) -> super::adaptive::Observation {
+    fn observe(
+        &mut self,
+        elapsed: Duration,
+        guest: Option<super::protocol::GuestTelemetry>,
+        acks_stale: bool,
+    ) -> super::adaptive::Observation {
         super::adaptive::Observation {
             capture_ms: Self::median(&mut self.capture),
             encode_ms: Self::median(&mut self.encode),
             send_blocked_ms: Self::median(&mut self.blocked),
             achieved_fps: self.frames as f32 / elapsed.as_secs_f32().max(0.001),
+            acks_stale,
             guest,
         }
     }
@@ -1799,7 +1805,12 @@ fn spawn_capture_pipeline(
                 }
 
                 let guest = *telemetry.lock().unwrap();
-                let observation = window.observe(elapsed, guest);
+                // The same silence the flow-control window uses to decide a
+                // guest cannot ack — see `AckState::is_reporting`. There it
+                // opens the window so frames keep flowing; here it is what
+                // tells the controller they are flowing nowhere.
+                let acks_stale = !acks.lock().unwrap().is_reporting();
+                let observation = window.observe(elapsed, guest, acks_stale);
                 window.clear();
                 window_started = std::time::Instant::now();
 

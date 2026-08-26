@@ -178,6 +178,17 @@ impl Duplication {
                     Ok(ready) => converter = Some(ready),
                     Err(e) => {
                         colour_log.conversion_refused(&e);
+                        // # The first duplication has to be let go of first
+                        //
+                        // DXGI permits one duplication per output per process,
+                        // and asking for a second while the first is alive is
+                        // refused. `duplication = duplicate(..)` evaluates the
+                        // new one before dropping the old, so the fallback
+                        // added to rescue an HDR desktop was itself asking for
+                        // something impossible — and answered, as the machine
+                        // that reported it showed, with the same "parameter is
+                        // incorrect" as the call it was replacing.
+                        drop(duplication);
                         duplication = duplicate(&device, &output1, false)?;
                         size = duplication_size(&duplication);
                     }

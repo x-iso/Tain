@@ -322,7 +322,8 @@ pub fn negotiate_format(
     }
     if !capturer.request_format(wanted) {
         info!(
-            "Capture format: BGRA — the encoder wanted {wanted:?} and the capture              backend would not produce it, so every frame is converted on the CPU"
+            "Capture format: BGRA — the encoder wanted {wanted:?} and the capture \
+             backend would not produce it, so every frame is converted on the CPU"
         );
         return PixelFormat::Bgra;
     }

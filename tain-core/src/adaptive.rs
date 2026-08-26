@@ -210,6 +210,23 @@ pub struct Observation {
     pub send_blocked_ms: f32,
     /// Frames per second the pipeline actually produced.
     pub achieved_fps: f32,
+    /// Whether the guest has stopped acknowledging frames.
+    ///
+    /// # Why this is its own field and not read from the round trip
+    ///
+    /// A guest that has said nothing for seconds reports no round trip at all,
+    /// so every latency-shaped signal goes quiet exactly when the link is at its
+    /// worst. The send path does not notice either: after the same silence the
+    /// flow-control window is deliberately opened, on the reasoning that a guest
+    /// which cannot ack should not also be starved of frames — so the pipeline
+    /// stops blocking and starts looking healthy.
+    ///
+    /// Measured, on a session relayed halfway around the world: acks fifteen
+    /// seconds stale, a hundred and thirty frames outstanding against a window
+    /// of four, and the controller raising the bitrate from 1.8 to 9.3 Mbit/s
+    /// across those same fifteen seconds because nothing it could see said
+    /// otherwise.
+    pub acks_stale: bool,
     /// Most recent guest report, if one has arrived.
     pub guest: Option<GuestTelemetry>,
 }
@@ -657,6 +674,12 @@ impl AdaptiveController {
         if obs.send_blocked_ms > budget * 0.5 {
             set.insert(Bottleneck::SlowNetwork);
         }
+        // Nothing coming back is the least ambiguous of all. Whatever else is
+        // true, a link that has not acknowledged a frame in seconds is not
+        // carrying them, and sending more is the one response that cannot help.
+        if obs.acks_stale {
+            set.insert(Bottleneck::SlowNetwork);
+        }
 
         if let Some(guest) = obs.guest {
             if guest.decode_ms > budget {
@@ -876,6 +899,7 @@ mod tests {
             encode_ms: 6.0,
             send_blocked_ms: 0.0,
             achieved_fps: 60.0,
+            acks_stale: false,
             guest: Some(GuestTelemetry {
                 decode_ms: 4.0,
                 render_ms: 2.0,
@@ -1014,6 +1038,50 @@ mod tests {
             first.bitrate_kbps < ceiling().bitrate_kbps,
             "bitrate is the axis a saturated uplink binds on, got {first:?}"
         );
+    }
+
+    /// A guest that has stopped acknowledging frames must stop the climb.
+    ///
+    /// Measured, on a session relayed halfway around the world: acks fifteen
+    /// seconds stale, a hundred and thirty frames outstanding against a window
+    /// of four, and the controller raising the bitrate from 1.8 to 9.3 Mbit/s
+    /// across those same fifteen seconds. Everything it could see said the
+    /// stream was healthy — the send path had stopped blocking, because after
+    /// the same silence the flow-control window is deliberately opened, and the
+    /// guest reported no round trip because it was reporting nothing at all.
+    #[test]
+    fn silence_from_the_guest_is_not_a_reason_to_send_more() {
+        let mut c = AdaptiveController::new(LatencyPriority::BALANCED, ceiling(), NATIVE);
+
+        // Get the stream down a few rungs, so there is something to climb back.
+        let blocked = Observation { send_blocked_ms: 40.0, ..healthy() };
+        let mut clock = Instant::now();
+        for _ in 0..12 {
+            clock += MIN_DWELL + Duration::from_millis(1);
+            c.observe_at(&blocked, clock);
+        }
+        let dropped_to = c.plan();
+        assert!(c.is_degraded(), "the test needs a stream with something to recover");
+
+        // Now the guest goes quiet. Nothing blocks, nothing is reported, and
+        // without the ack signal every one of these windows reads as clean.
+        let silent = Observation {
+            send_blocked_ms: 0.0,
+            acks_stale: true,
+            guest: None,
+            ..healthy()
+        };
+        for _ in 0..40 {
+            clock += MIN_DWELL + Duration::from_millis(1);
+            c.observe_at(&silent, clock);
+        }
+
+        assert!(
+            c.plan().bitrate_kbps <= dropped_to.bitrate_kbps,
+            "the bitrate climbed to {} while nothing was getting through",
+            c.plan().bitrate_kbps
+        );
+        assert!(c.bottlenecks().contains(Bottleneck::SlowNetwork));
     }
 
     /// A queue must not be paid for more than once.
@@ -1304,6 +1372,7 @@ mod tests {
     fn each_stage_is_identified_separately() {
         let mut c = AdaptiveController::new(LatencyPriority::BALANCED, ceiling(), NATIVE);
         let bad = Observation {
+            acks_stale: false,
             capture_ms: 50.0,
             encode_ms: 50.0,
             send_blocked_ms: 50.0,
