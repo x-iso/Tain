@@ -86,6 +86,8 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         component.as_deref().unwrap_or("application"),
     );
+    #[cfg(target_os = "windows")]
+    log_dpi_awareness();
 
     // # Three ways this executable can start
     //
@@ -259,11 +261,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Ask for per-monitor DPI awareness, before anything decides for us.
+/// Ask for per-monitor DPI awareness, and report what we actually got.
 ///
-/// Failure is not worth reporting: the usual cause is that something already
-/// settled it, which is exactly the case this exists to get in front of and
-/// nothing here can undo.
+/// The manifest embedded by the build script should already have settled this
+/// before any code ran — see `build.rs`. This call is the fallback for a binary
+/// built without it, and it fails harmlessly when the manifest did its job.
+///
+/// # Why the answer is logged
+///
+/// Getting this wrong is invisible from inside: a merely *system* aware process
+/// is told the primary monitor's DPI everywhere and quietly bitmap-stretched
+/// onto every other one. Everything reads as consistent, the numbers all agree,
+/// and the only symptom is an interface at the wrong size on the second
+/// monitor. Two attempts were spent on that. One line says which of the three
+/// answers this process actually has.
 #[cfg(target_os = "windows")]
 fn declare_dpi_awareness() {
     use windows::Win32::UI::HiDpi::{
@@ -273,6 +284,34 @@ fn declare_dpi_awareness() {
     // SAFETY: a documented call taking a constant, with no resources involved.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// Say which of the three answers this process ended up with.
+///
+/// Separate from declaring it because the declaration has to happen before
+/// anything else and there is no log to write to yet.
+#[cfg(target_os = "windows")]
+fn log_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+        DPI_AWARENESS_PER_MONITOR_AWARE, DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
+    };
+
+    // SAFETY: documented reads of this thread's own awareness.
+    unsafe {
+        let awareness = GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext());
+        let named = match awareness {
+            DPI_AWARENESS_PER_MONITOR_AWARE => "per-monitor",
+            DPI_AWARENESS_SYSTEM_AWARE => "system only — other monitors will be stretched",
+            DPI_AWARENESS_UNAWARE => "unaware — Windows will scale this window itself",
+            _ => "unrecognised",
+        };
+        if awareness == DPI_AWARENESS_PER_MONITOR_AWARE {
+            tracing::debug!("DPI awareness: {named}");
+        } else {
+            tracing::warn!("DPI awareness: {named}");
+        }
     }
 }
 
