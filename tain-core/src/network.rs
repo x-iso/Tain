@@ -1643,17 +1643,36 @@ fn spawn_capture_pipeline(
                 // — before the encoder — is the only safe place: no inter-frame
                 // state has been created yet, so the next frame we do encode
                 // still references one the guest has.
-                // Against the rate frames are *actually* leaving at, not the one
-                // the plan hopes for. A window counted in frames while the plan
-                // says 60 and the stream runs at 20 is a third of the time it
-                // was meant to be.
-                let effective_fps = if observed_fps > 1.0 {
-                    observed_fps.round() as u32
-                } else {
-                    controller.plan().fps
-                };
+                // # Sized from the rate being aimed for, not the one achieved
+                //
+                // This used to use the observed rate, to keep the window a
+                // consistent *duration* rather than a frame count. The
+                // reasoning was sound and the result was a ratchet.
+                //
+                // Throughput through a window is `window / ack_latency`, and
+                // the window is `ack_latency / frame_interval`. Compute the
+                // frame interval from the observed rate and the two equations
+                // close on themselves: a stream at 10 fps has a 100 ms frame
+                // interval, so with a 150 ms ack it gets a window of two, which
+                // admits about 13 fps, which keeps it at 10 fps, which keeps
+                // the window at two. A stable point far below what the link can
+                // carry, and nothing in the loop can climb out of it — the
+                // window shrank *because* the rate fell, and the rate cannot
+                // rise until the window does.
+                //
+                // Measured on a link with 30 Mbit/s upstream and a 40 ms round
+                // trip: 10.7 frames a second at 1.2 Mbit/s, with the host
+                // reporting a slow network throughout.
+                //
+                // Sized from the plan instead, the window is the
+                // bandwidth-delay product of the rate being attempted, which is
+                // what a window is for. The stream can then reach the plan, and
+                // if the link genuinely cannot carry it the blocked-send
+                // measurement says so and the controller lowers the plan — one
+                // feedback loop, driven by measurement, instead of two driving
+                // each other downwards.
                 let allowed =
-                    send_window(ack_or_rtt_ms(&acks, &telemetry), effective_fps);
+                    send_window(ack_or_rtt_ms(&acks, &telemetry), controller.plan().fps);
                 let too_far_ahead = {
                     let mut state = acks.lock().unwrap();
                     state.begin();
@@ -3007,6 +3026,54 @@ mod tests {
         state.record(50);
         state.record(20);
         assert_eq!(state.sequence, 50);
+    }
+
+    /// The window has to admit the rate it was sized for.
+    ///
+    /// Throughput through the window is `window / ack_latency`. If that comes
+    /// out below the rate being attempted, the stream can never reach the plan
+    /// however good the link is — it settles wherever the window happens to
+    /// pin it.
+    #[test]
+    fn the_window_admits_the_rate_it_is_sized_for() {
+        for fps in [15u32, 30, 60] {
+            for ack_ms in [20.0f32, 60.0, 150.0] {
+                let window = send_window(ack_ms, fps) as f32;
+                let admitted = window / (ack_ms / 1000.0);
+                assert!(
+                    admitted >= fps as f32 * 0.5,
+                    "a window of {window} at {ack_ms} ms admits {admitted:.0} fps, \
+                     which cannot sustain a {fps} fps plan",
+                );
+            }
+        }
+    }
+
+    /// Why the window is sized from the plan and not from what is achieved.
+    ///
+    /// Sizing it from the achieved rate does not lock a stream in place — the
+    /// window always admits somewhat more than the rate that produced it, so
+    /// there is a way up. It is a *drag*, and how heavy depends on the ack
+    /// latency: the headroom is one window's worth per acknowledgement, which
+    /// shrinks as acknowledgements slow down. On a link where acks take four
+    /// hundred milliseconds a stream at 10 fps is allowed twelve, and climbing
+    /// back to sixty from there takes longer than anyone watches.
+    ///
+    /// Kept as arithmetic because the call site reads perfectly reasonably
+    /// either way and the difference between them does not show up until
+    /// somebody counts frames on a link that is nowhere near saturated.
+    #[test]
+    fn sizing_the_window_from_the_achieved_rate_drags() {
+        // Slow acknowledgements are where the two answers diverge.
+        let ack_ms = 400.0;
+
+        let from_achieved = send_window(ack_ms, 10) as f32 / (ack_ms / 1000.0);
+        let from_plan = send_window(ack_ms, 60) as f32 / (ack_ms / 1000.0);
+
+        assert!(
+            from_plan > from_achieved * 1.5,
+            "sized from the plan the window admits {from_plan:.0} fps, from the achieved              rate only {from_achieved:.0} — the second is the drag this avoids",
+        );
     }
 
     #[test]
