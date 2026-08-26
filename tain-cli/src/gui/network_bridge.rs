@@ -446,6 +446,22 @@ pub struct GuestSessionState {
     pub host_name: Arc<Mutex<Option<String>>>,
     /// Measurements from this side, and the host's diagnosis coming back.
     pub health: Arc<Mutex<StreamHealth>>,
+    /// The codec the host said it is sending, once it has said.
+    ///
+    /// # Why this is shared rather than local to a reader
+    ///
+    /// The host names its codec in `SessionStart`, which travels on the control
+    /// stream. Frames travel on their own stream now, read by a second loop
+    /// with its own decoder — and that loop never sees `SessionStart`, so it
+    /// never learned what it was decoding. Every frame was refused with "the
+    /// host sent a frame before saying which codec it uses": eight frames a
+    /// second arriving, none decoded, a session stuck on "waiting for video".
+    ///
+    /// Splitting the streams was right; leaving the codec in one reader's local
+    /// state was what broke. It belongs to the session, not to whichever loop
+    /// happened to hear about it, and `CodecChanged` mid-session reaches the
+    /// frame reader the same way.
+    pub codec: Arc<Mutex<Option<VideoCodec>>>,
 }
 
 impl Default for GuestSessionState {
@@ -473,6 +489,7 @@ impl GuestSessionState {
             )),
             viewport: Arc::new(Mutex::new(None)),
             host_name: Arc::new(Mutex::new(None)),
+            codec: Arc::new(Mutex::new(None)),
             health: Arc::new(Mutex::new(StreamHealth::default())),
         }
     }
@@ -1118,6 +1135,12 @@ where
     // The host names the codec in SessionStart; anything unrecognised is a
     // version mismatch, and guessing would render garbage.
     let mut decoder = FrameDecoder::Pending;
+    // What `decoder` was built for, so a reader that learns the codec from the
+    // session rather than from a message knows whether it already has the right
+    // one. Kept beside the decoder rather than derived from it: a method
+    // mapping every variant back to a codec is one more thing to keep in step
+    // with the variants.
+    let mut built_for: Option<VideoCodec> = None;
 
     let mut tally = FrameTally::default();
     let mut tallied_at = std::time::Instant::now();
@@ -1149,7 +1172,9 @@ where
                         ss.encoder_type
                     )
                 })?;
+                *shared.codec.lock().unwrap() = Some(codec);
                 decoder = FrameDecoder::for_codec(codec)?;
+                built_for = Some(codec);
                 // Published so the render thread can try to open it for sharing.
                 shared.gpu_device.store(decoder.gpu_device(), Ordering::Relaxed);
                 *shared.remote_size.lock().unwrap() = (ss.screen_info.width, ss.screen_info.height);
@@ -1257,6 +1282,26 @@ where
                 health.note_clock(echo, host_ms, arrived);
             }
             Message::Frame(fm) => {
+                // # The stream carrying frames is not the one carrying the
+                // announcement
+                //
+                // This reader may be the one on the video stream, which never
+                // sees `SessionStart` or `CodecChanged`. It takes the answer
+                // from the session instead, and rebuilds when it changes —
+                // which is also how a mid-session codec switch reaches it.
+                //
+                // Compared every frame because the comparison is two words and
+                // getting it wrong means decoding H.265 as H.264: not an error,
+                // just a picture made of garbage.
+                let agreed = *shared.codec.lock().unwrap();
+                if let Some(agreed) = agreed
+                    && built_for != Some(agreed)
+                {
+                    decoder = FrameDecoder::for_codec(agreed)?;
+                    built_for = Some(agreed);
+                    shared.gpu_device.store(decoder.gpu_device(), Ordering::Relaxed);
+                }
+
                 tally.arrived += 1;
                 tally.bytes += fm.data.len();
                 // Stamped by the host at encode time, read against this
@@ -1356,7 +1401,9 @@ where
                 match VideoCodec::from_wire_name(&change.encoder_type) {
                     Some(codec) => {
                         info!("Host switched to {} — rebuilding the decoder", codec.label());
+                        *shared.codec.lock().unwrap() = Some(codec);
                         decoder = FrameDecoder::for_codec(codec)?;
+                        built_for = Some(codec);
                         shared.gpu_device.store(decoder.gpu_device(), Ordering::Relaxed);
                         // A new decoder has no reference frames at all, and the
                         // host's next frame is only a keyframe by luck.
@@ -1465,6 +1512,44 @@ mod tests {
         assert!(waiting.is_active());
         assert!(waiting.label().to_lowercase().contains("host"));
         assert_ne!(waiting.label(), GuestStatus::Connecting.label());
+    }
+
+    /// A reader that never hears the announcement still has to decode.
+    ///
+    /// The regression this pins: frames moved to their own stream, and the loop
+    /// reading that stream never sees `SessionStart`, where the codec is named.
+    /// Every frame was refused — eight a second arriving, none decoded, a
+    /// session stuck on "waiting for video" with the reason in the log all
+    /// along. The codec belongs to the session rather than to whichever reader
+    /// happened to hear about it.
+    #[tokio::test]
+    async fn a_reader_takes_the_codec_from_the_session_when_it_never_hears_it() {
+        use tain_core::protocol::{FrameMessage, Message};
+
+        let shared = GuestSessionState::new();
+        // What the control stream would have learned and written down.
+        *shared.codec.lock().unwrap() = Some(VideoCodec::Raw);
+
+        // One 2x2 frame, and nothing else — no `SessionStart` anywhere.
+        let (mut host, mut guest) = tokio::io::duplex(64 * 1024);
+        let frame = Message::Frame(FrameMessage {
+            sequence_number: 1,
+            width: 2,
+            height: 2,
+            timestamp_ms: 0,
+            is_keyframe: true,
+            data: vec![0u8; 2 * 2 * 4],
+        });
+        tain_core::network::write_stream_message(&mut host, &frame).await.unwrap();
+        drop(host);
+
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u32>();
+        let (control_tx, _control_rx) = mpsc::unbounded_channel::<Message>();
+        receive_loop(&mut guest, &shared, ack_tx, control_tx, || {}).await.unwrap();
+
+        // Acked means decoded: the loop refuses a frame it cannot read.
+        assert_eq!(ack_rx.try_recv().ok(), Some(1), "the frame should have been decoded");
+        assert!(shared.frame.lock().unwrap().is_some(), "and handed to the renderer");
     }
 
     #[test]
