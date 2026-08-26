@@ -107,11 +107,18 @@ mod platform {
         agent: Option<AgentReader>,
         /// Whether the last look found the input on a desktop we can capture.
         had_local_input: bool,
+        /// Frames taken from the agent since it was last connected.
+        ///
+        /// Counted so the two ends can be told apart in a log. "The agent sent
+        /// nothing" and "the host received nothing" look identical from either
+        /// side alone, and the first time this failed it took both logs to see
+        /// that nothing had failed at all — the picture simply stopped.
+        from_agent: u64,
     }
 
     impl DesktopFollowing {
         pub fn new(local: Box<dyn ScreenCaptureBackend>) -> Self {
-            Self { local, agent: None, had_local_input: true }
+            Self { local, agent: None, had_local_input: true, from_agent: 0 }
         }
 
         /// Whether this process can still see the desktop receiving input.
@@ -145,7 +152,11 @@ mod platform {
             if local != self.had_local_input {
                 self.had_local_input = local;
                 if local {
-                    tracing::info!("The input is back on this desktop — capturing here again");
+                    tracing::info!(
+                        "The input is back on this desktop — capturing here again ({} frames                          came from the agent)",
+                        self.from_agent,
+                    );
+                    self.from_agent = 0;
                     // Dropping it closes the pipe, which is what tells the
                     // agent to stop capturing. The link goes first, so no
                     // click can be sent down a pipe that is about to close.
@@ -183,7 +194,17 @@ mod platform {
 
             let Some(reader) = self.agent.as_mut() else { return Ok(None) };
             match reader.take() {
-                Some(frame) => Ok(Some(frame)),
+                Some(frame) => {
+                    self.from_agent += 1;
+                    if self.from_agent == 1 {
+                        tracing::info!(
+                            "First frame from the {SECURE_DESKTOP} agent: {}x{}",
+                            frame.width,
+                            frame.height,
+                        );
+                    }
+                    Ok(Some(frame))
+                }
                 None if reader.finished() => {
                     tracing::info!("The {SECURE_DESKTOP} agent stopped sending");
                     if let Ok(mut link) = LINK.lock() {

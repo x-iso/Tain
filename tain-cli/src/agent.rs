@@ -51,9 +51,25 @@
 //!
 //! The second of those was the one in doubt. Desktop Duplication has its own
 //! rules about which desktop and which session may open an output, and being
-//! SYSTEM does not automatically settle them. It turns out the secure desktop
-//! duplicates like any other, so the remaining work was transport and this file
-//! now does it: capture while a host is connected, and send.
+//! SYSTEM does not automatically settle them.
+//!
+//! # The probe that answered it also broke what came next
+//!
+//! It ran once, the first time the agent held the input, and created its own
+//! capturer to do it. That was harmless while nothing else captured. The moment
+//! serving arrived it was not: both attach to the same shared capture, they
+//! started within microseconds of each other, and the probe took the first
+//! frame.
+//!
+//! Which was the only frame there was going to be. Desktop Duplication reports
+//! *changes*, and a consent prompt does not move — so after the probe consumed
+//! the opening image the serving loop saw nothing for the rest of the prompt,
+//! sent nothing, and the guest kept showing the last frame from the ordinary
+//! desktop. A freeze, with nothing failing anywhere to say so.
+//!
+//! The probe is gone. What it measured is measured on the frames actually
+//! served, where it costs one pass over the first frame and cannot take
+//! anything away from anybody.
 
 use anyhow::Result;
 
@@ -112,10 +128,6 @@ mod platform {
         // agent's log and one in the other's — and a line every 300ms would
         // bury it.
         let mut had_input: Option<bool> = None;
-        // Tried once, the first time this agent holds the input. See the note
-        // at the top of this file.
-        let mut capture_probed = false;
-
         // The pipe waits on its own thread, because accepting a connection
         // blocks and this loop has a desktop to watch.
         let serving = {
@@ -145,11 +157,6 @@ mod platform {
                     ),
                 }
                 had_input = Some(mine);
-            }
-
-            if mine && !capture_probed {
-                capture_probed = true;
-                probe_capture(&started_on);
             }
 
             std::thread::sleep(WATCH);
@@ -187,6 +194,14 @@ mod platform {
             let injector = tain_core::input_inject::create_injector();
             tracing::info!("Serving {desktop}: capture started for a connected host");
 
+            // Measured on the way past, on the first frame only. A duplication
+            // that starts, returns a rectangle of zeroes and reports success
+            // looks exactly like a working one from a return code, and on the
+            // secure desktop that is a real possibility rather than a
+            // hypothetical: one machine reported 99.9% of pixels lit and
+            // another 0.0%, from the same code.
+            let mut sent = 0u64;
+
             while RUNNING.load(Ordering::Relaxed) {
                 // Drained every pass, including the ones where nothing is
                 // captured. A guest moving the pointer over a still prompt
@@ -211,12 +226,35 @@ mod platform {
                     // consent prompt is most of the time. Not an error, and not
                     // worth a frame.
                     Ok(None) => std::thread::sleep(std::time::Duration::from_millis(16)),
-                    Ok(Some(frame)) => writer.send(&PipeFrame {
-                        width: frame.width,
-                        height: frame.height,
-                        format: frame.format as u8,
-                        data: frame.data.to_vec(),
-                    })?,
+                    Ok(Some(frame)) => {
+                        if sent == 0 {
+                            let lit = frame
+                                .data
+                                .chunks_exact(4)
+                                .filter(|p| p[0] | p[1] | p[2] != 0)
+                                .count();
+                            let total = (frame.data.len() / 4).max(1);
+                            tracing::info!(
+                                "Serving {desktop}: first frame {}x{}, {:.1}% of pixels not \
+                                 black",
+                                frame.width,
+                                frame.height,
+                                lit as f32 * 100.0 / total as f32,
+                            );
+                        }
+                        writer.send(&PipeFrame {
+                            width: frame.width,
+                            height: frame.height,
+                            format: frame.format as u8,
+                            data: frame.data.to_vec(),
+                        })?;
+                        sent += 1;
+                        // Every hundred, so a stream that is running says so
+                        // without a line per frame.
+                        if sent.is_multiple_of(100) {
+                            tracing::debug!("Serving {desktop}: {sent} frames sent");
+                        }
+                    }
                     Err(e) => {
                         // A desktop switch invalidates a duplication, and the
                         // next connection will make a fresh one. Ending the
@@ -236,60 +274,6 @@ mod platform {
     /// Whether this desktop currently has the input.
     fn owns_input(desktop: &str) -> bool {
         input_desktop_name().is_some_and(|live| live.eq_ignore_ascii_case(desktop))
-    }
-
-    /// Try once to capture this desktop, and say what happened.
-    ///
-    /// Deliberately says more than "it worked". A duplication that starts, hands
-    /// back a rectangle of zeroes and reports success is indistinguishable from
-    /// a working one at the level of a return code, and would send the next
-    /// stage building transport for a black screen. So the frame is measured:
-    /// its size, and how many of its pixels are not black.
-    fn probe_capture(desktop: &str) {
-        use tain_core::screen_capture::{create_capturer, CaptureConfig};
-
-        let config = CaptureConfig::default();
-        let mut capturer = match create_capturer(config) {
-            Ok(capturer) => capturer,
-            Err(e) => {
-                tracing::warn!("Capture probe on {desktop}: could not start a capturer: {e:#}");
-                return;
-            }
-        };
-
-        let size = capturer.frame_size();
-        tracing::info!("Capture probe on {desktop}: capturer started, {}x{}", size.0, size.1);
-
-        // Desktop Duplication reports "no new frame" until something changes,
-        // which on a static consent prompt is most of the time. A handful of
-        // attempts over a second is enough to catch the first one.
-        for attempt in 1..=20 {
-            match capturer.capture_next() {
-                Ok(Some(frame)) => {
-                    let data = &frame.data;
-                    let lit = data.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
-                    let total = (data.len() / 4).max(1);
-                    tracing::info!(
-                        "Capture probe on {desktop}: got a frame after {attempt} attempts — \
-                         {}x{}, {} bytes, {:.1}% of pixels not black",
-                        frame.width,
-                        frame.height,
-                        data.len(),
-                        lit as f32 * 100.0 / total as f32,
-                    );
-                    return;
-                }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-                Err(e) => {
-                    tracing::warn!("Capture probe on {desktop}: capture failed: {e:#}");
-                    return;
-                }
-            }
-        }
-        tracing::warn!(
-            "Capture probe on {desktop}: the capturer started but produced no frame in a \
-             second. Nothing changed on screen, or this desktop does not duplicate."
-        );
     }
 
     /// The name of the desktop this thread is on.
