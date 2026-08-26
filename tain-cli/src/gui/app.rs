@@ -1740,6 +1740,10 @@ impl GuestApp {
                     ui.checkbox(
                         &mut grants.mouse,
                         egui::RichText::new("Mouse").color(TEXT),
+                    )
+                    .on_hover_text(
+                        "Also covers touch, if they are using a touchscreen — it is \
+                         the same act of pointing at your screen.",
                     );
                     ui.checkbox(
                         &mut grants.keyboard,

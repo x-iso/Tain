@@ -849,7 +849,8 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
         .response
         .on_hover_text(
             "Which boxes start ticked in the approval dialog. \
-             You still have to allow each connection.",
+             You still have to allow each connection. \
+             Mouse also covers touch.",
         );
         ui.end_row();
     });
