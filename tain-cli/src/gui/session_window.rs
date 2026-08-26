@@ -28,6 +28,31 @@ use super::theme::{self, *};
 /// One notch is roughly 50 points on a typical mouse.
 const POINTS_PER_DETENT: f32 = 50.0;
 
+/// Turn egui's scroll delta into the protocol's.
+///
+/// # The horizontal axis is the other way round
+///
+/// The two conventions agree vertically and disagree horizontally, which is
+/// why this was wrong in only one axis and went unnoticed until somebody used
+/// a trackpad. winit, which is where egui's deltas come from, documents them as
+///
+/// > Positive values indicate that the content that is being scrolled should
+/// > move right and down (revealing more content left and up).
+///
+/// So positive `y` means the content moves down, revealing what was above it —
+/// scrolling *up*, which is what `MOUSEEVENTF_WHEEL` calls positive too. But
+/// positive `x` means the content moves right, revealing what was to its
+/// *left* — scrolling left, where `MOUSEEVENTF_HWHEEL` calls rightward
+/// positive.
+///
+/// The protocol's own contract is "positive is right", so the conversion
+/// happens here rather than in the injector: the wire keeps one meaning and
+/// only the side that speaks egui has to know egui's.
+fn scroll_to_wheel(delta: egui::Vec2) -> ScrollEvent {
+    let to_wheel = |points: f32| (points / POINTS_PER_DETENT * WHEEL_DELTA as f32) as i16;
+    ScrollEvent { dx: -to_wheel(delta.x), dy: to_wheel(delta.y) }
+}
+
 /// Leading blank in a tab label, holding the space the status dot is painted in.
 const DOT_GAP: &str = "   ";
 
@@ -1112,11 +1137,7 @@ fn forward_pointer(
     if resp.hovered() {
         let delta = ui.input(|i| i.raw_scroll_delta);
         if delta != egui::Vec2::ZERO {
-            let to_wheel = |points: f32| (points / POINTS_PER_DETENT * WHEEL_DELTA as f32) as i16;
-            session.send_input(InputEvent::Scroll(ScrollEvent {
-                dx: to_wheel(delta.x),
-                dy: to_wheel(delta.y),
-            }));
+            session.send_input(InputEvent::Scroll(scroll_to_wheel(delta)));
         }
     }
 }
@@ -1237,6 +1258,43 @@ fn forward_keyboard(
 
 #[cfg(test)]
 mod tests {
+    /// The two axes disagree, and only one of them was wrong.
+    ///
+    /// winit documents a positive delta as "the content should move right and
+    /// down". Down means the view goes up, which is what Windows calls a
+    /// positive wheel — so vertical passes straight through. Right means the
+    /// view goes *left*, where Windows calls rightward positive, so horizontal
+    /// has to flip. Getting this wrong is invisible on a mouse with no tilt
+    /// wheel, which is why it shipped.
+    #[test]
+    fn horizontal_scroll_is_flipped_and_vertical_is_not() {
+        // Scrolling up: egui positive y, and the wire agrees.
+        let up = scroll_to_wheel(egui::vec2(0.0, POINTS_PER_DETENT));
+        assert_eq!(up.dy, WHEEL_DELTA, "one notch up should be one wheel delta");
+        assert_eq!(up.dx, 0);
+
+        // Scrolling down keeps its sign too.
+        let down = scroll_to_wheel(egui::vec2(0.0, -POINTS_PER_DETENT));
+        assert_eq!(down.dy, -WHEEL_DELTA);
+
+        // egui's positive x reveals content to the left, which the wire calls
+        // leftward — negative.
+        let left = scroll_to_wheel(egui::vec2(POINTS_PER_DETENT, 0.0));
+        assert_eq!(left.dx, -WHEEL_DELTA, "egui positive x is a leftward scroll");
+        assert_eq!(left.dy, 0);
+
+        let right = scroll_to_wheel(egui::vec2(-POINTS_PER_DETENT, 0.0));
+        assert_eq!(right.dx, WHEEL_DELTA);
+    }
+
+    /// A diagonal trackpad flick carries both axes at once.
+    #[test]
+    fn both_axes_travel_together() {
+        let both = scroll_to_wheel(egui::vec2(POINTS_PER_DETENT, POINTS_PER_DETENT));
+        assert_eq!(both.dx, -WHEEL_DELTA);
+        assert_eq!(both.dy, WHEEL_DELTA);
+    }
+
     use super::*;
 
     /// The three states must be distinguishable, and only two are clickable.
