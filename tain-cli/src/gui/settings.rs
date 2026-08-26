@@ -262,6 +262,21 @@ pub struct Settings {
     /// folding the two into one decision would mean anybody who wanted the
     /// first silently got the second.
     pub unattended_access: bool,
+    /// How large this application's own interface is, relative to the DPI
+    /// scale the monitor asks for. `1.0` follows the monitor exactly.
+    ///
+    /// # Why relative rather than absolute
+    ///
+    /// egui computes `pixels_per_point = zoom_factor * native_pixels_per_point`,
+    /// and this is the first of those. Keeping it a multiplier means the
+    /// interface still follows a monitor change on its own — someone who wants
+    /// it a little larger than Windows suggests gets that on every screen,
+    /// rather than pinning one size and having it be wrong on the next one.
+    ///
+    /// It is also where egui's own Ctrl+plus and Ctrl+minus land, so the two
+    /// are kept in step rather than fighting; see `GuestApp::sync_ui_scale`.
+    #[serde(default = "one")]
+    pub ui_scale: f32,
     #[serde(deserialize_with = "lenient")]
     pub rate_control: RateControlSetting,
     /// What to give up first if the stream cannot keep up, 0-100.
@@ -361,6 +376,7 @@ impl Default for Settings {
             h264_profile: ProfileSetting::default(),
             gpu_present: false,
             unattended_access: false,
+            ui_scale: 1.0,
             rate_control: RateControlSetting::default(),
             latency_priority: LatencyPriority::default().value(),
             // 60, not 30: with the hardware encoder a native-resolution frame
@@ -390,6 +406,19 @@ impl Default for Settings {
         }
     }
 }
+
+/// serde's default for [`Settings::ui_scale`], which is not `Default::default`.
+fn one() -> f32 {
+    1.0
+}
+
+/// The range the interface scale may be set to.
+///
+/// The bottom is where the smallest text is still readable at 100% DPI; the top
+/// is where a 1200-point window stops fitting on an ordinary display. Anything
+/// outside it is a config file that has been edited by hand or corrupted, and
+/// either way an interface nobody can use to put it right.
+pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.5;
 
 impl Settings {
     /// Clamp everything into a sane range.
@@ -425,6 +454,14 @@ impl Settings {
         if self.preferred_encoder.trim().len() != self.preferred_encoder.len() {
             self.preferred_encoder = self.preferred_encoder.trim().to_string();
         }
+
+        // NaN as well as out of range: it arrives from a hand-edited file, and
+        // a NaN scale multiplies into a `pixels_per_point` of NaN, which lays
+        // the whole interface out at no size at all and cannot be clicked back.
+        if !self.ui_scale.is_finite() {
+            self.ui_scale = 1.0;
+        }
+        self.ui_scale = self.ui_scale.clamp(*UI_SCALE_RANGE.start(), *UI_SCALE_RANGE.end());
 
         self.target_fps = self.target_fps.clamp(1, 240);
         self.approval_timeout_secs = self.approval_timeout_secs.clamp(5, 600);
@@ -814,6 +851,46 @@ mod tests {
         let mut s = Settings { max_bitrate_kbps: 0, ..Settings::default() };
         s.sanitize();
         assert_eq!(s.max_bitrate_kbps, 0);
+    }
+
+    /// A scale that is not a number lays the interface out at no size at all.
+    ///
+    /// It cannot come from the slider, only from a hand-edited or corrupted
+    /// file — and the result is a window with nothing clickable in it, which is
+    /// also a window the setting cannot be put right from.
+    #[test]
+    fn a_scale_that_is_not_a_number_becomes_one() {
+        for broken in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut s = Settings { ui_scale: broken, ..Settings::default() };
+            s.sanitize();
+            assert_eq!(s.ui_scale, 1.0, "{broken} should have become 1.0");
+        }
+    }
+
+    #[test]
+    fn the_interface_scale_stays_inside_a_usable_range() {
+        let mut tiny = Settings { ui_scale: 0.01, ..Settings::default() };
+        tiny.sanitize();
+        assert_eq!(tiny.ui_scale, *UI_SCALE_RANGE.start());
+
+        let mut huge = Settings { ui_scale: 40.0, ..Settings::default() };
+        huge.sanitize();
+        assert_eq!(huge.ui_scale, *UI_SCALE_RANGE.end());
+
+        // And an ordinary choice is left exactly alone.
+        let mut ordinary = Settings { ui_scale: 1.25, ..Settings::default() };
+        ordinary.sanitize();
+        assert_eq!(ordinary.ui_scale, 1.25);
+    }
+
+    /// Following the monitor is the default, and a config from before this
+    /// setting existed has to keep doing that.
+    #[test]
+    fn a_config_without_a_scale_follows_the_monitor() {
+        let settings: Settings =
+            serde_json::from_str("{}").expect("every field should have a default");
+        assert_eq!(settings.ui_scale, 1.0);
+        assert_eq!(Settings::default().ui_scale, 1.0);
     }
 
     #[test]

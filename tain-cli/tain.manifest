@@ -1,30 +1,43 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <!--
-    Per-monitor DPI awareness, declared where nothing can lose a race to it.
+    Per-monitor DPI awareness, version 2, declared before anything can query it.
 
-    Windows settles a process's DPI awareness the first time it is asked
-    something that depends on it, and after that `SetProcessDpiAwarenessContext`
-    fails. Calling it first in `main` was an improvement and still a race: the
-    loader, the C runtime and anything linked ahead of us all run first, and a
-    process that ends up merely *system* aware is told the primary monitor's DPI
-    everywhere and bitmap-stretched onto every other one — which looks like the
-    interface stepping back to the main monitor's scale, with the stretching
-    visible as artefacts.
+    # Why the version matters, and why only one setting is named
 
-    A manifest is applied by the loader before any of that. It cannot be
-    overridden by call order, and it is what Microsoft documents as the way to
-    declare this.
+    `dpiAware` is the Windows 8.1 spelling and its `true/pm` value means
+    per-monitor *version 1*. `dpiAwareness` is the Windows 10 spelling and is
+    documented to take precedence where both appear. On this machine it did not:
+    a manifest carrying both produced a window reporting
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE — v1 — read straight off the window
+    with `GetWindowDpiAwarenessContext`.
+
+    The difference is not academic. Under v1 the application must rescale its
+    own non-client area, and Windows will not do it: the title bar keeps its old
+    metrics, which is visible as a caption that is the wrong height and has lost
+    its icon. Under v2 Windows scales the frame, the menus and the scroll bars
+    itself. So the legacy line is gone rather than kept "for older Windows" —
+    the supportedOS declaration below already says which Windows this is for.
+
+    # Why a manifest rather than a call
+
+    winit calls `SetProcessDpiAwarenessContext` when it creates the event loop,
+    and for the application window that is enough. The agent has no event loop
+    at all — it is a headless process on another desktop — and it converts
+    normalised touch coordinates into physical pixels with `GetSystemMetrics`,
+    which answers in scaled coordinates to a process that has not declared
+    itself. The manifest is applied by the loader, so both binaries get the same
+    answer with no ordering to arrange.
   -->
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
     </windowsSettings>
   </application>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
-      <!-- Windows 10 and 11, which is what PerMonitorV2 needs. -->
+      <!-- PerMonitorV2 is honoured only for an application that says it was
+           built for Windows 10 or later. -->
       <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
     </application>
   </compatibility>

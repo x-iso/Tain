@@ -74,6 +74,8 @@ pub fn show(
                 .show(ui, |ui| {
                     identity_section(ui, settings);
                     ui.add_space(10.0);
+                    interface_section(ui, settings);
+                    ui.add_space(10.0);
                     video_section(ui, settings);
                     ui.add_space(10.0);
                     viewing_section(ui, settings);
@@ -865,6 +867,31 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
             .color(AMBER),
         );
     }
+}
+
+/// This application's own appearance, as opposed to what it shows of another
+/// machine.
+fn interface_section(ui: &mut egui::Ui, settings: &mut Settings) {
+    heading(ui, "Interface — this application's own window");
+
+    egui::Grid::new("interface").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+        ui.label("Scale").on_hover_text(
+            "Relative to what the monitor asks for, so it still follows a screen \
+             with a different DPI. Ctrl+plus and Ctrl+minus move it too.",
+        );
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut settings.ui_scale, super::settings::UI_SCALE_RANGE)
+                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                    .step_by(0.05),
+            );
+            // A slider can be nudged off 100% and be hard to put back exactly.
+            if ui.add_enabled(settings.ui_scale != 1.0, egui::Button::new("Reset")).clicked() {
+                settings.ui_scale = 1.0;
+            }
+        });
+        ui.end_row();
+    });
 }
 
 /// What this machine does with a session it connects **out** to.

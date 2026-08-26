@@ -1010,6 +1010,17 @@ pub struct GuestApp {
     session_window: SessionWindow,
     /// Win-key capture and pointer confinement, shared by whichever session is focused.
     immersive: Immersive,
+    /// The last scale reported to the log, so it is reported on change only.
+    ///
+    /// As `(what the monitor asks, what is being drawn, the window in points)`.
+    last_reported_scale: Option<(f32, f32, egui::Vec2)>,
+    /// The interface scale this application last handed to egui.
+    ///
+    /// Kept so the two directions can be told apart: egui's own Ctrl+plus and
+    /// Ctrl+minus change the zoom without going through the settings, and
+    /// without this the next frame would push the saved value straight back and
+    /// the keyboard would appear not to work. See `sync_ui_scale`.
+    applied_ui_scale: f32,
     /// Uploaded card pictures, keyed by host.
     ///
     /// Cached because a texture upload per card per frame would cost far more
@@ -1063,6 +1074,10 @@ impl GuestApp {
             sessions: Vec::new(),
             session_window: SessionWindow::default(),
             immersive: Immersive::default(),
+            last_reported_scale: None,
+            // Not the saved value: this is what egui has been told, and it has
+            // been told nothing yet. The first frame pushes the setting in.
+            applied_ui_scale: 1.0,
             previews: std::cell::RefCell::new(std::collections::HashMap::new()),
             host_sessions: None,
             pending_handles: None,
@@ -2466,12 +2481,132 @@ pub fn describe_grants(mouse: bool, keyboard: bool) -> &'static str {
     }
 }
 
+impl GuestApp {
+    /// Keep the interface scale, egui's zoom and the saved setting in step.
+    ///
+    /// # Why this is a negotiation rather than an assignment
+    ///
+    /// egui owns a zoom factor of its own and moves it when Ctrl+plus or
+    /// Ctrl+minus is pressed. Writing the setting into it every frame would
+    /// undo that a frame later, so the keyboard would appear not to work at
+    /// all; reading it every frame instead would mean the slider could never
+    /// move it. Which of the two changed is the only thing that distinguishes
+    /// them, and that is what `applied_ui_scale` remembers.
+    ///
+    /// A change from the keyboard is adopted into the settings, so it is saved
+    /// and the slider agrees with what is on screen.
+    /// Say what scale this window is being drawn at, whenever that changes.
+    ///
+    /// # Why this is worth a log line
+    ///
+    /// Nothing about DPI is visible from inside the process. Every number
+    /// agrees with every other one whether or not the awareness is the one that
+    /// was asked for, and the only symptom is an interface the wrong size on a
+    /// monitor the developer may not have. Three attempts went into that, two
+    /// of them chasing the wrong cause, and the thing that settled it was
+    /// measuring from outside with a second monitor attached.
+    ///
+    /// One line per change makes the same measurement available from the log:
+    /// drag the window to another screen, and either the monitor figure moves
+    /// or it does not.
+    fn log_scale(&mut self, ctx: &egui::Context) {
+        let native = ctx.native_pixels_per_point().unwrap_or(f32::NAN);
+        let drawn = ctx.pixels_per_point();
+        let size = ctx.screen_rect().size();
+
+        let changed = match self.last_reported_scale {
+            None => true,
+            Some((was_native, was_drawn, was_size)) => {
+                (was_native - native).abs() > 0.001
+                    || (was_drawn - drawn).abs() > 0.001
+                    // Points, not pixels: a window whose *point* size jumps
+                    // without the scale moving is the interesting failure, and
+                    // an ordinary resize is a handful of lines at most.
+                    || (was_size - size).length() > 16.0
+            }
+        };
+        if !changed {
+            return;
+        }
+        self.last_reported_scale = Some((native, drawn, size));
+        info!(
+            "Interface scale: monitor asks {native:.2}x, drawing at {drawn:.2}x \
+             (setting {:.0}%), window {:.0}x{:.0} points",
+            ctx.zoom_factor() * 100.0,
+            size.x,
+            size.y,
+        );
+    }
+
+    fn sync_ui_scale(&mut self, ctx: &egui::Context) {
+        let saved = self.state.settings.lock().unwrap().ui_scale;
+        match decide_scale(ctx.zoom_factor(), self.applied_ui_scale, saved) {
+            ScaleAction::Nothing => {}
+            ScaleAction::Adopt(scale) => {
+                self.applied_ui_scale = scale;
+                let mut settings = self.state.settings.lock().unwrap();
+                if (settings.ui_scale - scale).abs() > SCALE_EPSILON {
+                    settings.ui_scale = scale;
+                    drop(settings);
+                    // Through the same settling delay as any other edit, so
+                    // holding Ctrl+plus does not write the file per keystroke.
+                    self.settings_settling = Some(std::time::Instant::now());
+                }
+            }
+            ScaleAction::Push(scale) => {
+                ctx.set_zoom_factor(scale);
+                self.applied_ui_scale = scale;
+            }
+        }
+    }
+}
+
+/// What [`GuestApp::sync_ui_scale`] should do about the interface scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScaleAction {
+    Nothing,
+    /// Something other than the settings moved egui's zoom — its own Ctrl+plus
+    /// and Ctrl+minus, or its persistence restoring a value at startup. Record
+    /// it, and take it as the new setting if it differs from one.
+    Adopt(f32),
+    /// The setting differs from what egui is drawing at. Hand it over.
+    Push(f32),
+}
+
+/// Decide which way the interface scale should travel this frame.
+///
+/// `live` is egui's zoom now, `applied` is what this application last gave it,
+/// and `saved` is the setting. Separated from the frame it runs in because the
+/// interesting part is entirely in the comparison, and because getting it
+/// backwards is invisible: pushing when it should adopt makes the keyboard
+/// shortcut appear not to work, and adopting when it should push makes the
+/// slider appear not to.
+fn decide_scale(live: f32, applied: f32, saved: f32) -> ScaleAction {
+    // egui moved first: whoever did that is looking at the result, so it wins.
+    // Adopted even when it already equals the setting — otherwise `applied`
+    // never catches up, and the next move of the slider is read as egui having
+    // moved again and is overwritten by the value it was trying to replace.
+    if (live - applied).abs() > SCALE_EPSILON {
+        return ScaleAction::Adopt(live);
+    }
+    if (saved - live).abs() > SCALE_EPSILON {
+        return ScaleAction::Push(saved);
+    }
+    ScaleAction::Nothing
+}
+
+/// Smaller than a fifth of the slider's step, and far below anything the eye
+/// resolves. Floats arriving from three places will not be equal.
+const SCALE_EPSILON: f32 = 0.001;
+
 impl eframe::App for GuestApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         WINDOW_BG.to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.sync_ui_scale(ctx);
+        self.log_scale(ctx);
         let mut t = self.frametime.begin();
         // The endpoint may have finished binding since the last frame; see
         // `attach_when_ready`.
@@ -2634,6 +2769,56 @@ fn section_label(ui: &mut egui::Ui, text: &str, height: f32) {
         ui.allocate_exact_size(egui::vec2(size.x, height), egui::Sense::hover());
     ui.painter()
         .galley(egui::pos2(rect.left(), rect.center().y - size.y * 0.5), galley, TEXT);
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::{decide_scale, ScaleAction};
+
+    /// Nothing to do when all three already agree, which is every frame.
+    #[test]
+    fn a_settled_scale_is_left_alone() {
+        assert_eq!(decide_scale(1.0, 1.0, 1.0), ScaleAction::Nothing);
+        assert_eq!(decide_scale(1.25, 1.25, 1.25), ScaleAction::Nothing);
+    }
+
+    /// The slider moved: hand the new value to egui.
+    #[test]
+    fn a_changed_setting_is_pushed_into_egui() {
+        // Drawing at 1.0, that is also what we last gave it, setting says 1.5.
+        assert_eq!(decide_scale(1.0, 1.0, 1.5), ScaleAction::Push(1.5));
+    }
+
+    /// Ctrl+plus moved it: take that as the setting rather than undoing it.
+    #[test]
+    fn a_zoom_from_the_keyboard_is_adopted() {
+        // egui is at 1.1, we last gave it 1.0, and the setting still says 1.0.
+        assert_eq!(decide_scale(1.1, 1.0, 1.0), ScaleAction::Adopt(1.1));
+    }
+
+    /// The failure that makes the slider look broken.
+    ///
+    /// egui's own persistence restores a zoom at startup, so its value differs
+    /// from what this application has handed it even though it matches the
+    /// setting. If that were reported as "nothing to do", the record of what we
+    /// last applied would never catch up — and the next move of the slider
+    /// would be read as egui having moved, and adopted straight back to the
+    /// value the user was trying to change.
+    #[test]
+    fn a_restored_zoom_is_recorded_so_the_slider_still_works_afterwards() {
+        // Restored to 1.5 by egui; the setting already says 1.5.
+        assert_eq!(decide_scale(1.5, 1.0, 1.5), ScaleAction::Adopt(1.5));
+
+        // Having recorded it, moving the slider now pushes rather than adopts.
+        assert_eq!(decide_scale(1.5, 1.5, 1.75), ScaleAction::Push(1.75));
+    }
+
+    /// Float noise must not start a fight between the two directions.
+    #[test]
+    fn a_difference_too_small_to_see_is_not_a_change() {
+        assert_eq!(decide_scale(1.0, 1.0 + 1e-6, 1.0), ScaleAction::Nothing);
+        assert_eq!(decide_scale(1.0, 1.0, 1.0 - 1e-6), ScaleAction::Nothing);
+    }
 }
 
 #[cfg(test)]
