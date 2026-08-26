@@ -555,7 +555,7 @@ impl SessionWindow {
                 if on {
                     "Immersive — every key goes to the host and the pointer stays here"
                 } else {
-                    "Immersive mode: send every key, Win and Alt included, and keep the                      pointer in this window"
+                    "Immersive mode: send every key, Win and Alt included, and keep the pointer in this window"
                 },
             )
             .clicked()

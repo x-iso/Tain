@@ -153,7 +153,7 @@ mod platform {
                 self.had_local_input = local;
                 if local {
                     tracing::info!(
-                        "The input is back on this desktop — capturing here again ({} frames                          came from the agent)",
+                        "The input is back on this desktop — capturing here again ({} frames came from the agent)",
                         self.from_agent,
                     );
                     self.from_agent = 0;

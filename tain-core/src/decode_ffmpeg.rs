@@ -617,7 +617,7 @@ mod tests {
                 // large `worst` with no bias is localised corruption, and small
                 // everything is two implementations rounding differently.
                 println!(
-                    "frame 0: mad {mad:.2}, luma mad {luma_mad:.2}, worst pixel {worst_px},                      bias R{r:+.2} G{g:+.2} B{b:+.2}",
+                    "frame 0: mad {mad:.2}, luma mad {luma_mad:.2}, worst pixel {worst_px}, bias R{r:+.2} G{g:+.2} B{b:+.2}",
                     luma_mad = luma / pixels,
                     r = bias[0] as f64 / pixels,
                     g = bias[1] as f64 / pixels,
@@ -627,7 +627,7 @@ mod tests {
             worst = worst.max(mad);
             assert!(
                 mad < 3.0,
-                "frame {compared}: mean absolute difference {mad:.2} between GPU and CPU decode                  — that is a wrong picture, not rounding"
+                "frame {compared}: mean absolute difference {mad:.2} between GPU and CPU decode — that is a wrong picture, not rounding"
             );
             compared += 1;
         }

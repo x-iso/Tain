@@ -917,7 +917,7 @@ mod tests {
 
         assert!(
             !session.shared.present_on_gpu.load(Ordering::Relaxed),
-            "the session should have asked for the readback back rather than              dropping every frame for the rest of its life",
+            "the session should have asked for the readback back rather than dropping every frame for the rest of its life",
         );
     }
 

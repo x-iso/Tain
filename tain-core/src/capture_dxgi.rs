@@ -740,7 +740,7 @@ mod tests {
                     }
                 }
                 println!(
-                    "  shape {}x{} hotspot {},{} — {opaque} opaque ({white} pure white),                      {clear} transparent",
+                    "  shape {}x{} hotspot {},{} — {opaque} opaque ({white} pure white), {clear} transparent",
                     shape.width, shape.height, shape.hotspot_x, shape.hotspot_y
                 );
                 assert!(shape.width > 0 && shape.height > 0, "shape has no size");

@@ -433,7 +433,7 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
         // section is otherwise all about what this machine *sends*.
         if cfg!(target_os = "windows") {
             ui.label("Draw frames on the GPU").on_hover_text(
-                "For sessions this machine receives. Skips copying each decoded                  frame off the GPU and back, which is most of the decode cost —                  but it depends on a driver extension that has frozen the picture                  on at least one card. Turn it off if the video stops updating.",
+                "For sessions this machine receives. Skips copying each decoded frame off the GPU and back, which is most of the decode cost — but it depends on a driver extension that has frozen the picture on at least one card. Turn it off if the video stops updating.",
             );
             ui.checkbox(&mut settings.gpu_present, "Skip the readback (experimental)");
             ui.end_row();
@@ -587,7 +587,7 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
 
     egui::Grid::new("audio").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         ui.label("Quality").on_hover_text(
-            "Opus. 160 kbit/s is transparent for nearly all content; above 256              there is nothing left to gain.",
+            "Opus. 160 kbit/s is transparent for nearly all content; above 256 there is nothing left to gain.",
         );
         ui.horizontal(|ui| {
             for kbps in tain_core::AUDIO_BITRATES_KBPS {
@@ -611,7 +611,7 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
         ui.label("Exclude apps").on_hover_text(
             "Keep applications out of the streamed sound — a voice chat, say.
 
-             One app is removed by Windows itself, inside the audio engine.              Choosing more than one switches to mixing the apps that are left,              which is exact but only sees what was already playing when the              session started.",
+             One app is removed by Windows itself, inside the audio engine. Choosing more than one switches to mixing the apps that are left, which is exact but only sees what was already playing when the session started.",
         );
         ui.vertical(|ui| {
             if panel.audio_apps.is_empty() {
@@ -663,7 +663,7 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
             });
 
             let note = if settings.exclude_audio_processes.len() > 1 {
-                "Several excluded — the stream is mixed from the remaining apps,                  so anything that starts playing later will be missing until you                  reconnect."
+                "Several excluded — the stream is mixed from the remaining apps, so anything that starts playing later will be missing until you reconnect."
             } else {
                 "Only applications currently playing sound are listed."
             };

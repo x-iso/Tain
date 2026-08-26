@@ -1371,7 +1371,7 @@ fn spawn_audio_pipeline(
             // Worth saying: the user asked for something that did not happen,
             // and silence means they find out by hearing the excluded app.
             info!(
-                "Session #{session_id}: {name} has no audio session right now —                  it is not being excluded"
+                "Session #{session_id}: {name} has no audio session right now — it is not being excluded"
             );
         }
     }
@@ -2388,7 +2388,7 @@ impl ConnectionPath {
         match self {
             Self::Direct { .. } => "Connected peer to peer.".to_string(),
             Self::Relay { host, .. } => format!(
-                "Relayed through {host} because a direct connection could not be                  established. Relays are shared and rate-limited, so video over one                  stutters no matter what quality is chosen. A VPN on either machine                  is a common cause."
+                "Relayed through {host} because a direct connection could not be established. Relays are shared and rate-limited, so video over one stutters no matter what quality is chosen. A VPN on either machine is a common cause."
             ),
         }
     }
