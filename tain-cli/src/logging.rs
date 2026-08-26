@@ -212,7 +212,7 @@ mod tests {
         }
 
         // `log.1` is the run before last, and `log.8` the oldest kept.
-        for (slot, run) in (1..=KEEP).zip((1..=9).rev().skip(0)) {
+        for (slot, run) in (1..=KEEP).zip((1..=9u32).rev()) {
             let found = std::fs::read_to_string(path.with_extension(format!("log.{slot}")))
                 .unwrap_or_default();
             assert_eq!(found, format!("run {run}"), "slot {slot} holds the wrong run");
