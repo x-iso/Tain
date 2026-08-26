@@ -369,28 +369,78 @@ fn create_bgra_target(
     texture.context("conversion target came back empty")
 }
 
-/// Say what the display is doing, once, where it can be read back later.
+/// What has already been said about the display, so it is not said again.
 ///
-/// Worth a line even when there is no HDR anywhere: "the picture is washed out"
-/// and "the picture is fine" look identical in a log that never mentions which
-/// of the two colour pipelines was in use.
-pub fn log_display(colour: Option<DisplayColour>) {
-    let Some(colour) = colour else {
-        debug!("Display colour: could not be read — treating the desktop as SDR");
-        return;
-    };
-    if colour.is_hdr() {
-        info!(
-            "Display is in HDR — capturing in floating point and converting to SDR. \
-             Panel: {} bits per colour, {:.0}-{:.0} nits ({:.0} full frame). \
-             Highlights above reference white will clip; see capture_hdr.",
-            colour.bits_per_colour, colour.min_nits, colour.max_nits, colour.max_full_frame_nits,
+/// # Why this is not simply a log line
+///
+/// The duplication it belongs to is rebuilt whenever it is lost, and when the
+/// rebuild keeps failing that is about twenty-five times a second. A line
+/// written unconditionally during setup is a line written twenty-five times a
+/// second: the log that first showed the HDR fault is two messages repeated for
+/// its whole length, and the one that mattered — the duplication call that
+/// failed — is buried in them.
+///
+/// So this outlives the rebuild, and reports only what changed since last time.
+#[derive(Default)]
+pub struct ColourLog {
+    /// The last answer reported. The outer `Option` separates "nothing has been
+    /// reported yet" from "an output that would not answer was reported".
+    reported: Option<Option<DisplayColour>>,
+    /// Whether this GPU has already been reported as unable to convert.
+    reported_refusal: bool,
+}
+
+impl ColourLog {
+    /// Say what the display is doing, if that is not what was said last time.
+    ///
+    /// Worth saying at all — even where there is no HDR anywhere — because "the
+    /// picture is washed out" and "the picture is fine" look identical in a log
+    /// that never mentions which of the two colour pipelines was in use.
+    /// Returns whether anything was written, which is what the tests check:
+    /// the throttle is the entire point of this type and it is invisible from
+    /// the outside otherwise.
+    pub fn display(&mut self, colour: Option<DisplayColour>) -> bool {
+        if self.reported == Some(colour) {
+            return false;
+        }
+        self.reported = Some(colour);
+
+        let Some(colour) = colour else {
+            debug!("Display colour: could not be read — treating the desktop as SDR");
+            return true;
+        };
+        if colour.is_hdr() {
+            info!(
+                "Display is in HDR — {} bits per colour, {:.0}-{:.0} nits ({:.0} full frame)",
+                colour.bits_per_colour,
+                colour.min_nits,
+                colour.max_nits,
+                colour.max_full_frame_nits,
+            );
+        } else {
+            debug!(
+                "Display is SDR — {} bits per colour, up to {:.0} nits",
+                colour.bits_per_colour, colour.max_nits,
+            );
+        }
+        true
+    }
+
+    /// Report, once, that this GPU will not do the conversion.
+    ///
+    /// Once, because it will not start being able to. Capture carries on in
+    /// eight bits, which DXGI converts on its own terms.
+    pub fn conversion_refused(&mut self, reason: &anyhow::Error) -> bool {
+        if self.reported_refusal {
+            return false;
+        }
+        self.reported_refusal = true;
+        warn!(
+            "This GPU will not convert the floating-point HDR desktop ({reason:#}) — \
+             capturing it as eight-bit instead, which DXGI converts on its own terms \
+             and may look washed out"
         );
-    } else {
-        debug!(
-            "Display is SDR — {} bits per colour, up to {:.0} nits",
-            colour.bits_per_colour, colour.max_nits,
-        );
+        true
     }
 }
 
@@ -453,8 +503,57 @@ mod tests {
     /// Logging must survive an output that would not answer.
     #[test]
     fn an_unreadable_display_is_not_a_panic() {
-        log_display(None);
-        log_display(Some(sdr()));
+        let mut log = ColourLog::default();
+        assert!(log.display(None), "the first answer is always news");
+        assert!(log.display(Some(sdr())), "and so is a different one");
+    }
+
+    fn hdr() -> DisplayColour {
+        DisplayColour {
+            space: DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+            bits_per_colour: 10,
+            min_nits: 0.0,
+            max_nits: 418.0,
+            max_full_frame_nits: 418.0,
+        }
+    }
+
+    /// A rebuild loop must not write the same line on every attempt.
+    ///
+    /// This is not tidiness. The duplication is rebuilt on every capture call
+    /// while it cannot be created — about twenty-five times a second — and the
+    /// log from the machine where HDR first failed is two messages repeated for
+    /// its whole length, with the duplication error that actually explained it
+    /// buried among them.
+    #[test]
+    fn an_unchanged_display_is_reported_once() {
+        let mut log = ColourLog::default();
+        assert!(log.display(Some(hdr())), "the first answer is worth saying");
+        for _ in 0..100 {
+            assert!(!log.display(Some(hdr())), "and saying again is not");
+        }
+    }
+
+    /// A display that changes is news again — that is the event worth catching.
+    #[test]
+    fn switching_hdr_on_is_reported() {
+        let mut log = ColourLog::default();
+        assert!(log.display(Some(sdr())));
+        assert!(!log.display(Some(sdr())));
+        assert!(log.display(Some(hdr())), "HDR being switched on must be visible");
+        assert!(!log.display(Some(hdr())));
+        assert!(log.display(Some(sdr())), "and switched off again");
+    }
+
+    /// A GPU that will not convert will not start being able to.
+    #[test]
+    fn a_refusal_to_convert_is_reported_once() {
+        let mut log = ColourLog::default();
+        let reason = anyhow::anyhow!("this GPU will not convert");
+        assert!(log.conversion_refused(&reason));
+        for _ in 0..100 {
+            assert!(!log.conversion_refused(&reason));
+        }
     }
 
     /// What the display attached to this machine actually reports.

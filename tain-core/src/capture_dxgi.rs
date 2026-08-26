@@ -28,7 +28,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
@@ -36,7 +36,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
-use super::capture_hdr::{DisplayColour, HdrToSdr};
+use super::capture_hdr::{ColourLog, DisplayColour, HdrToSdr};
 use super::capture_nv12::Nv12Converter;
 use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, ScreenFrame};
 
@@ -87,7 +87,19 @@ struct Duplication {
 }
 
 impl Duplication {
-    fn create() -> Result<Self> {
+    /// # Why this takes something to log through
+    ///
+    /// Everything here is rebuilt on `DXGI_ERROR_ACCESS_LOST`, and when the
+    /// rebuild cannot succeed — a UAC prompt, or an HDR desktop this could not
+    /// duplicate — it is attempted again on the next capture call, about
+    /// twenty-five times a second. Anything said unconditionally in here is
+    /// therefore said twenty-five times a second: the log from the machine that
+    /// found the HDR fault is two lines repeated for its whole length, which is
+    /// most of what made it hard to read.
+    ///
+    /// The state that decides what is worth repeating has to outlive the thing
+    /// being rebuilt, so it is passed in.
+    fn create(colour_log: &mut ColourLog) -> Result<Self> {
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
 
@@ -140,7 +152,7 @@ impl Duplication {
             let output1: IDXGIOutput1 = output.cast().context("output is not IDXGIOutput1")?;
 
             let colour = super::capture_hdr::probe(&output);
-            super::capture_hdr::log_display(colour);
+            colour_log.display(colour);
             let hdr_desktop = colour.is_some_and(DisplayColour::is_hdr);
 
             let mut duplication = duplicate(&device, &output1, hdr_desktop)?;
@@ -165,11 +177,7 @@ impl Duplication {
                 match HdrToSdr::new(&device, &context, size.0, size.1) {
                     Ok(ready) => converter = Some(ready),
                     Err(e) => {
-                        warn!(
-                            "This GPU will not convert the floating-point HDR desktop \
-                             ({e:#}) — capturing it as eight-bit instead, which DXGI \
-                             will convert on its own terms and may look washed out"
-                        );
+                        colour_log.conversion_refused(&e);
                         duplication = duplicate(&device, &output1, false)?;
                         size = duplication_size(&duplication);
                     }
@@ -408,20 +416,29 @@ unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16
     out
 }
 
-/// Start duplication, asking for floating point when the desktop is in HDR.
+/// Start duplication, in the best format this desktop and this GPU allow.
 ///
-/// # Two calls, and why the old one is kept
+/// # Why the legacy call is the last resort and not the fallback
 ///
-/// `DuplicateOutput1` is the only one that can be asked for a format, and
-/// asking is the whole point: told nothing, DXGI converts an HDR desktop down
-/// to eight bits on its own terms, which is where a washed-out capture comes
-/// from. It is also documented to fail with `E_INVALIDARG` for a process that
-/// is not DPI aware — measured, while writing this — and this process is aware
-/// only because its manifest says so.
+/// It was the fallback, and on an HDR desktop that is a dead end:
+/// `IDXGIOutput1::DuplicateOutput` cannot duplicate one at all. It answers
+/// `E_INVALIDARG` — measured on the machine that reported this, where turning
+/// HDR on froze the picture and then refused every reconnection while it stayed
+/// on. Capture never came back, because the thing being retried could not work.
 ///
-/// The legacy call stays as the fallback for a Windows without `IDXGIOutput5`.
-/// It cannot deliver HDR, but for an SDR desktop it is exactly what shipped
-/// before any of this and there is no reason to prefer the newer one.
+/// `DuplicateOutput1` is the only call that can be asked for a format, and that
+/// is what makes it the fallback as well as the preferred path. Asked for
+/// eight-bit on an HDR desktop it converts, on its own terms and probably
+/// washed out — but it produces frames, which the legacy call does not.
+///
+/// It is also documented to fail with `E_INVALIDARG` for a process that is not
+/// DPI aware, which is true and was measured; this process is aware only
+/// because its manifest says so.
+///
+/// So: floating point if there is something able to convert it, eight-bit
+/// through the same call if not, and the legacy call only for a Windows too old
+/// to offer `IDXGIOutput5` — which is also a Windows too old to have an HDR
+/// desktop, so it is never the one being asked to do the impossible.
 fn duplicate(
     device: &ID3D11Device,
     output1: &IDXGIOutput1,
@@ -439,18 +456,26 @@ fn duplicate(
         }
     };
 
-    if floating_point && let Ok(output5) = output1.cast::<IDXGIOutput5>() {
-        let formats = [DXGI_FORMAT_R16G16B16A16_FLOAT];
-        // SAFETY: the format list outlives the call; the device is live.
-        match unsafe { output5.DuplicateOutput1(device, 0, &formats) } {
-            Ok(duplication) => return Ok(duplication),
-            // Access denied is about the desktop, not the format, and asking
-            // again in eight bits would be denied in exactly the same way.
-            Err(e) if denied(&e) => return Err(explain(e)),
-            Err(e) => warn!(
-                "DuplicateOutput1 would not give a floating-point desktop ({e}) — \
-                 falling back to eight-bit capture"
-            ),
+    if let Ok(output5) = output1.cast::<IDXGIOutput5>() {
+        let mut wanted: Vec<(&str, DXGI_FORMAT)> = Vec::new();
+        if floating_point {
+            wanted.push(("floating point", DXGI_FORMAT_R16G16B16A16_FLOAT));
+        }
+        wanted.push(("eight-bit", DXGI_FORMAT_B8G8R8A8_UNORM));
+
+        for (label, format) in wanted {
+            // SAFETY: the format list outlives the call; the device is live.
+            match unsafe { output5.DuplicateOutput1(device, 0, &[format]) } {
+                Ok(duplication) => {
+                    debug!("Duplicating the desktop in {label}");
+                    return Ok(duplication);
+                }
+                // Denial is about the desktop, not the format. Asking again in
+                // another format would be denied in exactly the same way, and
+                // the message for it is the useful one.
+                Err(e) if denied(&e) => return Err(explain(e)),
+                Err(e) => debug!("DuplicateOutput1 would not give {label}: {e}"),
+            }
         }
     }
 
@@ -547,11 +572,17 @@ pub struct DxgiCapturer {
     format: PixelFormat,
     /// Suppresses a log storm while duplication stays unavailable.
     reported_loss: bool,
+    /// What has already been said about the display's colour handling.
+    ///
+    /// Outlives the duplication it describes, because the duplication is what
+    /// keeps being rebuilt — see [`ColourLog`].
+    colour_log: ColourLog,
 }
 
 impl DxgiCapturer {
     pub fn new() -> Result<Self> {
-        let duplication = Duplication::create()?;
+        let mut colour_log = ColourLog::default();
+        let duplication = Duplication::create(&mut colour_log)?;
         let (width, height) = (duplication.width, duplication.height);
         Ok(Self {
             duplication: Some(duplication),
@@ -565,6 +596,7 @@ impl DxgiCapturer {
             ceiling: None,
             format: PixelFormat::Bgra,
             reported_loss: false,
+            colour_log,
         })
     }
 
@@ -583,7 +615,7 @@ impl DxgiCapturer {
     /// both deny duplication for as long as they are up.
     fn recover(&mut self) {
         self.duplication = None;
-        match Duplication::create() {
+        match Duplication::create(&mut self.colour_log) {
             Ok(duplication) => {
                 if duplication.width != self.width || duplication.height != self.height {
                     info!(
