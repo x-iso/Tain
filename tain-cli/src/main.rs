@@ -57,6 +57,17 @@ async fn main() -> Result<()> {
         tracing::info!("Logging to {}", path.display());
     }
 
+    // First line of every log, in every mode. Nearly everything difficult about
+    // this application has been diagnosed from a log file sent from another
+    // machine, and until now not one of them said which build produced it —
+    // so "is that the version with the fix" was never answerable from the
+    // evidence, only from asking.
+    tracing::info!(
+        "Tain {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        component.as_deref().unwrap_or("application"),
+    );
+
     // # Three ways this executable can start
     //
     // Handled before anything else opens a window, a socket or a credential
