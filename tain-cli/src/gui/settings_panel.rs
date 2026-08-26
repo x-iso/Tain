@@ -26,6 +26,26 @@ pub struct PanelState {
     /// Cached because enumerating them is a COM round trip and the settings
     /// window redraws continuously while it is open.
     pub audio_apps: Vec<tain_core::AudioSession>,
+    /// The interface scale being edited, and the saved value it started from.
+    ///
+    /// # Why this one setting is not applied as it is edited
+    ///
+    /// Everything else here changes something elsewhere. This changes the size
+    /// of the window it is being edited in — including the slider, and
+    /// including where that slider is under the pointer.
+    ///
+    /// A slider reads its value from where the pointer is within its own
+    /// rectangle. Move the rectangle and the same pointer position means a
+    /// different value, which moves the rectangle again: the reported effect
+    /// was a handle sliding between the extremes on its own, with the control
+    /// pulled out from under the hand holding it. So the edit is held here
+    /// until Apply.
+    ///
+    /// The second number is the setting this was taken from, so a change made
+    /// somewhere else while the window is open — Ctrl+plus, or Reset to
+    /// defaults — is followed rather than silently overwritten by a stale
+    /// pending value.
+    pub pending_ui_scale: Option<(f32, f32)>,
 }
 
 /// Draw the settings window. Returns true if any value changed this frame.
@@ -74,7 +94,7 @@ pub fn show(
                 .show(ui, |ui| {
                     identity_section(ui, settings);
                     ui.add_space(10.0);
-                    interface_section(ui, settings);
+                    interface_section(ui, settings, panel);
                     ui.add_space(10.0);
                     video_section(ui, settings);
                     ui.add_space(10.0);
@@ -108,9 +128,11 @@ pub fn show(
             });
         });
 
-    // Closing the window abandons any half-finished rebind.
+    // Closing the window abandons any half-finished rebind, and any scale that
+    // was dialled in without being applied.
     if !*open {
         panel.capturing = None;
+        panel.pending_ui_scale = None;
     }
 
     if *settings != before {
@@ -871,8 +893,20 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
 
 /// This application's own appearance, as opposed to what it shows of another
 /// machine.
-fn interface_section(ui: &mut egui::Ui, settings: &mut Settings) {
+fn interface_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelState) {
+    use super::app::SCALE_EPSILON as EPSILON;
+
     heading(ui, "Interface — this application's own window");
+
+    // Held rather than applied as it moves — see `PanelState::pending_ui_scale`
+    // for what happens when a slider resizes itself.
+    let (pending, taken_from) =
+        panel.pending_ui_scale.get_or_insert((settings.ui_scale, settings.ui_scale));
+    if (*taken_from - settings.ui_scale).abs() > EPSILON {
+        // Changed somewhere else while this window was open.
+        *pending = settings.ui_scale;
+        *taken_from = settings.ui_scale;
+    }
 
     egui::Grid::new("interface").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         ui.label("Scale").on_hover_text(
@@ -881,17 +915,43 @@ fn interface_section(ui: &mut egui::Ui, settings: &mut Settings) {
         );
         ui.horizontal(|ui| {
             ui.add(
-                egui::Slider::new(&mut settings.ui_scale, super::settings::UI_SCALE_RANGE)
+                egui::Slider::new(pending, super::settings::UI_SCALE_RANGE)
                     .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
                     .step_by(0.05),
             );
-            // A slider can be nudged off 100% and be hard to put back exactly.
-            if ui.add_enabled(settings.ui_scale != 1.0, egui::Button::new("Reset")).clicked() {
-                settings.ui_scale = 1.0;
+            // Sets the slider, without applying: a button that resized the
+            // window under the pointer would move the next thing to be clicked.
+            let off_default = (*pending - 1.0).abs() > EPSILON;
+            if ui
+                .add_enabled(off_default, egui::Button::new("100%"))
+                .on_hover_text("Follow the monitor exactly")
+                .clicked()
+            {
+                *pending = 1.0;
+            }
+
+            let differs = (*pending - settings.ui_scale).abs() > EPSILON;
+            if ui
+                .add_enabled(differs, egui::Button::new("Apply"))
+                .on_hover_text("Resize the interface to the chosen scale")
+                .clicked()
+            {
+                settings.ui_scale = *pending;
+                *taken_from = *pending;
             }
         });
         ui.end_row();
     });
+
+    ui.add_space(2.0);
+    let note = if (*pending - settings.ui_scale).abs() > EPSILON {
+        format!("Currently {:.0}%. Apply to resize the interface.", settings.ui_scale * 100.0)
+    } else {
+        "Applied on the button rather than as the slider moves, because this \
+         setting resizes the slider. Ctrl+plus and Ctrl+minus apply at once."
+            .to_string()
+    };
+    ui.label(RichText::new(note).size(11.0).color(TEXT_DIM));
 }
 
 /// What this machine does with a session it connects **out** to.
@@ -1061,6 +1121,104 @@ mod tests {
         assert!(RateControlSetting::Constant.to_core().uses_bitrate());
         assert!(RateControlSetting::Variable.to_core().uses_bitrate());
         assert!(!RateControlSetting::ConstantQuality.to_core().uses_bitrate());
+    }
+
+    /// Draw the settings window once, headlessly, and report what it said.
+    fn draw_once(settings: &mut Settings, panel: &mut PanelState) -> bool {
+        let ctx = Context::default();
+        let mut changed = false;
+        let mut open = true;
+        // The output is a frame to paint, which no test has a screen for.
+        let _ = ctx.run(Default::default(), |ctx| {
+            changed = show(ctx, &mut open, settings, panel);
+        });
+        changed
+    }
+
+    /// The interface scale must not take effect while it is being edited.
+    ///
+    /// It resizes the slider that sets it, so a value applied as it moved would
+    /// move the control out from under the pointer and be read again from the
+    /// new position — a handle sliding between the extremes on its own. The
+    /// held value existing is the whole defence, and nothing else in this
+    /// window works that way, so it is the kind of thing a later tidy-up
+    /// removes as an inconsistency.
+    #[test]
+    fn a_scale_being_edited_does_not_apply_until_it_is_applied() {
+        let mut settings = Settings::default();
+        let mut panel = PanelState { pending_ui_scale: Some((2.0, 1.0)), ..Default::default() };
+
+        let changed = draw_once(&mut settings, &mut panel);
+
+        assert_eq!(settings.ui_scale, 1.0, "a held edit must not reach the settings");
+        assert!(!changed, "and must not ask for the settings to be saved");
+        assert_eq!(
+            panel.pending_ui_scale.map(|(pending, _)| pending),
+            Some(2.0),
+            "while still being what the slider shows"
+        );
+    }
+
+    /// A scale changed from outside — Ctrl+plus, or Reset to defaults — has to
+    /// win over an edit nobody applied, or the panel would show a stale value
+    /// and offer to apply it.
+    #[test]
+    fn a_scale_changed_elsewhere_replaces_an_unapplied_edit() {
+        let mut settings = Settings { ui_scale: 1.5, ..Settings::default() };
+        // Dialled to 2.0, from a setting that then said 1.0.
+        let mut panel = PanelState { pending_ui_scale: Some((2.0, 1.0)), ..Default::default() };
+
+        draw_once(&mut settings, &mut panel);
+
+        assert_eq!(panel.pending_ui_scale, Some((1.5, 1.5)), "the edit follows the setting");
+        assert_eq!(settings.ui_scale, 1.5, "and the setting itself is untouched");
+    }
+
+    /// Closing the window throws the unapplied edit away rather than keeping it
+    /// to be applied by surprise on the next visit.
+    #[test]
+    fn closing_the_window_abandons_an_unapplied_scale() {
+        let mut settings = Settings::default();
+        let mut panel = PanelState { pending_ui_scale: Some((2.0, 1.0)), ..Default::default() };
+
+        let ctx = Context::default();
+        let mut open = false;
+        let _ = ctx.run(Default::default(), |ctx| {
+            show(ctx, &mut open, &mut settings, &mut panel);
+        });
+
+        assert_eq!(panel.pending_ui_scale, None);
+        assert_eq!(settings.ui_scale, 1.0);
+    }
+
+    /// The scale row must fit the window it is drawn in.
+    ///
+    /// A label, a slider with a value box and two buttons is more than any
+    /// other row here carries, and the window is a fixed width that does not
+    /// scroll sideways.
+    #[test]
+    fn the_settings_window_does_not_grow_sideways_for_the_scale_row() {
+        let ctx = Context::default();
+        let mut settings = Settings::default();
+        let mut panel = PanelState::default();
+        let mut open = true;
+
+        // Twice: egui sizes a window from what it measured on the frame before.
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                show(ctx, &mut open, &mut settings, &mut panel);
+            });
+        }
+
+        let rect = ctx
+            .memory(|m| m.area_rect(egui::Id::new("Settings")))
+            .expect("the settings window should have been laid out");
+        // 470 is the requested width; the margin is for the frame around it.
+        assert!(
+            rect.width() <= 500.0,
+            "the settings window widened to {:.0} points to fit its contents",
+            rect.width()
+        );
     }
 
     #[test]

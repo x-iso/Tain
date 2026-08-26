@@ -2597,7 +2597,10 @@ fn decide_scale(live: f32, applied: f32, saved: f32) -> ScaleAction {
 
 /// Smaller than a fifth of the slider's step, and far below anything the eye
 /// resolves. Floats arriving from three places will not be equal.
-const SCALE_EPSILON: f32 = 0.001;
+///
+/// Shared with the settings panel so the control and the thing it drives cannot
+/// disagree about what counts as a change.
+pub(super) const SCALE_EPSILON: f32 = 0.001;
 
 impl eframe::App for GuestApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
