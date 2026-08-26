@@ -174,6 +174,35 @@ pub fn encode_input(event: &crate::protocol::InputEvent) -> [u8; INPUT_LEN] {
     out
 }
 
+/// Ask the agent to start or stop capturing, in the same eight bytes.
+///
+/// A link opened only to deliver input — which is what an elevated window in
+/// the foreground needs — has no use for frames, and an agent duplicating a
+/// desktop nobody is watching holds a GPU resource for nothing.
+pub fn encode_frames_wanted(wanted: bool) -> [u8; INPUT_LEN] {
+    let mut out = [0u8; INPUT_LEN];
+    out[0] = 5;
+    out[1] = wanted as u8;
+    out
+}
+
+/// What a record turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeRequest {
+    /// Inject this on the agent's desktop.
+    Input(crate::protocol::InputEvent),
+    /// Start or stop capturing.
+    FramesWanted(bool),
+}
+
+/// Read one record, whatever kind it is.
+pub fn decode_request(bytes: &[u8; INPUT_LEN]) -> Option<PipeRequest> {
+    if bytes[0] == 5 {
+        return Some(PipeRequest::FramesWanted(bytes[1] != 0));
+    }
+    decode_input(bytes).map(PipeRequest::Input)
+}
+
 /// Read one back. `None` for a record this version does not know.
 pub fn decode_input(bytes: &[u8; INPUT_LEN]) -> Option<crate::protocol::InputEvent> {
     use crate::protocol::{
@@ -249,7 +278,7 @@ mod platform {
         /// eight-byte units and a short read would mean the next event is
         /// assembled from the tail of one and the head of another — a click at
         /// coordinates nobody asked for.
-        pub fn take_input(&mut self) -> Vec<crate::protocol::InputEvent> {
+        pub fn take_input(&mut self) -> Vec<PipeRequest> {
             let mut events = Vec::new();
             loop {
                 let mut available = 0u32;
@@ -271,8 +300,8 @@ mod platform {
                     return events;
                 }
                 // An unknown kind is skipped, not fatal. See `decode_input`.
-                if let Some(event) = decode_input(&record) {
-                    events.push(event);
+                if let Some(request) = decode_request(&record) {
+                    events.push(request);
                 }
             }
         }
@@ -388,7 +417,15 @@ mod platform {
         /// The lock covers a whole record. Half of one event followed by half
         /// of another is not a dropped click, it is a click somewhere else.
         pub fn send_input(&self, event: &crate::protocol::InputEvent) -> Result<()> {
-            let record = encode_input(event);
+            self.send_record(encode_input(event))
+        }
+
+        /// Tell the agent whether to capture at all.
+        pub fn send_frames_wanted(&self, wanted: bool) -> Result<()> {
+            self.send_record(encode_frames_wanted(wanted))
+        }
+
+        fn send_record(&self, record: [u8; INPUT_LEN]) -> Result<()> {
             let _serialised = self.writing.lock().map_err(|_| {
                 anyhow::anyhow!("the input channel to the agent was poisoned")
             })?;
@@ -514,6 +551,28 @@ mod tests {
             let decoded = decode_input(&encode_input(&event)).expect("our own encoding");
             assert_eq!(decoded, event, "round trip changed the event");
         }
+    }
+
+    /// The two record kinds share eight bytes and must not be read as each
+    /// other.
+    #[test]
+    fn a_frames_request_is_not_mistaken_for_input() {
+        use crate::protocol::{InputEvent, MouseButtonEvent};
+
+        for wanted in [true, false] {
+            assert_eq!(
+                decode_request(&encode_frames_wanted(wanted)),
+                Some(PipeRequest::FramesWanted(wanted)),
+            );
+        }
+
+        // And an input event still reads as one. A left click is the record
+        // most likely to collide by accident: it is nearly all zeroes.
+        let click = InputEvent::MouseButton(MouseButtonEvent { button: 0, pressed: true });
+        assert_eq!(
+            decode_request(&encode_input(&click)),
+            Some(PipeRequest::Input(click)),
+        );
     }
 
     /// A newer build sending something this one does not know must not take the

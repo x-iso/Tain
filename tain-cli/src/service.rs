@@ -656,19 +656,24 @@ mod windows_impl {
 
     /// Start an agent on `desktop` in `session`, as the right identity for it.
     ///
-    /// # Two identities, deliberately
+    /// # Both as SYSTEM, which the ordinary desktop one did not used to be
     ///
-    /// On the ordinary desktop the agent runs as the signed-in user: it is
-    /// their session being captured, and their profile and audio endpoints are
-    /// what it needs. On the secure desktop no user token is permitted at all —
-    /// that separation is the entire point of UAC — so the agent there runs as
-    /// SYSTEM, which the service already is.
+    /// It ran as the signed-in user, on the reasoning that it is their session
+    /// being captured and their profile and audio endpoints it would need. It
+    /// turned out to need neither: the agent captures a screen and injects
+    /// input, and does nothing with a profile.
+    ///
+    /// What running as the user *did* cost is the thing this was extended for.
+    /// `SendInput` cannot reach a window at a higher integrity level than the
+    /// process calling it — Windows enforces that in the kernel, and it is the
+    /// reason a guest loses control the moment anything elevated takes focus.
+    /// An agent at the same integrity as the application could not have helped
+    /// with that; one running as SYSTEM can.
+    ///
+    /// The console user's token is still what decides who may open the agent's
+    /// pipe, which is the part that has to stay narrow.
     fn spawn_agent(session: u32, desktop: &str) -> Result<HANDLE> {
-        let token = if desktop.eq_ignore_ascii_case("Default") {
-            console_user_token(session)?
-        } else {
-            system_token_for_session(session)?
-        };
+        let token = system_token_for_session(session)?;
         start_with_token(&token, desktop)
     }
 

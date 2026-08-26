@@ -185,14 +185,19 @@ mod platform {
         use tain_core::screen_capture::{create_capturer, CaptureConfig};
 
         let served = serve_forever(&desktop, &RUNNING, |writer| {
-            let mut capturer = create_capturer(CaptureConfig::default())
-                .context("could not start capturing for the host")?;
+            // Nothing is duplicated until somebody asks. A host that opened
+            // this link only to deliver input — which is what an elevated
+            // window in the foreground needs — never asks, and an agent
+            // capturing a desktop nobody is watching would hold a GPU resource
+            // for the whole session.
+            let mut capturer: Option<Box<dyn tain_core::screen_capture::ScreenCaptureBackend>> =
+                None;
             // Injection belongs to this process because `SendInput` reaches the
             // desktop of the thread that calls it, and this is the only process
             // on that desktop. It is also why the host cannot simply do it
             // itself while a consent prompt is up.
             let injector = tain_core::input_inject::create_injector();
-            tracing::info!("Serving {desktop}: capture started for a connected host");
+            tracing::info!("Serving {desktop}: a host connected");
 
             // Measured on the way past, on the first frame only. A duplication
             // that starts, returns a rectangle of zeroes and reports success
@@ -207,11 +212,37 @@ mod platform {
                 // captured. A guest moving the pointer over a still prompt
                 // produces input and no frames, and holding those until the
                 // picture changed would make the pointer lag behind the hand.
-                for event in writer.take_input() {
-                    if let Err(e) = tain_core::network::inject_input(&*injector, &event) {
-                        tracing::debug!("Serving {desktop}: could not inject: {e:#}");
+                for request in writer.take_input() {
+                    match request {
+                        tain_core::agent_pipe::PipeRequest::Input(event) => {
+                            if let Err(e) = tain_core::network::inject_input(&*injector, &event) {
+                                tracing::debug!("Serving {desktop}: could not inject: {e:#}");
+                            }
+                        }
+                        tain_core::agent_pipe::PipeRequest::FramesWanted(true)
+                            if capturer.is_none() =>
+                        {
+                            capturer = Some(
+                                create_capturer(CaptureConfig::default())
+                                    .context("could not start capturing for the host")?,
+                            );
+                            tracing::info!("Serving {desktop}: capture started");
+                        }
+                        tain_core::agent_pipe::PipeRequest::FramesWanted(false) => {
+                            if capturer.take().is_some() {
+                                tracing::info!("Serving {desktop}: capture stopped");
+                            }
+                        }
+                        tain_core::agent_pipe::PipeRequest::FramesWanted(true) => {}
                     }
                 }
+
+                let Some(capturer) = capturer.as_mut() else {
+                    // Input only. Nothing to capture and nothing to wait for
+                    // but the next record.
+                    std::thread::sleep(std::time::Duration::from_millis(4));
+                    continue;
+                };
 
                 // The host asked for this desktop, so it wants it whether or
                 // not it currently has the input — but there is nothing to

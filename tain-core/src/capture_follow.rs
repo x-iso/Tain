@@ -119,22 +119,215 @@ mod platform {
     /// machine so there is nothing to key it by.
     static LINK: Mutex<Option<Arc<super::super::agent_pipe::AgentFrames>>> = Mutex::new(None);
 
-    /// Send an event to the agent, if one is currently supplying frames.
+    /// A link to the ordinary desktop's agent, for input this process cannot
+    /// deliver itself.
     ///
-    /// Returns whether it went. `false` means inject locally as usual — there
-    /// is no agent involved, which is the ordinary case.
+    /// Separate from [`LINK`], which exists only while frames are coming from
+    /// the secure desktop. This one carries no frames at all.
+    static INPUT_LINK: Mutex<Option<Arc<super::super::agent_pipe::AgentFrames>>> =
+        Mutex::new(None);
+
+    /// Send an event to an agent, if one has to deliver it.
+    ///
+    /// Returns whether it went. `false` means inject locally as usual, which is
+    /// the ordinary case and the fast one.
+    ///
+    /// # Two reasons an agent has to do it instead
+    ///
+    /// The first is the secure desktop: this process cannot reach it at all, so
+    /// while frames are coming from there the clicks go back the same way.
+    ///
+    /// The second is an elevated window. `SendInput` cannot reach a window at a
+    /// higher integrity level than the process calling it — Windows enforces
+    /// that in the kernel, deliberately, and it is why a guest loses control the
+    /// moment anything running as administrator takes focus. There is no flag
+    /// that lifts it; the only way through is a process that outranks the
+    /// window, which is what the agent running as Local System is.
     pub fn send_input_to_agent(event: &crate::protocol::InputEvent) -> bool {
-        let Ok(link) = LINK.lock() else { return false };
+        if let Ok(link) = LINK.lock()
+            && let Some(agent) = link.as_ref()
+        {
+            return match agent.send_input(event) {
+                Ok(()) => true,
+                Err(e) => {
+                    // Not retried and not fatal. The capturer notices the same
+                    // failure on its next frame and drops the link; until then,
+                    // losing a click beats injecting it on the wrong desktop.
+                    tracing::debug!("Could not send input to the agent: {e:#}");
+                    false
+                }
+            };
+        }
+
+        if !foreground_outranks_us_cached() {
+            return false;
+        }
+        send_through_input_link(event)
+    }
+
+    /// Deliver one event through the ordinary desktop's agent.
+    ///
+    /// Connects on first need and keeps the link: an elevated window is usually
+    /// in front for as long as somebody is using it, and reconnecting per
+    /// keystroke would put a pipe handshake in the path of typing.
+    fn send_through_input_link(event: &crate::protocol::InputEvent) -> bool {
+        let Ok(mut link) = INPUT_LINK.lock() else { return false };
+
+        if link.is_none() {
+            match super::super::agent_pipe::connect("Default") {
+                Ok(agent) => {
+                    let agent = Arc::new(agent);
+                    // Explicitly no frames: this link exists to carry input.
+                    if let Err(e) = agent.send_frames_wanted(false) {
+                        tracing::debug!("Could not open an input link to the agent: {e:#}");
+                        return false;
+                    }
+                    tracing::info!(
+                        "An elevated window is in front — sending input through the agent, \
+                         which outranks it"
+                    );
+                    *link = Some(agent);
+                }
+                Err(e) => {
+                    // No service installed, most likely, which is the ordinary
+                    // case on a machine nobody has set that up on. Debug rather
+                    // than a warning per keystroke.
+                    tracing::debug!("No agent to send input through: {e:#}");
+                    return false;
+                }
+            }
+        }
+
         let Some(agent) = link.as_ref() else { return false };
         match agent.send_input(event) {
             Ok(()) => true,
             Err(e) => {
-                // Not retried and not fatal. The capturer notices the same
-                // failure on its next frame and drops the link; until then,
-                // losing a click beats injecting it on the wrong desktop.
-                tracing::debug!("Could not send input to the agent: {e:#}");
+                tracing::debug!("The input link to the agent failed: {e:#}");
+                // Dropped so the next event opens a fresh one rather than
+                // failing against a pipe that has gone.
+                *link = None;
                 false
             }
+        }
+    }
+
+    /// The last answer from [`foreground_outranks_us`], and when it was taken.
+    ///
+    /// # Why this is cached at all
+    ///
+    /// The check is four system calls — the foreground window, its process, two
+    /// token queries — and it sits on the path of every input event. Pointer
+    /// movement is now forwarded per movement rather than per frame, so that is
+    /// hundreds a second on a trackpad, and four syscalls each would be a real
+    /// cost for an answer that changes when somebody switches window.
+    ///
+    /// A fifth of a second is far longer than any input burst and far shorter
+    /// than anyone notices. The worst case is a handful of events going the
+    /// wrong way immediately after a focus change: on the way in they are lost
+    /// to UIPI, which is what happened to all of them before; on the way out
+    /// they take a pipe hop they did not need.
+    static OUTRANKED: Mutex<Option<(bool, std::time::Instant)>> = Mutex::new(None);
+
+    /// How long an answer about the foreground window stays good for.
+    const OUTRANK_CACHE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    fn foreground_outranks_us_cached() -> bool {
+        let Ok(mut cached) = OUTRANKED.lock() else { return false };
+        if let Some((answer, taken)) = *cached
+            && taken.elapsed() < OUTRANK_CACHE
+        {
+            return answer;
+        }
+        let answer = foreground_outranks_us();
+        *cached = Some((answer, std::time::Instant::now()));
+        answer
+    }
+
+    /// Whether the window in front belongs to something this process cannot
+    /// send input to.
+    ///
+    /// # Why an unreadable answer counts as yes
+    ///
+    /// Asking is itself subject to the rule being asked about: a medium
+    /// integrity process is often refused the token of a higher one, and that
+    /// refusal is the most reliable evidence available. Treating "cannot tell"
+    /// as "cannot reach" costs a pipe hop on the occasional system-owned window
+    /// and buys working input on every elevated one.
+    ///
+    /// The alternative was to try `SendInput` and check — and it cannot be
+    /// checked. Its documentation is explicit that when UIPI blocks it, neither
+    /// the return value nor `GetLastError` says so.
+    fn foreground_outranks_us() -> bool {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::Security::{
+            GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        };
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+
+        /// The integrity level of a process, or `None` if it cannot be read.
+        fn integrity_of(process: HANDLE) -> Option<u32> {
+            // SAFETY: a two-call query into a buffer sized by the first call.
+            unsafe {
+                let mut token = HANDLE::default();
+                OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+
+                let mut needed = 0u32;
+                let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut needed);
+                let mut buffer = vec![0u8; needed as usize];
+                let read = GetTokenInformation(
+                    token,
+                    TokenIntegrityLevel,
+                    Some(buffer.as_mut_ptr().cast()),
+                    needed,
+                    &mut needed,
+                )
+                .is_ok();
+                let level = read.then(|| {
+                    let label = &*(buffer.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+                    let count = *windows::Win32::Security::GetSidSubAuthorityCount(label.Label.Sid);
+                    *windows::Win32::Security::GetSidSubAuthority(
+                        label.Label.Sid,
+                        (count - 1) as u32,
+                    )
+                });
+                let _ = CloseHandle(token);
+                level
+            }
+        }
+
+        // SAFETY: documented reads; the process handle is closed below.
+        unsafe {
+            let window = GetForegroundWindow();
+            if window.is_invalid() {
+                return false;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(window, Some(&mut pid));
+            if pid == 0 {
+                return false;
+            }
+
+            let ours = match integrity_of(GetCurrentProcess()) {
+                Some(level) => level,
+                // Our own token is unreadable, which should not happen and is
+                // not a reason to reroute everything.
+                None => return false,
+            };
+
+            let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+                // Refused even limited information: not something we can send
+                // input to either.
+                return true;
+            };
+            let theirs = integrity_of(process);
+            let _ = CloseHandle(process);
+
+            theirs.is_none_or(|level| level > ours)
         }
     }
 
@@ -329,6 +522,9 @@ mod platform {
     impl AgentReader {
         fn start(desktop: &str) -> Result<Self> {
             let frames = Arc::new(super::super::agent_pipe::connect(desktop)?);
+            // Frames are opt-in now, because the same pipe carries input-only
+            // links that must not start a duplication. See `PipeRequest`.
+            frames.send_frames_wanted(true)?;
             let latest = Arc::new(Mutex::new(None));
             let done = Arc::new(AtomicBool::new(false));
 
