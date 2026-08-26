@@ -305,9 +305,28 @@ pub fn negotiate_format(
     capturer: &mut dyn ScreenCaptureBackend,
     wanted: PixelFormat,
 ) -> PixelFormat {
-    if wanted == PixelFormat::Bgra || !capturer.request_format(wanted) {
+    // # Why the answer is said out loud
+    //
+    // Which of these two happened decides whether the colour conversion runs on
+    // the GPU or costs a full-resolution readback and a CPU pass per frame — at
+    // 2560x1440 that is fourteen megabytes a frame — and until now the only
+    // trace of it was a line the *converter* logs, which never runs at all if
+    // the request does not reach it.
+    //
+    // A host reported as "Slow capture" with no GPU conversion in its log left
+    // no way to tell whether the converter had refused, or had never been
+    // asked. One line answers that.
+    if wanted == PixelFormat::Bgra {
+        debug!("Capture format: BGRA — the encoder asked for nothing else");
         return PixelFormat::Bgra;
     }
+    if !capturer.request_format(wanted) {
+        info!(
+            "Capture format: BGRA — the encoder wanted {wanted:?} and the capture              backend would not produce it, so every frame is converted on the CPU"
+        );
+        return PixelFormat::Bgra;
+    }
+    debug!("Capture format: {wanted:?}, as the encoder asked");
     wanted
 }
 
