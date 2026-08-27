@@ -3094,21 +3094,27 @@ mod scale_tests {
 mod tests {
     use super::*;
 
-    /// A name from another machine must never be able to panic this one.
+    /// Everything a pending card paints must land on the card.
     ///
-    /// The card shortens by characters rather than bytes for exactly this: a
-    /// `String` sliced at a byte index that lands inside a character panics,
-    /// and a name in Cyrillic or CJK is all multi-byte characters — which are
-    /// also the names most likely to be long enough to need shortening.
-    /// The dashed outline must be on the card, not around the row it sits in.
+    /// Two separate faults have put dashes outside it. The first drew the
+    /// outline on `content_ui.min_rect()` — what the *contents* claimed — and a
+    /// horizontal layout claims the width it is offered, so the border enclosed
+    /// the whole row.
     ///
-    /// It was drawn on `content_ui.min_rect()` — what the *contents* claimed —
-    /// and a horizontal layout claims the width it is offered, so the dashes
-    /// enclosed everything to the right of the card as well. This measures
-    /// where the paint actually lands rather than trusting which rectangle was
-    /// passed to it.
+    /// The second only appears once the clock has been running. The marching
+    /// dashes are driven by a phase taken from `input.time`, and epaint seeds
+    /// its walk along the path with that phase without clamping it, so a
+    /// negative one starts the walk somewhere behind the card and draws its way
+    /// there — a line trailing off into the window, growing longer the longer
+    /// the application has been open.
+    ///
+    /// This test was written for the first fault and ran at `time: 0`, which is
+    /// the one value where the second cannot appear. It passed, the release
+    /// build showed the stray line anyway, and that is the lesson worth keeping:
+    /// a default `RawInput` is not a running application. The clock below is
+    /// deliberately a couple of minutes in.
     #[test]
-    fn a_pending_card_is_outlined_on_itself() {
+    fn a_pending_card_paints_nothing_outside_itself() {
         let ctx = egui::Context::default();
         let conn = IncomingConnection {
             session_id: 1,
@@ -3120,19 +3126,21 @@ mod tests {
             is_admin: false,
         };
 
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1200.0, 800.0),
-            )),
-            ..Default::default()
-        };
-
         let mut card = egui::Rect::NOTHING;
         let mut painted = egui::Rect::NOTHING;
-        // Twice: egui sizes from what it measured on the frame before.
-        for _ in 0..2 {
-            let output = ctx.run(input.clone(), |ctx| {
+        // A couple of frames apart, because egui sizes from what it measured on
+        // the frame before — and at two different times, so a phase that only
+        // misbehaves at one of them cannot slip through.
+        for time in [137.0, 137.5] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
                 egui::CentralPanel::default()
                     // No frame of its own, so every shape below belongs to the
                     // card and nothing else.
@@ -3157,17 +3165,15 @@ mod tests {
         }
 
         // A stroke and the antialiasing around it land a little outside the
-        // rectangle they trace; a border drawn around the whole row would be
-        // out by hundreds.
+        // rectangle they trace. Everything that has actually gone wrong here
+        // was out by hundreds, so the slack costs nothing.
         let slack = 4.0;
         assert!(
-            painted.width() <= card.width() + slack && painted.height() <= card.height() + slack,
-            "the card is {:.0}x{:.0} but the painting covers {:.0}x{:.0} — \
-             something is being drawn outside it",
-            card.width(),
-            card.height(),
-            painted.width(),
-            painted.height(),
+            card.expand(slack).contains_rect(painted),
+            "the card is at {:?} but the painting covers {:?} — something is being \
+             drawn outside it",
+            card,
+            painted,
         );
     }
 
@@ -3226,6 +3232,12 @@ mod tests {
         );
     }
 
+    /// A name from another machine must never be able to panic this one.
+    ///
+    /// The card shortens by characters rather than bytes for exactly this: a
+    /// `String` sliced at a byte index that lands inside a character panics,
+    /// and a name in Cyrillic or CJK is all multi-byte characters — which are
+    /// also the names most likely to be long enough to need shortening.
     #[test]
     fn a_name_in_any_script_is_shortened_rather_than_split() {
         for name in [

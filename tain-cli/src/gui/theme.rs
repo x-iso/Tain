@@ -497,6 +497,24 @@ pub fn dashed_rect(ui: &Ui, rect: Rect, color: Color32, phase: f32) {
         path.push(first);
     }
 
+    // # The offset must be positive
+    //
+    // `dashes_from_line` seeds its walk with `position_on_segment = offset` and
+    // interpolates `start + vector * (position / segment_length)` without ever
+    // clamping. A negative offset therefore extrapolates *backwards* past the
+    // beginning of the path, and every dash laid down on the way there is drawn
+    // — a long line trailing off in the direction the outline came from.
+    //
+    // That is the stray diagonal reported against a pending card, and because
+    // the phase is driven by the clock it grew with uptime: two minutes in, the
+    // walk began some fourteen hundred points behind the corner and spent
+    // thousands of iterations per frame reaching it.
+    //
+    // The pattern repeats every dash-and-gap, so folding the phase into one
+    // period costs nothing and leaves the outline identical. Done here rather
+    // than at the call site because no caller should have to know this.
+    let phase = phase.rem_euclid(DASH + GAP);
+
     ui.painter().extend(egui::Shape::dashed_line_with_offset(
         &path,
         stroke,
