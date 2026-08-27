@@ -1895,6 +1895,77 @@ mod tests {
         );
     }
 
+    /// The format may change between frames, and the encoder must honour it.
+    ///
+    /// Two places now depend on this. `DesktopFollowing` negotiates NV12 while
+    /// knowing a consent prompt will interrupt it with BGRA frames from the
+    /// secure-desktop agent, and `DxgiCapturer` drops back to BGRA mid-session
+    /// when a rebuilt duplication cannot carry its GPU converter. Both are only
+    /// safe because a frame says what it is and this reads that field per call.
+    ///
+    /// There are two ways to break that, and only one of them is loud. An
+    /// encoder that *rejected* a format change would fail the first half here —
+    /// that is the regression this codebase has already had once, in
+    /// `encode_with`. An encoder that *ignored* the field would raise no error
+    /// at all: BGRA read as NV12 is the right number of bytes for a picture a
+    /// quarter the size, so it encodes happily and arrives as noise.
+    ///
+    /// So the second half measures rather than trusts, and calibrates itself on
+    /// whatever card is running it: the same picture down both honest paths
+    /// should cost about the same, and misreading it should cost enormously
+    /// more. On an AMD VCE the three totals are 1112, 1112 and 255762 bytes —
+    /// the honest pair agree exactly, because the encoder's own conversion is
+    /// the one this test used to build the NV12.
+    #[test]
+    fn a_frame_may_change_format_mid_stream() {
+        use crate::encoder::VideoEncoder;
+        let Some(_) = probe() else { return };
+
+        let (w, h) = (640u16, 480u16);
+        let bgra = pattern(w, h);
+        let mut nv12 = Vec::new();
+        bgra_to_nv12(&bgra, w, h, &mut nv12);
+        let config = EncodeConfig::default();
+
+        // ── a stream that changes format is not an error ──
+        let mut enc = HardwareH264Encoder::new(&config, true).expect("wrapper");
+        // NV12 first, so anything cached from the opening frame is the format
+        // that later has to give way.
+        enc.encode_frame(&nv12, w, h, PixelFormat::Nv12).expect("NV12 opening frame");
+        enc.encode_frame(&bgra, w, h, PixelFormat::Bgra)
+            .expect("a BGRA frame after NV12 — this is the consent prompt");
+        enc.encode_frame(&nv12, w, h, PixelFormat::Nv12)
+            .expect("and NV12 again once the prompt has gone");
+
+        // ── and the format is read, not assumed ──
+        let mut honest_nv12 = HardwareH264Encoder::new(&config, true).expect("wrapper");
+        let mut honest_bgra = HardwareH264Encoder::new(&config, true).expect("wrapper");
+        let mut misread = HardwareH264Encoder::new(&config, true).expect("wrapper");
+        let (mut nv12_bytes, mut bgra_bytes, mut misread_bytes) = (0usize, 0usize, 0usize);
+        // Enough frames to drain the transform: a hardware encoder holds the
+        // first several and returns nothing for them, so one frame measures
+        // zero against zero and would pass whatever the code did.
+        for _ in 0..12 {
+            let of = |f: crate::encoder::EncodedFrame| f.data.len();
+            nv12_bytes += of(honest_nv12.encode_frame(&nv12, w, h, PixelFormat::Nv12).unwrap());
+            bgra_bytes += of(honest_bgra.encode_frame(&bgra, w, h, PixelFormat::Bgra).unwrap());
+            misread_bytes += of(misread.encode_frame(&bgra, w, h, PixelFormat::Nv12).unwrap());
+        }
+
+        assert!(
+            bgra_bytes * 10 < misread_bytes,
+            "the same BGRA frames cost {bgra_bytes} bytes labelled BGRA and \
+             {misread_bytes} labelled NV12 — too close for the label to be doing \
+             anything, so the format field is being ignored and a mixed stream \
+             would arrive as noise"
+        );
+        assert!(
+            bgra_bytes <= nv12_bytes * 2 && nv12_bytes <= bgra_bytes * 2,
+            "one picture cost {bgra_bytes} bytes as BGRA and {nv12_bytes} as NV12; \
+             the two paths are meant to reach the same place"
+        );
+    }
+
     #[test]
     #[ignore = "requires a hardware H.264 encoder"]
     fn changing_the_bitrate_does_not_stall_the_stream() {

@@ -532,12 +532,27 @@ mod platform {
         }
 
         fn request_format(&mut self, format: PixelFormat) -> bool {
-            // Agent frames arrive as the agent captured them, which is BGRA.
-            // Accepting a negotiated NV12 here would be a promise this cannot
-            // keep the moment a consent prompt appears.
-            if format != PixelFormat::Bgra {
-                return false;
-            }
+            // # Why a mixed stream is not a broken promise
+            //
+            // This refused anything but BGRA, reasoning that NV12 could not be
+            // promised when a consent prompt might hand capture to the agent at
+            // any moment — the agent reads the secure desktop the ordinary way
+            // and has no GPU converter to offer.
+            //
+            // Nothing downstream was holding it to that promise. A frame says
+            // what it is, and every consumer reads that field per frame rather
+            // than the negotiated answer: the encoder converts BGRA and passes
+            // NV12 straight through, and the preview takes the format as an
+            // argument. `negotiate_format`'s return value reaches exactly one
+            // place, a log line.
+            //
+            // So the refusal bought nothing and cost every Windows host a
+            // full-resolution readback and a CPU colour pass on every frame —
+            // fourteen megabytes each at 2560x1440 — to avoid a mismatch, on
+            // the few seconds a prompt is up, that would not have been one.
+            //
+            // The agent's own frames still cost the conversion. They are rare,
+            // brief, and mostly a still dialog.
             self.local.as_mut().is_some_and(|local| local.request_format(format))
         }
 
@@ -623,6 +638,57 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An NV12 request must reach the local backend rather than stop here.
+    ///
+    /// This wrapper refused every format but BGRA, reasoning that a consent
+    /// prompt could hand capture to the agent — which produces only BGRA — at
+    /// any moment. The price was the GPU colour conversion, on every Windows
+    /// host, for every frame of every session. See `request_format` for why the
+    /// mixed stream it was avoiding was never a problem.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn an_nv12_request_reaches_the_local_backend() {
+        use std::sync::{Arc, Mutex};
+
+        struct Local {
+            asked: Arc<Mutex<Vec<PixelFormat>>>,
+            answer: bool,
+        }
+
+        impl ScreenCaptureBackend for Local {
+            fn capture_next(&mut self) -> anyhow::Result<Option<ScreenFrame>> {
+                Ok(None)
+            }
+
+            fn frame_size(&self) -> (u16, u16) {
+                (64, 64)
+            }
+
+            fn request_format(&mut self, format: PixelFormat) -> bool {
+                self.asked.lock().unwrap().push(format);
+                self.answer
+            }
+        }
+
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut following =
+            DesktopFollowing::new(Box::new(Local { asked: Arc::clone(&asked), answer: true }));
+        assert!(
+            following.request_format(PixelFormat::Nv12),
+            "a backend that can convert on the GPU has to be allowed to"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![PixelFormat::Nv12],
+            "and has to be asked for the format that was actually wanted"
+        );
+
+        // Still the backend's answer, not this wrapper's — delegating is not
+        // the same as agreeing.
+        let mut refusing = DesktopFollowing::new(Box::new(Local { asked, answer: false }));
+        assert!(!refusing.request_format(PixelFormat::Nv12));
+    }
 
     /// Only a *change* of route may release contacts.
     ///

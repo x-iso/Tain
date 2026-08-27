@@ -647,12 +647,22 @@ impl DxgiCapturer {
                         .unwrap()
                         .enable_nv12(self.out_width, self.out_height)
                 {
-                    // The contract cannot be met by the rebuilt chain, and the
-                    // encoder has no way to be told mid-session. Better to have
-                    // no capture than a stream of misread bytes.
-                    warn!("GPU colour conversion did not survive the rebuild — capture stopped");
-                    self.duplication = None;
-                    return;
+                    // This used to stop capture outright, on the grounds that
+                    // the encoder could not be told mid-session and a stream of
+                    // misread bytes is worse than no stream.
+                    //
+                    // The encoder does not need telling. Each frame carries its
+                    // own format and the encoder reads it there, so dropping
+                    // back to BGRA costs the CPU conversion and nothing else —
+                    // which is plainly better than a black screen for the rest
+                    // of the session. The buffered frame goes because it is
+                    // half of the old arrangement.
+                    warn!(
+                        "GPU colour conversion did not survive the rebuild — \
+                         converting on the CPU instead"
+                    );
+                    self.format = PixelFormat::Bgra;
+                    self.last_frame = None;
                 }
                 self.reported_loss = false;
             }
