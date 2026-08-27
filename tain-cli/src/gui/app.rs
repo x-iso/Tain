@@ -2595,6 +2595,37 @@ impl GuestApp {
     ///
     /// A change from the keyboard is adopted into the settings, so it is saved
     /// and the slider agrees with what is on screen.
+    /// Send every guest a goodbye, and wait briefly for it to leave.
+    ///
+    /// The wait is the point. `kick` queues the message on the session's own
+    /// writer, which is a task on the runtime, and this is the interface thread
+    /// on its way out — return immediately and the process exits before any of
+    /// those writers is scheduled, which is exactly as silent as sending
+    /// nothing.
+    ///
+    /// Blocking here is safe in a way it would not be anywhere else: the window
+    /// is already gone, so there is no frame to hold up, and the wait is only
+    /// paid when somebody is actually connected.
+    fn say_goodbye_to_guests(&mut self) {
+        /// Long enough for a writer to be scheduled and put a small message on
+        /// the wire, short enough not to be noticed as the application closing
+        /// slowly. It does not wait for delivery — nothing here could, and a
+        /// link that has already failed would never provide it.
+        const GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+        let Some(sessions) = self.host_sessions.as_ref() else { return };
+        let live = sessions.active_sessions();
+        if live.is_empty() {
+            return;
+        }
+
+        info!("Closing — telling {} connected guest(s)", live.len());
+        for id in live {
+            sessions.kick(id, "the host closed Tain");
+        }
+        std::thread::sleep(GRACE);
+    }
+
     /// Ask for focus once, shortly after the window appears.
     ///
     /// # Why this is needed at all
@@ -2785,6 +2816,24 @@ pub(super) const SCALE_EPSILON: f32 = 0.001;
 impl eframe::App for GuestApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         WINDOW_BG.to_normalized_gamma_f32()
+    }
+
+    /// Tell every connected guest before the window goes.
+    ///
+    /// # Why this is not already covered
+    ///
+    /// A guest that leaves says so, and a guest the host kicks is told — both
+    /// have been true for a while. Closing the host's window was the case
+    /// nobody was told about: the process simply stopped, and every guest sat
+    /// looking at the last frame it received until QUIC gave up on a connection
+    /// that had stopped answering, which is tens of seconds of a picture that
+    /// looks live and is not.
+    ///
+    /// A kick is exactly the right message for it — the session is over and the
+    /// host decided — so this is the same path, with a reason that says which
+    /// one it was.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.say_goodbye_to_guests();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -3174,6 +3223,57 @@ mod tests {
         // Nothing to assert about the filesystem without touching it, which is
         // the point — the flag is the guarantee, checked above.
         assert_eq!(state.settings.lock().unwrap().target_fps, 123);
+    }
+
+    /// Closing the host's window has to reach the guests, not just stop.
+    ///
+    /// Reported: a guest whose host closed its window kept showing the last
+    /// frame it had received until QUIC gave up on the connection — tens of
+    /// seconds of a picture that looks live and is not. A guest leaving said
+    /// so, and a kicked guest was told; this was the one ending nobody
+    /// announced.
+    #[test]
+    fn closing_the_window_tells_every_connected_guest() {
+        let (mut app, sessions) = app_with_sessions();
+
+        let mut inboxes = Vec::new();
+        for _ in 0..3 {
+            let id = sessions.add_session([0u8; 32], ControlGrants::ALL, PasscodeType::Guest);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            sessions.register_outbound(id, tx);
+            inboxes.push((id, rx));
+        }
+
+        app.say_goodbye_to_guests();
+
+        for (id, mut rx) in inboxes {
+            match rx.try_recv() {
+                Ok(tain_core::protocol::Message::SessionEnd(end)) => {
+                    assert_eq!(end.session_id, id);
+                    assert!(
+                        !end.reason.is_empty(),
+                        "a guest told nothing is a guest guessing why"
+                    );
+                }
+                other => panic!("session #{id} was not told the host was closing: {other:?}"),
+            }
+        }
+    }
+
+    /// And a host with nobody connected closes at once.
+    ///
+    /// The goodbye waits for the writers to be scheduled, and that wait must
+    /// not be paid by someone who simply opened the application and shut it.
+    #[test]
+    fn closing_with_no_guests_does_not_wait() {
+        let (mut app, _sessions) = app_with_sessions();
+        let started = std::time::Instant::now();
+        app.say_goodbye_to_guests();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "closing an idle host took {:?}",
+            started.elapsed()
+        );
     }
 
     /// An admin connection must appear in the list, or it cannot be ended.
