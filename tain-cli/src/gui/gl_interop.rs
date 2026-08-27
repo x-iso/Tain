@@ -319,6 +319,18 @@ impl InteropDevice {
             return None;
         }
         self.registered.push(Registered { d3d: d3d_texture, object, texture });
+        // # Why the count is worth saying
+        //
+        // A decoder that hands back one output texture registers once and this
+        // is silent for the rest of the session. One that rotates a pool
+        // registers a handful and then settles. One that keeps producing
+        // addresses this has never seen is neither, and that is what a picture
+        // stuck on its first frames would look like from in here — the number
+        // says which of the three is happening without needing the machine.
+        debug!(
+            "Registered a decoded texture at {d3d_texture:p} — {} in this generation",
+            self.registered.len()
+        );
         Some(self.registered.len() - 1)
     }
 
