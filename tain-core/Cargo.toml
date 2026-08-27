@@ -58,6 +58,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_Pointer",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Direct3D",
+    # D3DCompile, for the HDR tone-mapping shader.
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
