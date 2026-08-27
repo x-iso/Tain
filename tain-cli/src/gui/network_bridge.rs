@@ -83,15 +83,14 @@ pub struct FrameBuffer {
     pub height: usize,
     /// RGBA8, `width * height * 4` bytes. Empty when `gpu` is set.
     pub rgba: Vec<u8>,
-    /// The `ID3D11Texture2D` holding this frame and the converter generation it
-    /// belongs to, when it was never read back.
+    /// The texture holding this frame, when it was never read back.
     ///
-    /// A `usize` rather than a pointer so this stays `Send`: it crosses from the
-    /// decode task to the render thread, and nothing on the way dereferences it.
-    /// The generation travels with it because the pointer alone does not
-    /// identify a texture across a rebuild — see
-    /// `tain_core::decode_ffmpeg::GpuPicture`.
-    pub gpu: Option<(usize, u64)>,
+    /// Carried whole rather than as an address, because it owns a reference to
+    /// the surface: this crosses from the decode task to the render thread, and
+    /// the decoder behind it can be dropped — by a resolution change, or by the
+    /// session ending — while the render thread is still drawing the last frame
+    /// it was handed. See `tain_core::decode_ffmpeg::GpuPicture`.
+    pub gpu: Option<tain_core::decode_ffmpeg::GpuPicture>,
 }
 
 /// How the stream is doing, from both ends.
@@ -1090,8 +1089,7 @@ impl FrameDecoder {
                 let Some(picture) = decoder.decode(data)? else { return Ok(None) };
                 // The texture is asked for *after* decoding, so it names the
                 // frame that was just produced rather than the one before it.
-                let gpu =
-                    decoder.last_gpu_picture().map(|frame| (frame.texture, frame.generation));
+                let gpu = decoder.last_gpu_picture();
                 Ok(Some(FrameBuffer {
                     width: picture.width,
                     height: picture.height,

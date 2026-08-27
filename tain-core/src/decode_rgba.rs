@@ -275,22 +275,24 @@ impl RgbaConverter {
         self.width as usize * self.height as usize * 4
     }
 
+    /// A reference to the texture holding the frame `submit` last produced.
+    ///
+    /// A reference rather than a pointer, because whoever draws this is on
+    /// another thread and outlives nothing in particular: the session can end,
+    /// and this converter be dropped, while a render thread is still holding
+    /// the last frame it was handed. A COM reference costs an increment and
+    /// makes that safe; an address does not, and the crash it produces is a
+    /// silent process exit rather than anything that names itself.
+    pub fn last_texture(&self) -> ID3D11Texture2D {
+        self.targets[self.last].texture.clone()
+    }
+
     /// Queue the conversion of one decoded surface, without waiting for it.
     ///
     /// `slice` is the array index the decoder reported for this frame. The blit
     /// and the staging copy are both submitted and left to run; [`Self::read`]
     /// picks the result up on the next call, by which point the GPU has had a
     /// whole frame period to finish.
-    /// The raw `ID3D11Texture2D` behind the frame `submit` last produced.
-    ///
-    /// For handing to `WGL_NV_DX_interop2`, which takes an opaque pointer. Valid
-    /// for as long as this converter is — the targets are created once and
-    /// rotated, never reallocated.
-    pub fn last_texture_raw(&self) -> *mut core::ffi::c_void {
-        use windows::core::Interface;
-        self.targets[self.last].texture.as_raw()
-    }
-
     pub fn submit(&mut self, source: &ID3D11Texture2D, slice: u32) -> Result<()> {
         // # What the surface actually is, rather than what it should be
         //

@@ -87,13 +87,14 @@ pub struct GuestSession {
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     input_tx: Option<mpsc::UnboundedSender<InputEvent>>,
     texture: Option<egui::TextureHandle>,
-    /// The decoded frame still on the GPU when it was never read back: the
-    /// texture, which converter generation it belongs to, and its size.
+    /// The decoded frame still on the GPU when it was never read back, and the
+    /// size to draw it at.
     ///
-    /// The generation matters as much as the pointer — see
-    /// `tain_core::decode_ffmpeg::GpuPicture`.
+    /// Holding the picture is what keeps its surface alive: this outlives the
+    /// decoder whenever a session ends while a frame is on screen, which is
+    /// most of the time. See `tain_core::decode_ffmpeg::GpuPicture`.
     #[cfg(target_os = "windows")]
-    gpu_frame: Option<(usize, u64, egui::Vec2)>,
+    gpu_frame: Option<(tain_core::decode_ffmpeg::GpuPicture, egui::Vec2)>,
     /// Interop state for this session, built once the decoder has a device.
     ///
     /// `Some(None)` means it was tried and this machine cannot — checked once so
@@ -444,16 +445,19 @@ impl GuestSession {
     /// are safe to free, and the cost of a missed publish is the crash this
     /// exists to prevent — see `FfmpegDecoder::release_pictures_except`.
     #[cfg(target_os = "windows")]
-    fn hold_gpu_frame(&mut self, frame: Option<(usize, u64, egui::Vec2)>) {
-        self.gpu_frame = frame;
+    fn hold_gpu_frame(
+        &mut self,
+        frame: Option<(tain_core::decode_ffmpeg::GpuPicture, egui::Vec2)>,
+    ) {
         // Published after the field is set, so there is no moment where the
         // decoder is told a generation is in use before it actually is. The
         // reverse order would be harmless too — the generation being taken up
         // is always the current converter's, which is never a retired one.
-        self.shared.drawing_generation.store(
-            frame.map_or(0, |(_, generation, _)| generation),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let generation = frame.as_ref().map_or(0, |(picture, _)| picture.generation);
+        self.gpu_frame = frame;
+        self.shared
+            .drawing_generation
+            .store(generation, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The frame to draw straight from the GPU, if there is one.
@@ -461,15 +465,20 @@ impl GuestSession {
     pub fn gpu_frame(&self) -> Option<(usize, egui::Vec2)> {
         // Only meaningful once there is something able to draw it.
         self.renderer.as_ref()?.as_ref()?;
-        self.gpu_frame.map(|(texture, _, size)| (texture, size))
+        self.gpu_frame.as_ref().map(|(picture, size)| (picture.texture, *size))
     }
 
     /// A paint callback drawing this session's current frame over `rect`.
     #[cfg(target_os = "windows")]
     pub fn gpu_paint(&self, rect: egui::Rect) -> Option<egui::PaintCallback> {
         let renderer = self.renderer.as_ref()?.as_ref()?.clone();
-        let (texture, generation, _) = self.gpu_frame?;
-        Some(super::gl_interop::paint_callback(renderer, texture, generation, rect))
+        let (picture, _) = self.gpu_frame.as_ref()?;
+        Some(super::gl_interop::paint_callback(
+            renderer,
+            picture.texture,
+            picture.generation,
+            rect,
+        ))
     }
 
     /// Try once to open the decoder's device for sharing with OpenGL.
@@ -516,10 +525,9 @@ impl GuestSession {
         // A frame that never left the GPU has nothing to upload. Recorded and
         // drawn from where it already is.
         #[cfg(target_os = "windows")]
-        if let Some((texture, generation)) = frame.gpu {
+        if let Some(picture) = frame.gpu {
             self.hold_gpu_frame(Some((
-                texture,
-                generation,
+                picture,
                 egui::vec2(frame.width as f32, frame.height as f32),
             )));
             self.shared
@@ -1028,10 +1036,21 @@ mod tests {
     }
 
     /// And a working GPU path is left alone.
+    ///
+    /// The frame carries a real one-pixel texture rather than an invented
+    /// address, because a `GpuPicture` owns the surface it names and there is
+    /// deliberately no way to make one that does not. That is the whole point of
+    /// the type: an address with nothing keeping it alive is what crashed a
+    /// guest at disconnect.
     #[test]
     #[cfg(target_os = "windows")]
     fn frames_that_carry_a_texture_keep_the_gpu_path() {
         use std::sync::atomic::Ordering;
+
+        let Some(picture) = one_pixel_picture() else {
+            eprintln!("no D3D11 device — skipping");
+            return;
+        };
 
         let ctx = egui::Context::default();
         let mut session = super::GuestSession::test_stub();
@@ -1042,12 +1061,59 @@ mod tests {
                 width: 320,
                 height: 180,
                 rgba: Vec::new(),
-                gpu: Some((0xdead_beef, 1)),
+                gpu: Some(picture.clone()),
             });
             session.upload_pending_frame(&ctx);
         }
 
         assert!(session.shared.present_on_gpu.load(Ordering::Relaxed));
+    }
+
+    /// A `GpuPicture` over a real one-pixel surface, or `None` without a GPU.
+    #[cfg(target_os = "windows")]
+    fn one_pixel_picture() -> Option<tain_core::decode_ffmpeg::GpuPicture> {
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_FLAG,
+            D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let mut device = None;
+        // SAFETY: out-parameters are checked; nothing else is borrowed.
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                None,
+                D3D11_CREATE_DEVICE_FLAG(0),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .ok()?;
+        }
+        let device = device?;
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 1,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let mut texture = None;
+        // SAFETY: the descriptor is initialised; the out-parameter is checked.
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)).ok()? };
+        Some(tain_core::decode_ffmpeg::GpuPicture::from_texture(texture?, 1, 1, 1))
     }
 
     /// A local toggle narrows what the host allowed. It can never widen it.

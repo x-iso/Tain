@@ -71,17 +71,32 @@ unsafe extern "C" {
 
 /// A decoded frame that never left the GPU.
 ///
-/// The texture belongs to the decoder's colour converter, and this is a loan
-/// rather than a share: nothing here keeps it alive. It survives a rebuild of
-/// that converter only because the outgoing one is retired for a generation
-/// instead of freed — see `FfmpegDecoder::retired` for why that is needed and
-/// what it does not cover.
+/// # This owns the surface it names
 ///
-/// The pointer is carried as a `usize` so this can cross to the render thread;
-/// a raw pointer is not `Send`, and what travels here is a handle rather than
-/// anything that gets dereferenced on the way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The texture belongs to the decoder's colour converter, and the render thread
+/// that draws it runs on its own schedule — it holds the last frame it was
+/// given until a newer one arrives, which on a stalled stream is never. Two
+/// separate things can therefore free the surface out from under it: a rebuild
+/// of the converter on a resolution change, and the end of the session, which
+/// drops the whole decoder.
+///
+/// Handshakes fixed the first — `FfmpegDecoder::retired` and
+/// `release_pictures_except` — and could not fix the second, because at
+/// teardown there is nobody left to negotiate with. Both are answered instead
+/// by holding a reference: while this value is alive its surface is, whatever
+/// happens to the converter or the decoder behind it. The retirement stays as
+/// belt and braces and could now be removed.
+///
+/// The address is still carried separately as a `usize`, because that is what
+/// `WGL_NV_DX_interop2` takes and what the render thread caches registrations
+/// against. [`Self::generation`] remains the guard for a *reused* address.
+#[derive(Debug, Clone)]
 pub struct GpuPicture {
+    /// Keeps [`Self::texture`] pointing at a live surface. Never dereferenced
+    /// here; its whole job is the reference count, which is why it is never
+    /// read and must not be removed for being unread.
+    #[allow(dead_code, reason = "held for its reference count, not its value")]
+    keep: KeptTexture,
     pub texture: usize,
     pub width: u16,
     pub height: u16,
@@ -99,6 +114,44 @@ pub struct GpuPicture {
     /// two minutes, and the guest died.
     pub generation: u64,
 }
+
+impl GpuPicture {
+    /// Wrap a surface the caller already holds.
+    ///
+    /// The decoder builds its own; this is for anyone holding a texture from
+    /// elsewhere — in practice a test that needs a frame without a decode
+    /// pipeline behind it. Taking the interface rather than an address is the
+    /// point: there is no way to make one of these that does not own what it
+    /// names.
+    pub fn from_texture(texture: ID3D11Texture2D, width: u16, height: u16, generation: u64) -> Self {
+        use windows::core::Interface;
+        let address = texture.as_raw() as usize;
+        Self { keep: KeptTexture(texture), texture: address, width, height, generation }
+    }
+}
+
+/// A reference to a decoded texture, carried across to the render thread.
+///
+/// # Why this needs an unsafe `Send`
+///
+/// `ID3D11Texture2D` is a COM interface and `windows` does not mark those
+/// `Send`, because in general a COM object may be apartment-threaded and must
+/// be used only on the thread that made it. D3D11 is not: its objects are free
+/// threaded, the device here is created with multithread protection on, and the
+/// only thing done with this handle off the decode thread is holding it and
+/// eventually releasing it. `AddRef` and `Release` are interlocked operations.
+///
+/// The same reasoning already carries `Nv12Converter` and `HdrToSdr` to the
+/// capture thread; this is the narrower case, being one texture and no calls.
+#[derive(Debug, Clone)]
+pub struct KeptTexture(
+    #[allow(dead_code, reason = "held for its reference count, not its value")] ID3D11Texture2D,
+);
+
+// SAFETY: as documented above — a D3D11 resource handle, moved between threads
+// and released on one of them, never called on either.
+unsafe impl Send for KeptTexture {}
+unsafe impl Sync for KeptTexture {}
 
 /// H.264 decoding on the GPU, for real this time.
 pub struct FfmpegDecoder {
@@ -384,8 +437,16 @@ impl FfmpegDecoder {
             return None;
         }
         let (converter, w, h) = self.converter.as_ref()?;
+        // Taken once, so the address and the reference cannot disagree about
+        // which surface this is.
+        let keep = converter.last_texture();
+        let texture = {
+            use windows::core::Interface;
+            keep.as_raw() as usize
+        };
         Some(GpuPicture {
-            texture: converter.last_texture_raw() as usize,
+            keep: KeptTexture(keep),
+            texture,
             width: *w,
             height: *h,
             generation: self.converter_generation,
@@ -531,6 +592,57 @@ impl<T> Retired<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A picture must outlive the converter that produced it.
+    ///
+    /// This is the disconnect crash, in the smallest form that reproduces it. A
+    /// guest draws the last frame it was handed until a newer one arrives; when
+    /// the session ends there is no newer one, the decoder and its converters go,
+    /// and the render thread draws a freed surface. It exits without a panic,
+    /// which is why the log simply stops.
+    ///
+    /// The generation handshake cannot cover this — at teardown there is nobody
+    /// left to hand a generation to — so the picture holds a reference instead.
+    /// Here the converter is dropped while the picture is still held, and the
+    /// surface is then asked to describe itself: a freed one cannot.
+    #[test]
+    fn a_picture_keeps_its_surface_alive_after_the_converter_is_gone() {
+        use windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC;
+
+        let Ok((device, context)) = create_device() else {
+            eprintln!("no D3D11 device — skipping");
+            return;
+        };
+        let (w, h) = (640u16, 360u16);
+        let Ok(converter) = RgbaConverter::new(&device, &context, w, h) else {
+            eprintln!("no GPU colour conversion here — skipping");
+            return;
+        };
+
+        let picture = GpuPicture::from_texture(converter.last_texture(), w, h, 1);
+        let address = picture.texture;
+
+        // Everything the surface came from goes, exactly as it does when a
+        // session ends: the converter first, then the device it was made on.
+        drop(converter);
+        drop(context);
+        drop(device);
+
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: the picture holds a reference, so this is a live texture —
+        // which is the claim under test. Writing into an owned descriptor.
+        unsafe { picture.keep.0.GetDesc(&mut desc) };
+
+        assert_eq!(
+            (desc.Width, desc.Height),
+            (w as u32, h as u32),
+            "the surface no longer describes itself, so nothing was keeping it alive"
+        );
+        assert_eq!(
+            picture.texture, address,
+            "the address a picture reports must not move while it is held"
+        );
+    }
 
     /// The two things that can still be holding a retired converter.
     ///
