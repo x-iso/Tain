@@ -3100,6 +3100,77 @@ mod tests {
     /// `String` sliced at a byte index that lands inside a character panics,
     /// and a name in Cyrillic or CJK is all multi-byte characters — which are
     /// also the names most likely to be long enough to need shortening.
+    /// The dashed outline must be on the card, not around the row it sits in.
+    ///
+    /// It was drawn on `content_ui.min_rect()` — what the *contents* claimed —
+    /// and a horizontal layout claims the width it is offered, so the dashes
+    /// enclosed everything to the right of the card as well. This measures
+    /// where the paint actually lands rather than trusting which rectangle was
+    /// passed to it.
+    #[test]
+    fn a_pending_card_is_outlined_on_itself() {
+        let ctx = egui::Context::default();
+        let conn = IncomingConnection {
+            session_id: 1,
+            display_name: "DESKPC".into(),
+            name_is_self_reported: true,
+            mouse_allowed: false,
+            keyboard_allowed: false,
+            status: ApprovalStatus::Pending,
+            is_admin: false,
+        };
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut card = egui::Rect::NOTHING;
+        let mut painted = egui::Rect::NOTHING;
+        // Twice: egui sizes from what it measured on the frame before.
+        for _ in 0..2 {
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default()
+                    // No frame of its own, so every shape below belongs to the
+                    // card and nothing else.
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        let mut edits = PendingEdits::default();
+                        card = ui
+                            .horizontal(|ui| {
+                                GuestApp::render_incoming_pill(ui, &conn, &mut edits);
+                            })
+                            .response
+                            .rect;
+                    });
+            });
+            painted = egui::Rect::NOTHING;
+            for clipped in output.shapes {
+                let bounds = clipped.shape.visual_bounding_rect();
+                if bounds.is_positive() {
+                    painted = painted.union(bounds);
+                }
+            }
+        }
+
+        // A stroke and the antialiasing around it land a little outside the
+        // rectangle they trace; a border drawn around the whole row would be
+        // out by hundreds.
+        let slack = 4.0;
+        assert!(
+            painted.width() <= card.width() + slack && painted.height() <= card.height() + slack,
+            "the card is {:.0}x{:.0} but the painting covers {:.0}x{:.0} — \
+             something is being drawn outside it",
+            card.width(),
+            card.height(),
+            painted.width(),
+            painted.height(),
+        );
+    }
+
     /// A long name must widen the card rather than run under the icons.
     ///
     /// The card was twice sized from a figure worked out in advance, and both
