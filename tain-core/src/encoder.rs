@@ -82,7 +82,11 @@ impl VideoCodec {
             // [`Self::is_encodable_here`]. `Available` is about this build; the
             // hardware question is answered separately because the answer
             // differs between the two ends of the same session.
-            Self::H265 => Availability::Available,
+            // As H.265: the code exists, and whether this machine can encode it
+            // is asked separately. AV1 encoders are newer hardware still — Arc,
+            // Ada, RDNA3 and up — so most machines will answer no and advertise
+            // H.264 instead.
+            Self::H265 | Self::Av1 => Availability::Available,
             _ => Availability::Planned,
         }
     }
@@ -103,20 +107,32 @@ impl VideoCodec {
         match self {
             Self::H265 => {
                 static HEVC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *HEVC.get_or_init(|| {
-                    #[cfg(target_os = "windows")]
-                    {
-                        let found = !super::codec_mf::available_encoders_for(Self::H265).is_empty();
-                        debug!("HEVC hardware encoder present: {found}");
-                        found
-                    }
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        false
-                    }
-                })
+                *HEVC.get_or_init(|| Self::H265.ask_the_machine("HEVC"))
+            }
+            Self::Av1 => {
+                static AV1: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *AV1.get_or_init(|| Self::Av1.ask_the_machine("AV1"))
             }
             other => other.is_available(),
+        }
+    }
+
+    /// Whether Media Foundation offers an encoder for this codec here.
+    ///
+    /// Asked of the machine rather than assumed, and only once per codec — the
+    /// caller caches it, because this is a COM enumeration and `effective_codec`
+    /// is on the encode path.
+    fn ask_the_machine(self, label: &str) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            let found = !super::codec_mf::available_encoders_for(self).is_empty();
+            debug!("{label} hardware encoder present: {found}");
+            found
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = label;
+            false
         }
     }
 
@@ -1138,7 +1154,10 @@ mod tests {
             let cfg = EncodeConfig { codec, ..EncodeConfig::default() };
             let effective = cfg.effective_codec();
 
-            if codec.is_available() {
+            // Two questions, and both have to be yes: the build has the code,
+            // and this machine has the hardware. H.265 and AV1 are the ones
+            // where they can differ, and AV1 is the one where they usually do.
+            if codec.is_available() && codec.is_encodable_here() {
                 assert_eq!(effective, codec);
                 assert!(!cfg.is_falling_back());
             } else {
@@ -1146,14 +1165,15 @@ mod tests {
                 assert!(cfg.is_falling_back());
             }
 
-            // H.265 has no CPU encoder to fall back to, so at a size no GPU
-            // will take there is nothing to construct. Everything else must
-            // produce a frame.
+            // The GPU-only codecs have no CPU encoder to fall back to, so at a
+            // size no GPU will take there is nothing to construct. Everything
+            // else must produce a frame.
+            let gpu_only = matches!(effective, VideoCodec::H265 | VideoCodec::Av1);
             let Ok(mut enc) = create_encoder(cfg.clone()) else {
-                assert_eq!(effective, VideoCodec::H265, "{codec:?} must have produced an encoder");
+                assert!(gpu_only, "{codec:?} must have produced an encoder");
                 continue;
             };
-            if effective != VideoCodec::H265 {
+            if !gpu_only {
                 assert!(
                     enc.encode_frame(&bgra(16, 16), 16, 16, PixelFormat::Bgra).is_ok(),
                     "{codec:?} failed to encode"
@@ -1170,7 +1190,13 @@ mod tests {
         let available: Vec<_> = VideoCodec::ALL.into_iter().filter(|c| c.is_available()).collect();
         assert_eq!(
             available,
-            vec![VideoCodec::DeltaZstd, VideoCodec::Raw, VideoCodec::H264, VideoCodec::H265]
+            vec![
+                VideoCodec::DeltaZstd,
+                VideoCodec::Raw,
+                VideoCodec::H264,
+                VideoCodec::H265,
+                VideoCodec::Av1,
+            ]
         );
     }
 
@@ -1178,7 +1204,7 @@ mod tests {
     fn unimplemented_codecs_fall_back_to_h264_not_to_raw() {
         // Degrading to raw would mean an unavailable choice silently costs
         // hundreds of MB/s, which is worse than any codec it stood in for.
-        for codec in [VideoCodec::Av1, VideoCodec::Vp9] {
+        for codec in [VideoCodec::Vp9] {
             let cfg = EncodeConfig { codec, ..EncodeConfig::default() };
             assert_eq!(cfg.effective_codec(), VideoCodec::H264);
         }

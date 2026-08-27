@@ -156,6 +156,7 @@ fn subtype_for(codec: super::encoder::VideoCodec) -> Option<GUID> {
     match codec {
         VideoCodec::H264 => Some(MFVideoFormat_H264),
         VideoCodec::H265 => Some(MFVideoFormat_HEVC),
+        VideoCodec::Av1 => Some(MFVideoFormat_AV1),
         _ => None,
     }
 }
@@ -430,6 +431,12 @@ pub struct MediaFoundationEncoder {
     /// satisfied — see [`Self::pump_async`] for why these must survive the call
     /// that observed them.
     pending_input_requests: u32,
+    /// What this transform is actually producing.
+    ///
+    /// Needed because the bitstream leaving it is not the same shape for every
+    /// codec — see [`strip_unsupported_nals`], which is Annex-B H.264 logic and
+    /// must not be pointed at anything else.
+    codec: super::encoder::VideoCodec,
     pub info: EncoderInfo,
 }
 
@@ -457,6 +464,7 @@ impl MediaFoundationEncoder {
             frame_index: 0,
             frame_duration: 10_000_000 / config.fps.max(1) as i64,
             pending_input_requests: 0,
+            codec,
             info,
         };
         encoder.configure(config)
@@ -536,8 +544,12 @@ impl MediaFoundationEncoder {
             //
             // `eAVEncH265VProfile_Main_420_8` is 1. Named as a literal because
             // the enumeration lives behind a type this call does not take.
+            //
+            // AV1 takes the same value for the same reason:
+            // `eAVEncAV1VProfile_Main_420_8bits` is also 1, and its ten-bit
+            // profiles would go wrong in the same way against an NV12 decoder.
             let profile = match config.effective_codec() {
-                super::encoder::VideoCodec::H265 => 1,
+                super::encoder::VideoCodec::H265 | super::encoder::VideoCodec::Av1 => 1,
                 _ => config.profile.to_mf(),
             };
             output.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
@@ -786,7 +798,7 @@ impl MediaFoundationEncoder {
         let mut out = Vec::new();
         let mut keyframe = false;
         while let Some((data, key)) = self.process_output()? {
-            out.extend_from_slice(&strip_unsupported_nals(&data));
+            out.extend_from_slice(&self.clean(&data));
             keyframe |= key;
         }
         Ok((out, keyframe))
@@ -885,7 +897,7 @@ impl MediaFoundationEncoder {
         } else if kind == METransformHaveOutput.0 as u32 {
             // Exactly one call per event — see `process_output`.
             if let Some((data, key)) = self.process_output()? {
-                let data = strip_unsupported_nals(&data);
+                let data = self.clean(&data);
                 // A frame can arrive as several output samples; concatenating
                 // keeps the Annex-B stream contiguous rather than dropping
                 // earlier NALs.
@@ -894,6 +906,18 @@ impl MediaFoundationEncoder {
             }
         }
         Ok(())
+    }
+
+    /// Tidy one packet on the way out, where tidying it means anything.
+    ///
+    /// See [`needs_annex_b_cleanup`]: the cleanup is H.264 reasoning, and the
+    /// other codecs are handed on untouched.
+    fn clean(&self, data: &[u8]) -> Vec<u8> {
+        if needs_annex_b_cleanup(self.codec) {
+            strip_unsupported_nals(data)
+        } else {
+            data.to_vec()
+        }
     }
 
     /// Take one output sample, if the transform has one ready.
@@ -1259,6 +1283,25 @@ impl super::encoder::VideoEncoder for HardwareH264Encoder {
 ///
 /// 12 is filler data, which is padding by definition and equally safe to drop.
 const DROPPED_NAL_TYPES: [u8; 2] = [9, 12];
+
+/// Whether this codec's output is the Annex-B H.264 stream the cleanup expects.
+///
+/// # Why this is not "all of them"
+///
+/// [`strip_unsupported_nals`] reads a NAL type out of the low five bits of the
+/// byte after a start code and drops types 9 and 12. That is the H.264 layout
+/// and nothing else's. HEVC puts the type in a different field of a two-byte
+/// header, so the same mask lands on unrelated bits — by luck it removes only
+/// filler, but it is reading numbers that do not mean what it thinks. AV1 is
+/// not a start-code format at all: it is a sequence of OBUs, and hunting for
+/// `00 00 01` in one finds byte patterns inside the payload.
+///
+/// So the cleanup is applied where its reasoning holds and nowhere else. The
+/// reason it exists — AMD's H.264 MFT emitting an access unit delimiter that
+/// OpenH264 refuses — is a fact about H.264 and about one decoder.
+fn needs_annex_b_cleanup(codec: super::encoder::VideoCodec) -> bool {
+    matches!(codec, super::encoder::VideoCodec::H264)
+}
 
 /// Remove NAL units the guest's decoder cannot handle.
 ///

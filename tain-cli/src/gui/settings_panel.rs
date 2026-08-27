@@ -1078,7 +1078,13 @@ mod tests {
             VideoCodec::ALL.into_iter().filter(|c| c.is_available()).collect();
         assert_eq!(
             selectable,
-            vec![VideoCodec::DeltaZstd, VideoCodec::Raw, VideoCodec::H264, VideoCodec::H265]
+            vec![
+                VideoCodec::DeltaZstd,
+                VideoCodec::Raw,
+                VideoCodec::H264,
+                VideoCodec::H265,
+                VideoCodec::Av1,
+            ]
         );
     }
 
@@ -1107,7 +1113,14 @@ mod tests {
         if !VideoCodec::H265.is_encodable_here() {
             assert!(codec_text(CodecSetting::H265).contains("no encoder"));
         }
-        assert!(codec_text(CodecSetting::Av1).contains("planned"));
+        // AV1 joined H.265: implemented, and gated on the machine rather than
+        // on the build. Its encoders are newer hardware still, so most machines
+        // will say "no encoder on this PC" — which is a claim about them, not
+        // about whether the code exists.
+        assert!(!codec_text(CodecSetting::Av1).contains("planned"), "AV1 works now");
+        if !VideoCodec::Av1.is_encodable_here() {
+            assert!(codec_text(CodecSetting::Av1).contains("no encoder"));
+        }
         assert!(codec_text(CodecSetting::Vp9).contains("planned"));
     }
 

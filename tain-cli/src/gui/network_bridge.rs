@@ -1071,11 +1071,22 @@ impl FrameDecoder {
             VideoCodec::Raw => Self::Raw,
             VideoCodec::DeltaZstd => Self::Delta(DeltaDecoder::new()),
             VideoCodec::H264 => Self::h264(),
+            // Both go through the same D3D11VA decoder and differ only in which
+            // codec it is opened for. `Hevc` names the variant rather than the
+            // codec now, because everything downstream of it — the texture
+            // handover, the readback, the release — is identical.
             #[cfg(all(target_os = "windows", db_ffmpeg))]
-            VideoCodec::H265 => {
-                let decoder = tain_core::decode_ffmpeg::FfmpegDecoder::for_codec(codec)
-                    .context("this machine cannot decode H.265 — ask the host for H.264")?;
-                info!("H.265 decoding on the GPU via {}", decoder.name);
+            VideoCodec::H265 | VideoCodec::Av1 => {
+                let decoder =
+                    tain_core::decode_ffmpeg::FfmpegDecoder::for_codec(codec).with_context(
+                        || {
+                            format!(
+                                "this machine cannot decode {} — ask the host for H.264",
+                                codec.label()
+                            )
+                        },
+                    )?;
+                info!("{} decoding on the GPU via {}", codec.label(), decoder.name);
                 Self::Hevc(Box::new(decoder))
             }
             other => anyhow::bail!("this build has no decoder for {}", other.label()),

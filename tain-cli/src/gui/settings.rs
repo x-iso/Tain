@@ -1040,7 +1040,7 @@ mod tests {
     fn selecting_an_unimplemented_codec_falls_back_to_h264_not_raw() {
         // Degrading to raw would silently cost hundreds of MB/s, which is worse
         // than whichever codec the user actually asked for.
-        for codec in [CodecSetting::Av1, CodecSetting::Vp9] {
+        for codec in [CodecSetting::Vp9] {
             let s = Settings { codec, ..Settings::default() };
             let encode = s.to_session_config().encode;
             assert!(encode.is_falling_back());
