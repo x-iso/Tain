@@ -18,7 +18,6 @@ fn main() {
         return;
     }
 
-    embed_manifest();
     let Some(dir) = ffmpeg_dir() else { return };
     if !dir.join("include/libavcodec/avcodec.h").exists() {
         return;
@@ -87,37 +86,6 @@ fn main() {
             }
         }
     }
-}
-
-/// Embed the application manifest, which is where DPI awareness is declared.
-///
-/// # Why a manifest rather than a call
-///
-/// Windows settles a process's DPI awareness the first time it is asked
-/// something that depends on it, and after that `SetProcessDpiAwarenessContext`
-/// fails. Calling it first thing in `main` was an improvement and still a race:
-/// the loader and the C runtime both run before any of our code.
-///
-/// A process that ends up merely *system* aware is told the primary monitor's
-/// DPI everywhere and bitmap-stretched onto every other one, which is what
-/// "the interface steps back to the main monitor's scale, with artefacts"
-/// describes exactly.
-///
-/// The loader applies a manifest before any of that, so there is no ordering
-/// to get wrong.
-///
-/// `/MANIFESTINPUT` needs `/MANIFEST:EMBED`, and both are link.exe flags —
-/// which is why this needs no crate to do it.
-fn embed_manifest() {
-    let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") else { return };
-    let manifest = Path::new(&dir).join("tain.manifest");
-    if !manifest.exists() {
-        println!("cargo:warning=tain.manifest is missing — DPI awareness falls back to the call in main, which can lose to the loader");
-        return;
-    }
-    println!("cargo:rerun-if-changed={}", manifest.display());
-    println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-    println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
 }
 
 fn ffmpeg_dir() -> Option<PathBuf> {

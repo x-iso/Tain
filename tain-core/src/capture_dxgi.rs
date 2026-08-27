@@ -443,8 +443,10 @@ unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16
 /// washed out — but it produces frames, which the legacy call does not.
 ///
 /// It is also documented to fail with `E_INVALIDARG` for a process that is not
-/// DPI aware, which is true and was measured; this process is aware only
-/// because its manifest says so.
+/// DPI aware, which is true and was measured. Every process that reaches here
+/// has declared itself — the application through winit's event loop, the agent
+/// through the call at the top of `main` — but neither is free to stop, and
+/// this is what would break if one did.
 ///
 /// So: floating point if there is something able to convert it, eight-bit
 /// through the same call if not, and the legacy call only for a Windows too old

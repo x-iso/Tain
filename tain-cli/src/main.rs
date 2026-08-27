@@ -263,9 +263,32 @@ async fn main() -> Result<()> {
 
 /// Ask for per-monitor DPI awareness, and report what we actually got.
 ///
-/// The manifest embedded by the build script should already have settled this
-/// before any code ran — see `build.rs`. This call is the fallback for a binary
-/// built without it, and it fails harmlessly when the manifest did its job.
+/// # Why this is a call and emphatically not a manifest
+///
+/// It was a manifest, on the reasoning that the loader applies one before
+/// anything else can settle the awareness by accident. That reasoning is sound
+/// and the manifest broke the thing it was added to fix.
+///
+/// Measured on one machine with a 175% and a 125% monitor, dragging the window
+/// between them, same binary, only the manifest differing:
+///
+/// - with it: the window stays 2124x1464 physical on both, `WM_DPICHANGED`
+///   never reaches winit, and the interface is drawn at 175% on the 125%
+///   screen — which is exactly the "everything is huge over here" that started
+///   this.
+/// - without it: 2124x1464 becomes 1518x1047 and back, and egui is told
+///   `1.75x`, then `1.25x`, then `1.75x`.
+///
+/// Both report `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` on the window, so
+/// the awareness level is not the difference — something about declaring it in
+/// the manifest is. This call sets the same context and does not have that
+/// effect: the measurement above was taken with it still in place.
+///
+/// It is kept because winit only sets the awareness when it builds an event
+/// loop, and the agent never builds one. That process converts touch
+/// coordinates with `GetSystemMetrics` and opens duplication with
+/// `DuplicateOutput1`, both of which answer wrongly — or refuse outright — to a
+/// process that has not declared itself.
 ///
 /// # Why the answer is logged
 ///
@@ -282,35 +305,89 @@ fn declare_dpi_awareness() {
     };
 
     // SAFETY: a documented call taking a constant, with no resources involved.
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    let outcome = unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    };
+    // Kept for `log_dpi_awareness`, which runs once there is somewhere to write
+    // it. Whether this succeeded decides what winit does next: it asks for the
+    // same context, and on failure falls back to asking for version *one*.
+    if let Err(e) = outcome {
+        DPI_DECLARATION_ERROR.store(e.code().0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// Say which of the three answers this process ended up with.
+/// `HRESULT` from the awareness call at startup, or zero if it succeeded.
+#[cfg(target_os = "windows")]
+static DPI_DECLARATION_ERROR: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+/// Say which answer this process ended up with — including *which version*.
 ///
 /// Separate from declaring it because the declaration has to happen before
 /// anything else and there is no log to write to yet.
+///
+/// # Why the version is spelled out
+///
+/// `GetAwarenessFromDpiAwarenessContext` reports per-monitor v1 and v2 as the
+/// same value, so a line built on it says "per-monitor" for both. That is
+/// precisely the distinction that mattered: a v1 window on this machine did not
+/// follow a monitor change at all, and the log said everything was fine while
+/// the interface was drawn at 175% on a 125% screen. `AreDpiAwarenessContexts\
+/// Equal` can tell them apart, so it is what this uses.
 #[cfg(target_os = "windows")]
 fn log_dpi_awareness() {
     use windows::Win32::UI::HiDpi::{
-        GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
-        DPI_AWARENESS_PER_MONITOR_AWARE, DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
+        AreDpiAwarenessContextsEqual, GetAwarenessFromDpiAwarenessContext,
+        GetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
+        DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
     };
 
     // SAFETY: documented reads of this thread's own awareness.
     unsafe {
-        let awareness = GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext());
+        let context = GetThreadDpiAwarenessContext();
+        let is_v2 = AreDpiAwarenessContextsEqual(
+            context,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+        .as_bool();
+        let is_v1 =
+            AreDpiAwarenessContextsEqual(context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE)
+                .as_bool();
+
+        let awareness = GetAwarenessFromDpiAwarenessContext(context);
         let named = match awareness {
-            DPI_AWARENESS_PER_MONITOR_AWARE => "per-monitor",
+            DPI_AWARENESS_PER_MONITOR_AWARE if is_v2 => "per-monitor, version 2",
+            DPI_AWARENESS_PER_MONITOR_AWARE if is_v1 => {
+                "per-monitor, version 1 — a window will not follow a monitor change"
+            }
+            DPI_AWARENESS_PER_MONITOR_AWARE => "per-monitor, of no version this knows",
             DPI_AWARENESS_SYSTEM_AWARE => "system only — other monitors will be stretched",
             DPI_AWARENESS_UNAWARE => "unaware — Windows will scale this window itself",
             _ => "unrecognised",
         };
-        if awareness == DPI_AWARENESS_PER_MONITOR_AWARE {
+
+        // The call's own outcome, because it is what decides the rest: winit
+        // asks for the same context when it builds its event loop, and when
+        // that is refused it falls back to asking for version one.
+        let refused = DPI_DECLARATION_ERROR.load(std::sync::atomic::Ordering::Relaxed);
+        if is_v2 && refused == 0 {
             tracing::debug!("DPI awareness: {named}");
-        } else {
+        } else if refused == 0 {
             tracing::warn!("DPI awareness: {named}");
+        } else {
+            // Almost always Windows' own per-executable compatibility override,
+            // which the loader applies before any of this runs and which no
+            // call or manifest can undo from inside the process. It was set on
+            // exactly one machine here — enough to make the interface stay at
+            // the first monitor's scale and to make the code look wrong.
+            tracing::warn!(
+                "DPI awareness: {named} — asking for version 2 was refused \
+                 (0x{refused:08X}), so it had already been settled before this ran. \
+                 The usual cause is Windows' own override: right-click this \
+                 executable, Properties, Compatibility, \"Change high DPI settings\", \
+                 and clear \"Override high DPI scaling behaviour\"."
+            );
         }
     }
 }

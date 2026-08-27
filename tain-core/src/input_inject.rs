@@ -214,7 +214,7 @@ mod windows_impl {
         /// Reading them as *physical* pixels is what per-monitor DPI awareness
         /// buys; a process that ended up merely system aware would be handed a
         /// scaled virtual desktop here and put every touch in the wrong place
-        /// on the secondary monitors. See the manifest in `tain-cli`.
+        /// on the secondary monitors. See `declare_dpi_awareness` in `tain-cli`.
         fn to_desktop_pixels(x: u16, y: u16) -> POINT {
             use windows::Win32::UI::WindowsAndMessaging::{
                 GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
