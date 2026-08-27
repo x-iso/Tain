@@ -504,6 +504,25 @@ impl ConnectionStore {
             .collect()
     }
 
+    /// Forget every probe answer, so the cards say they are being asked again.
+    ///
+    /// A sweep can take the better part of a minute when nothing answers — one
+    /// timeout per host, and the timeout is the whole point on a link where
+    /// hosts are unreachable. Until this existed, pressing "Check again" looked
+    /// exactly like pressing nothing: the cards went on claiming to be offline,
+    /// which was last minute's answer, not this one's.
+    ///
+    /// Clearing rather than setting a state of its own, because "no answer yet"
+    /// is precisely what this is, and the card already knows how to say that.
+    ///
+    /// Rows with no code need no exception here: [`Self::apply_status`] decides
+    /// their status from `has_code` and never consults `probed` at all.
+    pub fn forget_probe_results(&mut self) {
+        for entry in self.entries.iter_mut() {
+            entry.probed = None;
+        }
+    }
+
     /// Record what a probe found for one host.
     pub fn set_probe_result(&mut self, endpoint_hex: &str, status: ConnectionStatus) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.endpoint_id == endpoint_hex) {
@@ -751,6 +770,38 @@ mod tests {
         // And when the session ends, the last probe result is what is left.
         store.apply_status(&[]);
         assert_eq!(by_id(&store, "b"), ConnectionStatus::Unreachable);
+    }
+
+    /// Asking again has to look like asking again.
+    ///
+    /// A sweep is one timeout per unreachable host, which on a bad link is
+    /// every host. Until the answers were cleared first, "Check again" left
+    /// every card claiming to be offline for the length of the sweep — the last
+    /// answer, presented as though it were this one's. Pressing the button and
+    /// watching nothing change is indistinguishable from a button that does
+    /// nothing.
+    #[test]
+    fn asking_again_puts_every_card_back_to_checking() {
+        let mut store = store_with(&[("a", "A"), ("b", "B")]);
+        store.set_probe_result("a", ConnectionStatus::Ready);
+        store.set_probe_result("b", ConnectionStatus::Unreachable);
+        store.apply_status(&[]);
+
+        let by_id = |s: &ConnectionStore, id: &str| {
+            s.entries().iter().find(|c| c.endpoint_id == id).unwrap().status
+        };
+        assert_eq!(by_id(&store, "b"), ConnectionStatus::Unreachable);
+
+        store.forget_probe_results();
+        store.apply_status(&[]);
+        for id in ["a", "b"] {
+            assert_eq!(
+                by_id(&store, id),
+                ConnectionStatus::Unknown,
+                "{id} is still showing the answer from before the button was pressed"
+            );
+            assert_eq!(by_id(&store, id).label(), "checking...");
+        }
     }
 
     #[test]

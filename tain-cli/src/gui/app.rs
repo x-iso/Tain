@@ -651,8 +651,10 @@ async fn run_probe_loop(
     checked_tx: mpsc::UnboundedSender<(ConnectionCode, ProbeOutcome)>,
     mut resweep_rx: mpsc::UnboundedReceiver<()>,
 ) {
+    // Shared rather than owned, because a sweep now hands it to several probes
+    // at once and they outlive this scope by a task boundary.
     let mut prober = match tain_core::network::Prober::bind().await {
-        Ok(prober) => prober,
+        Ok(prober) => std::sync::Arc::new(prober),
         Err(e) => {
             // Not fatal: the cards fall back to "checking..." forever, which is
             // still more honest than the claim this replaced.
@@ -715,13 +717,32 @@ async fn run_probe_loop(
                 // Collected in one pass and released before any network work:
                 // holding the store locked across a probe would stall every
                 // repaint.
-                let targets = store.lock().unwrap().probe_targets();
+                let targets = {
+                    let mut store = store.lock().unwrap();
+                    // Before any network work, so the cards say they are being
+                    // asked rather than repeating the last answer for however
+                    // long this takes.
+                    store.forget_probe_results();
+                    store.probe_targets()
+                };
 
                 // Counted so a sweep that reached nobody can be told apart from
                 // a sweep with nobody to reach.
                 let mut asked = 0u32;
                 let mut answered = 0u32;
 
+                // # All at once, not one after another
+                //
+                // These were probed in sequence, so a sweep cost one timeout per
+                // saved machine — and the timeout is the normal case on a link
+                // where the hosts are unreachable. Three of them was most of a
+                // minute during which nothing on screen changed and the button
+                // could not be pressed again to any effect.
+                //
+                // They do not depend on each other and the prober takes `&self`,
+                // so the whole sweep costs one timeout now, and each card
+                // updates as its own answer arrives rather than at the end.
+                let mut probes = tokio::task::JoinSet::new();
                 for (endpoint_hex, code) in targets {
                     let Ok(parsed) = ConnectionCode::parse(&code) else {
                         store
@@ -732,7 +753,14 @@ async fn run_probe_loop(
                     };
 
                     asked += 1;
-                    let status = status_of(prober.probe(&parsed, PROBE_TIMEOUT).await);
+                    let prober = std::sync::Arc::clone(&prober);
+                    probes.spawn(async move {
+                        (endpoint_hex, status_of(prober.probe(&parsed, PROBE_TIMEOUT).await))
+                    });
+                }
+
+                while let Some(finished) = probes.join_next().await {
+                    let Ok((endpoint_hex, status)) = finished else { continue };
                     if status.can_connect() {
                         answered += 1;
                     }
@@ -755,7 +783,7 @@ async fn run_probe_loop(
                     );
                     match tain_core::network::Prober::bind().await {
                         Ok(fresh) => {
-                            prober = fresh;
+                            prober = std::sync::Arc::new(fresh);
                             failed_sweeps = 0;
                         }
                         Err(e) => warn!("Could not rebind the prober: {e}"),
@@ -2936,6 +2964,12 @@ impl eframe::App for GuestApp {
                         .clicked()
                         && let Some(tx) = self.resweep_tx.as_ref()
                     {
+                        // Cleared here as well as in the sweep, so the cards
+                        // answer the click on this frame rather than whenever
+                        // the prober task next wakes. Pressing a button and
+                        // watching nothing happen is the complaint this fixes,
+                        // and a task hop is long enough to be that complaint.
+                        self.state.previous_connections.lock().unwrap().forget_probe_results();
                         let _ = tx.send(());
                     }
                 });
