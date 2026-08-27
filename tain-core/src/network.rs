@@ -1134,6 +1134,17 @@ impl AckState {
     /// So the window is enforced from the start. A guest that has genuinely
     /// said nothing for [`ACK_STALENESS_LIMIT`] *since the session began* is the
     /// one that cannot ack, and only then does the window open.
+    /// Whether this guest has ever acknowledged a single frame.
+    ///
+    /// The difference between a link that stopped delivering and one that has
+    /// not started. Both look identical to [`Self::is_reporting`] after the
+    /// staleness limit, and they call for opposite responses: a stream that was
+    /// flowing and stopped is evidence about the link, while a session still
+    /// establishing is no evidence at all.
+    fn has_ever_acked(&self) -> bool {
+        self.last_at.is_some()
+    }
+
     fn is_reporting(&self) -> bool {
         match self.last_at {
             Some(at) => at.elapsed() < ACK_STALENESS_LIMIT,
@@ -1805,11 +1816,23 @@ fn spawn_capture_pipeline(
                 }
 
                 let guest = *telemetry.lock().unwrap();
+                // # Stopped, not "not started yet"
+                //
                 // The same silence the flow-control window uses to decide a
                 // guest cannot ack — see `AckState::is_reporting`. There it
                 // opens the window so frames keep flowing; here it is what
                 // tells the controller they are flowing nowhere.
-                let acks_stale = !acks.lock().unwrap().is_reporting();
+                //
+                // But only once there has been something to stop. A session in
+                // its first seconds has not been acknowledged yet either, and
+                // reading that as a failing link is how a stream on a
+                // five-millisecond connection was taken down to 640x360 at
+                // 8 fps before its first frame was ever confirmed — and then
+                // spent seventy seconds climbing back out.
+                let acks_stale = {
+                    let state = acks.lock().unwrap();
+                    state.has_ever_acked() && !state.is_reporting()
+                };
                 let observation = window.observe(elapsed, guest, acks_stale);
                 window.clear();
                 window_started = std::time::Instant::now();

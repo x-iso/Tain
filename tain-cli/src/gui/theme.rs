@@ -74,7 +74,21 @@ const _: () = assert!(
 /// into it.
 pub const SETTINGS_BLOCK_W: f32 = 60.0;
 pub const CARD_SIZE: Vec2 = Vec2::new(300.0, 208.0);
-pub const PILL_SIZE: Vec2 = Vec2::new(217.0, 44.0);
+/// An incoming-connection card grows with the guest's name, so only its
+/// height and its fixed furniture are constants.
+///
+/// [`PILL_CHROME_W`] is everything in the card that is not the name: the person
+/// icon, the status mark, the two permission toggles, the gaps between them and
+/// the card's own margins. Adding the name's measured width to it is what keeps
+/// the text from ever reaching the buttons — the alternative, laying both out
+/// in one row and hoping, is what let a long name push the toggles off the
+/// card.
+pub const PILL_HEIGHT: f32 = 44.0;
+pub const PILL_CHROME_W: f32 = 122.0;
+
+/// Never narrower than this, so a one-letter name still reads as a card rather
+/// than a button with an icon on it.
+pub const PILL_MIN_W: f32 = 150.0;
 pub const CORNER: f32 = 5.0;
 
 /// Width to give each passcode button so the header fits `available`.

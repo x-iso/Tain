@@ -913,10 +913,22 @@ impl GuestSession {
             self.shared.present_on_gpu.store(false, std::sync::atomic::Ordering::Relaxed);
         }
 
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        // # Closed, not killed
+        //
+        // Dropping the input channel is what tells the session to wind up: the
+        // writer's loop ends the moment it closes, and on the way out it tells
+        // the host the session is over and closes the connection properly.
+        //
+        // Aborting the task took that away. Nothing was sent and nothing was
+        // closed — the log said `Endpoint dropped without calling
+        // Endpoint::close` — so the host went on showing a guest that had left
+        // until QUIC timed the connection out tens of seconds later.
+        //
+        // The handle is dropped rather than awaited, which detaches it: this
+        // runs on the interface thread and must not block it. What bounds the
+        // task is its own goodbye timeout and the silence limit it watches.
         self.input_tx = None;
+        drop(self.task.take());
         self.texture = None;
         self.last_pointer = None;
         self.touch_slots = [None; tain_core::protocol::MAX_TOUCH_CONTACTS as usize];

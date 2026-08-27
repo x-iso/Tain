@@ -525,6 +525,13 @@ impl GuestSessionState {
 /// is invisible next to the video.
 const TELEMETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// How long the goodbye may take before the teardown stops waiting for it.
+///
+/// Short on purpose. A session ending because the link failed is the ordinary
+/// way to arrive there, and the message will never be delivered in that case —
+/// waiting on it would make every failed session hang on the way out.
+const GOODBYE_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// How long the host may say nothing before the guest gives up on it.
 ///
 /// The host sends frames, control state and pong replies, so silence this long
@@ -912,6 +919,28 @@ pub async fn run_guest_session(
             } => Ok(()),
             r = reader => r.context("Receive task panicked"),
         };
+
+        // # Say goodbye before hanging up
+        //
+        // Without this the host learns nothing until QUIC gives up on a
+        // connection that stopped answering, which is tens of seconds. For that
+        // whole time its connection list shows a guest that has gone, and the
+        // guest code it might have regenerated on the last one leaving stays as
+        // it was.
+        //
+        // Best effort, and briefly: a link that has already failed is the
+        // common reason for getting here, and the teardown must not wait on it.
+        // The host treats this as the session ending however it arrives, and a
+        // dropped connection still ends it the slow way if this does not land.
+        let farewell = Message::SessionEnd(tain_core::protocol::SessionEnd {
+            session_id: 0,
+            reason: "the guest closed the session".into(),
+        });
+        let _ = tokio::time::timeout(
+            GOODBYE_GRACE,
+            write_stream_message(&mut send, &farewell),
+        )
+        .await;
 
         // The audio reader outlives the select, so it has to be stopped here or
         // it holds the stream — and the playback device behind it — open past

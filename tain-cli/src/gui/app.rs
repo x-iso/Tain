@@ -514,18 +514,28 @@ pub struct ProbeHandles {
     /// Ask the prober about one code now, rather than at the next sweep.
     pub check_tx: mpsc::UnboundedSender<ConnectionCode>,
     pub checked_rx: mpsc::UnboundedReceiver<(ConnectionCode, ProbeOutcome)>,
+    /// Asks for a sweep now rather than at the next interval.
+    ///
+    /// The sweep runs on a timer, and a machine that has just come back is
+    /// offline on every card until the timer comes round again. Worse, a card
+    /// that has given up says so with no way to ask it to look again — and it
+    /// can be wrong: a host reported as unreachable has connected on the next
+    /// attempt more than once.
+    pub resweep_tx: mpsc::UnboundedSender<()>,
 }
 
 /// Start the reachability prober. Returns at once; the bind happens inside.
 pub fn init_prober(state: &AppState) -> ProbeHandles {
     let (check_tx, check_rx) = mpsc::unbounded_channel();
     let (checked_tx, checked_rx) = mpsc::unbounded_channel();
+    let (resweep_tx, resweep_rx) = mpsc::unbounded_channel();
     tokio::spawn(run_probe_loop(
         Arc::clone(&state.previous_connections),
         check_rx,
         checked_tx,
+        resweep_rx,
     ));
-    ProbeHandles { check_tx, checked_rx }
+    ProbeHandles { check_tx, checked_rx, resweep_tx }
 }
 
 /// Bind the host server, generate initial passcodes, and start accepting connections.
@@ -639,6 +649,7 @@ async fn run_probe_loop(
     store: Arc<Mutex<ConnectionStore>>,
     mut check_rx: mpsc::UnboundedReceiver<ConnectionCode>,
     checked_tx: mpsc::UnboundedSender<(ConnectionCode, ProbeOutcome)>,
+    mut resweep_rx: mpsc::UnboundedReceiver<()>,
 ) {
     let mut prober = match tain_core::network::Prober::bind().await {
         Ok(prober) => prober,
@@ -689,6 +700,15 @@ async fn run_probe_loop(
                 if checked_tx.send((code, outcome)).is_err() {
                     return;
                 }
+            }
+
+            // Asked for by hand. Bringing the next sweep forward rather than
+            // probing here keeps one path through the work, so a manual check
+            // and a timed one cannot drift apart in what they do.
+            Some(()) = resweep_rx.recv() => {
+                next_sweep = tokio::time::Instant::now();
+                // Whatever the last sweep concluded, this is a fresh question.
+                failed_sweeps = 0;
             }
 
             _ = tokio::time::sleep_until(next_sweep) => {
@@ -1041,6 +1061,8 @@ pub struct GuestApp {
     /// has already replaced is discarded rather than shown against the new one.
     checking: Option<ConnectionCode>,
     check_tx: Option<mpsc::UnboundedSender<ConnectionCode>>,
+    /// Asks the prober to sweep now. See [`ProbeHandles::resweep_tx`].
+    resweep_tx: Option<mpsc::UnboundedSender<()>>,
     checked_rx: Option<mpsc::UnboundedReceiver<(ConnectionCode, ProbeOutcome)>>,
     /// A destructive action awaiting confirmation.
     confirm: Option<Confirm>,
@@ -1085,6 +1107,7 @@ impl GuestApp {
             paste_state: PasteState::default(),
             checking: None,
             check_tx: None,
+            resweep_tx: None,
             checked_rx: None,
             confirm: None,
             show_settings: false,
@@ -1162,6 +1185,7 @@ impl GuestApp {
     pub fn attach_prober(&mut self, handles: ProbeHandles) {
         self.check_tx = Some(handles.check_tx);
         self.checked_rx = Some(handles.checked_rx);
+        self.resweep_tx = Some(handles.resweep_tx);
     }
 
     fn send(&self, cmd: HostCommand) {
@@ -2331,7 +2355,19 @@ impl GuestApp {
         edits: &mut PendingEdits,
     ) {
         let pending = conn.status == ApprovalStatus::Pending;
-        let (rect, _) = ui.allocate_exact_size(PILL_SIZE, egui::Sense::hover());
+
+        // The card is sized to its name, and the name is measured rather than
+        // estimated: these come from other people's machines, and a character
+        // count is not a width in a proportional font — "WWWWWWWWWWWW" and
+        // "iiiiiiiiiiii" are the same twelve characters and nearly three times
+        // apart on screen.
+        let shown = elide(&conn.display_name, PILL_NAME_MAX_CHARS);
+        let name_font = egui::FontId::proportional(13.0);
+        let name_width = ui.fonts(|fonts| {
+            fonts.layout_no_wrap(shown.clone(), name_font.clone(), TEXT).rect.width()
+        });
+        let pill = egui::vec2((PILL_CHROME_W + name_width).max(PILL_MIN_W), PILL_HEIGHT);
+        let (rect, _) = ui.allocate_exact_size(pill, egui::Sense::hover());
 
         // Pending cards get the dashed outline from incoming_card_pending.svg.
         ui.painter().rect_filled(rect, CORNER, CARD_BG);
@@ -2383,18 +2419,34 @@ impl GuestApp {
         }
 
         content.add_space(6.0);
-        content
-            .label(egui::RichText::new(&conn.display_name).size(13.0).color(TEXT))
-            .on_hover_text(if pending {
-                "Waiting for your decision — nothing shared yet".to_string()
-            } else {
-                let mut text =
-                    describe_grants(conn.mouse_allowed, conn.keyboard_allowed).to_string();
-                if conn.name_is_self_reported {
-                    text.push_str("\nThis name was chosen by the connecting machine.");
+        // Given exactly the width it was measured at. Left to the row's own
+        // flow, a name would take whatever space it liked and the toggles would
+        // be pushed out of the card.
+        content.allocate_ui_with_layout(
+            egui::vec2(name_width, content.available_height()),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                // One tooltip, and it carries the full name whenever the card
+                // is showing only part of one: a guest identified by a name
+                // that has been cut short is a guest the person deciding
+                // cannot actually identify.
+                let mut hover = if shown == conn.display_name {
+                    String::new()
+                } else {
+                    format!("{}\n", conn.display_name)
+                };
+                if pending {
+                    hover.push_str("Waiting for your decision — nothing shared yet");
+                } else {
+                    hover.push_str(describe_grants(conn.mouse_allowed, conn.keyboard_allowed));
+                    if conn.name_is_self_reported {
+                        hover.push_str("\nThis name was chosen by the connecting machine.");
+                    }
                 }
-                text
-            });
+                ui.label(egui::RichText::new(&shown).font(name_font.clone()).color(TEXT))
+                    .on_hover_text(hover);
+            },
+        );
 
         content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             match conn.status {
@@ -2469,6 +2521,30 @@ impl GuestApp {
             }
         });
     }
+}
+
+/// Longest guest name an incoming card spells out before eliding it.
+///
+/// Names come from the machine connecting, which chooses its own, so this is
+/// not a length anything here controls — only how much of one a card is willing
+/// to become.
+const PILL_NAME_MAX_CHARS: usize = 12;
+
+/// Shorten `name` to at most `max` characters, marking where it was cut.
+///
+/// # Characters, not bytes
+///
+/// These names arrive from other people's machines and may be in any script.
+/// Slicing a `String` by byte index panics when the index lands inside a
+/// character, so a Cyrillic or CJK name would take the interface down rather
+/// than be shortened — and those are exactly the names long enough to need it.
+fn elide(name: &str, max: usize) -> String {
+    if name.chars().count() <= max {
+        return name.to_string();
+    }
+    // One character of the budget is spent saying that there was more.
+    let kept: String = name.chars().take(max.saturating_sub(1)).collect();
+    kept + "\u{2026}"
 }
 
 /// Plain-language summary of a session's input permissions.
@@ -2703,12 +2779,31 @@ impl eframe::App for GuestApp {
                     .inner_margin(egui::Margin::symmetric(16.0, 12.0)),
             )
             .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new("Previous connections:")
-                        .size(14.0)
-                        .strong()
-                        .color(TEXT),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Previous connections:")
+                            .size(14.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    // Beside the heading rather than on each card: the sweep is
+                    // one pass over all of them, so offering it per card would
+                    // promise something narrower than what happens.
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("Check again").size(12.0).color(TEXT_DIM),
+                        ))
+                        .on_hover_text(
+                            "Ask every host on this list whether it is reachable, now. \
+                             A card that says offline can still be reached with Connect — \
+                             this is the same question asked again, not a different one.",
+                        )
+                        .clicked()
+                        && let Some(tx) = self.resweep_tx.as_ref()
+                    {
+                        let _ = tx.send(());
+                    }
+                });
                 ui.add_space(10.0);
                 // auto_shrink=false makes the scroll area claim the whole panel,
                 // so the middle section keeps its space even when nearly empty.
@@ -2863,6 +2958,61 @@ mod scale_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name from another machine must never be able to panic this one.
+    ///
+    /// The card shortens by characters rather than bytes for exactly this: a
+    /// `String` sliced at a byte index that lands inside a character panics,
+    /// and a name in Cyrillic or CJK is all multi-byte characters — which are
+    /// also the names most likely to be long enough to need shortening.
+    #[test]
+    fn a_name_in_any_script_is_shortened_rather_than_split() {
+        for name in [
+            "\u{041c}\u{043e}\u{0439} \u{043a}\u{043e}\u{043c}\u{043f}\u{044c}\u{044e}\u{0442}\u{0435}\u{0440} \u{0434}\u{043e}\u{043c}\u{0430}",
+            "\u{4e0a}\u{6d77}\u{7684}\u{5de5}\u{4f5c}\u{7ad9}\u{4e00}\u{53f7}\u{673a}\u{5668}\u{4eba}",
+            "\u{1f5a5}\u{fe0f} studio desktop",
+        ] {
+            // Every cut point, not just the one the card happens to use. A
+            // single length proves very little here: a byte-sliced version of
+            // this passed on the first name tried, because eleven bytes into it
+            // lands on a character boundary by luck. One of these does not.
+            for max in 1..=name.chars().count() + 2 {
+                let short = elide(name, max);
+                assert!(
+                    short.chars().count() <= max,
+                    "{name:?} cut to {max} became {short:?}, which is longer"
+                );
+                assert!(
+                    name.starts_with(short.trim_end_matches('\u{2026}')),
+                    "{short:?} is not the start of {name:?}"
+                );
+            }
+        }
+    }
+
+    /// A name that fits is left exactly as it is — no stray ellipsis.
+    #[test]
+    fn a_short_name_is_not_marked_as_cut() {
+        for name in ["Q", "DESKPC", "LAPTOP-7K2Q"] {
+            assert_eq!(elide(name, PILL_NAME_MAX_CHARS), name);
+        }
+        // Exactly at the cap still counts as fitting.
+        let twelve = "abcdefghijkl";
+        assert_eq!(twelve.chars().count(), PILL_NAME_MAX_CHARS);
+        assert_eq!(elide(twelve, PILL_NAME_MAX_CHARS), twelve);
+    }
+
+    /// And one that does not fit says so, within the same budget.
+    #[test]
+    fn a_long_name_is_cut_and_marked() {
+        let long = "LAPTOP-7K2Q9F-workstation";
+        let short = elide(long, PILL_NAME_MAX_CHARS);
+        assert!(short.ends_with('\u{2026}'), "{short:?} does not say it was cut");
+        assert_eq!(short.chars().count(), PILL_NAME_MAX_CHARS);
+        assert!(long.starts_with(short.trim_end_matches('\u{2026}')));
+    }
+
+
     use tain_core::PasscodeType as CorePasscodeType;
 
     fn incoming(session_id: u32, status: ApprovalStatus) -> IncomingConnection {
