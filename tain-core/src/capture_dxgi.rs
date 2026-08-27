@@ -174,7 +174,11 @@ impl Duplication {
             // is why this is not simply asked first.
             let mut converter = None;
             if hdr_desktop {
-                match HdrToSdr::new(&device, &context, size.0, size.1) {
+                // What the display says white is worth, or 80 nits if it will
+                // not say — see `DisplayColour::reference_white`. Getting this
+                // wrong does not fail, it just washes the picture out.
+                let white = colour.map_or(1.0, |colour| colour.reference_white);
+                match HdrToSdr::new(&device, &context, size.0, size.1, white) {
                     Ok(ready) => converter = Some(ready),
                     Err(e) => {
                         colour_log.conversion_refused(&e);

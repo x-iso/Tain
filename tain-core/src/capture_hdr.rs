@@ -89,11 +89,31 @@ const SDR: DXGI_COLOR_SPACE_TYPE = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 
 /// What an output says about its own colour handling.
 ///
-/// Read once, when duplication is set up. The luminance figures are not used
-/// yet; they are what a tone curve would be built from, and they are read here
-/// because this is the only place that has the output to ask.
+/// Read once, when duplication is set up, because this is the only place that
+/// has the output to ask.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplayColour {
+    /// What an ordinary white window is worth in [`SCRGB`], where `1.0` is 80
+    /// nits by definition.
+    ///
+    /// # Why this is not 1.0, and why assuming it was bleached the picture
+    ///
+    /// scRGB pins `1.0` to 80 nits and nothing else. It does not mean "white".
+    /// When the desktop goes HDR, Windows composites SDR content at whatever
+    /// the "SDR content brightness" slider says — commonly 200 to 480 nits —
+    /// so an ordinary white window arrives at 2.5 to 6.0, and a mid grey lands
+    /// well above `1.0` too.
+    ///
+    /// Treating `1.0` as white therefore drives everything from a third of SDR
+    /// white upwards into the top of the range, which is exactly the washed-out
+    /// picture that was reported — before the tone curve and after it, because
+    /// a curve cannot fix an exposure. The video processor path bleaches for
+    /// the same reason and has no way not to: a colour space enum carries no
+    /// white level, so the driver assumes 80 nits as well.
+    ///
+    /// `1.0` when the display cannot be asked, which is the right guess for an
+    /// SDR desktop — there is no slider in play and white is white.
+    pub reference_white: f32,
     /// The space the *panel* is being driven in. HDR10 here means the desktop
     /// is being composited in [`SCRGB`].
     pub space: DXGI_COLOR_SPACE_TYPE,
@@ -144,12 +164,103 @@ pub fn probe(output: &IDXGIOutput) -> Option<DisplayColour> {
     // SAFETY: a documented read into a local, on a live interface.
     let desc = unsafe { output6.GetDesc1() }.ok()?;
     Some(DisplayColour {
+        reference_white: reference_white(&desc.DeviceName).unwrap_or(1.0),
         space: desc.ColorSpace,
         bits_per_colour: desc.BitsPerColor,
         min_nits: desc.MinLuminance,
         max_nits: desc.MaxLuminance,
         max_full_frame_nits: desc.MaxFullFrameLuminance,
     })
+}
+
+/// What SDR white is worth in scRGB on the display DXGI calls `device_name`.
+///
+/// DXGI knows the luminance the panel can reach but not where Windows has put
+/// SDR white inside it — that lives in the display configuration, against the
+/// *target* rather than the adapter output, and has to be matched back by GDI
+/// device name. `None` if the display cannot be found or will not answer, which
+/// the caller reads as "assume 80 nits".
+fn reference_white(device_name: &[u16; 32]) -> Option<f32> {
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+        DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    };
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+
+    let mut path_count = 0;
+    let mut mode_count = 0;
+    // SAFETY: both out-parameters are owned locals.
+    let sized = unsafe {
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+    };
+    if sized != ERROR_SUCCESS {
+        return None;
+    }
+
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+    // SAFETY: both buffers are exactly the length just asked for, and the counts
+    // are passed by pointer so the call can shorten them.
+    let queried = unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        )
+    };
+    if queried != ERROR_SUCCESS {
+        return None;
+    }
+    paths.truncate(path_count as usize);
+
+    for path in paths {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the header describes the struct it is embedded in, which is a
+        // local and outlives the call.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
+            continue;
+        }
+        if source.viewGdiDeviceName != *device_name {
+            continue;
+        }
+
+        let mut white = DISPLAYCONFIG_SDR_WHITE_LEVEL {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+                size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
+                // The *target*, not the source: the slider belongs to the
+                // monitor being driven, not to the desktop being drawn.
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        // SAFETY: as above.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut white.header) } != 0 {
+            return None;
+        }
+
+        // Documented as a scale in thousandths against 80 nits, which is the
+        // scRGB unit — so the ratio is the answer, no nits needed.
+        let scale = white.SDRWhiteLevel as f32 / 1000.0;
+        // A display that answers with nonsense is worse than one that does not
+        // answer: it would set the exposure for the whole session.
+        return (scale.is_finite() && (0.5..=20.0).contains(&scale)).then_some(scale);
+    }
+    None
 }
 
 /// Converts a floating-point HDR desktop into the BGRA the pipeline expects.
@@ -415,7 +526,7 @@ impl VideoProcessorPath {
 const TONEMAP_HLSL: &str = r#"
 Texture2D<float4> Source : register(t0);
 SamplerState Point : register(s0);
-cbuffer Params : register(b0) { float Knee; float3 Padding; };
+cbuffer Params : register(b0) { float Knee; float ReferenceWhite; float2 Padding; };
 
 struct Vertex { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 
@@ -444,7 +555,11 @@ float encode(float c) {
 }
 
 float4 ps_main(Vertex v) : SV_TARGET {
-    float3 c = Source.Sample(Point, v.uv).rgb;
+    // Exposure first. scRGB pins 1.0 to 80 nits, not to white, and Windows
+    // composites SDR content at whatever the brightness slider says — so an
+    // ordinary white window arrives somewhere between 2.5 and 6.0. Rolling off
+    // before dividing by that is what bleached the picture.
+    float3 c = Source.Sample(Point, v.uv).rgb / ReferenceWhite;
     c = float3(roll(c.r, Knee), roll(c.g, Knee), roll(c.b, Knee));
     return float4(encode(c.r), encode(c.g), encode(c.b), 1.0);
 }
@@ -480,8 +595,13 @@ impl ShaderPath {
         context: &ID3D11DeviceContext,
         width: u16,
         height: u16,
+        reference_white: f32,
     ) -> Result<Self> {
         anyhow::ensure!(width > 0 && height > 0, "display is {width}x{height}");
+        anyhow::ensure!(
+            reference_white.is_finite() && reference_white > 0.0,
+            "reference white is {reference_white}, which would divide the picture by nothing"
+        );
 
         let vertex_code = compile(TONEMAP_HLSL, s!("vs_main"), s!("vs_4_0"))?;
         let pixel_code = compile(TONEMAP_HLSL, s!("ps_main"), s!("ps_4_0"))?;
@@ -493,7 +613,8 @@ impl ShaderPath {
         let mut target = None;
         let mut target_view = None;
 
-        let knee = [KNEE, 0.0, 0.0, 0.0];
+        // Laid out to match the cbuffer: knee, reference white, two of padding.
+        let knee = [KNEE, reference_white, 0.0, 0.0];
         let buffer_desc = D3D11_BUFFER_DESC {
             ByteWidth: std::mem::size_of_val(&knee) as u32,
             Usage: D3D11_USAGE_IMMUTABLE,
@@ -738,15 +859,22 @@ enum Route {
 }
 
 impl HdrToSdr {
+    /// `reference_white` is what an ordinary white window is worth in scRGB —
+    /// see [`DisplayColour::reference_white`], which is where it comes from.
     pub fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         width: u16,
         height: u16,
+        reference_white: f32,
     ) -> Result<Self> {
-        match ShaderPath::new(device, context, width, height) {
+        match ShaderPath::new(device, context, width, height, reference_white) {
             Ok(shader) => {
-                info!("HDR desktop will be tone mapped in a shader at {width}x{height}");
+                info!(
+                    "HDR desktop will be tone mapped in a shader at {width}x{height}, \
+                     with white at {:.0} nits",
+                    reference_white * 80.0
+                );
                 return Ok(Self(Route::Shader(shader)));
             }
             Err(e) => {
@@ -757,6 +885,18 @@ impl HdrToSdr {
         }
         let processor = VideoProcessorPath::new(device, context, width, height)?;
         info!("HDR desktop will be converted by the video processor at {width}x{height}");
+        // The video processor is told a colour space, and a colour space enum
+        // carries no white level — so it will read scRGB 1.0 as white however
+        // bright Windows is actually compositing SDR content. There is nothing
+        // to pass it and nothing it could do with it; this says so out loud
+        // rather than leaving a washed-out picture unexplained.
+        if reference_white > 1.05 {
+            warn!(
+                "White is at {:.0} nits on this display and the video processor cannot be \
+                 told that — the picture will look washed out until the shader path works",
+                reference_white * 80.0
+            );
+        }
         Ok(Self(Route::Processor(processor)))
     }
 
@@ -975,28 +1115,81 @@ mod tests {
             [-0.5, 0.0, 0.25, 0.5, 0.75, 0.875, 1.0, 1.5, 2.0, 4.0, 8.0, 16.0];
         let width = inputs.len() as u16;
 
-        for directly_bindable in [true, false] {
-            let source = float_texture(&device, &inputs, directly_bindable);
-            let mut path = ShaderPath::new(&device, &context, width, 1)
-                .expect("the shader path should build on any D3D11 device");
-            let target = path.convert(&source).expect("convert");
-            let pixels = read_back(&device, &context, &target, width);
+        // 1.0 is an SDR desktop. 4.0 is an HDR one with the brightness slider
+        // at 320 nits, which is an ordinary place for it to sit and the case
+        // that was washing the picture out — every one of these inputs but the
+        // first three is at or above white when the exposure is ignored.
+        for reference_white in [1.0, 4.0] {
+            for directly_bindable in [true, false] {
+                let source = float_texture(&device, &inputs, directly_bindable);
+                let mut path = ShaderPath::new(&device, &context, width, 1, reference_white)
+                    .expect("the shader path should build on any D3D11 device");
+                let target = path.convert(&source).expect("convert");
+                let pixels = read_back(&device, &context, &target, width);
 
-            for (i, &x) in inputs.iter().enumerate() {
-                let expected = (encode(rolled_off(x, KNEE)) * 255.0).round();
-                // BGRA: all three channels carry the same value here, so a
-                // channel swap would show up as well.
-                for (channel, offset) in [("blue", 0), ("green", 1), ("red", 2)] {
-                    let got = f32::from(pixels[i * 4 + offset]);
-                    assert!(
-                        (got - expected).abs() <= 1.0,
-                        "scRGB {x} came back as {got} in {channel}, and the curve says \
-                         {expected} (bound directly: {directly_bindable})"
-                    );
+                for (i, &x) in inputs.iter().enumerate() {
+                    let expected =
+                        (encode(rolled_off(x / reference_white, KNEE)) * 255.0).round();
+                    // BGRA: all three channels carry the same value here, so a
+                    // channel swap would show up as well.
+                    for (channel, offset) in [("blue", 0), ("green", 1), ("red", 2)] {
+                        let got = f32::from(pixels[i * 4 + offset]);
+                        assert!(
+                            (got - expected).abs() <= 1.0,
+                            "scRGB {x} with white at {reference_white} came back as {got} in \
+                             {channel}, and the curve says {expected} (bound directly: \
+                             {directly_bindable})"
+                        );
+                    }
+                    assert_eq!(pixels[i * 4 + 3], 255, "alpha must be opaque");
                 }
-                assert_eq!(pixels[i * 4 + 3], 255, "alpha must be opaque");
             }
         }
+    }
+
+    /// Ignoring where white actually is turns a desktop into a white sheet.
+    ///
+    /// This is the reported symptom, in numbers. With the brightness slider at
+    /// 320 nits an ordinary desktop lives between scRGB 0 and 4, and if `1.0` is
+    /// taken for white then everything from a quarter of the range upwards
+    /// encodes to within a few levels of 255 — no contrast left anywhere above
+    /// mid grey. The point of the assertion is that it fails loudly for the
+    /// version of this code that shipped.
+    #[test]
+    fn white_in_the_wrong_place_flattens_the_whole_picture() {
+        let white = 4.0;
+        let level = |x: f32, exposed: bool| {
+            let scaled = if exposed { x / white } else { x };
+            (encode(rolled_off(scaled, KNEE)) * 255.0).round()
+        };
+
+        // Quarter, half and three-quarter grey on a desktop where white is 4.0.
+        let greys = [1.0, 2.0, 3.0];
+
+        // Quarter to three-quarter grey should span most of the range. Ignoring
+        // the exposure it spans about a dozen levels out of 255 — measured at
+        // 240, 250, 252, which is a white sheet with a faint stain on it.
+        let ignored: Vec<f32> = greys.iter().map(|&x| level(x, false)).collect();
+        let flattened = ignored.last().unwrap() - ignored.first().unwrap();
+        assert!(
+            flattened < 20.0 && *ignored.first().unwrap() > 200.0,
+            "the greys came out at {ignored:?}, spanning {flattened} levels — if that is no \
+             longer flat then this test has stopped describing the bug it was written for"
+        );
+
+        let exposed: Vec<f32> = greys.iter().map(|&x| level(x, true)).collect();
+        for pair in exposed.windows(2) {
+            assert!(
+                pair[1] - pair[0] > 20.0,
+                "exposed for white at {white}, the greys came out at {exposed:?}, which is \
+                 not enough separation to read as a gradient"
+            );
+        }
+        assert!(
+            exposed[0] < 150.0,
+            "a quarter-grey encoded to {} — still far too bright",
+            exposed[0]
+        );
     }
 
     /// A device, or `None` on a machine with no D3D11 at all.
@@ -1129,6 +1322,8 @@ mod tests {
             min_nits: 0.5,
             max_nits: 270.0,
             max_full_frame_nits: 270.0,
+            // An SDR desktop has no brightness slider in play: white is white.
+            reference_white: 1.0,
         }
     }
 
@@ -1146,6 +1341,7 @@ mod tests {
             min_nits: 5.0762,
             max_nits: 507.0,
             max_full_frame_nits: 507.0,
+            reference_white: 1.0,
         };
         assert!(!capable.is_hdr());
         assert_eq!(capable.duplication_format(), DXGI_FORMAT_B8G8R8A8_UNORM);
@@ -1159,6 +1355,7 @@ mod tests {
             min_nits: 0.0,
             max_nits: 1000.0,
             max_full_frame_nits: 600.0,
+            reference_white: 2.5,
         };
         assert!(hdr.is_hdr());
         assert_eq!(hdr.duplication_format(), DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -1189,6 +1386,8 @@ mod tests {
             min_nits: 0.0,
             max_nits: 418.0,
             max_full_frame_nits: 418.0,
+            // 200 nits, which is where Windows puts the slider by default.
+            reference_white: 2.5,
         }
     }
 
@@ -1266,6 +1465,11 @@ mod tests {
                             println!(
                                 "  luminance {:.4}-{:.0} nits ({:.0} full frame)",
                                 colour.min_nits, colour.max_nits, colour.max_full_frame_nits,
+                            );
+                            println!(
+                                "  white at scRGB {:.3} ({:.0} nits)",
+                                colour.reference_white,
+                                colour.reference_white * 80.0,
                             );
                             println!("  colour space {} — {verdict}", colour.space.0);
                         }
