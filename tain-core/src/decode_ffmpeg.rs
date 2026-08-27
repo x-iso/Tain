@@ -69,6 +69,14 @@ unsafe extern "C" {
     fn db_decoder_free(d: *mut DbDecoder);
 }
 
+/// How long to wait for a colour conversion the render thread is about to read.
+///
+/// One blit at desktop size is a fraction of a millisecond, against a frame
+/// interval of twenty-odd, so this is not a budget being spent — it is a bound
+/// on a GPU that has stopped answering, where drawing the previous frame is
+/// better than never drawing again.
+const BLIT_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// A decoded frame that never left the GPU.
 ///
 /// # This owns the surface it names
@@ -389,6 +397,16 @@ impl FfmpegDecoder {
         // happens: no staging copy, no map, no eight megabytes allocated and
         // zeroed to be immediately overwritten.
         if self.present_on_gpu {
+            // But the blit does have to have *happened*. Nothing downstream
+            // waits for it: the texture goes to the render thread, which locks
+            // it for OpenGL and samples it. Sampling a target the GPU has not
+            // written yet shows what was in it before — the frame from three
+            // ago, given the rotation — which is the trail of repeated frames
+            // reported from an NVIDIA guest. `read` never needed this because
+            // mapping the staging texture waits on its own.
+            let t = std::time::Instant::now();
+            converter.finish(BLIT_WAIT);
+            self.stage_read += t.elapsed();
             return Ok(Some(DecodedPicture {
                 width: w as usize,
                 height: h as usize,

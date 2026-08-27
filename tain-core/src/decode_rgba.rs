@@ -42,6 +42,8 @@
 //! out. Getting this wrong does not fail; it washes the picture out, which looks
 //! like a bad capture rather than a bad conversion.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use tracing::*;
 
@@ -51,8 +53,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorEnumerator1,
     ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET,
     D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_RESOURCE_MISC_SHARED,
-    D3D11_TEXTURE2D_DESC,
+    ID3D11Query, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_RESOURCE_MISC_SHARED, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
@@ -122,6 +124,25 @@ pub struct RgbaConverter {
     last: usize,
     /// CPU-readable copy of `target`.
     staging: ID3D11Texture2D,
+    /// Signals when the GPU has actually finished the last blit.
+    ///
+    /// # Why submitting is not the same as finishing
+    ///
+    /// [`Self::submit`] queues the blit and flushes, which starts it — it does
+    /// not wait for it. That is fine for [`Self::read`], where mapping the
+    /// staging texture waits on the CPU's behalf as a side effect.
+    ///
+    /// It is not fine for the zero-copy path. There the target is handed to
+    /// OpenGL and sampled on the render thread, and `WGL_NV_DX_interop` is
+    /// explicit that the application must ensure Direct3D has finished with a
+    /// resource before locking it. Nothing here was doing that, so the render
+    /// thread could sample a target the GPU had not written yet and get
+    /// whatever was in it before — which, with three targets in rotation, is
+    /// the frame from three frames ago.
+    ///
+    /// That is the trail of repeated frames reported from an NVIDIA guest once
+    /// the surfaces were shareable and the picture stopped freezing outright.
+    fence: ID3D11Query,
     /// Views cached against the (texture, array slice) they were built from.
     ///
     /// Keyed on both because a decoder rotates through slices of one texture:
@@ -282,6 +303,12 @@ impl RgbaConverter {
         )
         .context("could not create the RGBA staging texture")?;
 
+        let fence_desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
+        let mut fence = None;
+        // SAFETY: the descriptor is a plain value; the out-param is checked.
+        unsafe { device.CreateQuery(&fence_desc, Some(&mut fence)) }
+            .context("could not create the blit-completion query")?;
+
         info!("GPU colour conversion ready — NV12 to RGBA at {width}x{height}");
         Ok(Self {
             context: context.clone(),
@@ -293,6 +320,7 @@ impl RgbaConverter {
             next: 0,
             last: 0,
             staging,
+            fence: fence.context("query came back empty")?,
             views: Vec::new(),
             width,
             height,
@@ -416,14 +444,57 @@ impl RgbaConverter {
         self.last = self.next;
         self.next = (self.next + 1) % TARGETS;
 
-        // SAFETY: the blit is queued; flushing starts it without waiting.
+        // SAFETY: the blit is queued; ending the query marks the point after it
+        // and flushing starts both. Neither waits — see `finish`, which does.
         //
         // The staging copy that used to be here has moved into `read`, which is
         // the only thing that needs it. The zero-copy path never calls `read`,
         // and doing the copy here would have made it pay for a readback it does
         // not perform.
-        unsafe { self.context.Flush() };
+        unsafe {
+            self.context.End(&self.fence);
+            self.context.Flush();
+        }
         Ok(())
+    }
+
+    /// Wait until the GPU has actually finished the last [`Self::submit`].
+    ///
+    /// Only the zero-copy path needs this, and it needs it before the target is
+    /// handed to anyone else: OpenGL samples the surface directly, so reading it
+    /// while the blit is still in flight shows whatever the target held before —
+    /// three frames ago, given the rotation. [`Self::read`] does not call this
+    /// because mapping the staging texture already waits.
+    ///
+    /// The wait is for one blit at desktop size, which is a fraction of a
+    /// millisecond, against a frame interval of twenty-odd. It is bounded
+    /// anyway: a GPU that has not finished in `limit` is in trouble no decoder
+    /// can help with, and returning is better than never drawing again.
+    pub fn finish(&self, limit: Duration) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            let mut done = windows::Win32::Foundation::BOOL(0);
+            // SAFETY: the query is live and `done` is a BOOL of the size given.
+            // An unfinished query returns S_FALSE and writes nothing, which is
+            // why `done` starts false and is not trusted from the return value —
+            // windows-rs reports S_FALSE as success.
+            let _ = unsafe {
+                self.context.GetData(
+                    &self.fence,
+                    Some(std::ptr::from_mut(&mut done).cast()),
+                    std::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32,
+                    0,
+                )
+            };
+            if done.as_bool() {
+                return true;
+            }
+            if started.elapsed() >= limit {
+                debug!("The colour conversion did not finish within {limit:?}");
+                return false;
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// Read whatever [`Self::submit`] last put in the staging texture.
@@ -547,6 +618,56 @@ mod tests {
         D3D11CreateDevice, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
     };
+
+    /// The blit has to be reported finished, and reported so promptly.
+    ///
+    /// The zero-copy path hands the target straight to OpenGL, which samples it
+    /// on another thread, so it must not be handed over while the GPU is still
+    /// writing it — that shows whatever the target held before, which with three
+    /// in rotation is the frame from three ago. `submit` only starts the blit;
+    /// `finish` is what waits.
+    ///
+    /// This cannot prove the render thread sees the right pixels — any CPU-side
+    /// check of that would itself wait, and so would pass whether or not
+    /// `finish` did anything. Nor can it tell a query ended after the blit from
+    /// one ended before it, since both signal.
+    ///
+    /// What it does catch is the query not signalling at all: the wrong kind of
+    /// query, or one never ended, both of which leave `finish` spending its
+    /// whole timeout and returning false while the picture goes on trailing.
+    /// Dropping the `End` call fails it in 2.2 seconds.
+    #[test]
+    fn a_submitted_conversion_reports_itself_finished() {
+        let Some((device, context)) = device() else {
+            eprintln!("no D3D11 device with video support — skipping");
+            return;
+        };
+        let (w, h) = (640u16, 360u16);
+        let Ok(mut converter) = RgbaConverter::new(&device, &context, w, h) else {
+            eprintln!("no NV12 to RGBA conversion on this GPU — skipping");
+            return;
+        };
+
+        let source = flat_nv12(&device, w, h, 126, 128, 128).expect("source");
+        converter.submit(&source, 0).expect("submit");
+
+        let started = std::time::Instant::now();
+        assert!(
+            converter.finish(Duration::from_secs(2)),
+            "the blit never reported itself finished, so nothing downstream can know \
+             when the target is safe to read"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "waiting for one blit took {:?}, which is not a wait a frame can afford",
+            started.elapsed()
+        );
+
+        // And it must still be true a second time round, since the query is
+        // reused for every frame rather than made afresh.
+        converter.submit(&source, 0).expect("submit");
+        assert!(converter.finish(Duration::from_secs(2)));
+    }
 
     /// Every target the converter draws into must be shareable.
     ///
