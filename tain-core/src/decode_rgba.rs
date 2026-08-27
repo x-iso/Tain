@@ -124,6 +124,12 @@ pub struct RgbaConverter {
     last: usize,
     /// CPU-readable copy of `target`.
     staging: ID3D11Texture2D,
+    /// The surface size the processor was described with.
+    ///
+    /// Starts as the picture size and is corrected the first time a decoder
+    /// hands back something larger — see [`build_processor`] for why describing
+    /// it wrongly turns the picture green rather than merely cropping it.
+    source: (u16, u16),
     /// Signals when the GPU has actually finished the last blit.
     ///
     /// # Why submitting is not the same as finishing
@@ -182,52 +188,11 @@ impl RgbaConverter {
             .cast()
             .context("device context is not a ID3D11VideoContext1 (needs D3D11.1)")?;
 
-        let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
-            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            InputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
-            InputWidth: width as u32,
-            InputHeight: height as u32,
-            OutputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
-            OutputWidth: width as u32,
-            OutputHeight: height as u32,
-            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-        };
-
-        // SAFETY: desc is fully initialised and outlives the call.
-        let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&desc) }
-            .context("no video processor for this content description")?;
-
-        // Ask before assuming, as on the capture side. A driver too old to
-        // answer the D3D11.1 query is not evidence either way, so that case
-        // proceeds and lets the blit be the judge.
-        if let Ok(enumerator1) = enumerator.cast::<ID3D11VideoProcessorEnumerator1>() {
-            // SAFETY: plain value arguments.
-            let supported = unsafe {
-                enumerator1.CheckVideoProcessorFormatConversion(
-                    DXGI_FORMAT_NV12,
-                    YUV_SPACE,
-                    DXGI_FORMAT_R8G8B8A8_UNORM,
-                    RGB_SPACE,
-                )
-            }
-            .context("could not query NV12 to RGBA support")?;
-            anyhow::ensure!(supported.as_bool(), "this GPU will not convert NV12 to RGBA");
-        }
-
-        // SAFETY: the enumerator outlives the processor it produces.
-        let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
-            .context("could not create the video processor")?;
-
-        // SAFETY: processor is live; both colour spaces are valid enum values.
-        unsafe {
-            video.VideoProcessorSetStreamColorSpace1(&processor, 0, YUV_SPACE);
-            video.VideoProcessorSetOutputColorSpace1(&processor, RGB_SPACE);
-            video.VideoProcessorSetStreamFrameFormat(
-                &processor,
-                0,
-                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            );
-        }
+        // Built for a source the size of the picture, which is a guess: a
+        // decoder is free to hand back something larger. `submit` corrects it
+        // the moment it sees the real surface — see `build_processor`.
+        let (enumerator, processor) =
+            build_processor(&video_device, &video, (width, height), (width, height))?;
 
         let view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -320,6 +285,7 @@ impl RgbaConverter {
             next: 0,
             last: 0,
             staging,
+            source: (width, height),
             fence: fence.context("query came back empty")?,
             views: Vec::new(),
             width,
@@ -366,6 +332,30 @@ impl RgbaConverter {
             "decoded surface is {:?}, not NV12 — this stream is not 8-bit 4:2:0",
             desc.Format
         );
+
+        // The surface the decoder actually produced, which is not necessarily
+        // the picture inside it. Rebuilding on a change rather than assuming at
+        // construction, because nothing knows the answer until a frame arrives
+        // and different codecs give different ones.
+        let arrived = (desc.Width as u16, desc.Height as u16);
+        if arrived != self.source {
+            info!(
+                "Decoded surface is {}x{} for a {}x{} picture — describing the conversion \
+                 to match",
+                arrived.0, arrived.1, self.width, self.height
+            );
+            let (enumerator, processor) = build_processor(
+                &self.video_device,
+                &self.video,
+                arrived,
+                (self.width, self.height),
+            )?;
+            self.enumerator = enumerator;
+            self.processor = processor;
+            self.source = arrived;
+            // Every cached view was made against the enumerator just replaced.
+            self.views.clear();
+        }
 
         let input = self.input_view_for(source, slice)?;
 
@@ -580,6 +570,80 @@ fn copy_rows(mapped: &D3D11_MAPPED_SUBRESOURCE, w: usize, h: usize, out: &mut [u
         unsafe { std::ptr::copy_nonoverlapping(src, out[row * y..].as_mut_ptr(), row) };
     }
     Ok(())
+}
+
+/// Build a video processor that converts `source` NV12 into `output` RGBA.
+///
+/// # Why the source size is not the picture size
+///
+/// A hardware decoder returns the picture inside whatever surface its codec
+/// wants. H.264 hands back exactly the picture; HEVC pads the height up to its
+/// coding-tree size, so a 640x480 picture arrives in a 640x512 surface.
+///
+/// In NV12 the chroma plane begins after the luma one, so where it begins
+/// depends on the height of the *surface*. Describing the input as 640x480 when
+/// it is really 640x512 has the driver look for chroma thirty-two rows early —
+/// inside the luma padding, which is zeros. Zero chroma is not a subtle shift:
+/// it is a flat green field with the luma showing through as tinted shapes,
+/// which is exactly what an HEVC session looked like, on every frame, while
+/// H.264 through the identical code was perfect.
+///
+/// The source rect set per frame is what crops the padding back off, so the
+/// output stays the picture and only the description changes.
+fn build_processor(
+    video_device: &ID3D11VideoDevice,
+    video: &ID3D11VideoContext1,
+    source: (u16, u16),
+    output: (u16, u16),
+) -> Result<(ID3D11VideoProcessorEnumerator, ID3D11VideoProcessor)> {
+    let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+        InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        InputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+        InputWidth: source.0 as u32,
+        InputHeight: source.1 as u32,
+        OutputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+        OutputWidth: output.0 as u32,
+        OutputHeight: output.1 as u32,
+        Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    };
+
+    // SAFETY: desc is fully initialised and outlives the call.
+    let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&desc) }
+        .context("no video processor for this content description")?;
+
+    // Ask before assuming, as on the capture side. A driver too old to
+    // answer the D3D11.1 query is not evidence either way, so that case
+    // proceeds and lets the blit be the judge.
+    if let Ok(enumerator1) = enumerator.cast::<ID3D11VideoProcessorEnumerator1>() {
+        // SAFETY: plain value arguments.
+        let supported = unsafe {
+            enumerator1.CheckVideoProcessorFormatConversion(
+                DXGI_FORMAT_NV12,
+                YUV_SPACE,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                RGB_SPACE,
+            )
+        }
+        .context("could not query NV12 to RGBA support")?;
+        anyhow::ensure!(supported.as_bool(), "this GPU will not convert NV12 to RGBA");
+    }
+
+    // SAFETY: the enumerator outlives the processor it produces.
+    let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
+        .context("could not create the video processor")?;
+
+    // SAFETY: processor is live; both colour spaces are valid enum values.
+    unsafe {
+        video.VideoProcessorSetStreamColorSpace1(&processor, 0, YUV_SPACE);
+        video.VideoProcessorSetOutputColorSpace1(&processor, RGB_SPACE);
+        video.VideoProcessorSetStreamFrameFormat(
+            &processor,
+            0,
+            D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        );
+    }
+
+    Ok((enumerator, processor))
 }
 
 fn create_rgba(

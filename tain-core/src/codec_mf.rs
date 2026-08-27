@@ -1620,6 +1620,111 @@ mod tests {
         }
     }
 
+    /// A picture must survive the round trip *looking like itself*.
+    ///
+    /// # What the existing round-trip tests do not check
+    ///
+    /// They assert that a picture came out, which is a real bar — a stream that
+    /// encodes and never decodes hid behind the host's own preview for a week.
+    /// But a picture that comes out mangled passes it, and a guest reported
+    /// exactly that: HEVC arriving as a green field with red text, structure
+    /// intact and colour destroyed.
+    ///
+    /// They also feed BGRA, which is no longer what a Windows host sends. The
+    /// capture backend now converts on the GPU and hands the encoder NV12
+    /// directly, so the path in production is the one path nothing covered.
+    ///
+    /// Two colours, in large flat blocks so that lossy compression cannot
+    /// account for a difference, and the assertion is on which channel wins
+    /// rather than on a value — chroma read from the wrong place does not shift
+    /// a colour, it replaces it.
+    ///
+    /// # This currently fails, and is committed failing on purpose
+    ///
+    /// H.264 passes through both input formats: mean R=129 G=40 B=115, which is
+    /// the picture that went in. H.265 comes back R=6 G=124 B=0 on every frame
+    /// — flat green, no chroma — through the same encoder wrapper, the same
+    /// converter and the same decoder.
+    ///
+    /// Ruled out so far, by measurement rather than reasoning: the input format
+    /// (it fails from BGRA as well as NV12, so it is not the direct-NV12
+    /// capture); NAL stripping (the only unit dropped from the HEVC stream is
+    /// type 38, filler, which is correct); output-sample concatenation (one
+    /// sample per frame, distinct timestamps); and the decode surface being
+    /// padded to 640x512 for a 640x480 picture, which is real and now described
+    /// correctly, and changed nothing.
+    ///
+    /// Left failing because a green picture is what a user sees and this says
+    /// so in one line. It is `#[ignore]`d, so it costs no one a red suite.
+    #[test]
+    #[ignore = "requires a hardware encoder and decoder; HEVC currently fails it"]
+    fn a_picture_keeps_its_colours_through_every_codec_and_input_format() {
+        use crate::encoder::VideoCodec;
+
+        let (w, h) = (640u16, 480u16);
+        let bgra = pattern(w, h);
+        let mut nv12 = Vec::new();
+        bgra_to_nv12(&bgra, w, h, &mut nv12);
+
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            if !codec.is_encodable_here() {
+                eprintln!("no {codec:?} encoder here — skipping");
+                continue;
+            }
+            for (label, source, format) in [
+                ("BGRA", &bgra, PixelFormat::Bgra),
+                ("NV12", &nv12, PixelFormat::Nv12),
+            ] {
+                let config = EncodeConfig { codec, fps: 30, ..EncodeConfig::default() };
+                let mut encoder =
+                    MediaFoundationEncoder::new(&config, w, h).expect("encoder");
+                let Ok(mut decoder) = crate::decode_ffmpeg::FfmpegDecoder::for_codec(codec)
+                else {
+                    eprintln!("no {codec:?} decoder here — skipping");
+                    continue;
+                };
+
+                // Enough frames to get past the encoder's own buffering and to
+                // give it a settled picture to describe.
+                let mut last = None;
+                for _ in 0..30 {
+                    let Ok((packet, _)) = encoder.encode(source, w, h, format) else { continue };
+                    if packet.is_empty() {
+                        continue;
+                    }
+                    if let Ok(Some(picture)) = decoder.decode(&packet) {
+                        last = Some(picture);
+                    }
+                }
+
+                let Some(picture) = last else {
+                    panic!("{codec:?} from {label} produced no picture at all");
+                };
+                assert_eq!(picture.rgba.len(), w as usize * h as usize * 4);
+
+                // The source is red-dominant on the left, blue-dominant on the
+                // right. Sampled well inside each block, away from the seam.
+                let at = |x: usize, y: usize| {
+                    let i = (y * w as usize + x) * 4;
+                    (picture.rgba[i] as i32, picture.rgba[i + 2] as i32)
+                };
+                let (left_r, left_b) = at(w as usize / 4, h as usize / 2);
+                let (right_r, right_b) = at(w as usize * 3 / 4, h as usize / 2);
+
+                assert!(
+                    left_r > left_b + 40,
+                    "{codec:?} from {label}: the red half came back R={left_r} B={left_b}, \
+                     which is not red — the chroma is not the chroma that was sent"
+                );
+                assert!(
+                    right_b > right_r + 40,
+                    "{codec:?} from {label}: the blue half came back R={right_r} B={right_b}, \
+                     which is not blue"
+                );
+            }
+        }
+    }
+
     /// HEVC end to end: encoded on this GPU, decoded on this GPU.
     ///
     /// The bar is a *picture out of the decoder*, not bytes out of the encoder —
