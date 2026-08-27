@@ -11,6 +11,13 @@ use egui::{Color32, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 pub const WINDOW_BG: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1E);
 pub const HEADER_BG: Color32 = Color32::from_rgb(0x2C, 0x2C, 0x2E);
 pub const CARD_BG: Color32 = Color32::from_rgb(0x2C, 0x2C, 0x2E);
+/// The same card with the pointer over it.
+///
+/// Deliberately a small step. The card is a control — clicking the person on it
+/// admits or removes a guest — and a control that does not react at all reads
+/// as a label, which is what an incoming card looked like while somebody was
+/// waiting to be let in.
+pub const CARD_BG_HOVER: Color32 = Color32::from_rgb(0x3A, 0x3A, 0x3D);
 pub const CARD_INNER_BG: Color32 = Color32::from_rgb(0x33, 0x33, 0x36);
 pub const CARD_STROKE: Color32 = Color32::from_rgb(0x8E, 0x8E, 0x93);
 pub const TEXT: Color32 = Color32::from_rgb(0xF2, 0xF2, 0xF7);
@@ -74,15 +81,7 @@ const _: () = assert!(
 /// into it.
 pub const SETTINGS_BLOCK_W: f32 = 60.0;
 pub const CARD_SIZE: Vec2 = Vec2::new(300.0, 208.0);
-/// An incoming-connection card grows with the guest's name, so only its
-/// height and its fixed furniture are constants.
-///
-/// [`PILL_CHROME_W`] is everything in the card that is not the name: the person
-/// icon, the status mark, the two permission toggles, the gaps between them and
-/// the card's own margins. Adding the name's measured width to it is what keeps
-/// the text from ever reaching the buttons — the alternative, laying both out
-/// in one row and hoping, is what let a long name push the toggles off the
-/// card.
+
 /// Smallest the main window may be dragged to, in points.
 ///
 /// # Why this is a constant rather than a literal at the call site
@@ -102,11 +101,16 @@ pub const CARD_SIZE: Vec2 = Vec2::new(300.0, 208.0);
 /// silently change the minimum rather than fail.
 pub const MIN_WINDOW_SIZE: [f32; 2] = [800.0, 600.0];
 
+/// An incoming-connection card is sized by what is in it, so only its height
+/// and its smallest useful width are constants.
+///
+/// There used to be a third: the width of everything that was *not* the name,
+/// counted out by hand so the card could be sized in advance. It was wrong
+/// twice — the count left out the spacing egui puts between widgets, and a long
+/// name ran under the permission icons. A frame that measures its own contents
+/// cannot get that wrong, and does not need to be told.
 pub const PILL_HEIGHT: f32 = 44.0;
-pub const PILL_CHROME_W: f32 = 122.0;
 
-/// Never narrower than this, so a one-letter name still reads as a card rather
-/// than a button with an icon on it.
 pub const PILL_MIN_W: f32 = 150.0;
 pub const CORNER: f32 = 5.0;
 
@@ -447,7 +451,19 @@ pub fn play_triangle(ui: &Ui, rect: Rect, color: Color32) {
 }
 
 /// Stroke a rounded rect with a dashed outline, matching `incoming_card_pending.svg`.
-pub fn dashed_rect(ui: &Ui, rect: Rect, color: Color32) {
+/// A dashed outline, optionally rotating.
+///
+/// `phase` slides the dashes along the outline. Zero is a still border; feeding
+/// it the clock makes the dashes travel, which is the difference between a
+/// border that is merely styled and one that says *this is waiting for you*.
+/// A guest sitting unanswered is the one thing on this screen that wants
+/// noticing, and a static dotted rectangle was not managing it.
+pub fn dashed_rect(ui: &Ui, rect: Rect, color: Color32, phase: f32) {
+    /// Dash and gap, in points. Equal, so the outline reads as a rhythm rather
+    /// than a dotted line with holes in it.
+    const DASH: f32 = 3.0;
+    const GAP: f32 = 3.0;
+
     let stroke = Stroke::new(1.0, color);
     let r = rect.shrink(0.5);
     let corners = [
@@ -456,12 +472,29 @@ pub fn dashed_rect(ui: &Ui, rect: Rect, color: Color32) {
         Pos2::new(r.right(), r.bottom()),
         Pos2::new(r.left(), r.bottom()),
     ];
+
+    // Each side continues the pattern where the last one stopped, so the dashes
+    // travel around the outline instead of restarting at every corner.
     let painter = ui.painter();
+    let mut travelled = phase;
     for i in 0..4 {
         let seg = [corners[i], corners[(i + 1) % 4]];
-        painter.extend(egui::Shape::dashed_line(&seg, stroke, 2.0, 2.0));
+        painter.extend(egui::Shape::dashed_line_with_offset(
+            &seg,
+            stroke,
+            &[DASH],
+            &[GAP],
+            travelled,
+        ));
+        travelled += (seg[1] - seg[0]).length();
     }
 }
+
+/// How fast the dashes travel, in points per second.
+///
+/// Slow enough to read as waiting rather than loading — this is not progress,
+/// nothing is happening, and a fast crawl would suggest otherwise.
+pub const DASH_SPEED: f32 = 12.0;
 
 #[cfg(test)]
 mod icon_tests {

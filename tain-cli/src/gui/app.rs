@@ -2350,89 +2350,86 @@ impl GuestApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 8.0);
             for conn in &incoming {
-                self.render_incoming_pill(ui, conn, edits);
+                Self::render_incoming_pill(ui, conn, edits);
             }
         });
     }
 
+    /// One incoming connection, as a card that fits the name on it.
+    ///
+    /// # Why the card measures itself
+    ///
+    /// It was a fixed rectangle with the name dropped in, and then a rectangle
+    /// whose width was a hand-counted sum of everything that was not the name.
+    /// Both were wrong the same way: the sum left out the spacing egui puts
+    /// between widgets, so a long name ran underneath the permission icons.
+    ///
+    /// A frame sized by its own contents cannot be wrong about that, and it
+    /// removes the constant that has now been wrong twice. The background is
+    /// chosen after the contents are laid out, which is also the first moment
+    /// the card's rectangle — and therefore whether the pointer is over it — is
+    /// known at all.
     fn render_incoming_pill(
-        &self,
         ui: &mut egui::Ui,
         conn: &IncomingConnection,
         edits: &mut PendingEdits,
     ) {
+        const MARGIN: egui::Vec2 = egui::vec2(8.0, 10.0);
+
         let pending = conn.status == ApprovalStatus::Pending;
-
-        // The card is sized to its name, and the name is measured rather than
-        // estimated: these come from other people's machines, and a character
-        // count is not a width in a proportional font — "WWWWWWWWWWWW" and
-        // "iiiiiiiiiiii" are the same twelve characters and nearly three times
-        // apart on screen.
         let shown = elide(&conn.display_name, PILL_NAME_MAX_CHARS);
-        let name_font = egui::FontId::proportional(13.0);
-        let name_width = ui.fonts(|fonts| {
-            fonts.layout_no_wrap(shown.clone(), name_font.clone(), TEXT).rect.width()
-        });
-        let pill = egui::vec2((PILL_CHROME_W + name_width).max(PILL_MIN_W), PILL_HEIGHT);
-        let (rect, _) = ui.allocate_exact_size(pill, egui::Sense::hover());
 
-        // Pending cards get the dashed outline from incoming_card_pending.svg.
-        ui.painter().rect_filled(rect, CORNER, CARD_BG);
-        if pending {
-            theme::dashed_rect(ui, rect, TEXT_DIM);
-        } else {
-            ui.painter()
-                .rect_stroke(rect, CORNER, egui::Stroke::new(1.0, CARD_STROKE));
-        }
+        let mut card = egui::Frame::none()
+            .rounding(CORNER)
+            .inner_margin(egui::Margin::symmetric(MARGIN.x, MARGIN.y))
+            .begin(ui);
 
-        let mut content = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(rect.shrink2(egui::vec2(8.0, 10.0)))
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        );
-
-        // The person icon *is* the accept/remove control. Pending guests are
-        // admitted here; established ones swap to the kick icon on hover, which
-        // is the only way to remove a connected guest.
-        let (icon_rect, icon_resp) =
-            content.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::click());
-        // Kickable whether or not it was ever approved: an admin connection is
-        // never asked about, and "cannot be asked about" must not mean "cannot
-        // be ended".
-        let kicking = !pending && icon_resp.hovered();
-        let icon_src = if kicking {
-            egui::include_image!("../../assets/incoming_connection_kick.svg")
-        } else if conn.is_admin {
-            // Its own mark: this one holds the admin passcode and already has
-            // full control, which is worth being able to see at a glance.
-            egui::include_image!("../../assets/incoming_connection_admin_icon.svg")
-        } else {
-            egui::include_image!("../../assets/incoming_connection_icon.svg")
-        };
-        if content.is_rect_visible(icon_rect) {
-            let icon_rect = theme::snap(&content, icon_rect);
-            theme::sharp_image(icon_src, icon_rect.size()).paint_at(&content, icon_rect);
-        }
-        let icon_resp = icon_resp.on_hover_text(if pending {
-            "Waiting for you — click to decide"
-        } else {
-            "Disconnect this guest"
-        });
-        if icon_resp.clicked() {
-            edits.confirm.push((
-                conn.session_id,
-                if pending { ConfirmAction::Approve } else { ConfirmAction::Kick },
+        {
+            let ui = &mut card.content_ui;
+            // A card is still a card with one letter on it.
+            ui.set_min_size(egui::vec2(
+                PILL_MIN_W - MARGIN.x * 2.0,
+                PILL_HEIGHT - MARGIN.y * 2.0,
             ));
-        }
 
-        content.add_space(6.0);
-        // Given exactly the width it was measured at. Left to the row's own
-        // flow, a name would take whatever space it liked and the toggles would
-        // be pushed out of the card.
-        content.allocate_ui_with_layout(
-            egui::vec2(name_width, content.available_height()),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
+            ui.horizontal(|ui| {
+                // The person icon *is* the accept/remove control. Pending
+                // guests are admitted here; established ones swap to the kick
+                // icon on hover, which is the only way to remove a connected
+                // guest.
+                let (icon_rect, icon_resp) =
+                    ui.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::click());
+                // Kickable whether or not it was ever approved: an admin
+                // connection is never asked about, and "cannot be asked about"
+                // must not mean "cannot be ended".
+                let kicking = !pending && icon_resp.hovered();
+                let icon_src = if kicking {
+                    egui::include_image!("../../assets/incoming_connection_kick.svg")
+                } else if conn.is_admin {
+                    // Its own mark: this one holds the admin passcode and
+                    // already has full control, worth seeing at a glance.
+                    egui::include_image!("../../assets/incoming_connection_admin_icon.svg")
+                } else {
+                    egui::include_image!("../../assets/incoming_connection_icon.svg")
+                };
+                if ui.is_rect_visible(icon_rect) {
+                    let icon_rect = theme::snap(ui, icon_rect);
+                    theme::sharp_image(icon_src, icon_rect.size()).paint_at(ui, icon_rect);
+                }
+                if icon_resp
+                    .on_hover_text(if pending {
+                        "Waiting for you — click to decide"
+                    } else {
+                        "Disconnect this guest"
+                    })
+                    .clicked()
+                {
+                    edits.confirm.push((
+                        conn.session_id,
+                        if pending { ConfirmAction::Approve } else { ConfirmAction::Kick },
+                    ));
+                }
+
                 // One tooltip, and it carries the full name whenever the card
                 // is showing only part of one: a guest identified by a name
                 // that has been cut short is a guest the person deciding
@@ -2450,83 +2447,103 @@ impl GuestApp {
                         hover.push_str("\nThis name was chosen by the connecting machine.");
                     }
                 }
-                ui.label(egui::RichText::new(&shown).font(name_font.clone()).color(TEXT))
+                ui.label(egui::RichText::new(&shown).size(13.0).color(TEXT))
                     .on_hover_text(hover);
-            },
-        );
 
-        content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            match conn.status {
-                ApprovalStatus::Pending => {
-                    ui.add(egui::Spinner::new().size(14.0).color(TEXT_DIM))
-                        .on_hover_text("Nothing is being shared until you decide");
-                }
-                ApprovalStatus::Allowed => {
-                    theme::icon(ui, 13.0, egui::include_image!("../../assets/in_connect_live.svg"));
-                }
-            }
-
-            ui.add_space(6.0);
-
-            // On an established connection these toggle directly — revoking
-            // should be instant. On a pending one there is nothing to toggle
-            // yet, so they open the same dialog the person icon does.
-            let kbd = if conn.keyboard_allowed {
-                egui::include_image!("../../assets/keyboard_allowed.svg")
-            } else {
-                egui::include_image!("../../assets/keyboard_disabled.svg")
-            };
-            if theme::icon_button(
-                ui,
-                22.0,
-                kbd,
-                match (pending, conn.keyboard_allowed) {
-                    (true, _) => "Decide whether to allow this connection",
-                    (false, true) => "Keyboard allowed — click to revoke",
-                    (false, false) => "Keyboard blocked — click to allow",
-                },
-            )
-            .clicked()
-            {
-                if pending {
-                    edits.confirm.push((conn.session_id, ConfirmAction::Approve));
+                // On an established connection these toggle directly — revoking
+                // should be instant. On a pending one there is nothing to
+                // toggle yet, so they open the same dialog the person icon does.
+                let mouse = if conn.mouse_allowed {
+                    egui::include_image!("../../assets/mouse_allowed.svg")
                 } else {
-                    edits.set_grants.push((
-                        conn.session_id,
-                        ControlGrants::new(conn.mouse_allowed, !conn.keyboard_allowed),
-                    ));
+                    egui::include_image!("../../assets/mouse_disabled.svg")
+                };
+                if theme::icon_button(
+                    ui,
+                    22.0,
+                    mouse,
+                    match (pending, conn.mouse_allowed) {
+                        (true, _) => "Decide whether to allow this connection",
+                        (false, true) => "Mouse allowed — click to revoke",
+                        (false, false) => "Mouse blocked — click to allow",
+                    },
+                )
+                .clicked()
+                {
+                    if pending {
+                        edits.confirm.push((conn.session_id, ConfirmAction::Approve));
+                    } else {
+                        edits.set_grants.push((
+                            conn.session_id,
+                            ControlGrants::new(!conn.mouse_allowed, conn.keyboard_allowed),
+                        ));
+                    }
                 }
-            }
 
-            ui.add_space(4.0);
-
-            let mouse = if conn.mouse_allowed {
-                egui::include_image!("../../assets/mouse_allowed.svg")
-            } else {
-                egui::include_image!("../../assets/mouse_disabled.svg")
-            };
-            if theme::icon_button(
-                ui,
-                22.0,
-                mouse,
-                match (pending, conn.mouse_allowed) {
-                    (true, _) => "Decide whether to allow this connection",
-                    (false, true) => "Mouse allowed — click to revoke",
-                    (false, false) => "Mouse blocked — click to allow",
-                },
-            )
-            .clicked()
-            {
-                if pending {
-                    edits.confirm.push((conn.session_id, ConfirmAction::Approve));
+                let kbd = if conn.keyboard_allowed {
+                    egui::include_image!("../../assets/keyboard_allowed.svg")
                 } else {
-                    edits.set_grants.push((
-                        conn.session_id,
-                        ControlGrants::new(!conn.mouse_allowed, conn.keyboard_allowed),
-                    ));
+                    egui::include_image!("../../assets/keyboard_disabled.svg")
+                };
+                if theme::icon_button(
+                    ui,
+                    22.0,
+                    kbd,
+                    match (pending, conn.keyboard_allowed) {
+                        (true, _) => "Decide whether to allow this connection",
+                        (false, true) => "Keyboard allowed — click to revoke",
+                        (false, false) => "Keyboard blocked — click to allow",
+                    },
+                )
+                .clicked()
+                {
+                    if pending {
+                        edits.confirm.push((conn.session_id, ConfirmAction::Approve));
+                    } else {
+                        edits.set_grants.push((
+                            conn.session_id,
+                            ControlGrants::new(conn.mouse_allowed, !conn.keyboard_allowed),
+                        ));
+                    }
                 }
-            }
-        });
+
+                match conn.status {
+                    ApprovalStatus::Pending => {
+                        ui.add(egui::Spinner::new().size(14.0).color(TEXT_DIM))
+                            .on_hover_text("Nothing is being shared until you decide");
+                    }
+                    ApprovalStatus::Allowed => {
+                        theme::icon(
+                            ui,
+                            13.0,
+                            egui::include_image!("../../assets/in_connect_live.svg"),
+                        );
+                    }
+                }
+            });
+        }
+
+        let rect = card.content_ui.min_rect().expand2(MARGIN);
+        // Not `interact`: the rectangle has not been allocated in the parent
+        // yet — that is what `end` below does — and all this needs is where the
+        // pointer is.
+        let hovered = ui.rect_contains_pointer(rect);
+        card.frame = card.frame.fill(if hovered { CARD_BG_HOVER } else { CARD_BG });
+        if !pending {
+            card.frame = card.frame.stroke(egui::Stroke::new(1.0, CARD_STROKE));
+        }
+        card.end(ui);
+
+        if pending {
+            // Travelling dashes. A guest waiting to be let in is the one thing
+            // on this screen that wants noticing, and a still dotted rectangle
+            // was not managing it.
+            let phase = -(ui.input(|i| i.time) as f32) * theme::DASH_SPEED;
+            theme::dashed_rect(ui, rect, TEXT_DIM, phase);
+            // Time-driven, so it has to be asked for; nothing else here repaints
+            // while the screen is idle.
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -3017,6 +3034,61 @@ mod tests {
     /// `String` sliced at a byte index that lands inside a character panics,
     /// and a name in Cyrillic or CJK is all multi-byte characters — which are
     /// also the names most likely to be long enough to need shortening.
+    /// A long name must widen the card rather than run under the icons.
+    ///
+    /// The card was twice sized from a figure worked out in advance, and both
+    /// times the figure left something out — most recently the spacing egui
+    /// puts between widgets, which put the name underneath the permission
+    /// toggles. This measures the card that is actually produced.
+    #[test]
+    fn a_card_grows_to_fit_the_name_it_shows() {
+        let card_width = |name: &str| {
+            let ctx = egui::Context::default();
+            let conn = IncomingConnection {
+                session_id: 1,
+                display_name: name.to_string(),
+                name_is_self_reported: true,
+                mouse_allowed: false,
+                keyboard_allowed: false,
+                status: ApprovalStatus::Allowed,
+                is_admin: false,
+            };
+
+            let mut width = 0.0f32;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            // Twice: egui sizes from what it measured on the frame before.
+            for _ in 0..2 {
+                let _ = ctx.run(input.clone(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut edits = PendingEdits::default();
+                        // The card's own rectangle, not the panel it sits in.
+                        width = ui
+                            .horizontal(|ui| {
+                                GuestApp::render_incoming_pill(ui, &conn, &mut edits);
+                            })
+                            .response
+                            .rect
+                            .width();
+                    });
+                });
+            }
+            width
+        };
+
+        let short = card_width("Q");
+        let long = card_width("LAPTOP-7K2Q9F");
+        assert!(
+            long > short,
+            "a longer name produced the same {short} point card, so it has              nowhere to go but under the icons"
+        );
+    }
+
     #[test]
     fn a_name_in_any_script_is_shortened_rather_than_split() {
         for name in [
