@@ -1030,6 +1030,12 @@ pub struct GuestApp {
     session_window: SessionWindow,
     /// Win-key capture and pointer confinement, shared by whichever session is focused.
     immersive: Immersive,
+    /// Frames drawn, until the window has been asked for focus once.
+    ///
+    /// See [`GuestApp::claim_focus_once`]. Counted rather than a flag because
+    /// the request has to wait for the window to exist as far as Windows is
+    /// concerned, which is one frame later than this application first runs.
+    frames_before_focus: u32,
     /// The last scale reported to the log, so it is reported on change only.
     ///
     /// As `(what the monitor asks, what is being drawn, the window in points)`.
@@ -1096,6 +1102,7 @@ impl GuestApp {
             sessions: Vec::new(),
             session_window: SessionWindow::default(),
             immersive: Immersive::default(),
+            frames_before_focus: 0,
             last_reported_scale: None,
             // Not the saved value: this is what egui has been told, and it has
             // been told nothing yet. The first frame pushes the setting in.
@@ -2571,6 +2578,42 @@ impl GuestApp {
     ///
     /// A change from the keyboard is adopted into the settings, so it is saved
     /// and the slider agrees with what is on screen.
+    /// Ask for focus once, shortly after the window appears.
+    ///
+    /// # Why this is needed at all
+    ///
+    /// eframe creates the window **hidden** and shows it after the first frame,
+    /// deliberately — it is how the white flash on startup is avoided. But a
+    /// window that was created hidden and then shown is shown *without being
+    /// activated*, so the application opens behind whatever the person was
+    /// looking at and has to be clicked before it will take a keystroke.
+    ///
+    /// # Why once, and why not immediately
+    ///
+    /// Once, because repeating it is how an application becomes the one that
+    /// snatches the screen back every time you look away — the command's own
+    /// documentation says as much. Not on the first frame, because the window
+    /// is still hidden then and the request would be dropped: `focus_window`
+    /// has no effect on a window that is not visible.
+    ///
+    /// Windows may refuse anyway — a process that does not own the foreground
+    /// cannot take it, which is the rule that stops background programs
+    /// interrupting. Launched by someone double-clicking it, this application
+    /// does own it, and that is the case this is for.
+    fn claim_focus_once(&mut self, ctx: &egui::Context) {
+        /// Frames to let pass first. One is enough for eframe to have shown the
+        /// window; a couple more costs nothing and is not a race.
+        const SETTLE: u32 = 3;
+
+        if self.frames_before_focus > SETTLE {
+            return;
+        }
+        self.frames_before_focus += 1;
+        if self.frames_before_focus == SETTLE {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
     /// Say what scale this window is being drawn at, whenever that changes,
     /// and throw away pictures that were drawn for the old one.
     ///
@@ -2721,6 +2764,7 @@ impl eframe::App for GuestApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_ui_scale(ctx);
+        self.claim_focus_once(ctx);
         self.note_scale_change(ctx);
         let mut t = self.frametime.begin();
         // The endpoint may have finished binding since the last frame; see
