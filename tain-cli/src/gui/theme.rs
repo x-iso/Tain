@@ -83,6 +83,25 @@ pub const CARD_SIZE: Vec2 = Vec2::new(300.0, 208.0);
 /// the text from ever reaching the buttons — the alternative, laying both out
 /// in one row and hoping, is what let a long name push the toggles off the
 /// card.
+/// Smallest the main window may be dragged to, in points.
+///
+/// # Why this is a constant rather than a literal at the call site
+///
+/// It is set twice: once when the window is built, and again whenever the
+/// display scale changes. The second is not optional — winit converts this to
+/// physical pixels when it is given, and never reconverts it. A window given a
+/// minimum on a 175% display and then dragged to a 125% one keeps the *pixel*
+/// figure, so its minimum silently grows by 40% in the units that matter.
+///
+/// Measured on the machine that reported it: 814x637 points on the first
+/// display, 1134x878 on the second — a minimum taller than the 1080-pixel
+/// screen it was now on, which is why the window could not be dragged smaller
+/// there and could only be maximised.
+///
+/// Two places with the same number written out would drift, and the drift would
+/// silently change the minimum rather than fail.
+pub const MIN_WINDOW_SIZE: [f32; 2] = [800.0, 600.0];
+
 pub const PILL_HEIGHT: f32 = 44.0;
 pub const PILL_CHROME_W: f32 = 122.0;
 

@@ -2681,6 +2681,14 @@ impl GuestApp {
             .is_some_and(|(_, was_drawn, _)| (was_drawn - drawn).abs() > SCALE_EPSILON);
         if rescaled {
             ctx.forget_all_images();
+            // The minimum size has to be restated for the same reason, and it
+            // is not cosmetic: winit converted it to pixels when it was given
+            // and does not reconvert it, so after a change of scale the window
+            // has a minimum measured in the *old* display's pixels. Restating
+            // it here is what makes it mean the same thing on both.
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+                MIN_WINDOW_SIZE.into(),
+            ));
         }
 
         self.last_reported_scale = Some((native, drawn, size));

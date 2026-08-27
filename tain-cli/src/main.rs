@@ -213,7 +213,7 @@ async fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Tain")
             .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([800.0, 600.0])
+            .with_min_inner_size(gui::theme::MIN_WINDOW_SIZE)
             // The mark identifies the app in the native title bar and taskbar,
             // which is why the header no longer carries a logo row.
             .with_icon(gui::icon::window_icon(64)),
