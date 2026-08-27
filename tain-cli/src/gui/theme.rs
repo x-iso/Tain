@@ -466,29 +466,49 @@ pub fn dashed_rect(ui: &Ui, rect: Rect, color: Color32, phase: f32) {
 
     let stroke = Stroke::new(1.0, color);
     let r = rect.shrink(0.5);
-    let corners = [
-        Pos2::new(r.left(), r.top()),
-        Pos2::new(r.right(), r.top()),
-        Pos2::new(r.right(), r.bottom()),
-        Pos2::new(r.left(), r.bottom()),
-    ];
+    let radius = CORNER.min(r.width() * 0.5).min(r.height() * 0.5).max(0.0);
 
-    // Each side continues the pattern where the last one stopped, so the dashes
-    // travel around the outline instead of restarting at every corner.
-    let painter = ui.painter();
-    let mut travelled = phase;
-    for i in 0..4 {
-        let seg = [corners[i], corners[(i + 1) % 4]];
-        painter.extend(egui::Shape::dashed_line_with_offset(
-            &seg,
-            stroke,
-            &[DASH],
-            &[GAP],
-            travelled,
-        ));
-        travelled += (seg[1] - seg[0]).length();
+    // # One closed path, not four sides
+    //
+    // Drawn as four separate segments the dashes restart at every corner, so
+    // they shuffle in place instead of travelling, and the corners are square
+    // while the card behind them is rounded. A single path around the rounded
+    // outline fixes both at once: the pattern is continuous, and the corners
+    // follow the same radius as the card.
+    let mut path = Vec::with_capacity(4 * (ARC_STEPS + 1));
+    let corners = [
+        // (centre of the arc, angle it starts at) going clockwise from top-left.
+        (Pos2::new(r.left() + radius, r.top() + radius), std::f32::consts::PI),
+        (Pos2::new(r.right() - radius, r.top() + radius), 1.5 * std::f32::consts::PI),
+        (Pos2::new(r.right() - radius, r.bottom() - radius), 0.0),
+        (Pos2::new(r.left() + radius, r.bottom() - radius), 0.5 * std::f32::consts::PI),
+    ];
+    for (centre, start) in corners {
+        for step in 0..=ARC_STEPS {
+            let angle = start + (step as f32 / ARC_STEPS as f32) * 0.5 * std::f32::consts::PI;
+            path.push(Pos2::new(
+                centre.x + radius * angle.cos(),
+                centre.y + radius * angle.sin(),
+            ));
+        }
     }
+    // Closed, so the pattern meets itself rather than leaving a gap at the top.
+    if let Some(first) = path.first().copied() {
+        path.push(first);
+    }
+
+    ui.painter().extend(egui::Shape::dashed_line_with_offset(
+        &path,
+        stroke,
+        &[DASH],
+        &[GAP],
+        phase,
+    ));
 }
+
+/// Points per quarter-turn of a corner. Four is smooth at this radius and keeps
+/// the path short enough that the dash pattern stays even along it.
+const ARC_STEPS: usize = 4;
 
 /// How fast the dashes travel, in points per second.
 ///

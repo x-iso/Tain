@@ -2694,9 +2694,34 @@ impl Prober {
     async fn try_probe(&self, code: &ConnectionCode) -> Result<ProbeOutcome> {
         let public_key =
             iroh::PublicKey::from_bytes(&code.endpoint_id).context("bad endpoint id")?;
+
+        // # Reach the host the way a real connection would
+        //
+        // This dialled the bare public key, which leaves iroh nothing to work
+        // with but discovery — and discovery means resolving `dns.iroh.link`.
+        // On a filtered connection that never answers: twenty-three consecutive
+        // failures in the log from the machine that reported this, while the
+        // Connect button on the very same host worked every time.
+        //
+        // So every card said offline and the list was worse than useless — it
+        // was confidently wrong, and the one thing it exists to answer is
+        // exactly the thing it got wrong.
+        //
+        // The relay is carried in the code for precisely this reason (see
+        // `connection_code`), and it costs nothing to use it here as well.
+        let mut addr = iroh::EndpointAddr::new(public_key);
+        if let Some(url) = code.relay_url.as_deref().filter(|url| !url.is_empty()) {
+            match url.parse() {
+                Ok(parsed) => addr = addr.with_relay_url(parsed),
+                // A code from a newer or hand-edited build. Discovery is still
+                // there to fall back on, so this is not a refusal.
+                Err(e) => debug!("Ignoring the relay in a saved code while probing: {e}"),
+            }
+        }
+
         let conn = self
             .endpoint
-            .connect(iroh::EndpointAddr::new(public_key), ALPN)
+            .connect(addr, ALPN)
             .await
             .context("could not reach the host")?;
 

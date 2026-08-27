@@ -2523,16 +2523,33 @@ impl GuestApp {
             });
         }
 
-        let rect = card.content_ui.min_rect().expand2(MARGIN);
-        // Not `interact`: the rectangle has not been allocated in the parent
-        // yet — that is what `end` below does — and all this needs is where the
-        // pointer is.
-        let hovered = ui.rect_contains_pointer(rect);
-        card.frame = card.frame.fill(if hovered { CARD_BG_HOVER } else { CARD_BG });
+        // # The rectangle comes from the frame, not from its contents
+        //
+        // `content_ui.min_rect()` is the region the *contents* claimed, and a
+        // horizontal layout claims the width it was offered — the whole row.
+        // Outlining that drew a dashed box around everything to the right of
+        // the card as well, which is what the reported screenshot shows.
+        //
+        // `end` returns the rectangle the frame actually took, which is the
+        // card. It is only known afterwards, so the hover that decides the fill
+        // is remembered from the previous frame: a frame of lag on a background
+        // tint is not perceptible, and being right about the shape is.
+        let id = ui.make_persistent_id(("incoming-card", conn.session_id));
+        let was_hovered = ui.data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+        card.frame = card.frame.fill(if was_hovered { CARD_BG_HOVER } else { CARD_BG });
         if !pending {
             card.frame = card.frame.stroke(egui::Stroke::new(1.0, CARD_STROKE));
         }
-        card.end(ui);
+        let rect = card.end(ui).rect;
+
+        // The whole card decides, not only the person on it. Someone looking at
+        // a card that says it is waiting for them will click the card.
+        let sense = if pending { egui::Sense::click() } else { egui::Sense::hover() };
+        let card_resp = ui.interact(rect, id, sense);
+        ui.data_mut(|d| d.insert_temp(id, card_resp.hovered()));
+        if card_resp.clicked() {
+            edits.confirm.push((conn.session_id, ConfirmAction::Approve));
+        }
 
         if pending {
             // Travelling dashes. A guest waiting to be let in is the one thing

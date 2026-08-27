@@ -64,6 +64,8 @@ fn rotate(path: &std::path::Path) {
 pub fn init(console: bool) -> Option<PathBuf> {
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
+    log_panics();
+
     let Some(path) = log_path() else {
         // No writable location. Better than nothing is the console, if present.
         if console {
@@ -108,6 +110,55 @@ pub fn init(console: bool) -> Option<PathBuf> {
         builder.init();
     }
     Some(path)
+}
+
+/// Write panics to the log as well as to standard error.
+///
+/// # Why this is worth its own hook
+///
+/// A release build launched by double-click has no console, so the default
+/// panic handler prints into nothing. The application vanishes and its log ends
+/// mid-sentence, which is exactly what a crash reported from another machine
+/// looked like: a session logging normally, then nothing, and no way to tell a
+/// panic from a hard fault from the process being killed.
+///
+/// The default hook still runs, so a debug build keeps printing to the console
+/// it has.
+///
+/// This cannot catch everything. A genuine access violation is not a panic and
+/// unwinds nothing, so it will still leave a log that simply stops — but it
+/// will now leave one that stops *without* a panic line, which is itself the
+/// answer to a question that has already cost a round of guessing.
+fn log_panics() {
+    // Once: `init` is called by the application, the service and the agent, and
+    // chaining a hook per call would multiply the output rather than the
+    // coverage.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Location and message, because a bare "panicked" is not worth the
+            // line it is written on.
+            let where_ = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "an unknown place".to_string());
+            tracing::error!("Panic at {where_}: {}", panic_message(info));
+            previous(info);
+        }));
+    });
+}
+
+/// The payload of a panic, for the two types it is ever set to.
+fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = info.payload();
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "a payload of an unexpected type".to_string()
+    }
 }
 
 /// Beside the settings, so there is one place to look for everything.

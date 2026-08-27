@@ -143,6 +143,28 @@ mod ffi {
 /// Lives on the render thread and nowhere else: every call here is against the
 /// current GL context, which is that thread's alone.
 pub struct InteropDevice {
+    /// A reference on the D3D11 device the interop handle was opened against.
+    ///
+    /// # Why this is held rather than borrowed
+    ///
+    /// The device arrives here as a bare address, taken from the decoder. The
+    /// decoder owns it, and when the decoder goes the device is destroyed —
+    /// while this object still holds a `wglDXOpenDeviceNV` handle on it and a
+    /// list of textures registered through it. Tearing that down afterwards
+    /// reads freed memory, which is an access violation and not a panic: no
+    /// message, no backtrace, a log that simply stops.
+    ///
+    /// It used to be avoided by ordering — the interface released these before
+    /// the session's task was stopped, so the decoder always outlived them.
+    /// That holds only while the *interface* decides when a session ends. A
+    /// host closing its window ends it from the other side, the task drops the
+    /// decoder on its own, and the ordering never gets a chance to apply. That
+    /// is the crash that was reported, and it is why this is a reference now
+    /// rather than a convention: a count cannot be got out of order.
+    ///
+    /// Declared first so it is dropped last, after `Drop` below has closed
+    /// everything that needs the device to still exist.
+    _device: Option<windows::Win32::Graphics::Direct3D11::ID3D11Device>,
     entry: ffi::Entry,
     device: ffi::Handle,
     gl: Arc<glow::Context>,
@@ -211,6 +233,23 @@ impl InteropDevice {
     pub unsafe fn open(gl: Arc<glow::Context>, d3d_device: *mut std::ffi::c_void) -> Option<Self> {
         // SAFETY: the caller promises a current context.
         let entry = unsafe { ffi::Entry::resolve() }?;
+        // A reference of our own, so the device cannot be destroyed under us
+        // by whoever handed the address over. See `_device`.
+        // SAFETY: the caller promises a live `ID3D11Device` at this address.
+        let owned = {
+            use windows::core::Interface as _;
+            // SAFETY: as above — a live device at this address, borrowed for
+            // long enough to take a reference of our own.
+            unsafe {
+                windows::Win32::Graphics::Direct3D11::ID3D11Device::from_raw_borrowed(&d3d_device)
+            }
+            .cloned()
+        };
+        if owned.is_none() {
+            warn!("No D3D11 device at the address the decoder gave — frames will be read back");
+            return None;
+        }
+
         // SAFETY: the caller promises a live device.
         let device = unsafe { (entry.open_device)(d3d_device) };
         if device.is_null() {
@@ -218,7 +257,15 @@ impl InteropDevice {
             return None;
         }
         info!("Drawing decoded frames directly from the GPU (WGL_NV_DX_interop2)");
-        Some(Self { entry, device, gl, registered: Vec::new(), generation: 0, failures: 0 })
+        Some(Self {
+            _device: owned,
+            entry,
+            device,
+            gl,
+            registered: Vec::new(),
+            generation: 0,
+            failures: 0,
+        })
     }
 
     /// The GL texture standing for a D3D texture, registering it if new.
