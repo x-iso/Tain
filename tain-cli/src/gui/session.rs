@@ -101,6 +101,27 @@ pub struct GuestSession {
     /// a driver that refuses is not asked again every frame.
     #[cfg(target_os = "windows")]
     renderer: Option<Option<super::gl_interop::SharedRenderer>>,
+    /// Which D3D11 device [`Self::renderer`] was opened against.
+    ///
+    /// # Why this is not "the decoder's device" once and for all
+    ///
+    /// `wglDXOpenDeviceNV` shares one device, and every texture registered
+    /// afterwards has to belong to *that* device. The session decides its codec
+    /// in stages, and each stage builds a fresh decoder with a fresh device —
+    /// `for_codec` is called from three places, and a log of a working session
+    /// shows two decoders inside a third of a second.
+    ///
+    /// Whether the render thread opens the interop before or after the last of
+    /// them is a race, and it is the difference between a session that runs and
+    /// one that does not. Losing it means registering textures on a device that
+    /// never owned them: one machine repeated its first few frames, the other
+    /// died a few seconds in.
+    ///
+    /// So the device is remembered and compared. It cannot be inferred from the
+    /// renderer, which only knows the handle it opened, and it must not be
+    /// assumed stable, which is what the old comment here did.
+    #[cfg(target_os = "windows")]
+    renderer_device: usize,
     /// Whether this session may draw frames straight from the GPU at all.
     ///
     /// The user's choice, taken when the session opened. See
@@ -198,6 +219,8 @@ impl GuestSession {
             gpu_frame: None,
             #[cfg(target_os = "windows")]
             renderer: None,
+            #[cfg(target_os = "windows")]
+            renderer_device: 0,
             gpu_present: settings.gpu_present,
             #[cfg(target_os = "windows")]
             empty_frames: 0,
@@ -286,6 +309,8 @@ impl GuestSession {
             gpu_frame: None,
             #[cfg(target_os = "windows")]
             renderer: None,
+            #[cfg(target_os = "windows")]
+            renderer_device: 0,
             gpu_present: false,
             #[cfg(target_os = "windows")]
             empty_frames: 0,
@@ -481,18 +506,17 @@ impl GuestSession {
         ))
     }
 
-    /// Try once to open the decoder's device for sharing with OpenGL.
+    /// Open the decoder's device for sharing with OpenGL, and reopen it if the
+    /// decoder is replaced by one on a different device.
     ///
     /// Runs on the render thread, which is the only place the GL context is
-    /// current. Failure is recorded so it is not retried per frame, and leaves
-    /// the readback path running exactly as before.
+    /// current. A refusal is recorded against the device that refused, so it is
+    /// not retried per frame but is asked again if the decoder changes — a
+    /// driver that would not share one device has said nothing about another.
     #[cfg(target_os = "windows")]
     fn ensure_renderer(&mut self) {
         use std::sync::atomic::Ordering;
 
-        if self.renderer.is_some() {
-            return;
-        }
         if !self.gpu_present {
             // Recorded as "asked and answered", so this does not run again.
             self.renderer = Some(None);
@@ -503,13 +527,31 @@ impl GuestSession {
             // No GPU decoder yet, or none on this machine. Ask again next frame.
             return;
         }
+        if self.renderer.is_some() && self.renderer_device == device {
+            return;
+        }
+
+        if self.renderer.is_some() {
+            tracing::info!(
+                "The decoder moved to another device — reopening the GPU path against it"
+            );
+            // Both belong to the device being left behind: the frame is a
+            // texture on it, and the renderer holds registrations against it.
+            // Neither may outlive this, and the frame goes first because the
+            // renderer is what is drawing it.
+            self.hold_gpu_frame(None);
+            self.renderer = None;
+        }
+
         // SAFETY: this is the render thread with the context current, and the
-        // pointer came from a live decoder that outlives the session.
+        // pointer is the device the decoder published, which is kept alive by
+        // the interop's own reference for as long as it is open.
         let renderer = unsafe { super::gl_interop::renderer_for(device as *mut _) };
         // Told before the first GPU frame is expected, so the decoder stops
         // reading back from the next one onwards.
         self.shared.present_on_gpu.store(renderer.is_some(), Ordering::Relaxed);
         self.renderer = Some(renderer);
+        self.renderer_device = device;
     }
 
     /// Upload a newly arrived frame, if there is one.
@@ -1067,6 +1109,65 @@ mod tests {
         }
 
         assert!(session.shared.present_on_gpu.load(Ordering::Relaxed));
+    }
+
+    /// A decoder that moves to another device takes the GPU path with it.
+    ///
+    /// # The race this lost
+    ///
+    /// `wglDXOpenDeviceNV` shares one device and every texture registered
+    /// afterwards has to belong to it. The session settles its codec in stages
+    /// and each stage builds a decoder with a device of its own — two inside a
+    /// third of a second, in the logs of both a working session and a crashed
+    /// one. The only difference between them was whether the render thread
+    /// opened the interop before or after the last decoder appeared.
+    ///
+    /// Opening once and never looking again meant registering textures on a
+    /// device that never owned them. One machine repeated its first few frames;
+    /// the other died a few seconds in.
+    ///
+    /// `renderer_for` gives up at its `OnceLock` when there is no render thread,
+    /// so no GL or D3D call is reached here and the handles below are never
+    /// dereferenced. What is under test is the bookkeeping that decides whether
+    /// they would be.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_decoder_on_a_new_device_reopens_the_gpu_path() {
+        use std::sync::atomic::Ordering;
+
+        let mut session = super::GuestSession::test_stub();
+        session.gpu_present = true;
+
+        // The decoder built while the codec was still being agreed.
+        session.shared.gpu_device.store(0x1000, Ordering::Relaxed);
+        session.ensure_renderer();
+        assert_eq!(session.renderer_device, 0x1000);
+        assert!(session.renderer.is_some(), "the attempt is recorded either way");
+
+        // A frame from that device, on screen.
+        if let Some(picture) = one_pixel_picture() {
+            session.hold_gpu_frame(Some((picture, egui::vec2(1.0, 1.0))));
+            assert!(session.gpu_frame.is_some(), "the frame should be held to begin with");
+        }
+
+        // The codec settles and the decoder is rebuilt on a device of its own.
+        session.shared.gpu_device.store(0x2000, Ordering::Relaxed);
+        session.ensure_renderer();
+
+        assert_eq!(
+            session.renderer_device, 0x2000,
+            "the interop is still bound to the device the decoder has left, so every \
+             texture registered from now on belongs to a device that never owned it"
+        );
+        assert!(
+            session.gpu_frame.is_none(),
+            "the frame on screen is a texture on the old device and must not be drawn again"
+        );
+
+        // And a decoder that stays put is not disturbed.
+        session.shared.gpu_device.store(0x2000, Ordering::Relaxed);
+        session.ensure_renderer();
+        assert_eq!(session.renderer_device, 0x2000);
     }
 
     /// A `GpuPicture` over a real one-pixel surface, or `None` without a GPU.
