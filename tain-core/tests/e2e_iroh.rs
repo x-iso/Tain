@@ -72,6 +72,94 @@ async fn start_host() -> Result<(Arc<HostServer>, String, [u8; 32])> {
     Ok((server, passcode, id))
 }
 
+/// Where this host can actually be dialled from this machine.
+///
+/// `bound_sockets` reports what the endpoint bound, which is a wildcard —
+/// `0.0.0.0:60617` and `[::]:60619`. Handing those to a guest as an address to
+/// try is meaningless, and the first version of this test did exactly that: it
+/// passed anyway, over the relay, while claiming to need no relay. It only
+/// failed once the relay stopped answering, which is the condition it was
+/// supposed to be testing under.
+///
+/// Substituting loopback for the unspecified address gives the guest something
+/// it can really dial, and takes the relay out of the path for good.
+fn loopback_addrs(server: &HostServer) -> Vec<std::net::SocketAddr> {
+    server
+        .local_addrs()
+        .into_iter()
+        .filter(|addr| addr.is_ipv4())
+        .map(|mut addr| {
+            if addr.ip().is_unspecified() {
+                addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+            }
+            addr
+        })
+        .collect()
+}
+
+/// Several guests arriving at once must all be answered.
+///
+/// # The failure this is for
+///
+/// The accept loop used to complete each QUIC handshake inline, so the host
+/// could only shake hands with one guest at a time and everyone else waited
+/// behind them — not for a moment, but until that handshake finished or timed
+/// out. On a link where handshakes stall that is most of them, and from the
+/// guest it looks like the host ignoring them at random. The host log said
+/// "Failed to accept QUIC connection: timed out" and nothing about the attempts
+/// that died queued behind it.
+///
+/// # Why this one needs no relay
+///
+/// It dials the host's own socket, which is the path a guest takes once it has
+/// connected before. That makes it the only test in this file that runs on a
+/// machine which cannot reach the n0 relay — which is the machine this software
+/// is written for, and increasingly the one it is developed on.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_guests_arriving_together_are_all_answered() -> Result<()> {
+    let (server, passcode, host_id) = start_host().await?;
+    let addrs = loopback_addrs(&server);
+    assert!(!addrs.is_empty(), "the host bound no dialable socket");
+    let key = iroh::PublicKey::from_bytes(&host_id).context("host id")?;
+
+    // Enough to notice serialisation, few enough to stay quick.
+    const GUESTS: usize = 4;
+    let mut dials = Vec::new();
+    for _ in 0..GUESTS {
+        let (key, addrs, passcode) = (key, addrs.clone(), passcode.clone());
+        dials.push(tokio::spawn(async move {
+            let mut guest = GuestClient::connect_via(&key, None, &addrs).await?;
+            let (_send, mut recv) = guest.authenticate(&passcode, Some("Crowd")).await?;
+            // Reaching SessionStart is the proof: the handshake completed, the
+            // stream opened and the host answered on it.
+            let bytes = tokio::time::timeout(Duration::from_secs(20), read_stream_message(&mut recv))
+                .await
+                .context("timed out waiting for SessionStart")??
+                .context("stream closed before SessionStart")?;
+            anyhow::ensure!(
+                matches!(bincode::deserialize::<Message>(&bytes)?, Message::SessionStart(_)),
+                "first message was not SessionStart"
+            );
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+
+    let mut answered = 0;
+    let mut failures = Vec::new();
+    for dial in dials {
+        match dial.await.context("dial task panicked")? {
+            Ok(()) => answered += 1,
+            Err(e) => failures.push(format!("{e:#}")),
+        }
+    }
+
+    assert_eq!(
+        answered, GUESTS,
+        "only {answered} of {GUESTS} guests were answered: {failures:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires network access to the n0 relay"]
 async fn guest_authenticates_and_receives_frames_over_iroh() -> Result<()> {

@@ -75,6 +75,13 @@ pub use super::connection_code::ConnectionCode;
 /// Application-layer protocol name used in iroh ALPN negotiation.
 pub const ALPN: &[u8] = b"tain/2";
 
+/// How long a starting host waits to reach a relay before listening anyway.
+///
+/// Long enough that an ordinary connection is made before the warning appears,
+/// short enough that a censored link does not turn "starting the host" into a
+/// hang with nothing on screen.
+const HOST_ONLINE_WAIT: Duration = Duration::from_secs(10);
+
 /// What the host decided about a guest that asked to connect.
 ///
 /// This gates the *stream*, not just input: a guest sees nothing at all until
@@ -207,6 +214,15 @@ pub struct HostServer {
 }
 
 impl HostServer {
+    /// The addresses this host is actually bound to.
+    ///
+    /// What a guest needs to reach it without asking a relay or a name server
+    /// anything — which is what a guest that has connected once already does,
+    /// and what a test on a machine with no relay must do.
+    pub fn local_addrs(&self) -> Vec<std::net::SocketAddr> {
+        self.endpoint.bound_sockets()
+    }
+
     /// Create a new host with a fresh identity.
     pub async fn bind() -> Result<Self> {
         Self::bind_with_identity(None).await
@@ -233,7 +249,27 @@ impl HostServer {
             builder = builder.secret_key(iroh::SecretKey::from_bytes(&bytes));
         }
         let endpoint = builder.bind().await?;
-        endpoint.online().await;
+
+        // # Coming online is a courtesy, not a requirement
+        //
+        // `online()` resolves once the endpoint has reached a relay and has
+        // somewhere to be found. This waited for it with no timeout, which on a
+        // link where the relays are unreachable — the link this is built for —
+        // is a host that never finishes starting: no listener, no log line past
+        // this point, and nothing to say why.
+        //
+        // It is not needed to accept anything. A guest that already knows an
+        // address, which after one successful connection it does, reaches this
+        // host over the network directly and never involves a relay. So the
+        // wait is bounded and its failure is reported rather than fatal — the
+        // guest side has always done exactly this.
+        if tokio::time::timeout(HOST_ONLINE_WAIT, endpoint.online()).await.is_err() {
+            warn!(
+                "No relay answered within {}s — this host is listening anyway, and can be \
+                 reached by anyone who already knows an address for it",
+                HOST_ONLINE_WAIT.as_secs()
+            );
+        }
 
         info!("Host endpoint ready");
         info!("  Endpoint ID: {}", endpoint.id());
@@ -402,22 +438,42 @@ impl HostServer {
             // iroh 1.x: accept().await returns Option<Incoming>. None means endpoint closed.
             let Some(incoming) = self.endpoint.accept().await else { break };
 
-            // A failed handshake must not take the whole server down.
-            let conn = match incoming.await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    warn!("Failed to accept QUIC connection: {}", e);
-                    continue;
-                }
-            };
-
-            if conn.alpn() != ALPN.to_vec() {
-                info!("Rejected non-RDP connection (ALPN: {:?})", conn.alpn());
-                continue;
-            }
-
+            // # Nothing per-connection may happen on this loop
+            //
+            // `incoming.await` is the QUIC handshake, and it used to be awaited
+            // right here. That made the whole server single-file: one guest
+            // could be shaking hands at a time, and anyone else who dialled
+            // waited behind them — not for a moment, but until that handshake
+            // either finished or gave up.
+            //
+            // On a link where handshakes routinely stall, which is the link this
+            // is for, that is most of them. The log shows what it looks like
+            // from here: "Failed to accept QUIC connection: timed out", and
+            // every attempt that arrived during the wait is gone. From the
+            // guest it looks like the host ignoring them at random, including
+            // while the card says it is online — because the reachability sweep
+            // dials every saved host too, and those handshakes were queueing in
+            // front of the one the user actually asked for.
+            //
+            // So the handshake is spawned with the connection it belongs to.
+            // The loop does nothing now but hand work off, which is the only
+            // thing an accept loop should ever do.
             let server = Arc::clone(&self);
             tokio::spawn(async move {
+                // A failed handshake must not take the whole server down.
+                let conn = match incoming.await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        warn!("Failed to accept QUIC connection: {}", e);
+                        return;
+                    }
+                };
+
+                if conn.alpn() != ALPN.to_vec() {
+                    info!("Rejected non-RDP connection (ALPN: {:?})", conn.alpn());
+                    return;
+                }
+
                 if let Err(e) = server.handle_connection(conn).await {
                     error!("Connection handler error: {}", e);
                 }
