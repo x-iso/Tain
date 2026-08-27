@@ -82,10 +82,9 @@ impl VideoCodec {
             // [`Self::is_encodable_here`]. `Available` is about this build; the
             // hardware question is answered separately because the answer
             // differs between the two ends of the same session.
-            // As H.265: the code exists, and whether this machine can encode it
-            // is asked separately. AV1 encoders are newer hardware still — Arc,
-            // Ada, RDNA3 and up — so most machines will answer no and advertise
-            // H.264 instead.
+            //
+            // AV1 encoders are newer hardware still — Arc, Ada, RDNA3 and up —
+            // so most machines will answer no and advertise H.264 instead.
             Self::H265 | Self::Av1 => Availability::Available,
             _ => Availability::Planned,
         }
@@ -1204,10 +1203,8 @@ mod tests {
     fn unimplemented_codecs_fall_back_to_h264_not_to_raw() {
         // Degrading to raw would mean an unavailable choice silently costs
         // hundreds of MB/s, which is worse than any codec it stood in for.
-        for codec in [VideoCodec::Vp9] {
-            let cfg = EncodeConfig { codec, ..EncodeConfig::default() };
-            assert_eq!(cfg.effective_codec(), VideoCodec::H264);
-        }
+        let cfg = EncodeConfig { codec: VideoCodec::Vp9, ..EncodeConfig::default() };
+        assert_eq!(cfg.effective_codec(), VideoCodec::H264);
     }
 
     /// H.265 falls back on hardware grounds, not on build grounds.
