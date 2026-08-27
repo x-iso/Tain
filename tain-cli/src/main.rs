@@ -156,6 +156,15 @@ async fn main() -> Result<()> {
     // new identity and break every code anyone had saved.
     migrate::from_deskbridge();
 
+    // Before anything binds an endpoint, because the resolver is fixed at that
+    // point and every endpoint after it should share the same one. A link where
+    // DNS is interfered with cannot resolve a relay hostname, and this is what
+    // lets it reach the relay anyway — see `tain_core::dns_cache`.
+    tain_core::dns_cache::install(
+        gui::settings::Settings::path()
+            .and_then(|p| p.parent().map(|dir| dir.join("dns-cache.json"))),
+    );
+
     // Unpack and load the ffmpeg runtime now, in the background, so the first
     // session does not pay for it and the log says up front whether hardware
     // decode is available.

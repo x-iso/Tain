@@ -57,6 +57,7 @@ pub mod codec_mf_decode;
 pub mod decode_rgba;
 // Gated on the build script finding an ffmpeg tree; see tain-core/build.rs.
 #[cfg(all(target_os = "windows", db_ffmpeg))]
+pub mod dns_cache;
 pub mod ffmpeg_runtime;
 #[cfg(all(target_os = "windows", db_ffmpeg))]
 pub mod decode_ffmpeg;

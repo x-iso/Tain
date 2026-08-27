@@ -224,7 +224,11 @@ impl HostServer {
         // connection during the TLS handshake ("peer doesn't support any known
         // protocol") — the listener appears healthy but can never accept.
         let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            .alpns(vec![ALPN.to_vec()]);
+            .alpns(vec![ALPN.to_vec()])
+            // Relay hostnames answered from what was resolved last time, so a
+            // link that cannot reach DNS can still reach the relays. See
+            // `dns_cache`.
+            .dns_resolver(super::dns_cache::resolver());
         if let Some(bytes) = identity {
             builder = builder.secret_key(iroh::SecretKey::from_bytes(&bytes));
         }
@@ -2341,7 +2345,13 @@ impl GuestClient {
         /// report and nothing to cancel.
         const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
-        let endpoint = iroh::Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        // The cached resolver, as everywhere else — this is the path a user on
+        // a censored link actually presses, and the one where three seconds of
+        // DNS per relay is the difference between connecting and not.
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .dns_resolver(super::dns_cache::resolver())
+            .bind()
+            .await?;
 
         let online = tokio::time::timeout(ONLINE_WAIT, endpoint.online()).await.is_ok();
         if !online {
@@ -2670,7 +2680,10 @@ pub enum ProbeOutcome {
 
 impl Prober {
     pub async fn bind() -> Result<Self> {
-        let endpoint = iroh::Endpoint::bind(iroh::endpoint::presets::N0).await?;
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .dns_resolver(super::dns_cache::resolver())
+            .bind()
+            .await?;
         endpoint.online().await;
         Ok(Self { endpoint })
     }
