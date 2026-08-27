@@ -51,7 +51,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorEnumerator1,
     ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET,
     D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
+    D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_RESOURCE_MISC_SHARED,
+    D3D11_TEXTURE2D_DESC,
     D3D11_USAGE, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
@@ -213,17 +214,44 @@ impl RgbaConverter {
         };
         let mut targets = Vec::with_capacity(TARGETS);
         for _ in 0..TARGETS {
+            // SHADER_RESOURCE as well as RENDER_TARGET: the zero-copy path
+            // hands this texture to OpenGL, and a surface GL is going to
+            // sample from has to be created able to be sampled.
+            let bind = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
+            // # Why these are shared and the staging texture is not
+            //
+            // `WGL_NV_DX_interop2` is registering these, and a resource handed
+            // across an API boundary that way is expected to have been created
+            // shareable. AMD does not insist; NVIDIA does, and not by failing —
+            // registration succeeds, the lock succeeds, and the surface GL sees
+            // simply never changes again.
+            //
+            // That is the frozen picture reported from an RTX guest, and it
+            // took the registration count to find: exactly three registrations
+            // in one generation and then silence, which says the addresses were
+            // cycling correctly and being found in the cache, so the only thing
+            // left was the contents.
+            //
+            // Shared is not free — it can be refused, and there is no reason to
+            // ask for it on a texture nobody outside this device will ever see.
+            // The staging texture is read back by the CPU here and nowhere
+            // else, and STAGING cannot be shared in any case.
             let texture = create_rgba(
                 device,
                 width,
                 height,
                 D3D11_USAGE_DEFAULT,
-                // SHADER_RESOURCE as well as RENDER_TARGET: the zero-copy path
-                // hands this texture to OpenGL, and a surface GL is going to
-                // sample from has to be created able to be sampled.
-                (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                bind,
                 0,
+                D3D11_RESOURCE_MISC_SHARED.0 as u32,
             )
+            // A driver that will not share leaves the readback path, which
+            // wants nothing from this flag and is what runs if the interop
+            // gives up anyway. Better a slower picture than none.
+            .or_else(|e| {
+                debug!("No shared RGBA target ({e:#}) — the GPU path may not work here");
+                create_rgba(device, width, height, D3D11_USAGE_DEFAULT, bind, 0, 0)
+            })
             .context("could not create an RGBA render target")?;
 
             let mut output_view = None;
@@ -250,6 +278,7 @@ impl RgbaConverter {
             D3D11_USAGE_STAGING,
             0,
             D3D11_CPU_ACCESS_READ.0 as u32,
+            0,
         )
         .context("could not create the RGBA staging texture")?;
 
@@ -489,6 +518,7 @@ fn create_rgba(
     usage: D3D11_USAGE,
     bind: u32,
     cpu_access: u32,
+    misc: u32,
 ) -> Result<ID3D11Texture2D> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width as u32,
@@ -500,7 +530,7 @@ fn create_rgba(
         Usage: usage,
         BindFlags: bind,
         CPUAccessFlags: cpu_access,
-        MiscFlags: 0,
+        MiscFlags: misc,
     };
     let mut texture = None;
     // SAFETY: desc is fully initialised; the out-param is checked below.
@@ -517,6 +547,43 @@ mod tests {
         D3D11CreateDevice, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
     };
+
+    /// Every target the converter draws into must be shareable.
+    ///
+    /// `WGL_NV_DX_interop2` registers these, and a resource crossing to another
+    /// API that way is expected to have been created shareable. NVIDIA enforces
+    /// it in the worst possible way — registration succeeds, the lock succeeds,
+    /// and the surface GL sees never changes again — so nothing anywhere else
+    /// in this codebase would catch its absence. A guest reported a frozen
+    /// picture and the log showed a perfectly healthy stream behind it.
+    ///
+    /// Asserted on the texture rather than on the descriptor that was passed
+    /// in, because a driver is free to refuse the flag, and there is a fallback
+    /// here that quietly builds an unshared target when it does. If this fails
+    /// on some machine, that machine cannot draw without a readback and wants
+    /// to know rather than to freeze.
+    #[test]
+    fn the_targets_handed_to_opengl_are_shareable() {
+        let Some((device, context)) = device() else {
+            eprintln!("no D3D11 device with video support — skipping");
+            return;
+        };
+        let Ok(converter) = RgbaConverter::new(&device, &context, 640, 360) else {
+            eprintln!("no GPU colour conversion here — skipping");
+            return;
+        };
+
+        for (index, target) in converter.targets.iter().enumerate() {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: reading the description of a texture this owns.
+            unsafe { target.texture.GetDesc(&mut desc) };
+            assert!(
+                desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED.0 as u32 != 0,
+                "target {index} was created unshared, which on an NVIDIA guest is a \
+                 picture that freezes while every log line says the stream is fine"
+            );
+        }
+    }
 
     /// A device with video support, or `None` on a machine without one.
     fn device() -> Option<(ID3D11Device, ID3D11DeviceContext)> {
