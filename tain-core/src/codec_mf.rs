@@ -1671,55 +1671,67 @@ mod tests {
                 eprintln!("no {codec:?} encoder here — skipping");
                 continue;
             }
-            for (label, source, format) in [
-                ("BGRA", &bgra, PixelFormat::Bgra),
-                ("NV12", &nv12, PixelFormat::Nv12),
-            ] {
+            for (label, source, format) in
+                [("BGRA", &bgra, PixelFormat::Bgra), ("NV12", &nv12, PixelFormat::Nv12)]
+            {
                 let config = EncodeConfig { codec, fps: 30, ..EncodeConfig::default() };
-                let mut encoder =
-                    MediaFoundationEncoder::new(&config, w, h).expect("encoder");
-                let Ok(mut decoder) = crate::decode_ffmpeg::FfmpegDecoder::for_codec(codec)
-                else {
+                let mut encoder = MediaFoundationEncoder::new(&config, w, h).expect("encoder");
+                let Ok(mut decoder) = crate::decode_ffmpeg::FfmpegDecoder::for_codec(codec) else {
                     eprintln!("no {codec:?} decoder here — skipping");
                     continue;
                 };
 
-                // Enough frames to get past the encoder's own buffering and to
-                // give it a settled picture to describe.
-                let mut last = None;
+                // The source is red-dominant on the left and blue-dominant on
+                // the right, sampled well inside each block and away from the
+                // seam. Reported as "is red winning where red should win",
+                // because chroma taken from the wrong place does not shift a
+                // colour, it replaces it.
+                let reads_right = |rgba: &[u8]| {
+                    let at = |x: usize, y: usize| {
+                        let i = (y * w as usize + x) * 4;
+                        (rgba[i] as i32, rgba[i + 2] as i32)
+                    };
+                    let (left_r, left_b) = at(w as usize / 4, h as usize / 2);
+                    let (right_r, right_b) = at(w as usize * 3 / 4, h as usize / 2);
+                    left_r > left_b + 40 && right_b > right_r + 40
+                };
+
+                // Counted apart, because they fail apart: see the note above.
+                let (mut key_ok, mut key_bad) = (0u32, 0u32);
+                let (mut inter_ok, mut inter_bad) = (0u32, 0u32);
                 for _ in 0..30 {
-                    let Ok((packet, _)) = encoder.encode(source, w, h, format) else { continue };
+                    let Ok((packet, keyframe)) = encoder.encode(source, w, h, format) else {
+                        continue;
+                    };
                     if packet.is_empty() {
                         continue;
                     }
                     if let Ok(Some(picture)) = decoder.decode(&packet) {
-                        last = Some(picture);
+                        assert_eq!(picture.rgba.len(), w as usize * h as usize * 4);
+                        match (keyframe, reads_right(&picture.rgba)) {
+                            (true, true) => key_ok += 1,
+                            (true, false) => key_bad += 1,
+                            (false, true) => inter_ok += 1,
+                            (false, false) => inter_bad += 1,
+                        }
                     }
                 }
 
-                let Some(picture) = last else {
-                    panic!("{codec:?} from {label} produced no picture at all");
-                };
-                assert_eq!(picture.rgba.len(), w as usize * h as usize * 4);
-
-                // The source is red-dominant on the left, blue-dominant on the
-                // right. Sampled well inside each block, away from the seam.
-                let at = |x: usize, y: usize| {
-                    let i = (y * w as usize + x) * 4;
-                    (picture.rgba[i] as i32, picture.rgba[i + 2] as i32)
-                };
-                let (left_r, left_b) = at(w as usize / 4, h as usize / 2);
-                let (right_r, right_b) = at(w as usize * 3 / 4, h as usize / 2);
-
                 assert!(
-                    left_r > left_b + 40,
-                    "{codec:?} from {label}: the red half came back R={left_r} B={left_b}, \
-                     which is not red — the chroma is not the chroma that was sent"
+                    key_ok + inter_ok + key_bad + inter_bad > 5,
+                    "{codec:?} from {label} produced almost no pictures at all"
                 );
-                assert!(
-                    right_b > right_r + 40,
-                    "{codec:?} from {label}: the blue half came back R={right_r} B={right_b}, \
-                     which is not blue"
+                assert_eq!(
+                    key_bad, 0,
+                    "{codec:?} from {label}: {key_bad} keyframe(s) came back the wrong colour"
+                );
+                assert_eq!(
+                    inter_bad, 0,
+                    "{codec:?} from {label}: every keyframe was right ({key_ok} of them) and \
+                     {inter_bad} inter frames came back a flat neutral grey, against \
+                     {inter_ok} that were right — a decoder writing nothing into the surface \
+                     it hands back, which on real content shows as a picture that starts \
+                     blank and fills in only where something moved"
                 );
             }
         }
