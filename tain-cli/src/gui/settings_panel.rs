@@ -474,16 +474,6 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
             ui.end_row();
         }
 
-        // Guest-side, unlike everything above it, and said so plainly: this
-        // section is otherwise all about what this machine *sends*.
-        if cfg!(target_os = "windows") {
-            ui.label("Draw frames on the GPU").on_hover_text(
-                "For sessions this machine receives. Skips copying each decoded frame off the GPU and back, which is most of the decode cost — but it depends on a driver extension that has frozen the picture on at least one card. Turn it off if the video stops updating.",
-            );
-            ui.checkbox(&mut settings.gpu_present, "Skip the readback (experimental)");
-            ui.end_row();
-        }
-
         ui.label("Capture cursor");
         ui.checkbox(&mut settings.show_cursor, "Include the pointer in frames");
         ui.end_row();
@@ -973,12 +963,27 @@ fn viewing_section(ui: &mut egui::Ui, settings: &mut Settings) {
         });
         ui.end_row();
 
+        // # One setting, on the side it belongs to
+        //
+        // This was offered twice — here, and again among the hosting settings,
+        // where a comment admitted it did not belong. Two checkboxes for one
+        // value read as two decisions, and invited the question of which end
+        // wins.
+        //
+        // Neither, because there is nothing to agree on. Whether a decoded
+        // frame can be drawn without being copied back depends on the receiving
+        // machine's driver and its decoder, and the sender neither knows nor
+        // affects it — the value is read in exactly one place, this machine's
+        // own renderer. A host has no more say in it than in which monitor the
+        // window is on.
         if cfg!(target_os = "windows") {
             ui.label("Draw frames on the GPU").on_hover_text(
-                "Skips copying each decoded frame off the GPU and back, which is \
-                 most of the decode cost — but it depends on a driver extension \
-                 that has frozen the picture on at least one card. Turn it off if \
-                 the video stops updating.",
+                "For sessions this machine receives. Skips copying each decoded \
+                 frame off the GPU and back, which is most of the decode cost. \
+                 It depends on a driver extension, and turns itself off for the \
+                 session if the extension is missing or the decoder will not hand \
+                 its textures over — but it cannot tell that the picture has \
+                 stopped updating, so turn it off if that happens.",
             );
             ui.checkbox(&mut settings.gpu_present, "Skip the readback (experimental)");
             ui.end_row();
