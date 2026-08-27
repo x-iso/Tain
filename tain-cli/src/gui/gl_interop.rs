@@ -49,6 +49,7 @@ use std::sync::Arc;
 use tracing::*;
 
 use eframe::glow::{self, HasContext};
+use tain_core::decode_ffmpeg::GpuPicture;
 
 /// The entry points a zero-copy present needs.
 ///
@@ -200,7 +201,22 @@ pub struct InteropDevice {
 const FAILURE_BUDGET: u32 = 3;
 
 struct Registered {
-    d3d: *mut std::ffi::c_void,
+    /// The picture this was registered from, held for its reference to the
+    /// surface.
+    ///
+    /// # Why the registration has to own it
+    ///
+    /// A registration names a D3D texture, and unregistering it touches that
+    /// texture. The decoder owns three and rotates them, so this cache holds up
+    /// to three at a time — but only the one currently on screen was kept alive
+    /// by anything, and only for as long as it was on screen.
+    ///
+    /// When a session ends, the decode task drops the decoder whenever it gets
+    /// there, and the render thread drops this whenever the tab closes. Nothing
+    /// orders those. Losing that order means `wglDXUnregisterObjectNV` on three
+    /// surfaces that no longer exist, which is a crash on disconnect and
+    /// nothing else — the stream was fine a moment earlier.
+    picture: GpuPicture,
     object: ffi::Handle,
     texture: glow::Texture,
 }
@@ -274,24 +290,23 @@ impl InteropDevice {
     ///
     /// `d3d_texture` must be a live `ID3D11Texture2D` on the device this was
     /// opened with, and must outlive every draw that uses the returned name.
-    unsafe fn gl_texture_for(
-        &mut self,
-        d3d_texture: *mut std::ffi::c_void,
-        generation: u64,
-    ) -> Option<usize> {
+    unsafe fn gl_texture_for(&mut self, picture: &GpuPicture) -> Option<usize> {
+        let d3d_texture = picture.texture as *mut std::ffi::c_void;
         // A new generation means every texture this cache knows about has been
         // freed. Nothing may be reused, and the entries have to go before
         // anything looks one up by address.
-        if generation != self.generation {
+        if picture.generation != self.generation {
             debug!(
                 "Decoder rebuilt its converter — dropping {} registrations",
                 self.registered.len()
             );
             // SAFETY: forwarded from this function's contract.
             unsafe { self.release_all() };
-            self.generation = generation;
+            self.generation = picture.generation;
         }
-        if let Some(index) = self.registered.iter().position(|r| r.d3d == d3d_texture) {
+        if let Some(index) =
+            self.registered.iter().position(|r| r.picture.texture == picture.texture)
+        {
             return Some(index);
         }
 
@@ -318,18 +333,23 @@ impl InteropDevice {
             unsafe { self.gl.delete_texture(texture) };
             return None;
         }
-        self.registered.push(Registered { d3d: d3d_texture, object, texture });
-        // # Why the count is worth saying
+        self.registered.push(Registered { picture: picture.clone(), object, texture });
+        // # Why the count is worth saying, and saying out loud
         //
         // A decoder that hands back one output texture registers once and this
         // is silent for the rest of the session. One that rotates a pool
         // registers a handful and then settles. One that keeps producing
         // addresses this has never seen is neither, and that is what a picture
-        // stuck on its first frames would look like from in here — the number
-        // says which of the three is happening without needing the machine.
-        debug!(
-            "Registered a decoded texture at {d3d_texture:p} — {} in this generation",
-            self.registered.len()
+        // stuck on its first frames would look like from in here.
+        //
+        // At `debug` this needed the machine to be re-run with a filter set,
+        // which is a round trip per question. It happens a handful of times per
+        // session and never again, so it costs nothing to say plainly — and a
+        // log that keeps repeating it is the answer to why a picture froze.
+        info!(
+            "Registered a decoded texture at {d3d_texture:p} — {} in generation {}",
+            self.registered.len(),
+            picture.generation,
         );
         Some(self.registered.len() - 1)
     }
@@ -347,15 +367,14 @@ impl InteropDevice {
     /// As [`Self::gl_texture_for`].
     pub unsafe fn with_locked<T>(
         &mut self,
-        d3d_texture: *mut std::ffi::c_void,
-        generation: u64,
+        picture: &GpuPicture,
         draw: impl FnOnce(&glow::Context, glow::Texture) -> T,
     ) -> Option<T> {
         if self.failures >= FAILURE_BUDGET {
             return None;
         }
         // SAFETY: forwarded from this function's own contract.
-        let index = unsafe { self.gl_texture_for(d3d_texture, generation) }?;
+        let index = unsafe { self.gl_texture_for(picture) }?;
         let mut object = self.registered[index].object;
         let texture = self.registered[index].texture;
 
@@ -597,11 +616,11 @@ impl Renderer {
     /// # Safety
     ///
     /// As [`InteropDevice::with_locked`].
-    unsafe fn draw(&mut self, texture: *mut std::ffi::c_void, generation: u64) -> Option<()> {
+    unsafe fn draw(&mut self, picture: &GpuPicture) -> Option<()> {
         let quad = &self.quad;
         // SAFETY: forwarded from this function's contract.
         unsafe {
-            self.device.with_locked(texture, generation, |gl, tex| {
+            self.device.with_locked(picture, |gl, tex| {
                 // SAFETY: the texture is locked for GL for the length of this
                 // call, which is the contract `draw` asks for.
                 quad.draw(gl, tex);
@@ -610,14 +629,13 @@ impl Renderer {
     }
 }
 
-/// Draw one decoded texture over `rect`.
+/// Draw one decoded picture over `rect`.
 ///
-/// `texture` is the `ID3D11Texture2D` pointer the decoder reported, carried as a
-/// `usize` because it crossed a thread to get here.
+/// The whole picture rather than its address, because it owns a reference to the
+/// surface and the registration made from it has to as well — see [`Registered`].
 pub fn paint_callback(
     renderer: SharedRenderer,
-    texture: usize,
-    generation: u64,
+    picture: GpuPicture,
     rect: egui::Rect,
 ) -> egui::PaintCallback {
     egui::PaintCallback {
@@ -642,15 +660,13 @@ pub fn paint_callback(
                     );
                 }
 
-                // SAFETY: the pointer came from the decoder's converter, whose
-                // textures live as long as the converter and are only replaced
-                // on a size change — which produces a new pointer and a fresh
-                // registration rather than reusing this one.
-                let drawn = unsafe { renderer.draw(texture as *mut _, generation) };
+                // SAFETY: the picture owns a reference to its surface, so it is
+                // live for this call however the decoder behind it has fared.
+                let drawn = unsafe { renderer.draw(&picture) };
                 if drawn.is_none() {
                     // Nothing drawn beats something wrong. The reason has
                     // already been named by whichever call refused.
-                    debug!("Frame {texture:#x} was not drawn");
+                    debug!("Frame {:#x} was not drawn", picture.texture);
                 }
             },
         )),

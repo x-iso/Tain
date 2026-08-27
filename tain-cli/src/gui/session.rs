@@ -498,12 +498,7 @@ impl GuestSession {
     pub fn gpu_paint(&self, rect: egui::Rect) -> Option<egui::PaintCallback> {
         let renderer = self.renderer.as_ref()?.as_ref()?.clone();
         let (picture, _) = self.gpu_frame.as_ref()?;
-        Some(super::gl_interop::paint_callback(
-            renderer,
-            picture.texture,
-            picture.generation,
-            rect,
-        ))
+        Some(super::gl_interop::paint_callback(renderer, picture.clone(), rect))
     }
 
     /// Open the decoder's device for sharing with OpenGL, and reopen it if the
