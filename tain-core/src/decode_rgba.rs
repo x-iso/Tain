@@ -120,6 +120,26 @@ pub struct RgbaConverter {
     targets: Vec<Target>,
     /// The target the next blit goes into.
     next: usize,
+    /// The target the consumer says it is drawing, as a texture address.
+    ///
+    /// # Why three targets was not enough on its own
+    ///
+    /// The rotation was chosen so the decoder has to get two whole frames ahead
+    /// before it can come back around to a target the render thread is still
+    /// holding, and the note on `targets` admits that this is a bound rather
+    /// than a proof: a render thread that misses three published frames while
+    /// still drawing the stale handle sees the surface change under it.
+    ///
+    /// It is not a rare case. The render thread holds the last picture it was
+    /// given until a newer one *and a repaint* arrive, and it draws that same
+    /// picture on every repaint in between. Any stretch where the decoder is
+    /// ahead of the window — a busy compositor, a frame the window missed, a
+    /// stream running faster than the display — laps it, and what that looks
+    /// like is a trail of previous frames rather than an error.
+    ///
+    /// So the render thread says which one it has, and that one is skipped.
+    /// Zero means it is drawing none of them.
+    in_use: usize,
     /// The target the last blit went into, which is what `read` picks up.
     last: usize,
     /// CPU-readable copy of `target`.
@@ -283,6 +303,7 @@ impl RgbaConverter {
             enumerator,
             targets,
             next: 0,
+            in_use: 0,
             last: 0,
             staging,
             source: (width, height),
@@ -296,6 +317,14 @@ impl RgbaConverter {
     /// RGBA bytes for one frame of this converter's size.
     pub fn output_len(&self) -> usize {
         self.width as usize * self.height as usize * 4
+    }
+
+    /// Say which target the consumer is drawing, so the next blit avoids it.
+    ///
+    /// `0` for none. See [`Self::in_use`] for why this is needed and what goes
+    /// wrong without it.
+    pub fn set_in_use(&mut self, texture: usize) {
+        self.in_use = texture;
     }
 
     /// A reference to the texture holding the frame `submit` last produced.
@@ -424,6 +453,17 @@ impl RgbaConverter {
                 true,
                 Some(&picture),
             );
+        }
+
+        // Step over the target the consumer says it is drawing. Bounded by the
+        // number of targets, so a consumer naming something that is not one of
+        // them — or naming the only one left — cannot spin here.
+        for _ in 0..TARGETS {
+            use windows::core::Interface;
+            if self.targets[self.next].texture.as_raw() as usize != self.in_use {
+                break;
+            }
+            self.next = (self.next + 1) % TARGETS;
         }
 
         let stream = D3D11_VIDEO_PROCESSOR_STREAM {
@@ -705,6 +745,67 @@ mod tests {
         D3D11CreateDevice, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
     };
+
+    /// The surface being drawn must never be the one written next.
+    ///
+    /// # The trail this is about
+    ///
+    /// Three targets in rotation means the decoder comes back around to a given
+    /// one every third frame. The render thread holds the last picture it was
+    /// handed and redraws it on every repaint until a newer one arrives, so any
+    /// stretch where the decoder is ahead of the window ends with the decoder
+    /// writing the surface the window is reading — which is not an error, it is
+    /// a picture made partly of an older frame. Reported as a trail of previous
+    /// frames, almost all the time.
+    ///
+    /// Asserted against the address the render thread would actually publish,
+    /// over enough frames that the rotation wraps several times. Without the
+    /// skip it fails on the third blit.
+    #[test]
+    fn the_target_being_drawn_is_never_the_one_written_next() {
+        let Some((device, context)) = device() else {
+            eprintln!("no D3D11 device with video support — skipping");
+            return;
+        };
+        let (w, h) = (640u16, 360u16);
+        let Ok(mut converter) = RgbaConverter::new(&device, &context, w, h) else {
+            eprintln!("no GPU colour conversion here — skipping");
+            return;
+        };
+        let source = flat_nv12(&device, w, h, 126, 128, 128).expect("source");
+
+        // Take a picture and hold it, exactly as the render thread does.
+        converter.submit(&source, 0).expect("submit");
+        let held = {
+            use windows::core::Interface;
+            converter.last_texture().as_raw() as usize
+        };
+        converter.set_in_use(held);
+
+        // Now let the decoder run on without the window ever moving.
+        for frame in 0..(TARGETS * 4) {
+            converter.submit(&source, 0).expect("submit");
+            let wrote = {
+                use windows::core::Interface;
+                converter.last_texture().as_raw() as usize
+            };
+            assert_ne!(
+                wrote, held,
+                "frame {frame} was blitted into the surface the window is drawing, which is \
+                 a picture made half of this frame and half of the last one"
+            );
+        }
+
+        // And releasing it lets the rotation use every target again.
+        converter.set_in_use(0);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..(TARGETS * 2) {
+            converter.submit(&source, 0).expect("submit");
+            use windows::core::Interface;
+            seen.insert(converter.last_texture().as_raw() as usize);
+        }
+        assert_eq!(seen.len(), TARGETS, "the rotation did not come back to every target");
+    }
 
     /// The blit has to be reported finished, and reported so promptly.
     ///

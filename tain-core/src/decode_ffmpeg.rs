@@ -484,6 +484,17 @@ impl FfmpegDecoder {
         self.retired.release_except(held);
     }
 
+    /// Tell the converter which texture the render thread is drawing.
+    ///
+    /// `0` for none. Without this the decoder can lap a render thread that is
+    /// holding a picture and overwrite the surface being drawn — see
+    /// `RgbaConverter::in_use`, which is where the consequence is described.
+    pub fn drawing_now(&mut self, texture: usize) {
+        if let Some((converter, _, _)) = self.converter.as_mut() {
+            converter.set_in_use(texture);
+        }
+    }
+
     fn ensure_converter(&mut self, w: u16, h: u16) -> Result<()> {
         if matches!(&self.converter, Some((_, cw, ch)) if (*cw, *ch) == (w, h)) {
             return Ok(());

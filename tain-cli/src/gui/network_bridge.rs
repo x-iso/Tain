@@ -206,6 +206,8 @@ pub struct FrameTally {
     /// Keyframes among the arrivals. The host sends one to recover, so a stream
     /// stuck behind a decode failure shows these arriving and still not moving.
     pub keyframes: u32,
+    /// Decoded frames replaced before the window drew them.
+    pub displaced: u32,
     pub bytes: usize,
 }
 
@@ -232,6 +234,22 @@ impl FrameTally {
         }
         if self.keyframes > 0 {
             line.push_str(&format!(", {} keyframes", self.keyframes));
+        }
+        // # Why this is worth a place on the line
+        //
+        // A frame counted here was decoded and then replaced before the window
+        // drew it, so every stage paid for it and nobody saw it. That is a cost
+        // on its own, and it is also the measurement that says whether the
+        // decoder is running ahead of the window — which is the condition under
+        // which it laps the render thread and overwrites the surface being
+        // drawn. See `RgbaConverter::in_use`: that is a trail of previous
+        // frames on screen, and until this figure existed there was nothing in
+        // a log to tell it apart from a slow link.
+        if self.displaced > 0 {
+            line.push_str(&format!(
+                ", {:.1}/s decoded but never shown",
+                per_sec(self.displaced)
+            ));
         }
         Some(line)
     }
@@ -441,6 +459,13 @@ pub struct GuestSessionState {
     /// arrives, which on a stalled stream may be never. See
     /// `FfmpegDecoder::release_pictures_except`.
     pub drawing_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Which decoded texture the render thread is drawing, or 0 for none.
+    ///
+    /// The generation above says whether a *converter* is still reachable; this
+    /// says which of its three targets is on screen. The decoder rotates
+    /// through them and would otherwise come back around and overwrite the one
+    /// being drawn — see `RgbaConverter::in_use`.
+    pub drawing_texture: Arc<std::sync::atomic::AtomicUsize>,
     /// This machine's quality-versus-latency position, 0-100, for the jitter
     /// buffer to size itself from.
     ///
@@ -499,6 +524,7 @@ impl GuestSessionState {
             gpu_device: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             present_on_gpu: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drawing_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            drawing_texture: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             audio_priority: Arc::new(std::sync::atomic::AtomicU8::new(
                 tain_core::LatencyPriority::BALANCED.value(),
             )),
@@ -1158,6 +1184,15 @@ impl FrameDecoder {
         let _ = held;
     }
 
+    /// Tell the decoder which texture is on screen, so it does not write it.
+    fn drawing_now(&mut self, texture: usize) {
+        #[cfg(all(target_os = "windows", db_ffmpeg))]
+        if let Self::H264Ffmpeg(decoder) | Self::Hevc(decoder) = self {
+            decoder.drawing_now(texture);
+        }
+        let _ = texture;
+    }
+
     /// Drop inter-frame state after a failure, so the next keyframe recovers.
     fn reset(&mut self) {
         if let Self::Delta(decoder) = self {
@@ -1435,6 +1470,9 @@ where
                 // its predecessor against an answer the render thread gave
                 // while that predecessor was still the newest thing to draw.
                 decoder.release_pictures_except(shared.drawing_generation.load(Ordering::Relaxed));
+                // And which surface is on screen right now, so the blit below
+                // does not land on the one being drawn.
+                decoder.drawing_now(shared.drawing_texture.load(Ordering::Relaxed));
                 let decoded = decoder.decode(&fm.data, fm.width, fm.height, fm.is_keyframe);
                 shared
                     .health
@@ -1499,6 +1537,7 @@ where
                 let displaced = shared.frame.lock().unwrap().replace(buffer).is_some();
                 if displaced {
                     shared.health.lock().unwrap().note_skipped();
+                    tally.displaced += 1;
                 }
                 if shared.status() != GuestStatus::Streaming {
                     shared.set_status(GuestStatus::Streaming);

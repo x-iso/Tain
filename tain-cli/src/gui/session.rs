@@ -479,10 +479,16 @@ impl GuestSession {
         // reverse order would be harmless too — the generation being taken up
         // is always the current converter's, which is never a retired one.
         let generation = frame.as_ref().map_or(0, |(picture, _)| picture.generation);
+        let texture = frame.as_ref().map_or(0, |(picture, _)| picture.texture);
         self.gpu_frame = frame;
         self.shared
             .drawing_generation
             .store(generation, std::sync::atomic::Ordering::Relaxed);
+        // Which of the converter's targets this is, so the decoder rotates
+        // around it rather than through it.
+        self.shared
+            .drawing_texture
+            .store(texture, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The frame to draw straight from the GPU, if there is one.
