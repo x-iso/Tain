@@ -71,11 +71,15 @@ unsafe extern "C" {
 
 /// A decoded frame that never left the GPU.
 ///
-/// The texture belongs to the decoder's colour converter and stays valid until
-/// the converter is rebuilt — which happens only on a size change, and takes the
-/// frame with it. The pointer is carried as a `usize` so this can cross to the
-/// render thread; a raw pointer is not `Send`, and what travels here is a handle
-/// rather than anything that gets dereferenced on the way.
+/// The texture belongs to the decoder's colour converter, and this is a loan
+/// rather than a share: nothing here keeps it alive. It survives a rebuild of
+/// that converter only because the outgoing one is retired for a generation
+/// instead of freed — see `FfmpegDecoder::retired` for why that is needed and
+/// what it does not cover.
+///
+/// The pointer is carried as a `usize` so this can cross to the render thread;
+/// a raw pointer is not `Send`, and what travels here is a handle rather than
+/// anything that gets dereferenced on the way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuPicture {
     pub texture: usize,
@@ -105,6 +109,35 @@ pub struct FfmpegDecoder {
     converter: Option<(RgbaConverter, u16, u16)>,
     /// How many times the converter has been built. See [`GpuPicture`].
     converter_generation: u64,
+    /// The converter replaced at the last rebuild, kept one generation longer.
+    ///
+    /// # Why the old textures are not freed at once
+    ///
+    /// Whoever draws these frames is on another thread and holds the last
+    /// picture it was given — that is the whole point of handing over a texture
+    /// instead of pixels. It finds out the converter was rebuilt when the *next*
+    /// frame reaches it, which is at best one frame away and at worst never, if
+    /// the stream has stalled. Until then it will keep drawing the picture it
+    /// has.
+    ///
+    /// Freeing the textures the moment the new ones exist therefore pulls a
+    /// live surface out from under the render thread. `generation` does not
+    /// help: it distinguishes a *reused address* from an old one, and here the
+    /// address is not reused, it is dangling — the consumer's cache hits, the
+    /// driver is handed a freed surface, and the process dies without a panic.
+    /// Reported twice, and visible in the log as a converter rebuilt two
+    /// seconds before the last line.
+    ///
+    /// Retiring for one generation gives every consumer a whole rebuild cycle —
+    /// seconds, against a frame time in milliseconds — to notice and move on.
+    /// It costs one converter's textures for the length of a session.
+    ///
+    /// It bounds the window rather than closing it: two rebuilds inside a
+    /// single drawn frame would still free something in use. The durable answer
+    /// is for the picture to carry a reference to its texture rather than an
+    /// address, which is a change to what crosses the thread boundary and wants
+    /// doing on its own.
+    retired: Option<RgbaConverter>,
     /// Whether the caller will draw the converted texture itself.
     ///
     /// Set by the guest once its render thread has established that this driver
@@ -180,6 +213,7 @@ impl FfmpegDecoder {
             context,
             converter: None,
             converter_generation: 0,
+            retired: None,
             present_on_gpu: false,
             rgba: Vec::new(),
             name,
@@ -360,9 +394,10 @@ impl FfmpegDecoder {
         }
         let converter = RgbaConverter::new(&self.device, &self.context, w, h)
             .with_context(|| format!("no GPU colour conversion for {w}x{h}"))?;
-        // Dropped only now, so the old textures are freed after the new ones
-        // exist — and the generation moves, which is what tells anyone holding a
-        // pointer to the old ones that it is worthless.
+        // Retired rather than dropped — see `retired` for why the render thread
+        // may still be drawing from it. The one retired before this has had a
+        // full generation to be let go of and goes now.
+        self.retired = self.converter.take().map(|(previous, _, _)| previous);
         self.converter = Some((converter, w, h));
         self.converter_generation += 1;
         Ok(())
