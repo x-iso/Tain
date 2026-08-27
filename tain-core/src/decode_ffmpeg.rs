@@ -109,16 +109,14 @@ pub struct FfmpegDecoder {
     converter: Option<(RgbaConverter, u16, u16)>,
     /// How many times the converter has been built. See [`GpuPicture`].
     converter_generation: u64,
-    /// The converter replaced at the last rebuild, kept one generation longer.
+    /// Converters replaced by a rebuild, with the generation each one served.
     ///
     /// # Why the old textures are not freed at once
     ///
     /// Whoever draws these frames is on another thread and holds the last
     /// picture it was given — that is the whole point of handing over a texture
-    /// instead of pixels. It finds out the converter was rebuilt when the *next*
-    /// frame reaches it, which is at best one frame away and at worst never, if
-    /// the stream has stalled. Until then it will keep drawing the picture it
-    /// has.
+    /// instead of pixels. Until a newer frame reaches it, it keeps drawing the
+    /// one it has.
     ///
     /// Freeing the textures the moment the new ones exist therefore pulls a
     /// live surface out from under the render thread. `generation` does not
@@ -128,16 +126,22 @@ pub struct FfmpegDecoder {
     /// Reported twice, and visible in the log as a converter rebuilt two
     /// seconds before the last line.
     ///
-    /// Retiring for one generation gives every consumer a whole rebuild cycle —
-    /// seconds, against a frame time in milliseconds — to notice and move on.
-    /// It costs one converter's textures for the length of a session.
+    /// # What keeps this bounded
     ///
-    /// It bounds the window rather than closing it: two rebuilds inside a
-    /// single drawn frame would still free something in use. The durable answer
-    /// is for the picture to carry a reference to its texture rather than an
-    /// address, which is a change to what crosses the thread boundary and wants
-    /// doing on its own.
-    retired: Option<RgbaConverter>,
+    /// Two things can be holding a picture, so two are kept, and everything
+    /// else goes at the next rebuild.
+    ///
+    /// The render thread says which generation it is drawing, through
+    /// [`Self::release_pictures_except`] — that covers a consumer stalled for
+    /// any length of time, which is the case a fixed number of generations
+    /// cannot cover.
+    ///
+    /// The newest retired one is kept unconditionally, because a decoded frame
+    /// can be sitting in the channel between here and the render thread, at a
+    /// generation the render thread has not claimed yet and never will until it
+    /// picks the frame up. That queued frame is always from the generation
+    /// immediately before the current one.
+    retired: Retired<RgbaConverter>,
     /// Whether the caller will draw the converted texture itself.
     ///
     /// Set by the guest once its render thread has established that this driver
@@ -213,7 +217,7 @@ impl FfmpegDecoder {
             context,
             converter: None,
             converter_generation: 0,
-            retired: None,
+            retired: Retired::default(),
             present_on_gpu: false,
             rgba: Vec::new(),
             name,
@@ -388,16 +392,32 @@ impl FfmpegDecoder {
         })
     }
 
+    /// Free every retired converter except the ones still reachable.
+    ///
+    /// `held` is the generation the render thread is currently drawing, or 0 if
+    /// it is drawing none of them. See [`Self::retired`] for why the newest is
+    /// kept regardless of what is held.
+    ///
+    /// Called from the decode loop rather than on a timer, so the memory is
+    /// returned as soon as the consumer has moved on and never later than the
+    /// next frame after that.
+    pub fn release_pictures_except(&mut self, held: u64) {
+        self.retired.release_except(held);
+    }
+
     fn ensure_converter(&mut self, w: u16, h: u16) -> Result<()> {
         if matches!(&self.converter, Some((_, cw, ch)) if (*cw, *ch) == (w, h)) {
             return Ok(());
         }
         let converter = RgbaConverter::new(&self.device, &self.context, w, h)
             .with_context(|| format!("no GPU colour conversion for {w}x{h}"))?;
-        // Retired rather than dropped — see `retired` for why the render thread
-        // may still be drawing from it. The one retired before this has had a
-        // full generation to be let go of and goes now.
-        self.retired = self.converter.take().map(|(previous, _, _)| previous);
+        // Retired rather than dropped — see `retired`. The generation recorded
+        // is the one the outgoing converter's pictures carry, which is the
+        // count before this rebuild is counted.
+        let outgoing = self.converter_generation;
+        if let Some((previous, _, _)) = self.converter.take() {
+            self.retired.retire(outgoing, previous);
+        }
         self.converter = Some((converter, w, h));
         self.converter_generation += 1;
         Ok(())
@@ -469,9 +489,106 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     Ok((device, context))
 }
 
+/// Converters kept alive past their rebuild, and the rule for letting them go.
+///
+/// Generic over what is held so the rule can be tested without a GPU: getting
+/// it wrong costs a use-after-free on the render thread, and the cases that
+/// distinguish a right rule from a plausible one are all about the order things
+/// happen in, not about D3D11.
+struct Retired<T> {
+    kept: Vec<(u64, T)>,
+}
+
+impl<T> Default for Retired<T> {
+    fn default() -> Self {
+        Self { kept: Vec::new() }
+    }
+}
+
+impl<T> Retired<T> {
+    /// Set aside the converter that served `generation`.
+    fn retire(&mut self, generation: u64, converter: T) {
+        self.kept.push((generation, converter));
+    }
+
+    /// Let go of everything but what is still reachable.
+    ///
+    /// `held` is the generation the render thread says it is drawing, or 0 for
+    /// none. The newest is kept whatever the answer, because a decoded frame
+    /// can be in the channel at a generation nobody has claimed yet — see
+    /// [`FfmpegDecoder::retired`].
+    fn release_except(&mut self, held: u64) {
+        let newest = self.kept.last().map_or(0, |(generation, _)| *generation);
+        self.kept.retain(|(generation, _)| *generation == held || *generation == newest);
+    }
+
+    #[cfg(test)]
+    fn generations(&self) -> Vec<u64> {
+        self.kept.iter().map(|(generation, _)| *generation).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two things that can still be holding a retired converter.
+    ///
+    /// A rebuilt converter's textures are freed on the decode thread while the
+    /// render thread may still be drawing from them. Two claims have to be
+    /// honoured and they are not the same claim, which is the whole subtlety:
+    /// the generation the render thread says it is drawing, and the newest
+    /// retired one, which covers a decoded frame sitting in the channel at a
+    /// generation the render thread has not picked up and so cannot name.
+    ///
+    /// Dropping either rule leaves something that looks right and crashes
+    /// rarely, so both are pinned here.
+    #[test]
+    fn a_retired_converter_is_kept_while_anything_can_still_reach_it() {
+        let mut retired = Retired::default();
+
+        // Generation 1 is retired while the render thread is drawing it.
+        retired.retire(1, "first");
+        retired.release_except(1);
+        assert_eq!(retired.generations(), vec![1], "the frame on screen came from this one");
+
+        // It stays through further rebuilds for as long as that is the answer —
+        // a stalled consumer is exactly the case a fixed number of generations
+        // cannot cover.
+        retired.retire(2, "second");
+        retired.release_except(1);
+        retired.retire(3, "third");
+        retired.release_except(1);
+        assert_eq!(
+            retired.generations(),
+            vec![1, 3],
+            "the drawn one, and the newest for whatever is in the channel — but not 2, \
+             which nothing can reach any more"
+        );
+
+        // The render thread picks up the queued frame and says so.
+        retired.release_except(3);
+        assert_eq!(retired.generations(), vec![3], "1 is finally free");
+
+        // And with nothing being drawn, only the channel's claim remains.
+        retired.retire(4, "fourth");
+        retired.release_except(0);
+        assert_eq!(retired.generations(), vec![4]);
+    }
+
+    /// Holding nothing must not free the frame that is on its way.
+    ///
+    /// The render thread reports 0 both before it has ever drawn a GPU frame
+    /// and after it lets one go. Treating that as "free everything" would drop
+    /// the converter behind a frame already decoded and queued — which is the
+    /// crash, arrived at from the other direction.
+    #[test]
+    fn nothing_being_drawn_does_not_free_what_is_still_in_flight() {
+        let mut retired = Retired::default();
+        retired.retire(7, "in flight");
+        retired.release_except(0);
+        assert_eq!(retired.generations(), vec![7]);
+    }
 
     /// Where hardware decode time goes, against the Media Foundation numbers.
     ///

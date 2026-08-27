@@ -437,6 +437,25 @@ impl GuestSession {
         self.texture.as_ref()
     }
 
+    /// Take or release the GPU frame, telling the decoder which one it is.
+    ///
+    /// Assignment goes through here so it cannot be done without publishing.
+    /// The decoder needs the answer to know when a rebuilt converter's textures
+    /// are safe to free, and the cost of a missed publish is the crash this
+    /// exists to prevent — see `FfmpegDecoder::release_pictures_except`.
+    #[cfg(target_os = "windows")]
+    fn hold_gpu_frame(&mut self, frame: Option<(usize, u64, egui::Vec2)>) {
+        self.gpu_frame = frame;
+        // Published after the field is set, so there is no moment where the
+        // decoder is told a generation is in use before it actually is. The
+        // reverse order would be harmless too — the generation being taken up
+        // is always the current converter's, which is never a retired one.
+        self.shared.drawing_generation.store(
+            frame.map_or(0, |(_, generation, _)| generation),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// The frame to draw straight from the GPU, if there is one.
     #[cfg(target_os = "windows")]
     pub fn gpu_frame(&self) -> Option<(usize, egui::Vec2)> {
@@ -498,11 +517,11 @@ impl GuestSession {
         // drawn from where it already is.
         #[cfg(target_os = "windows")]
         if let Some((texture, generation)) = frame.gpu {
-            self.gpu_frame = Some((
+            self.hold_gpu_frame(Some((
                 texture,
                 generation,
                 egui::vec2(frame.width as f32, frame.height as f32),
-            ));
+            )));
             self.shared
                 .health
                 .lock()
@@ -516,7 +535,7 @@ impl GuestSession {
         }
         #[cfg(target_os = "windows")]
         {
-            self.gpu_frame = None;
+            self.hold_gpu_frame(None);
         }
 
         // A frame with neither pixels nor a texture. It happens in the window
@@ -908,7 +927,7 @@ impl GuestSession {
         // paths that do not come through here, such as the window closing.
         #[cfg(target_os = "windows")]
         {
-            self.gpu_frame = None;
+            self.hold_gpu_frame(None);
             self.renderer = None;
             self.shared.present_on_gpu.store(false, std::sync::atomic::Ordering::Relaxed);
         }

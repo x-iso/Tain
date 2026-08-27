@@ -434,6 +434,14 @@ pub struct GuestSessionState {
     /// only known after the render thread has seen a device, which is after the
     /// first frames have already been decoded.
     pub present_on_gpu: Arc<std::sync::atomic::AtomicBool>,
+    /// Which decoded generation the render thread is holding, or 0 for none.
+    ///
+    /// The decoder cannot free a rebuilt converter's textures while the render
+    /// thread is still drawing one of them, and it has no other way to find
+    /// out — the render thread learns about a rebuild only when the next frame
+    /// arrives, which on a stalled stream may be never. See
+    /// `FfmpegDecoder::release_pictures_except`.
+    pub drawing_generation: Arc<std::sync::atomic::AtomicU64>,
     /// This machine's quality-versus-latency position, 0-100, for the jitter
     /// buffer to size itself from.
     ///
@@ -491,6 +499,7 @@ impl GuestSessionState {
             audio_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gpu_device: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             present_on_gpu: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drawing_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_priority: Arc::new(std::sync::atomic::AtomicU8::new(
                 tain_core::LatencyPriority::BALANCED.value(),
             )),
@@ -1140,6 +1149,17 @@ impl FrameDecoder {
         let _ = on;
     }
 
+    /// Let go of the textures behind every generation but the one being drawn.
+    ///
+    /// Only the decoders that hand textures over have anything to release.
+    fn release_pictures_except(&mut self, held: u64) {
+        #[cfg(all(target_os = "windows", db_ffmpeg))]
+        if let Self::H264Ffmpeg(decoder) | Self::Hevc(decoder) = self {
+            decoder.release_pictures_except(held);
+        }
+        let _ = held;
+    }
+
     /// Drop inter-frame state after a failure, so the next keyframe recovers.
     fn reset(&mut self) {
         if let Self::Delta(decoder) = self {
@@ -1413,6 +1433,10 @@ where
                 // Cheap, and it has to be per frame: the render thread decides
                 // this after the session is already running.
                 decoder.set_present_on_gpu(shared.present_on_gpu.load(Ordering::Relaxed));
+                // Before decoding, so a rebuild triggered by this frame retires
+                // its predecessor against an answer the render thread gave
+                // while that predecessor was still the newest thing to draw.
+                decoder.release_pictures_except(shared.drawing_generation.load(Ordering::Relaxed));
                 let decoded = decoder.decode(&fm.data, fm.width, fm.height, fm.is_keyframe);
                 shared
                     .health
