@@ -353,8 +353,31 @@ impl RgbaConverter {
             self.enumerator = enumerator;
             self.processor = processor;
             self.source = arrived;
-            // Every cached view was made against the enumerator just replaced.
+            // Every view was made against the enumerator just replaced, and a
+            // view belongs to the enumerator it came from. The inputs are a
+            // cache and can simply go; the outputs are the targets themselves
+            // and have to be made again, or the blit writes through a view the
+            // new processor does not own.
             self.views.clear();
+            let view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            for target in &mut self.targets {
+                let mut view = None;
+                // SAFETY: the texture and the new enumerator both outlive the
+                // view; the out-parameter is checked.
+                unsafe {
+                    self.video_device.CreateVideoProcessorOutputView(
+                        &target.texture,
+                        &self.enumerator,
+                        &view_desc,
+                        Some(&mut view),
+                    )
+                }
+                .context("could not rebuild an RGBA output view")?;
+                target.view = view.context("output view came back empty")?;
+            }
         }
 
         let input = self.input_view_for(source, slice)?;

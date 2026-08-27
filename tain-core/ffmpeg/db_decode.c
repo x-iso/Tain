@@ -180,7 +180,9 @@ DbDecoder *db_decoder_new(void *d3d11_device, int codec, char *err, int err_len)
      * neither of which any hardware encoder emits, and the list is a
      * conservative default rather than a hardware limit.
      */
-    d->ctx->hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
+    if (id == AV_CODEC_ID_H264) {
+        d->ctx->hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
+    }
 
     rc = avcodec_open2(d->ctx, decoder, NULL);
     if (rc < 0) {
