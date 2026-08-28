@@ -17,6 +17,36 @@ use tain_core::network::{read_stream_message, write_stream_message};
 use tain_core::protocol::{DisplayConfig, GuestTelemetry, InputEvent, Message, StreamStatus};
 use tain_core::{BottleneckSet, ConnectionCode, ControlGrants, GuestClient, VideoCodec};
 
+/// What a connected-but-blank session is actually waiting on.
+///
+/// # Why one word was not enough
+///
+/// "Authenticated — waiting for video" covered three situations that want
+/// three different responses, and a session stuck in any of them looked the
+/// same. The host might not have described the session yet; it might have, and
+/// be sending nothing; or it might be sending video this machine cannot decode
+/// — which is a real failure wearing the costume of a slow connection, and the
+/// one an AV1 or HEVC session lands in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    /// Passcode accepted; the host has not said what it is about to send.
+    Session,
+    /// The host described the session and no video has arrived at all.
+    FirstFrame,
+    /// Video is arriving and none of it has turned into a picture.
+    Decoding,
+}
+
+impl Waiting {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Session => "Connected — waiting for the host to open the session…",
+            Self::FirstFrame => "Session open — waiting for the first frame…",
+            Self::Decoding => "Video is arriving, but none of it is decoding on this machine",
+        }
+    }
+}
+
 /// Where a guest session currently is. Drives what the UI shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuestStatus {
@@ -25,8 +55,9 @@ pub enum GuestStatus {
     /// the step shown is the one in progress, so the one left on screen when it
     /// fails is the one that did not finish.
     Connecting(tain_core::network::DialStep),
-    /// Authenticated; waiting for the host's first frame.
-    Authenticated,
+    /// Past the passcode, and not yet showing anything. See [`Waiting`] — the
+    /// three reasons look identical from outside and are not the same problem.
+    Authenticated(Waiting),
     /// The host has been asked and has not answered. Nothing is streaming yet —
     /// this is a distinct state from "connected but no video", because the
     /// waiting is someone else's decision rather than a stall.
@@ -42,7 +73,7 @@ impl GuestStatus {
         match self {
             Self::Disconnected => "Disconnected".into(),
             Self::Connecting(step) => step.label().into(),
-            Self::Authenticated => "Authenticated — waiting for video".into(),
+            Self::Authenticated(waiting) => waiting.label().into(),
             Self::AwaitingApproval => "Waiting for the host to allow this connection…".into(),
             Self::Streaming => "Connected".into(),
             Self::Failed(e) => format!("Failed: {e}"),
@@ -53,7 +84,7 @@ impl GuestStatus {
         matches!(
             self,
             Self::Connecting(_)
-            | Self::Authenticated
+            | Self::Authenticated(_)
             | Self::AwaitingApproval
             | Self::Streaming
         )
@@ -633,7 +664,7 @@ pub async fn run_guest_session(
         // The host authenticates on the secret inside the code, so send it whole.
         let (mut send, mut recv) =
             client.authenticate(&code.encode(), client_name.as_deref()).await?;
-        shared.set_status(GuestStatus::Authenticated);
+        shared.set_status(GuestStatus::Authenticated(Waiting::Session));
 
         // Recorded, but deliberately not judged yet.
         //
@@ -1367,9 +1398,11 @@ where
                     ss.host_name.as_deref().and_then(tain_core::sanitize_device_name);
                 // SessionStart only arrives once the host has allowed us, so
                 // this is where "waiting" ends.
-                if shared.status() == GuestStatus::AwaitingApproval {
-                    shared.set_status(GuestStatus::Authenticated);
-                }
+                // Approved, or never needed approval. Either way the host has
+                // now said what it will send, so the wait becomes a different
+                // one — and if it never moves on from here the host is not
+                // sending, which is a different problem from not being allowed.
+                shared.set_status(GuestStatus::Authenticated(Waiting::FirstFrame));
                 repaint();
             }
             Message::ControlState(cs) => {
@@ -1487,6 +1520,13 @@ where
                 }
 
                 tally.arrived += 1;
+                // Video is reaching this machine. If the picture never appears
+                // from here, the host is doing its part and the fault is on
+                // this side — which is a different thing to be told than "the
+                // host is not sending", and until now looked exactly like it.
+                if shared.status() == GuestStatus::Authenticated(Waiting::FirstFrame) {
+                    shared.set_status(GuestStatus::Authenticated(Waiting::Decoding));
+                }
                 carried_video = true;
                 tally.bytes += fm.data.len();
                 // Stamped by the host at encode time, read against this
@@ -1685,6 +1725,39 @@ mod tests {
         let data = vec![9u8; 64];
         let frame = bgra_to_rgba(&data, 2, 2).unwrap();
         assert_eq!(frame.rgba.len(), 2 * 2 * 4);
+    }
+
+    /// A blank session must say which of the three reasons it is blank for.
+    ///
+    /// They want different responses — wait, chase the host, or stop using this
+    /// codec — and until they were separated a session stuck in any of them
+    /// said "waiting for video" and left the user with nowhere to go. The third
+    /// is the one worth having: video arriving that never becomes a picture is
+    /// a failure on this machine wearing the costume of a slow host.
+    #[test]
+    fn a_blank_session_says_what_it_is_blank_for() {
+        let labels: Vec<_> = [Waiting::Session, Waiting::FirstFrame, Waiting::Decoding]
+            .into_iter()
+            .map(|w| GuestStatus::Authenticated(w).label())
+            .collect();
+
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "two of these say the same thing: {labels:?}");
+
+        // The decoding one has to name the machine it is a problem on. "Waiting"
+        // would put it back with the other two, which is where it started.
+        let decoding = GuestStatus::Authenticated(Waiting::Decoding).label();
+        assert!(
+            decoding.contains("decoding") && !decoding.contains("Waiting"),
+            "{decoding:?} does not say that the picture is failing here rather than \
+             being slow to arrive"
+        );
+
+        // And all three are still "active": a session in any of them is open,
+        // and offering to reconnect would be wrong.
+        for waiting in [Waiting::Session, Waiting::FirstFrame, Waiting::Decoding] {
+            assert!(GuestStatus::Authenticated(waiting).is_active());
+        }
     }
 
     #[test]

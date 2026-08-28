@@ -12,6 +12,7 @@ pub mod immersive;
 pub mod preview;
 pub mod keymap;
 pub mod network_bridge;
+pub mod notify;
 pub mod session;
 pub mod session_window;
 pub mod settings;

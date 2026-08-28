@@ -1118,6 +1118,11 @@ pub struct GuestApp {
     check_tx: Option<mpsc::UnboundedSender<ConnectionCode>>,
     /// Asks the prober to sweep now. See [`ProbeHandles::resweep_tx`].
     resweep_tx: Option<mpsc::UnboundedSender<()>>,
+    /// Sessions already announced, so a notification fires once each.
+    ///
+    /// `reconcile_incoming` runs every frame; without this the same arrival
+    /// would be announced sixty times a second.
+    announced: std::collections::HashSet<u32>,
     checked_rx: Option<mpsc::UnboundedReceiver<(ConnectionCode, ProbeOutcome)>>,
     /// A destructive action awaiting confirmation.
     confirm: Option<Confirm>,
@@ -1164,6 +1169,7 @@ impl GuestApp {
             checking: None,
             check_tx: None,
             resweep_tx: None,
+            announced: std::collections::HashSet::new(),
             checked_rx: None,
             confirm: None,
             show_settings: false,
@@ -1698,6 +1704,27 @@ impl GuestApp {
                 });
             }
 
+            // # Announced once, from here rather than from the approval channel
+            //
+            // This is the one place every incoming session passes through,
+            // whichever way it arrived. Hanging the notification off the
+            // approval request instead would have missed exactly the connection
+            // most worth announcing: an admin passcode is never asked about, so
+            // it raises no request and would have arrived in silence.
+            for card in incoming.iter() {
+                if !self.announced.insert(card.session_id) {
+                    continue;
+                }
+                super::notify::incoming_connection(
+                    &card.display_name,
+                    card.status == ApprovalStatus::Pending,
+                );
+            }
+            // A session id is only unique while it is live, so the set is
+            // trimmed to what is still here rather than growing for the life of
+            // the process.
+            self.announced.retain(|id| active.contains(id));
+
             for card in incoming.iter_mut() {
                 let Some(grants) = sessions.grants(card.session_id) else { continue };
                 card.mouse_allowed = grants.mouse;
@@ -1735,7 +1762,7 @@ impl GuestApp {
                 let status = match s.status() {
                     GuestStatus::Streaming => ConnectionStatus::Online,
                     GuestStatus::AwaitingApproval => ConnectionStatus::Waiting,
-                    GuestStatus::Connecting(_) | GuestStatus::Authenticated => {
+                    GuestStatus::Connecting(_) | GuestStatus::Authenticated(_) => {
                         ConnectionStatus::Connecting
                     }
                     // A failed attempt is the one case where we have actually
@@ -2908,6 +2935,10 @@ impl eframe::App for GuestApp {
     /// one it was.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.say_goodbye_to_guests();
+        // Otherwise the icon is left in the tray until something makes the
+        // shell notice the process has gone, which is usually a mouse passing
+        // over it.
+        super::notify::shut_down();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
