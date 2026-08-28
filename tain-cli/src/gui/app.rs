@@ -1714,7 +1714,7 @@ impl GuestApp {
                 let status = match s.status() {
                     GuestStatus::Streaming => ConnectionStatus::Online,
                     GuestStatus::AwaitingApproval => ConnectionStatus::Waiting,
-                    GuestStatus::Connecting | GuestStatus::Authenticated => {
+                    GuestStatus::Connecting(_) | GuestStatus::Authenticated => {
                         ConnectionStatus::Connecting
                     }
                     // A failed attempt is the one case where we have actually

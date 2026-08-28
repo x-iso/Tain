@@ -21,7 +21,10 @@ use tain_core::{BottleneckSet, ConnectionCode, ControlGrants, GuestClient, Video
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuestStatus {
     Disconnected,
-    Connecting,
+    /// Dialling, and how far it has got. See `tain_core::network::DialStep`:
+    /// the step shown is the one in progress, so the one left on screen when it
+    /// fails is the one that did not finish.
+    Connecting(tain_core::network::DialStep),
     /// Authenticated; waiting for the host's first frame.
     Authenticated,
     /// The host has been asked and has not answered. Nothing is streaming yet —
@@ -38,7 +41,7 @@ impl GuestStatus {
     pub fn label(&self) -> String {
         match self {
             Self::Disconnected => "Disconnected".into(),
-            Self::Connecting => "Connecting…".into(),
+            Self::Connecting(step) => step.label().into(),
             Self::Authenticated => "Authenticated — waiting for video".into(),
             Self::AwaitingApproval => "Waiting for the host to allow this connection…".into(),
             Self::Streaming => "Connected".into(),
@@ -49,7 +52,10 @@ impl GuestStatus {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Connecting | Self::Authenticated | Self::AwaitingApproval | Self::Streaming
+            Self::Connecting(_)
+            | Self::Authenticated
+            | Self::AwaitingApproval
+            | Self::Streaming
         )
     }
 }
@@ -601,13 +607,29 @@ pub async fn run_guest_session(
     mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
     repaint: impl Fn() + Send + Sync + 'static,
 ) -> Result<()> {
-    shared.set_status(GuestStatus::Connecting);
+    use tain_core::network::DialStep;
+    shared.set_status(GuestStatus::Connecting(DialStep::Starting));
+
+    // Remembered as well as displayed: when the dial fails, the step it had
+    // reached is the only thing that says *which* part of reaching this host did
+    // not work, and by then the status has been replaced by the failure.
+    let reached = std::sync::Arc::new(std::sync::Mutex::new(DialStep::Starting));
 
     let result = async {
-        let mut client = GuestClient::connect_with_code(&code, &known_addrs)
+        let announce = {
+            let (shared, reached) = (shared.clone(), std::sync::Arc::clone(&reached));
+            move |step: DialStep| {
+                *reached.lock().unwrap() = step;
+                shared.set_status(GuestStatus::Connecting(step));
+            }
+        };
+        let mut client = GuestClient::connect_with_code_reporting(&code, &known_addrs, &announce)
             .await
-            .context("Could not reach that host")?;
+            .with_context(|| {
+                format!("Could not reach that host — {}", reached.lock().unwrap().stalled_at())
+            })?;
 
+        announce(DialStep::Authenticating);
         // The host authenticates on the secret inside the code, so send it whole.
         let (mut send, mut recv) =
             client.authenticate(&code.encode(), client_name.as_deref()).await?;
@@ -1670,7 +1692,7 @@ mod tests {
         assert_eq!(GuestStatus::Disconnected.label(), "Disconnected");
         assert!(GuestStatus::Failed("nope".into()).label().contains("nope"));
         assert!(!GuestStatus::Disconnected.is_active());
-        assert!(GuestStatus::Connecting.is_active());
+        assert!(GuestStatus::Connecting(tain_core::network::DialStep::Starting).is_active());
         assert!(GuestStatus::Streaming.is_active());
         assert!(!GuestStatus::Failed("x".into()).is_active());
     }
@@ -1682,7 +1704,10 @@ mod tests {
         let waiting = GuestStatus::AwaitingApproval;
         assert!(waiting.is_active());
         assert!(waiting.label().to_lowercase().contains("host"));
-        assert_ne!(waiting.label(), GuestStatus::Connecting.label());
+        assert_ne!(
+            waiting.label(),
+            GuestStatus::Connecting(tain_core::network::DialStep::ViaRelay).label()
+        );
     }
 
     /// A reader that never hears the announcement still has to decode.

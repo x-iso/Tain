@@ -2360,6 +2360,69 @@ pub struct GuestClient {
     connection: Option<iroh::endpoint::Connection>,
 }
 
+/// Where a connection attempt has got to.
+///
+/// # Why "Connecting" was not enough
+///
+/// Dialling a host is four or five separate things that can each fail on their
+/// own, and on a link where the relays are interfered with they fail at quite
+/// different rates. A user watching one word for twenty seconds cannot tell
+/// "this host is switched off" from "the relay is unreachable from here" from
+/// "the code has expired", and those want three different responses.
+///
+/// The steps are reported as they are reached, so the last one shown is the one
+/// that did not finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialStep {
+    /// Binding this machine's own endpoint.
+    Starting,
+    /// Waiting to reach a relay, because the code carried no address to try.
+    ReachingRelay,
+    /// Dialling the relay named in the code.
+    ViaRelay,
+    /// Dialling an address this host answered on before, with no relay involved.
+    Direct,
+    /// Connected at the transport level; sending the passcode.
+    Authenticating,
+}
+
+impl DialStep {
+    /// What to show while this step is the one in progress.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting up…",
+            Self::ReachingRelay => "Looking up where the host is…",
+            Self::ViaRelay => "Reaching the host through its relay…",
+            Self::Direct => "Reaching the host directly…",
+            Self::Authenticating => "Sending the passcode…",
+        }
+    }
+
+    /// What to say when the attempt gave up here.
+    ///
+    /// Phrased as the thing that did not happen rather than as an error code,
+    /// because the useful next action differs at every step.
+    pub fn stalled_at(self) -> &'static str {
+        match self {
+            Self::Starting => "this machine could not open a connection of its own",
+            Self::ReachingRelay => {
+                "no relay could be reached from here, and the code carries no address to \
+                 try directly — ask for a fresh code, or connect once on a network that \
+                 works so an address can be remembered"
+            }
+            Self::ViaRelay => {
+                "the host's relay could not be reached from here. The host may be fine and \
+                 the relay blocked"
+            }
+            Self::Direct => {
+                "the host did not answer on the address it last used. It may be switched \
+                 off, asleep, or on another network"
+            }
+            Self::Authenticating => "the host answered but did not accept the passcode",
+        }
+    }
+}
+
 impl GuestClient {
     /// Connect to the host identified by its PublicKey (EndpointId).
     pub async fn connect(host_public_key: &iroh::PublicKey) -> Result<Self> {
@@ -2383,6 +2446,21 @@ impl GuestClient {
         relay_url: Option<&str>,
         known_addrs: &[std::net::SocketAddr],
     ) -> Result<Self> {
+        Self::connect_reporting(host_public_key, relay_url, known_addrs, &|_| {}).await
+    }
+
+    /// As [`Self::connect_via`], saying which step it has reached as it goes.
+    ///
+    /// `on_step` is called from the dialling task, so it must be cheap and must
+    /// not block — publishing to shared state is what it is for. The last step
+    /// reported before a failure is the one that did not finish, which is the
+    /// whole point: see [`DialStep`].
+    pub async fn connect_reporting(
+        host_public_key: &iroh::PublicKey,
+        relay_url: Option<&str>,
+        known_addrs: &[std::net::SocketAddr],
+        on_step: &(dyn Fn(DialStep) + Send + Sync),
+    ) -> Result<Self> {
         /// How long to wait for the endpoint to report itself online.
         ///
         /// Not a requirement, a courtesy. Coming online means reaching a relay
@@ -2404,11 +2482,18 @@ impl GuestClient {
         // The cached resolver, as everywhere else — this is the path a user on
         // a censored link actually presses, and the one where three seconds of
         // DNS per relay is the difference between connecting and not.
+        on_step(DialStep::Starting);
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .dns_resolver(super::dns_cache::resolver())
             .bind()
             .await?;
 
+        // Only worth naming as a step when there is nothing else to go on. With
+        // a relay in the code or an address on file, this wait is a courtesy
+        // and the user should not be told the connection depends on it.
+        if relay_url.is_none_or(str::is_empty) && known_addrs.is_empty() {
+            on_step(DialStep::ReachingRelay);
+        }
         let online = tokio::time::timeout(ONLINE_WAIT, endpoint.online()).await.is_ok();
         if !online {
             warn!(
@@ -2449,6 +2534,10 @@ impl GuestClient {
         if !known_addrs.is_empty() {
             info!("Also trying {} address(es) this host answered on before", known_addrs.len());
         }
+
+        // Whichever way this is going to be reached, said before the wait
+        // rather than after it — a step nobody sees is not a step.
+        on_step(if known_addrs.is_empty() { DialStep::ViaRelay } else { DialStep::Direct });
 
         let conn = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN))
             .await
@@ -2498,13 +2587,22 @@ impl GuestClient {
         code: &ConnectionCode,
         known_addrs: &[std::net::SocketAddr],
     ) -> Result<Self> {
+        Self::connect_with_code_reporting(code, known_addrs, &|_| {}).await
+    }
+
+    /// As [`Self::connect_with_code`], saying which step it has reached.
+    pub async fn connect_with_code_reporting(
+        code: &ConnectionCode,
+        known_addrs: &[std::net::SocketAddr],
+        on_step: &(dyn Fn(DialStep) + Send + Sync),
+    ) -> Result<Self> {
         let public_key =
             iroh::PublicKey::from_bytes(&code.endpoint_id).context("Invalid endpoint ID bytes")?;
         // The relay the host put in the code, so no lookup is needed to find
         // it. Codes issued before this existed carry none, and fall back to the
         // lookup path. `known_addrs` is where this host answered last time,
         // which can remove the relay from the path entirely.
-        Self::connect_via(&public_key, code.relay_url.as_deref(), known_addrs).await
+        Self::connect_reporting(&public_key, code.relay_url.as_deref(), known_addrs, on_step).await
     }
 
     /// Take ownership of the underlying connection's stream pair, authenticating first.
@@ -2894,6 +2992,48 @@ mod tests {
     use super::*;
     use crate::protocol::{DisplayConfig, InputEvent, MouseEvent};
     use tokio::io::duplex;
+
+    /// Every dial step must say something different, in both directions.
+    ///
+    /// The whole value of reporting steps is that the one left on screen
+    /// identifies what failed. Two steps sharing a phrase would silently undo
+    /// that — the user would see a sentence that could mean either, which is
+    /// where "Connecting…" started.
+    ///
+    /// The stalled text is held to more than being distinct: it has to name the
+    /// thing that did not happen, so it is checked for being a sentence rather
+    /// than a label. A step whose failure text reads like a status is not
+    /// telling anybody what to do next.
+    #[test]
+    fn each_dial_step_says_something_of_its_own() {
+        let steps = [
+            DialStep::Starting,
+            DialStep::ReachingRelay,
+            DialStep::ViaRelay,
+            DialStep::Direct,
+            DialStep::Authenticating,
+        ];
+
+        let mut labels = std::collections::HashSet::new();
+        let mut stalls = std::collections::HashSet::new();
+        for step in steps {
+            assert!(labels.insert(step.label()), "{step:?} shares its label with another step");
+            assert!(
+                stalls.insert(step.stalled_at()),
+                "{step:?} shares its failure text with another step"
+            );
+            assert!(
+                step.stalled_at().len() > step.label().len(),
+                "{step:?} explains its failure in fewer words than it names itself, which \
+                 means it is not explaining"
+            );
+            assert!(
+                !step.stalled_at().ends_with('…') && !step.stalled_at().ends_with("..."),
+                "{step:?} reads like something still in progress rather than something that \
+                 stopped"
+            );
+        }
+    }
 
     fn test_config() -> SessionConfig {
         SessionConfig {
