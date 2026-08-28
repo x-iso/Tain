@@ -698,7 +698,16 @@ async fn run_probe_loop(
             biased;
 
             Some(code) = check_rx.recv() => {
-                let outcome = prober.probe(&code, PROBE_TIMEOUT).await;
+                // Whatever this host answered on before, as the sweep does and
+                // as Connect does. A paste of a code for a machine already on
+                // this list should not be answered worse than a sweep of it.
+                let known: Vec<_> = store
+                    .lock()
+                    .unwrap()
+                    .direct_addr(&super::connections::endpoint_hex(&code.endpoint_id))
+                    .into_iter()
+                    .collect();
+                let outcome = prober.probe(&code, &known, PROBE_TIMEOUT).await;
                 if checked_tx.send((code, outcome)).is_err() {
                     return;
                 }
@@ -743,28 +752,29 @@ async fn run_probe_loop(
                 // so the whole sweep costs one timeout now, and each card
                 // updates as its own answer arrives rather than at the end.
                 let mut probes = tokio::task::JoinSet::new();
-                for (endpoint_hex, code) in targets {
+                for (endpoint_hex, code, known) in targets {
                     let Ok(parsed) = ConnectionCode::parse(&code) else {
                         store
                             .lock()
                             .unwrap()
-                            .set_probe_result(&endpoint_hex, ConnectionStatus::NoCode);
+                            .set_probe_result(&endpoint_hex, ConnectionStatus::NoCode, None);
                         continue;
                     };
 
                     asked += 1;
                     let prober = std::sync::Arc::clone(&prober);
                     probes.spawn(async move {
-                        (endpoint_hex, status_of(prober.probe(&parsed, PROBE_TIMEOUT).await))
+                        let outcome = prober.probe(&parsed, &known, PROBE_TIMEOUT).await;
+                        (endpoint_hex, status_of(&outcome), why_of(&outcome))
                     });
                 }
 
                 while let Some(finished) = probes.join_next().await {
-                    let Ok((endpoint_hex, status)) = finished else { continue };
+                    let Ok((endpoint_hex, status, why)) = finished else { continue };
                     if status.can_connect() {
                         answered += 1;
                     }
-                    store.lock().unwrap().set_probe_result(&endpoint_hex, status);
+                    store.lock().unwrap().set_probe_result(&endpoint_hex, status, why);
                 }
 
                 if asked > 0 && answered == 0 {
@@ -798,11 +808,22 @@ async fn run_probe_loop(
 }
 
 /// One probe answer, as a saved-connection status.
-fn status_of(outcome: ProbeOutcome) -> ConnectionStatus {
+/// The sentence to keep beside a card, when there is one worth keeping.
+///
+/// Only a failure has anything to explain — a host that answered has said all
+/// there is to say by answering.
+fn why_of(outcome: &ProbeOutcome) -> Option<String> {
+    match outcome {
+        ProbeOutcome::Unreachable { why } => Some(why.clone()),
+        _ => None,
+    }
+}
+
+fn status_of(outcome: &ProbeOutcome) -> ConnectionStatus {
     match outcome {
         ProbeOutcome::Valid { .. } => ConnectionStatus::Ready,
         ProbeOutcome::Stale => ConnectionStatus::Stale,
-        ProbeOutcome::Unreachable => ConnectionStatus::Unreachable,
+        ProbeOutcome::Unreachable { .. } => ConnectionStatus::Unreachable,
     }
 }
 
@@ -1284,7 +1305,7 @@ impl GuestApp {
                         PasteState::Ready { host: host_name, needs_approval }
                     }
                     ProbeOutcome::Stale => PasteState::Stale,
-                    ProbeOutcome::Unreachable => PasteState::Unreachable,
+                    ProbeOutcome::Unreachable { .. } => PasteState::Unreachable,
                 };
             }
         }
@@ -2326,8 +2347,16 @@ impl GuestApp {
                 .max_rect(bar_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
+        // The reason the last probe gave, where it gave one, in preference to
+        // the generic explanation. "Offline" cannot separate a host that is
+        // switched off from a relay that is blocked from here, and those want
+        // opposite responses — so when the probe knows which it was, it says.
+        let detail = match conn.probe_why.as_deref() {
+            Some(why) => format!("{} — {why}.", conn.status.detail()),
+            None => conn.status.detail().to_string(),
+        };
         bar.label(egui::RichText::new(conn.status.label()).size(14.0).color(TEXT))
-            .on_hover_text(conn.status.detail());
+            .on_hover_text(detail);
         bar.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // The triangle's colour says whether pressing it does anything; the
             // label beside it says what the state is. Conflating the two is what
@@ -4055,11 +4084,18 @@ mod tests {
     fn a_probe_outcome_maps_to_the_status_a_card_shows() {
         use crate::gui::connections::ConnectionStatus;
         assert_eq!(
-            status_of(ProbeOutcome::Valid { host_name: None, needs_approval: false }),
+            status_of(&ProbeOutcome::Valid { host_name: None, needs_approval: false }),
             ConnectionStatus::Ready
         );
-        assert_eq!(status_of(ProbeOutcome::Stale), ConnectionStatus::Stale);
-        assert_eq!(status_of(ProbeOutcome::Unreachable), ConnectionStatus::Unreachable);
+        assert_eq!(status_of(&ProbeOutcome::Stale), ConnectionStatus::Stale);
+        let offline = ProbeOutcome::Unreachable { why: "the relay would not answer".into() };
+        assert_eq!(status_of(&offline), ConnectionStatus::Unreachable);
+        assert_eq!(
+            why_of(&offline).as_deref(),
+            Some("the relay would not answer"),
+            "the card keeps the reason, because \"offline\" alone cannot say which kind"
+        );
+        assert_eq!(why_of(&ProbeOutcome::Stale), None, "a host that answered has explained itself");
     }
 
     #[test]

@@ -181,6 +181,13 @@ pub struct SavedConnection {
     /// which is exactly the false confidence the probe exists to replace.
     #[serde(skip)]
     pub probed: Option<ConnectionStatus>,
+    /// Why the last probe could not reach this host, if it could not.
+    ///
+    /// Not serialised: it describes one attempt from one network at one moment,
+    /// and showing last week's reason after moving networks would be worse than
+    /// showing none.
+    #[serde(skip)]
+    pub probe_why: Option<String>,
 }
 
 impl SavedConnection {
@@ -196,6 +203,7 @@ impl SavedConnection {
             has_code: false,
             status: ConnectionStatus::default(),
             probed: None,
+            probe_why: None,
         }
     }
 
@@ -492,15 +500,24 @@ impl ConnectionStore {
         }
     }
 
-    /// Every row we hold a code for, as `(endpoint_hex, code)`.
+    /// Every row we hold a code for, as `(endpoint_hex, code, known addresses)`.
+    ///
+    /// The addresses matter: probing with the relay alone reported a host on
+    /// this very network as offline every sweep, while Connect reached it
+    /// directly and at once. A sweep that does less than the button it is
+    /// describing will disagree with it.
     ///
     /// Pulled out in one pass so the prober can work without holding the store
     /// locked across the network.
-    pub fn probe_targets(&self) -> Vec<(String, String)> {
+    pub fn probe_targets(&self) -> Vec<(String, String, Vec<std::net::SocketAddr>)> {
         self.entries
             .iter()
             .filter(|e| e.has_code)
-            .filter_map(|e| Some((e.endpoint_id.clone(), self.secrets.load(&e.endpoint_id)?)))
+            .filter_map(|e| {
+                let code = self.secrets.load(&e.endpoint_id)?;
+                let addrs = self.direct_addr(&e.endpoint_id).into_iter().collect();
+                Some((e.endpoint_id.clone(), code, addrs))
+            })
             .collect()
     }
 
@@ -523,10 +540,21 @@ impl ConnectionStore {
         }
     }
 
-    /// Record what a probe found for one host.
-    pub fn set_probe_result(&mut self, endpoint_hex: &str, status: ConnectionStatus) {
+    /// Record what a probe found for one host, and why if it failed.
+    ///
+    /// `why` is kept beside the status rather than inside it so that
+    /// [`ConnectionStatus`] stays a small copyable answer. The card shows the
+    /// status and the tooltip shows the reason, which is where there is room
+    /// for a sentence.
+    pub fn set_probe_result(
+        &mut self,
+        endpoint_hex: &str,
+        status: ConnectionStatus,
+        why: Option<String>,
+    ) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.endpoint_id == endpoint_hex) {
             entry.probed = Some(status);
+            entry.probe_why = why;
         }
     }
 
@@ -615,6 +643,7 @@ mod tests {
                 last_connected: i as u64,
                 status: ConnectionStatus::Ready,
                 probed: None,
+            probe_why: None,
             })
             .collect();
         // No path: these must never reach the real user's connection list.
@@ -753,8 +782,8 @@ mod tests {
     #[test]
     fn a_probe_result_survives_until_the_next_one_replaces_it() {
         let mut store = store_with(&[("a", "A"), ("b", "B")]);
-        store.set_probe_result("a", ConnectionStatus::Ready);
-        store.set_probe_result("b", ConnectionStatus::Unreachable);
+        store.set_probe_result("a", ConnectionStatus::Ready, None);
+        store.set_probe_result("b", ConnectionStatus::Unreachable, None);
         store.apply_status(&[]);
 
         let by_id = |s: &ConnectionStore, id: &str| {
@@ -783,8 +812,8 @@ mod tests {
     #[test]
     fn asking_again_puts_every_card_back_to_checking() {
         let mut store = store_with(&[("a", "A"), ("b", "B")]);
-        store.set_probe_result("a", ConnectionStatus::Ready);
-        store.set_probe_result("b", ConnectionStatus::Unreachable);
+        store.set_probe_result("a", ConnectionStatus::Ready, None);
+        store.set_probe_result("b", ConnectionStatus::Unreachable, None);
         store.apply_status(&[]);
 
         let by_id = |s: &ConnectionStore, id: &str| {
@@ -826,6 +855,7 @@ mod tests {
             last_connected: 0,
             status: ConnectionStatus::Ready,
             probed: None,
+            probe_why: None,
         });
 
         store.apply_status(&[]);

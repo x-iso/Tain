@@ -372,7 +372,7 @@ async fn a_probe_answers_without_disturbing_the_host() -> Result<()> {
 
     // A valid guest code: reachable, current, and it says approval is needed.
     let code = ConnectionCode::parse(&guest_code)?;
-    match prober.probe(&code, timeout).await {
+    match prober.probe(&code, &[], timeout).await {
         ProbeOutcome::Valid { host_name, needs_approval } => {
             assert_eq!(host_name.as_deref(), Some("Test Host"));
             assert!(needs_approval, "a guest code must report that it will ask");
@@ -382,7 +382,7 @@ async fn a_probe_answers_without_disturbing_the_host() -> Result<()> {
 
     // A master code is equally valid but would not wait for anyone.
     let master = ConnectionCode::parse(&master_code)?;
-    match prober.probe(&master, timeout).await {
+    match prober.probe(&master, &[], timeout).await {
         ProbeOutcome::Valid { needs_approval, .. } => {
             assert!(!needs_approval, "a master code connects without asking");
         }
@@ -393,7 +393,7 @@ async fn a_probe_answers_without_disturbing_the_host() -> Result<()> {
     // exactly the "the host regenerated while you were away" case, and it must
     // be distinguishable from the host being off.
     server.regenerate_passcode(tain_core::PasscodeType::Guest).await?;
-    assert_eq!(prober.probe(&code, timeout).await, ProbeOutcome::Stale);
+    assert_eq!(prober.probe(&code, &[], timeout).await, ProbeOutcome::Stale);
 
     // And through all of it, nobody was asked anything.
     assert!(

@@ -2828,8 +2828,15 @@ pub enum ProbeOutcome {
     /// The host answered, but this code is not one it accepts any more —
     /// almost always because it regenerated after the last disconnect.
     Stale,
-    /// No answer. The machine is off, asleep, or unreachable from here.
-    Unreachable,
+    /// No answer, and what stopped it.
+    ///
+    /// `why` is the sentence a card can show: "offline" alone cannot separate a
+    /// host that is switched off from a relay that is blocked from here, and
+    /// those want opposite responses from whoever is reading it. Phrased as the
+    /// thing that did not happen — see [`DialStep::stalled_at`], which is where
+    /// most of these come from, so that a card and a session window explain the
+    /// same failure the same way.
+    Unreachable { why: String },
 }
 
 impl Prober {
@@ -2847,18 +2854,34 @@ impl Prober {
     /// Never raises an approval request on the host, and never fails the caller:
     /// every outcome, including "could not reach it", is an answer worth showing
     /// on the card.
-    pub async fn probe(&self, code: &ConnectionCode, timeout: Duration) -> ProbeOutcome {
-        match tokio::time::timeout(timeout, self.try_probe(code)).await {
+    pub async fn probe(
+        &self,
+        code: &ConnectionCode,
+        known_addrs: &[std::net::SocketAddr],
+        timeout: Duration,
+    ) -> ProbeOutcome {
+        match tokio::time::timeout(timeout, self.try_probe(code, known_addrs)).await {
             Ok(Ok(outcome)) => outcome,
+            // The reason travels with the answer now. A card that says a host
+            // is offline is making a claim, and the claim is worth a lot more
+            // when it says which part of reaching it did not work — the relay
+            // being blocked from here and the host being switched off look
+            // identical on a card and want opposite responses.
             Ok(Err(e)) => {
                 debug!("Probe failed: {e}");
-                ProbeOutcome::Unreachable
+                ProbeOutcome::Unreachable { why: format!("{e}") }
             }
-            Err(_) => ProbeOutcome::Unreachable,
+            Err(_) => ProbeOutcome::Unreachable {
+                why: format!("it did not answer within {}s", timeout.as_secs()),
+            },
         }
     }
 
-    async fn try_probe(&self, code: &ConnectionCode) -> Result<ProbeOutcome> {
+    async fn try_probe(
+        &self,
+        code: &ConnectionCode,
+        known_addrs: &[std::net::SocketAddr],
+    ) -> Result<ProbeOutcome> {
         let public_key =
             iroh::PublicKey::from_bytes(&code.endpoint_id).context("bad endpoint id")?;
 
@@ -2886,11 +2909,32 @@ impl Prober {
             }
         }
 
+        // # The same addresses the Connect button would use
+        //
+        // This probed with the relay alone. Connecting also tries wherever the
+        // host answered last time, and that difference showed: a host on the
+        // same network as this machine was reported offline by every sweep,
+        // while Connect reached it directly and immediately. A list that is
+        // confidently wrong about the one thing it exists to answer is worse
+        // than no list.
+        for known in known_addrs {
+            addr.addrs.insert(iroh::TransportAddr::Ip(*known));
+        }
+
         let conn = self
             .endpoint
             .connect(addr, ALPN)
             .await
-            .context("could not reach the host")?;
+            .with_context(|| {
+                // Named in the same vocabulary the Connect button uses, so a
+                // card and a session window explain a failure the same way.
+                let step = if known_addrs.is_empty() {
+                    DialStep::ViaRelay
+                } else {
+                    DialStep::Direct
+                };
+                step.stalled_at().to_string()
+            })?;
 
         let (mut send, mut recv) = conn.open_bi().await?;
         write_stream_message(
@@ -2915,7 +2959,11 @@ impl Prober {
             // still works.
             other => {
                 debug!("Host answered a probe with {other:?}");
-                ProbeOutcome::Unreachable
+                ProbeOutcome::Unreachable {
+                    why: "it answered with something this version does not understand — it is \
+                          probably running an older build"
+                        .into(),
+                }
             }
         };
 
