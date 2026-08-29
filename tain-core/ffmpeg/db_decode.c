@@ -109,7 +109,27 @@ DbDecoder *db_decoder_new(void *d3d11_device, int codec, char *err, int err_len)
         av_log_set_level(AV_LOG_DEBUG);
     }
 
-    const AVCodec *decoder = avcodec_find_decoder(id);
+    /*
+     * # Why AV1 is asked for by name
+     *
+     * `avcodec_find_decoder` returns libavcodec's *preferred* decoder for an
+     * id, and for AV1 that is libdav1d wherever it is compiled in. dav1d is an
+     * excellent decoder and completely useless here: it is software only and
+     * has no hwaccel, so `get_format` below is never offered D3D11 and the
+     * whole hardware path is quietly skipped. The first AV1 session on this
+     * machine decoded nothing at all and said "libdav1d" while doing it.
+     *
+     * The native decoder, plain "av1", is the one that carries the D3D11VA
+     * hwaccel. Asked for by name, and only for AV1 — every other codec here has
+     * exactly one decoder and the preference is the right one.
+     */
+    const AVCodec *decoder = NULL;
+    if (id == AV_CODEC_ID_AV1) {
+        decoder = avcodec_find_decoder_by_name("av1");
+    }
+    if (!decoder) {
+        decoder = avcodec_find_decoder(id);
+    }
     if (!decoder) {
         db_fail(err, err_len, "libavcodec has no decoder for this codec");
         return NULL;

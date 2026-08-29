@@ -1183,6 +1183,40 @@ mod tests {
         }
     }
 
+    /// What this machine can actually encode, by name.
+    ///
+    /// Prints rather than asserts, because the answer is a property of the GPU
+    /// in front of you and any fixed expectation would be wrong on half the
+    /// machines this runs on. It exists because the question kept being answered
+    /// from memory instead of from the machine — including by me, wrongly.
+    ///
+    /// ```bash
+    /// cargo test -p tain-core -- --ignored --nocapture what_this_machine_can_encode
+    /// ```
+    #[test]
+    #[ignore = "diagnostic — run explicitly, prints rather than asserts"]
+    fn what_this_machine_can_encode() {
+        for codec in VideoCodec::ALL {
+            let encoders = {
+                #[cfg(target_os = "windows")]
+                {
+                    crate::codec_mf::available_encoders_for(codec)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Vec::<String>::new()
+                }
+            };
+            println!(
+                "{:<22} available={:<5} encodable_here={:<5} encoders={:?}",
+                codec.label(),
+                codec.is_available(),
+                codec.is_encodable_here(),
+                encoders,
+            );
+        }
+    }
+
     #[test]
     fn the_implemented_codecs_are_the_documented_ones() {
         // A reminder to update the docs and UI when this changes.

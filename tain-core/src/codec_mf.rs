@@ -1709,7 +1709,12 @@ mod tests {
         let mut nv12 = Vec::new();
         bgra_to_nv12(&bgra, w, h, &mut nv12);
 
-        for codec in [VideoCodec::H264, VideoCodec::H265] {
+        // Collected rather than asserted one at a time. Stopping at the first
+        // bad codec hides every codec after it, and "which of these work" is
+        // the question this is here to answer.
+        let mut faults: Vec<String> = Vec::new();
+
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
             if !codec.is_encodable_here() {
                 eprintln!("no {codec:?} encoder here — skipping");
                 continue;
@@ -1760,24 +1765,32 @@ mod tests {
                     }
                 }
 
-                assert!(
-                    key_ok + inter_ok + key_bad + inter_bad > 5,
-                    "{codec:?} from {label} produced almost no pictures at all"
-                );
-                assert_eq!(
-                    key_bad, 0,
-                    "{codec:?} from {label}: {key_bad} keyframe(s) came back the wrong colour"
-                );
-                assert_eq!(
-                    inter_bad, 0,
-                    "{codec:?} from {label}: every keyframe was right ({key_ok} of them) and \
-                     {inter_bad} inter frames came back a flat neutral grey, against \
-                     {inter_ok} that were right — a decoder writing nothing into the surface \
-                     it hands back, which on real content shows as a picture that starts \
-                     blank and fills in only where something moved"
-                );
+                let total = key_ok + inter_ok + key_bad + inter_bad;
+                if total <= 5 {
+                    faults.push(format!("{codec:?}/{label}: produced almost no pictures ({total})"));
+                    continue;
+                }
+                if key_bad > 0 {
+                    faults.push(format!(
+                        "{codec:?}/{label}: {key_bad} keyframe(s) came back the wrong colour"
+                    ));
+                }
+                if inter_bad > 0 {
+                    faults.push(format!(
+                        "{codec:?}/{label}: keyframes fine ({key_ok}), {inter_bad} inter frames \
+                         a flat neutral grey against {inter_ok} right — a decoder writing \
+                         nothing into the surface it hands back, which on real content is a \
+                         picture that starts blank and fills in only where something moved"
+                    ));
+                }
+                if faults.is_empty() {
+                    println!("{codec:?}/{label}: {key_ok} keyframes and {inter_ok} inter frames, \
+                              all the right colours");
+                }
             }
         }
+
+        assert!(faults.is_empty(), "{}", faults.join("\n"));
     }
 
     /// HEVC end to end: encoded on this GPU, decoded on this GPU.
