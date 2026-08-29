@@ -1663,6 +1663,129 @@ mod tests {
         }
     }
 
+    /// Moving content has to arrive where it was sent.
+    ///
+    /// # Why the still picture was not enough
+    ///
+    /// The other round trip sends one picture thirty times. Every inter frame
+    /// is then "copy the previous one", which is the easiest possible thing to
+    /// predict — it catches a decoder that produces nothing, and nothing else.
+    /// It cannot see a picture that is *wrong*, which is what was reported: the
+    /// smearing where part of the screen keeps content that has moved on.
+    ///
+    /// So this moves a bright bar across a dark field, one step per frame, and
+    /// asks of every decoded frame whether the bar is where that frame said it
+    /// would be. A frame predicted from the wrong reference, or built partly
+    /// from an older one, leaves the bar behind — and this notices, because it
+    /// checks the place the bar has left as well as the place it should be.
+    ///
+    /// Lossy compression is not a problem for this: the bar is a quarter of the
+    /// width and the test asks only which of two regions is brighter, which no
+    /// bitrate this runs at can reverse.
+    #[test]
+    #[ignore = "requires a hardware encoder and decoder"]
+    fn moving_content_arrives_where_it_was_sent() {
+        use crate::encoder::VideoCodec;
+
+        let (w, h) = (640u16, 480u16);
+        const FRAMES: usize = 40;
+        let bar = w as usize / 4;
+        // Where the bar starts on frame `i`, always well inside the picture.
+        let at = |i: usize| (i * 8) % (w as usize - bar);
+
+        let frame_at = |i: usize| {
+            let mut data = vec![0u8; w as usize * h as usize * 4];
+            let start = at(i);
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let px = (y * w as usize + x) * 4;
+                    let bright = x >= start && x < start + bar;
+                    let v = if bright { 235 } else { 20 };
+                    data[px] = v;
+                    data[px + 1] = v;
+                    data[px + 2] = v;
+                    data[px + 3] = 255;
+                }
+            }
+            data
+        };
+
+        let mut faults: Vec<String> = Vec::new();
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
+            if !codec.is_encodable_here() {
+                eprintln!("no {codec:?} encoder here — skipping");
+                continue;
+            }
+            let config = EncodeConfig { codec, fps: 30, ..EncodeConfig::default() };
+            let mut encoder = MediaFoundationEncoder::new(&config, w, h).expect("encoder");
+            let Ok(mut decoder) = crate::decode_ffmpeg::FfmpegDecoder::for_codec(codec) else {
+                eprintln!("no {codec:?} decoder here — skipping");
+                continue;
+            };
+
+            // The encoder holds frames back, so what comes out is behind what
+            // went in. Counting decoded pictures rather than assuming a
+            // one-to-one match is what keeps this honest about which frame it
+            // is looking at.
+            let mut decoded_index = 0usize;
+            let (mut right, mut wrong) = (0u32, 0u32);
+            for i in 0..FRAMES {
+                let source = frame_at(i);
+                let Ok((packet, _)) = encoder.encode(&source, w, h, PixelFormat::Bgra) else {
+                    continue;
+                };
+                if packet.is_empty() {
+                    continue;
+                }
+                let Ok(Some(picture)) = decoder.decode(&packet) else {
+                    continue;
+                };
+
+                let expected = at(decoded_index);
+                decoded_index += 1;
+
+                let row = h as usize / 2;
+                let sample = |x: usize| {
+                    let px = (row * w as usize + x) * 4;
+                    picture.rgba[px] as i32
+                };
+                // The middle of where the bar should be, and the middle of where
+                // it was two steps ago — which is dark unless something is
+                // holding on to an older frame.
+                let here = sample(expected + bar / 2);
+                let behind_at = at(decoded_index.saturating_sub(3));
+                let behind = sample(behind_at + bar / 2);
+
+                if here > 140 && (behind_at.abs_diff(expected) < bar || behind < 140) {
+                    right += 1;
+                } else {
+                    if wrong < 3 {
+                        eprintln!(
+                            "{codec:?} frame {decoded_index}: bar should be at {expected}, \
+                             brightness there {here}, and {behind} where it was three frames ago"
+                        );
+                    }
+                    wrong += 1;
+                }
+            }
+
+            if right + wrong < 10 {
+                faults.push(format!("{codec:?}: only {} pictures came back", right + wrong));
+            } else if wrong > 0 {
+                faults.push(format!(
+                    "{codec:?}: {wrong} of {} frames had the bar in the wrong place or left a \
+                     copy of it behind — content from an earlier frame surviving into a later \
+                     one, which is what smearing is",
+                    right + wrong
+                ));
+            } else {
+                println!("{codec:?}: {right} moving frames, all where they were sent");
+            }
+        }
+
+        assert!(faults.is_empty(), "{}", faults.join("\n"));
+    }
+
     /// A picture must survive the round trip *looking like itself*.
     ///
     /// # What the existing round-trip tests do not check
