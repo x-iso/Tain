@@ -245,10 +245,10 @@ impl FfmpegDecoder {
             VideoCodec::Av1 => 2,
             other => anyhow::bail!("{} is not a codec this decoder handles", other.label()),
         };
-        Self::open(codec_id)
+        Self::open(codec_id, codec.label())
     }
 
-    fn open(codec_id: i32) -> Result<Self> {
+    fn open(codec_id: i32, asked_for: &str) -> Result<Self> {
         super::ffmpeg_runtime::require()?;
         let (device, context) = create_device()?;
 
@@ -271,7 +271,14 @@ impl FfmpegDecoder {
             .to_string_lossy()
             .into_owned();
 
-        info!("H.264 decoding on the GPU via libavcodec {name} (D3D11VA)");
+        // Both halves matter, and they are not the same fact. `asked_for` is
+        // the codec the session negotiated; `name` is the decoder libavcodec
+        // actually picked for it, which has not always been the one that can
+        // use the GPU — asking for AV1 selected `libdav1d`, a software decoder,
+        // until it was asked for by name. This line said "H.264" for every
+        // codec until it was fixed, and cost an afternoon of reading logs that
+        // claimed a session was running a codec it was not.
+        info!("{asked_for} decoding on the GPU via libavcodec {name} (D3D11VA)");
         Ok(Self {
             handle,
             device,
