@@ -1183,6 +1183,36 @@ mod tests {
         }
     }
 
+    /// Which decoder each codec opens, and whether it is really the GPU.
+    ///
+    /// # Why this is worth asking out loud
+    ///
+    /// "Hardware decode" was claimed for AV1 while `libdav1d` — software, no
+    /// hwaccel — was doing the work, and the log said so in a line nobody read.
+    /// The shim refuses any frame that is not an `AV_PIX_FMT_D3D11` surface, so
+    /// a picture coming back is proof of hardware and not merely a claim about
+    /// it. This prints the decoder's own name beside that proof.
+    ///
+    /// ```bash
+    /// cargo test -p tain-core -- --ignored --nocapture what_this_machine_can_decode
+    /// ```
+    #[test]
+    #[ignore = "diagnostic — run explicitly, prints rather than asserts"]
+    #[cfg(all(target_os = "windows", db_ffmpeg))]
+    fn what_this_machine_can_decode() {
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
+            match crate::decode_ffmpeg::FfmpegDecoder::for_codec(codec) {
+                Ok(decoder) => println!(
+                    "{:<22} decoder={:?} — opened with the D3D11VA hwaccel; the shim returns \
+                     nothing that is not a GPU surface",
+                    codec.label(),
+                    decoder.name,
+                ),
+                Err(e) => println!("{:<22} no GPU decoder: {e:#}", codec.label()),
+            }
+        }
+    }
+
     /// What this machine can actually encode, by name.
     ///
     /// Prints rather than asserts, because the answer is a property of the GPU
