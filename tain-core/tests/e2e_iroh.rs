@@ -160,6 +160,47 @@ async fn several_guests_arriving_together_are_all_answered() -> Result<()> {
     Ok(())
 }
 
+/// A host that can be reached directly must be *carried* directly.
+///
+/// # What this guards
+///
+/// Connecting no longer returns as soon as the transport answers: every iroh
+/// connection begins on a relay and upgrades if it can, so the guest now waits
+/// for the upgrade and refuses the session if it never comes. A relay is a
+/// shared, rate-limited public server — ample for the handshake it exists to
+/// carry, and a slideshow for video.
+///
+/// That wait is the kind of change that can go wrong in two opposite ways, and
+/// this covers both. If the wait were broken, `connect_via` would hang here for
+/// its full timeout and then refuse a connection to a host on this very
+/// machine. If the *check* were broken — reading a relay as direct, or a
+/// candidate iroh has not selected as one — it would pass while proving
+/// nothing, so the path is asserted on afterwards as well.
+///
+/// Loopback for the same reason the test above uses it: it takes the relay out
+/// of the picture entirely, so this runs on a machine that cannot reach one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_can_be_reached_directly_is_carried_directly() -> Result<()> {
+    let (server, _passcode, host_id) = start_host().await?;
+    let addrs = loopback_addrs(&server);
+    assert!(!addrs.is_empty(), "the host bound no dialable socket");
+    let key = iroh::PublicKey::from_bytes(&host_id).context("host id")?;
+
+    // Comfortably inside DIRECT_PATH_WAIT: a punch to ourselves is immediate,
+    // so anything approaching the real budget means the wait is not returning.
+    let guest = tokio::time::timeout(Duration::from_secs(10), GuestClient::connect_via(&key, None, &addrs))
+        .await
+        .context("connecting to a host on this machine took longer than the punch should")??;
+
+    let path = guest.connection_path().context("connected with no path at all")?;
+    assert!(
+        path.is_direct(),
+        "a host on this machine was carried over {} — the direct-path gate let a relay past",
+        path.remote(),
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires network access to the n0 relay"]
 async fn guest_authenticates_and_receives_frames_over_iroh() -> Result<()> {

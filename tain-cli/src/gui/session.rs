@@ -742,6 +742,12 @@ impl GuestSession {
     /// of whether a session is usable, and it is otherwise completely invisible.
     /// The first real two-machine test of this app ran over a relay for minutes
     /// while the picture crawled, and nothing on screen said so.
+    ///
+    /// A session can no longer *begin* on a relay — see
+    /// `tain_core::network::await_direct_path`, which refuses one rather than
+    /// letting it start. So this now means something narrower and worse: a
+    /// session that had a direct path and lost it, and is being carried by the
+    /// relay until one comes back.
     pub fn relay_warning(&self) -> Option<String> {
         let health = self.shared.health.lock().unwrap();
         match health.path {

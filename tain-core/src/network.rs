@@ -474,6 +474,36 @@ impl HostServer {
                     return;
                 }
 
+                // # The same refusal the guest makes, made here too
+                //
+                // The guest is waiting on this at the same moment, so in the
+                // normal case both sides settle together and this costs
+                // nothing. It is here anyway for the two cases where the guest
+                // does not decide it: an older build on the other end, and a
+                // host that would otherwise spend the wait starting a capture,
+                // an encoder and an audio stream for a session that is about to
+                // be refused from the far side.
+                match await_direct_path(&conn, DIRECT_PATH_WAIT + HOST_PUNCH_MARGIN).await {
+                    DirectPath::Established(path) => {
+                        info!("Guest connected directly: {}", path.remote());
+                    }
+                    DirectPath::StillRelayed { via } => {
+                        warn!(
+                            "A guest reached this host only through the relay {via} and no \
+                             direct path opened — refusing the connection rather than \
+                             streaming over a relay. The guest should have given up first \
+                             and been told why; that it did not suggests an older build on \
+                             the other end."
+                        );
+                        conn.close(0u32.into(), b"relay-only");
+                        return;
+                    }
+                    DirectPath::Lost => {
+                        debug!("A guest connection ended before a direct path opened");
+                        return;
+                    }
+                }
+
                 if let Err(e) = server.handle_connection(conn).await {
                     error!("Connection handler error: {}", e);
                 }
@@ -2382,6 +2412,13 @@ pub enum DialStep {
     ViaRelay,
     /// Dialling an address this host answered on before, with no relay involved.
     Direct,
+    /// Reached the host, and waiting for hole punching to open a direct path.
+    ///
+    /// Its own step because it is the one that takes real time and the one most
+    /// likely to be where an attempt ends. Everything before it is a handshake
+    /// measured in hundreds of milliseconds; this is two machines trying to
+    /// find a route to each other through whatever is between them.
+    Punching,
     /// Connected at the transport level; sending the passcode.
     Authenticating,
 }
@@ -2394,6 +2431,7 @@ impl DialStep {
             Self::ReachingRelay => "Looking up where the host is…",
             Self::ViaRelay => "Reaching the host through its relay…",
             Self::Direct => "Reaching the host directly…",
+            Self::Punching => "Opening a direct path…",
             Self::Authenticating => "Sending the passcode…",
         }
     }
@@ -2417,6 +2455,11 @@ impl DialStep {
             Self::Direct => {
                 "the host did not answer on the address it last used. It may be switched \
                  off, asleep, or on another network"
+            }
+            Self::Punching => {
+                "the host answered, but only through a relay — no direct path could be \
+                 opened, and a relay cannot carry video. A VPN or a strict NAT on either \
+                 machine is the usual reason"
             }
             Self::Authenticating => "the host answered but did not accept the passcode",
         }
@@ -2569,6 +2612,38 @@ impl GuestClient {
         };
         info!("Connected to host: {}", conn.remote_id());
 
+        // # The relay has now done its job
+        //
+        // Reaching the host is not the same as being able to stream from it.
+        // Every iroh connection starts on the relay, and the relay is there to
+        // carry the handshake and the address exchange that let the two
+        // machines punch a direct path. Once that has happened the relay has
+        // nothing left to contribute, and if it has *not* happened the
+        // connection is a shared, rate-limited public server pretending to be a
+        // video link.
+        //
+        // So the wait happens here, before the caller is handed anything it
+        // could stream over.
+        on_step(DialStep::Punching);
+        match await_direct_path(&conn, DIRECT_PATH_WAIT).await {
+            DirectPath::Established(path) => {
+                info!(
+                    "Direct path to host: {} ({:.0} ms round trip)",
+                    path.remote(),
+                    path.rtt_ms()
+                );
+            }
+            DirectPath::StillRelayed { via } => {
+                conn.close(0u32.into(), b"relay-only");
+                anyhow::bail!("{}", relay_only_message(&via));
+            }
+            DirectPath::Lost => {
+                anyhow::bail!(
+                    "The host stopped answering while a direct path was being opened."
+                );
+            }
+        }
+
         Ok(Self { endpoint, connection: Some(conn) })
     }
 
@@ -2649,28 +2724,7 @@ impl GuestClient {
     /// traffic, hopeless for 17 Mbit/s of video — and a user watching a
     /// stuttering picture has no way to tell that from a slow machine.
     pub fn connection_path(&self) -> Option<ConnectionPath> {
-        let conn = self.connection.as_ref()?;
-        let paths = conn.paths();
-        // The *selected* path is the one carrying data. A connection commonly
-        // holds an idle relay path alongside a direct one, so reporting the
-        // first path found would say "relay" for a healthy direct session.
-        let selected = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next())?;
-        let rtt_ms = selected.rtt().as_secs_f32() * 1000.0;
-
-        Some(if selected.is_relay() {
-            ConnectionPath::Relay {
-                host: format!("{}", selected.remote_addr()),
-                rtt_ms,
-            }
-        } else {
-            // The address is carried for direct paths too, because "direct" only
-            // means "not through an iroh relay" — it says nothing about the route
-            // those packets then take. Two machines both on a VPN get a direct
-            // path *to their VPN addresses*, and the round trip is the tunnel's,
-            // which can be several times the physical one. That reads as "direct,
-            // 110 ms" with nothing on screen to explain it.
-            ConnectionPath::Direct { rtt_ms, remote: format!("{}", selected.remote_addr()) }
-        })
+        path_of(self.connection.as_ref()?)
     }
 
     /// Shut down the guest endpoint.
@@ -2757,9 +2811,174 @@ impl ConnectionPath {
     }
 }
 
+/// Which path a connection settled on, once it has had time to settle.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirectPath {
+    /// Hole punching worked. This is the path the video will take.
+    Established(ConnectionPath),
+    /// It never left the relay in the time allowed.
+    StillRelayed { via: String },
+    /// The connection ended before it settled either way.
+    Lost,
+}
+
+/// How long hole punching gets before a connection is refused as relay-only.
+///
+/// # Why a session is refused rather than relayed
+///
+/// A relay is a shared public server carrying every other connection that
+/// landed on it, and it is rate limited. That is ample for the few hundred
+/// kbit/s of control traffic a relay exists to carry — the handshake, and the
+/// address exchange that lets two machines find each other — and hopeless for
+/// the ten to twenty Mbit/s of a desktop stream.
+///
+/// A session that runs over one is not a degraded session, it is an unusable
+/// one: the measured example collapsed to a third of full resolution at 8 fps
+/// and stayed there. Failing to connect at least says so, and says it in a
+/// second rather than after a minute of watching a slideshow.
+///
+/// Generous, because the whole point is to wait rather than to give up: longer
+/// than the eight seconds the status chip allowed, long enough for a punch
+/// across an ocean and for a couple of iroh's own retries, and still short
+/// enough to be a connection attempt rather than a hang.
+pub const DIRECT_PATH_WAIT: Duration = Duration::from_secs(25);
+
+/// How often the selected path is re-read while waiting for one.
+const PATH_POLL: Duration = Duration::from_millis(250);
+
+/// What the host adds to [`DIRECT_PATH_WAIT`] before giving up on a guest.
+///
+/// Both ends wait for the same punch, so both deadlines expire at nearly the
+/// same moment — and whoever closes first decides what the *user* is told. The
+/// guest is the one with something to say ("no direct path opened, here is what
+/// to check"); the host closing first would replace that with the connection
+/// vanishing mid-wait, which explains nothing.
+///
+/// The guest's timer already starts earlier — the host does not know a
+/// connection exists until the handshake it dialled has completed — but only by
+/// a handshake, and a handshake is not a margin. This is.
+const HOST_PUNCH_MARGIN: Duration = Duration::from_secs(5);
+
+/// How this connection is carried right now, if it is carrying anything.
+///
+/// A free function because both ends need the same answer: the guest to decide
+/// whether to go on, the host to decide whether to serve.
+pub fn path_of(conn: &iroh::endpoint::Connection) -> Option<ConnectionPath> {
+    let paths = conn.paths();
+    // The *selected* path is the one carrying data. A connection commonly holds
+    // an idle relay path alongside a direct one, so reporting the first path
+    // found would say "relay" for a healthy direct session.
+    let selected = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next())?;
+    let rtt_ms = selected.rtt().as_secs_f32() * 1000.0;
+
+    Some(if selected.is_relay() {
+        ConnectionPath::Relay { host: format!("{}", selected.remote_addr()), rtt_ms }
+    } else {
+        // The address is carried for direct paths too, because "direct" only
+        // means "not through an iroh relay" — it says nothing about the route
+        // those packets then take. Two machines both on a VPN get a direct path
+        // *to their VPN addresses*, and the round trip is the tunnel's, which
+        // can be several times the physical one. That reads as "direct, 110 ms"
+        // with nothing on screen to explain it.
+        ConnectionPath::Direct { rtt_ms, remote: format!("{}", selected.remote_addr()) }
+    })
+}
+
+/// Wait for hole punching to produce a direct path.
+///
+/// Every iroh connection starts on the relay and upgrades if it can, so the
+/// path at connect time is not an answer — it is a stopwatch that has not
+/// started. This runs the stopwatch.
+///
+/// The relay is left doing exactly what it is for while this waits: carrying
+/// the handshake and the address exchange that make the punch possible. What
+/// it is not allowed to do is carry the session afterwards.
+pub async fn await_direct_path(conn: &iroh::endpoint::Connection, limit: Duration) -> DirectPath {
+    let deadline = std::time::Instant::now() + limit;
+    let mut last_relay = None;
+
+    loop {
+        // Only a path iroh has actually *selected* counts here. `path_of` falls
+        // back to reporting whatever path exists when none is selected yet,
+        // which is the right answer for a status line and the wrong one for a
+        // gate: a direct candidate that has not been chosen is carrying nothing.
+        let carrying_direct = conn.paths().iter().any(|p| p.is_selected() && !p.is_relay());
+        match path_of(conn) {
+            Some(path) if carrying_direct => return DirectPath::Established(path),
+            Some(ConnectionPath::Relay { host, .. }) => last_relay = Some(host),
+            // No path at all means the connection has nothing open on it. That
+            // is normal for the first poll or two and terminal after that, so
+            // it is the close reason rather than the path that decides.
+            _ => {}
+        }
+        if conn.close_reason().is_some() {
+            return DirectPath::Lost;
+        }
+        if std::time::Instant::now() >= deadline {
+            return match last_relay {
+                Some(via) => DirectPath::StillRelayed { via },
+                None => DirectPath::Lost,
+            };
+        }
+        tokio::time::sleep(PATH_POLL).await;
+    }
+}
+
+/// What to tell someone whose connection would not leave the relay.
+///
+/// One sentence on what happened and three on what to do about it, because the
+/// remedies are not guessable: two of them are somebody else's machine, and the
+/// one that most often works — connecting once on a network where it succeeds —
+/// looks like it has nothing to do with the problem.
+fn relay_only_message(via: &str) -> String {
+    format!(
+        "Connected to the host through the relay {via}, but no direct path opened within \
+         {DIRECT_PATH_WAIT:?}, so the session was refused rather than run over the relay — \
+         relays are shared and rate limited, and video over one is a slideshow.\n\n\
+         A VPN or tunnel on either machine is the usual cause, because it hides the address \
+         the other side needs to punch to. A strict or symmetric NAT on either side does the \
+         same. If both machines are on the same network, they should be reachable directly: \
+         check that neither is on a guest or isolated Wi-Fi network, and that the host's \
+         firewall is not blocking incoming UDP.\n\n\
+         Connecting once from a network where a direct path does open teaches this machine \
+         the host's address, and that address is tried first next time."
+    )
+}
+
 #[cfg(test)]
 mod path_tests {
     use super::ConnectionPath;
+
+    /// A refusal has to leave the user with something to try.
+    ///
+    /// This is the one message in the app that reports a working connection
+    /// being thrown away on purpose, which is a hard thing to read as anything
+    /// but a bug. It has to name the relay it is refusing, say why a relay is
+    /// not good enough, and give the remedies — none of which are guessable,
+    /// since two of them are somebody else's machine and the one that most
+    /// often works (connect once where it succeeds, so the address is
+    /// remembered) looks unrelated to the problem.
+    #[test]
+    fn refusing_a_relay_says_what_to_do_about_it() {
+        let message = super::relay_only_message("relay:https://euc1-1.relay.n0.iroh.link./");
+
+        assert!(
+            message.contains("euc1-1.relay.n0.iroh.link"),
+            "the refusal does not say which relay it refused: {message}"
+        );
+        for remedy in ["VPN", "NAT", "firewall", "same network"] {
+            assert!(
+                message.contains(remedy),
+                "the refusal never mentions {remedy}, which is one of the things to check: \
+                 {message}"
+            );
+        }
+        assert!(
+            message.contains("tried first next time"),
+            "the refusal does not tell the user that connecting once from a working network \
+             fixes it for later, which is the remedy that actually resolves this: {message}"
+        );
+    }
 
     fn direct(remote: &str) -> ConnectionPath {
         ConnectionPath::Direct { rtt_ms: 90.0, remote: remote.to_string() }
@@ -3059,6 +3278,7 @@ mod tests {
             DialStep::ReachingRelay,
             DialStep::ViaRelay,
             DialStep::Direct,
+            DialStep::Punching,
             DialStep::Authenticating,
         ];
 
