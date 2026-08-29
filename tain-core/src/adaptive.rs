@@ -343,6 +343,32 @@ pub struct AdaptiveController {
     /// While set, the last change was made because of a queue and the queue has
     /// not had time to drain. See [`QUEUE_DRAIN`].
     queue_hold_until: Option<Instant>,
+    /// Whether the guest has ever reported decoding a frame.
+    ///
+    /// # Why the delivered-frame check needs this
+    ///
+    /// A guest reports telemetry from the moment its stream opens, which is
+    /// well before it has a decoder: it is still authenticating, sizing its
+    /// window, and negotiating a codec. Every one of those reports carries
+    /// `decoded_fps: 0.0`, because zero frames is the honest answer to "how
+    /// many did you decode" when there is nothing to decode with.
+    ///
+    /// The host, meanwhile, is already capturing and sending. Comparing the
+    /// two reads a guest that has not started as a link losing every frame.
+    ///
+    /// Measured, on the session that prompted this: the host began sending at
+    /// 17:01:32 and the guest opened its session at 17:01:55. In those
+    /// twenty-three seconds the host sent three hundred frames, saw a guest
+    /// reporting none decoded, diagnosed `SlowNetwork`, and collapsed to 33%
+    /// resolution at 8 fps — where it then sat, at exactly 8.0 captured/s, for
+    /// a further minute before beginning to climb. The link was fine
+    /// throughout, and the guest decoded every frame that reached it.
+    ///
+    /// So the number is not evidence until it has been something other than
+    /// zero. This is the same guard `acks_stale` carries on the host side, for
+    /// the same reason: silence from a peer that has not started saying
+    /// anything yet is not a peer that has stopped.
+    guest_has_decoded: bool,
 }
 
 /// The shortest round trip this link has shown lately.
@@ -442,6 +468,7 @@ impl AdaptiveController {
             last_change: Instant::now(),
             rtt_floor: RttFloor::default(),
             queue_hold_until: None,
+            guest_has_decoded: false,
         }
     }
 
@@ -517,6 +544,10 @@ impl AdaptiveController {
     pub fn observe_at(&mut self, obs: &Observation, now: Instant) -> Option<StreamPlan> {
         if let Some(guest) = obs.guest {
             self.rtt_floor.observe(guest.rtt_ms, now);
+            // Latched, never cleared: see `guest_has_decoded`. Once a guest has
+            // decoded something, a later zero means the frames stopped
+            // arriving, which is exactly what the check is for.
+            self.guest_has_decoded |= guest.decoded_fps > 0.0;
         }
 
         let before = self.plan();
@@ -692,8 +723,12 @@ impl AdaptiveController {
             // produced means they were lost or late in between. Comparing
             // against what it drew instead reads a 60 Hz monitor as a lossy
             // link — see `GuestTelemetry::decoded_fps` for the session that
-            // cost.
-            if obs.achieved_fps > 1.0 && guest.decoded_fps < obs.achieved_fps * 0.8 {
+            // cost. And it says nothing at all until the guest has a decoder
+            // to report about — see `Self::guest_has_decoded`.
+            if self.guest_has_decoded
+                && obs.achieved_fps > 1.0
+                && guest.decoded_fps < obs.achieved_fps * 0.8
+            {
                 set.insert(Bottleneck::SlowNetwork);
             }
             if guest.rtt_ms > HIGH_LATENCY_MS {
@@ -1082,6 +1117,65 @@ mod tests {
             c.plan().bitrate_kbps
         );
         assert!(c.bottlenecks().contains(Bottleneck::SlowNetwork));
+    }
+
+    /// A guest that has not started decoding yet is not a link losing frames.
+    ///
+    /// # The session this is from
+    ///
+    /// The host authenticated a guest and began capturing and sending at
+    /// 17:01:32. The guest opened its own session — and so built its decoder —
+    /// at 17:01:55. Through those twenty-three seconds the host sent three
+    /// hundred frames, and the guest, which reports on a timer from the moment
+    /// its stream opens, truthfully said it had decoded none of them.
+    ///
+    /// The host read that as a link dropping everything, called it
+    /// `SlowNetwork`, and collapsed to 33% resolution at 8 fps — then held
+    /// exactly 8.0 captured/s for a further minute before it began to climb,
+    /// and never got past a third of what it could do. Nothing was wrong with
+    /// the link: every frame that reached the guest decoded, and the same pair
+    /// of machines ran at 41 fps in the other direction.
+    #[test]
+    fn a_guest_that_has_not_started_decoding_is_not_a_slow_link() {
+        let mut c = AdaptiveController::new(LatencyPriority::BALANCED, ceiling(), NATIVE);
+
+        // Connected and answering pings, with no decoder behind it yet.
+        let idle = GuestTelemetry {
+            decode_ms: 0.0,
+            render_ms: 0.0,
+            displayed_fps: 0.0,
+            decoded_fps: 0.0,
+            rtt_ms: 12.0,
+        };
+        let not_started = Observation {
+            achieved_fps: 15.0,
+            guest: Some(idle),
+            ..healthy()
+        };
+
+        drive(&mut c, &not_started, 40);
+        assert!(
+            !c.is_degraded(),
+            "collapsed to {} at {}fps, {}kbps before the guest ever had a decoder",
+            c.plan().scale.label(),
+            c.plan().fps,
+            c.plan().bitrate_kbps,
+        );
+
+        // The guard is about a guest that has not started, not about ignoring
+        // the guest. Once it has decoded something, the same zero means the
+        // frames have stopped arriving — which is the whole point of the check.
+        let running = Observation {
+            achieved_fps: 15.0,
+            guest: Some(GuestTelemetry { decoded_fps: 15.0, displayed_fps: 15.0, ..idle }),
+            ..healthy()
+        };
+        drive(&mut c, &running, 4);
+        drive(&mut c, &not_started, 2);
+        assert!(
+            c.bottlenecks().contains(Bottleneck::SlowNetwork),
+            "a guest that decoded and then stopped is a link that stopped carrying",
+        );
     }
 
     /// A queue must not be paid for more than once.
