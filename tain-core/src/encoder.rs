@@ -1,9 +1,12 @@
 //! Video encoding pipeline for screen frames.
 //!
 //! The codec surface here is the full set a remote desktop realistically needs.
-//! [`VideoCodec::H264`], [`VideoCodec::DeltaZstd`] and [`VideoCodec::Raw`] have
-//! backends; the rest are declared with an honest [`Availability`] so the UI can
-//! show what is coming without pretending it works.
+//! [`VideoCodec::H264`], [`VideoCodec::H265`], [`VideoCodec::Av1`],
+//! [`VideoCodec::DeltaZstd`] and [`VideoCodec::Raw`] have backends; the rest are
+//! declared with an honest [`Availability`] so the UI can show what is coming
+//! without pretending it works. H.265 and AV1 additionally need the *machine* to
+//! have the encoder — see [`VideoCodec::is_encodable_here`], which is a separate
+//! question from whether this build implements them.
 //! [`EncodeConfig::effective_codec`] resolves whatever was requested down to
 //! something that actually runs, and the host advertises *that* to the guest —
 //! never the aspiration.
@@ -1068,17 +1071,36 @@ pub fn create_encoder(config: EncodeConfig) -> Result<Box<dyn VideoEncoder>> {
         VideoCodec::H264 => create_h264(&config),
         // # No software path, deliberately
         //
-        // `effective_codec` only resolves to HEVC on a machine whose GPU can
-        // encode it, so reaching here means the hardware is there. There is no
-        // CPU HEVC encoder in this build to fall back to and adding one would be
-        // a poor trade anyway — software HEVC is several times the cost of
-        // software H.264 for a stream that has to stay interactive. A machine
-        // that loses its hardware encoder mid-session drops to H.264 through the
-        // same rebuild path everything else uses.
-        VideoCodec::H265 => {
+        // `effective_codec` only resolves to one of these on a machine whose GPU
+        // can encode it, so reaching here means the hardware is there. There is
+        // no CPU encoder for either in this build to fall back to, and adding
+        // one would be a poor trade anyway — software HEVC is several times the
+        // cost of software H.264 for a stream that has to stay interactive, and
+        // software AV1 is worse again. A machine that loses its hardware encoder
+        // mid-session drops to H.264 through the same rebuild path everything
+        // else uses.
+        //
+        // # Why they share an arm
+        //
+        // `HardwareH264Encoder` reads the codec off the config and looks the
+        // transform up by it, so this match was the only thing that ever
+        // distinguished them — and AV1 shipped as `Available` without an arm
+        // here, which made every AV1 session fail in the worst possible way.
+        // The host answered "yes, I can do AV1" during negotiation, the guest
+        // opened an AV1 session and built a decoder, and only then did the host
+        // try to build the encoder, bail with "AV1 encoder is not implemented",
+        // and tear the connection down — 418 ms after the session started, with
+        // nothing on either side naming the codec as the reason. Mid-session
+        // switches to AV1 failed through the same bail.
+        VideoCodec::H265 | VideoCodec::Av1 => {
             let encoder = super::codec_mf::HardwareH264Encoder::new(&config, false)
-                .context("H.265 needs a hardware encoder and this machine has none")?;
-            info!("H.265 encoding on the GPU via {}", encoder.name());
+                .with_context(|| {
+                    format!(
+                        "{} needs a hardware encoder and this machine has none",
+                        effective.label()
+                    )
+                })?;
+            info!("{} encoding on the GPU via {}", effective.label(), encoder.name());
             Ok(Box::new(encoder))
         }
         VideoCodec::DeltaZstd => Ok(Box::new(DeltaZstdEncoder::new(&config)?)),
@@ -1167,6 +1189,15 @@ mod tests {
             // The GPU-only codecs have no CPU encoder to fall back to, so at a
             // size no GPU will take there is nothing to construct. Everything
             // else must produce a frame.
+            //
+            // Note what this branch cannot see: it accepts *any* failure from a
+            // GPU-only codec as the expected one. AV1 failing with "encoder is
+            // not implemented" — no arm in `create_encoder` at all — landed here
+            // and was read as "the GPU declined sixteen pixels", so this test
+            // stayed green through a release where every AV1 session died on
+            // connect. Telling those two apart needs the error text, which is
+            // what `every_available_codec_has_an_encoder_behind_it` does. Widen
+            // this hatch no further.
             let gpu_only = matches!(effective, VideoCodec::H265 | VideoCodec::Av1);
             let Ok(mut enc) = create_encoder(cfg.clone()) else {
                 assert!(gpu_only, "{codec:?} must have produced an encoder");
@@ -1261,6 +1292,52 @@ mod tests {
                 VideoCodec::Av1,
             ]
         );
+    }
+
+    /// Every codec the app offers must have an encoder behind it.
+    ///
+    /// # The gap this closes
+    ///
+    /// `is_available` is three things at once: what the settings list, what
+    /// negotiation promises a guest, and what `effective_codec` stops falling
+    /// back from. `create_encoder` is what actually has to build the thing.
+    /// Nothing tied the two together, so AV1 shipped listed, offered and
+    /// negotiated — and unbuildable, because the match in `create_encoder` had
+    /// no arm for it and fell through to "is not implemented".
+    ///
+    /// What that looked like from outside: a guest negotiated AV1, built a
+    /// decoder, logged that it was decoding AV1 on the GPU, and had the host
+    /// drop the connection 418 ms later. It read as "AV1 crashes", and it
+    /// happened in both directions, because both machines had the same gap.
+    ///
+    /// The assertion is on the error *text* rather than on success, because
+    /// whether a particular machine can build a hardware AV1 or HEVC encoder is
+    /// a property of its GPU. "This machine has no such encoder" is a fine
+    /// answer here. "Nobody wrote this arm" is not.
+    #[test]
+    fn every_available_codec_has_an_encoder_behind_it() {
+        for codec in VideoCodec::ALL {
+            if !codec.is_available() {
+                continue;
+            }
+            let config = EncodeConfig { codec, ..EncodeConfig::default() };
+            // Without the hardware, `effective_codec` legitimately resolves to
+            // something else and this proves nothing about `codec`. Say so
+            // rather than passing quietly, so a green run on a machine that
+            // skipped half the codecs does not read as a green run.
+            if config.effective_codec() != codec {
+                eprintln!("{} cannot be encoded here — not exercised", codec.label());
+                continue;
+            }
+            if let Err(e) = create_encoder(config) {
+                let reported = format!("{e:#}");
+                assert!(
+                    !reported.contains("is not implemented"),
+                    "{} is offered to guests but has no arm in create_encoder: {reported}",
+                    codec.label(),
+                );
+            }
+        }
     }
 
     #[test]
