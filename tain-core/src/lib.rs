@@ -7,7 +7,7 @@
 //! ## Architecture
 //!
 //! ```text
-//! ┌──────────┐  iroh P2P QUIC (ALPN: "tain/1")   ┌──────────┐
+//! ┌──────────┐  iroh P2P QUIC (ALPN: "tain/4")   ┌──────────┐
 //! │  Host    │ ◄════════════════════════════► │  Guest   │
 //! │          │                                  │          │
 //! │ Screen   │  Frame stream (H.264/raw BGRA)   │ Decoder  │
@@ -44,6 +44,8 @@ pub mod capture_hdr;
 pub mod capture_nv12;
 #[cfg(target_os = "windows")]
 pub mod capture_shared;
+#[cfg(target_os = "windows")]
+pub mod capture_wall;
 pub mod encoder;
 pub mod adaptive;
 pub mod codec_delta;

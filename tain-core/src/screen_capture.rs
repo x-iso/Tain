@@ -121,6 +121,24 @@ pub fn primary_display_size() -> (u16, u16) {
     FALLBACK_DISPLAY
 }
 
+/// Which of the host's screens a session is watching.
+///
+/// Names rather than the wire's numeric ids: an id is an enumeration index and
+/// renumbers when a monitor is plugged in, while a device name does not. The
+/// translation happens once, where the request arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DisplayTarget {
+    /// Whichever display sits at the origin of the virtual desktop. What a
+    /// session that has not asked for anything else gets.
+    #[default]
+    Primary,
+    /// One named display, as [`displays`] reports it.
+    One(String),
+    /// Every display, composed into one picture laid out as the host has them.
+    /// See [`super::capture_wall`].
+    All,
+}
+
 /// A display's real mode: size in physical pixels, and where it sits.
 ///
 /// Split out because it is the one part of [`displays`] that must not come from
@@ -263,14 +281,8 @@ pub fn displays() -> Vec<super::protocol::DisplayInfo> {
 /// Configuration for screen capture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureConfig {
-    /// Which display to capture, as a device name — `\\.\DISPLAY2` and the
-    /// like, exactly as [`displays`] reports it.
-    ///
-    /// `None` is the primary display, which is what a session that has not
-    /// asked for anything else gets. A name rather than the wire's numeric id
-    /// because the id is an enumeration index and renumbers when a monitor is
-    /// plugged in; the name does not.
-    pub display: Option<String>,
+    /// Which of the host's screens to capture. See [`DisplayTarget`].
+    pub display: DisplayTarget,
     /// Target frames per second.
     pub fps: u32,
     /// How much of the host's native resolution to stream.
@@ -288,7 +300,7 @@ pub struct CaptureConfig {
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
-            display: None,
+            display: Default::default(),
             fps: 30,
             quality: QualityScale::default(),
             show_cursor: true,
@@ -722,12 +734,24 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
                 // enumerated, so "the primary" and its own name do not become
                 // two registry entries for one display — which would mean two
                 // duplications of it, and the second one failing.
-                let want = config
-                    .display
-                    .clone()
-                    .or_else(|| displays().into_iter().find(|d| d.primary).map(|d| d.name));
-                let local = super::capture_shared::attach(want)
-                    .context("could not start screen capture")?;
+                let local: Box<dyn ScreenCaptureBackend> = match &config.display {
+                    DisplayTarget::All => {
+                        let all = displays();
+                        anyhow::ensure!(
+                            !all.is_empty(),
+                            "this host cannot enumerate its displays, so it cannot compose them"
+                        );
+                        Box::new(super::capture_wall::Wall::new(&all)?)
+                    }
+                    chosen => {
+                        let want = match chosen {
+                            DisplayTarget::One(name) => Some(name.clone()),
+                            _ => displays().into_iter().find(|d| d.primary).map(|d| d.name),
+                        };
+                        super::capture_shared::attach(want)
+                            .context("could not start screen capture")?
+                    }
+                };
                 // Wrapped so a consent prompt does not end the picture. See
                 // `capture_follow`: everything above this sees one capturer.
                 Box::new(super::capture_follow::DesktopFollowing::new(local))
@@ -775,7 +799,7 @@ mod tests {
 
     fn config_for(native: (u16, u16), quality: QualityScale) -> CaptureConfig {
         CaptureConfig {
-            display: None,
+            display: Default::default(),
             fps: 30,
             quality,
             show_cursor: false,

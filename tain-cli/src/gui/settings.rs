@@ -532,7 +532,7 @@ impl Settings {
         CaptureConfig {
             // Which display a session streams is chosen per session, not in
             // the global settings: two guests can be watching different ones.
-            display: None,
+            display: Default::default(),
             fps: self.effective_fps(),
             quality: self.effective_quality(),
             show_cursor: self.show_cursor,

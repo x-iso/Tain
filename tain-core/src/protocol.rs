@@ -409,6 +409,21 @@ pub struct CodecChanged {
     pub encoder_type: String,
 }
 
+/// What a guest wants to see.
+///
+/// An enum rather than an id with a reserved value, because "all of them" is a
+/// different kind of answer from "that one" — the host composes for it, the
+/// pointer maps against the whole desk rather than one screen, and a sentinel
+/// id would have every reader deciding for itself which of those applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayChoice {
+    /// One display, by [`DisplayInfo::id`].
+    One(u32),
+    /// Every display the session may see, composed into one picture laid out
+    /// the way the host has them arranged.
+    All,
+}
+
 /// Host → guest: which display the stream is now showing.
 ///
 /// Sent in answer to [`Message::WatchDisplay`], and sent whether or not the
@@ -417,8 +432,8 @@ pub struct CodecChanged {
 /// will show a selection that is not real.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DisplayChanged {
-    /// The display actually being streamed, as [`DisplayInfo::id`].
-    pub id: u32,
+    /// What is actually being streamed, which is not always what was asked for.
+    pub showing: DisplayChoice,
     /// Why the request was not honoured, when it was not. `None` on success.
     pub why: Option<String>,
 }
@@ -582,13 +597,13 @@ pub enum Message {
     /// session — a visible hitch bought as insurance against something that
     /// announces itself perfectly well.
     RequestKeyframe,
-    /// Show me this display instead.
+    /// Show me this instead. See [`DisplayChoice`].
     ///
-    /// The id comes from the list in [`SessionStart::displays`]. A guest may
-    /// only ask for one it was told about; anything else is refused rather than
+    /// An id comes from the list in [`SessionStart::displays`]. A guest may only
+    /// ask for one it was told about; anything else is refused rather than
     /// guessed at, because an id the host does not recognise is far more likely
     /// to be a stale menu than a display it has forgotten.
-    WatchDisplay(u32),
+    WatchDisplay(DisplayChoice),
     /// Check a code without asking to connect. Answered with [`ProbeResult`],
     /// then the connection closes.
     Probe(Probe),

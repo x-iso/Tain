@@ -1051,33 +1051,50 @@ fn render_display_picker(ui: &mut egui::Ui, session: &GuestSession) {
     }
     let watching = session.watching();
 
+    use tain_core::protocol::DisplayChoice;
+
     ui.add_space(12.0);
-    let current = displays
-        .iter()
-        .find(|d| Some(d.id) == watching)
-        .map(|d| describe_display(d, &displays))
-        .unwrap_or_else(|| "Screen".to_string());
+    let current = match watching {
+        Some(DisplayChoice::All) => "All screens".to_string(),
+        Some(DisplayChoice::One(id)) => displays
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| describe_display(d, &displays))
+            .unwrap_or_else(|| "Screen".to_string()),
+        None => "Screen".to_string(),
+    };
 
     egui::ComboBox::from_id_salt("display-picker")
         .selected_text(RichText::new(current).size(12.0).color(TEXT))
-        .width(112.0)
+        .width(120.0)
         .show_ui(ui, |ui| {
+            // Every screen at once, first, because it is the answer to "what is
+            // on that machine" and the single screens are the refinement.
+            let all = watching == Some(DisplayChoice::All);
+            if ui.selectable_label(all, "All screens").clicked() && !all {
+                session.watch_display(DisplayChoice::All);
+            }
+            ui.separator();
+
             for display in &displays {
-                let selected = Some(display.id) == watching;
+                let choice = DisplayChoice::One(display.id);
+                let selected = watching == Some(choice);
                 let mut label = describe_display(display, &displays);
                 if display.hdr {
                     label.push_str(" · HDR");
                 }
                 if ui.selectable_label(selected, label).clicked() && !selected {
-                    session.watch_display(display.id);
+                    session.watch_display(choice);
                 }
             }
         })
         .response
         .on_hover_text(
-            "Which of the host's screens to watch. The host is only asked; it answers with \
-             whichever screen it is actually showing, so a monitor unplugged since this menu \
-             was drawn cannot leave the picture and the label disagreeing.",
+            "Which of the host's screens to watch. \"All screens\" composes them into one \
+             picture laid out the way the host has them — use 1:1 rather than Fit to see it \
+             at full resolution.\n\nThe host is only asked; it answers with whatever it is \
+             actually showing, so a monitor unplugged since this menu was drawn cannot leave \
+             the picture and the label disagreeing.",
         );
 }
 

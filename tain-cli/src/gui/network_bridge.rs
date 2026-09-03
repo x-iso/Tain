@@ -480,9 +480,9 @@ pub struct GuestSessionState {
     /// them. Empty until `SessionStart`, and from a host that cannot enumerate
     /// them at all — which means "unknown", not "none".
     pub displays: Arc<Mutex<Vec<tain_core::protocol::DisplayInfo>>>,
-    /// Which display is being streamed, once the host has said. `None` before
-    /// the first answer, which the UI shows as the primary.
-    pub watching: Arc<Mutex<Option<u32>>>,
+    /// What is being streamed, once the host has said. `None` before the first
+    /// answer, which the UI shows as the primary.
+    pub watching: Arc<Mutex<Option<tain_core::protocol::DisplayChoice>>>,
     /// Sends a control message to the host, while a session is live.
     ///
     /// The UI needs a way to *ask* for something rather than only to report,
@@ -1036,7 +1036,15 @@ pub async fn run_guest_session(
                             // fullscreen since the last tick, which changes what
                             // is worth sending by a factor of four.
                             let current = *writer_state.viewport.lock().unwrap();
-                            if current != reported_viewport && current.is_some() {
+                            // `None` used to be skipped as "not known yet". It
+                            // is now also a real answer — 1:1 asks for no
+                            // ceiling at all, see `GuestSession::report_viewport`
+                            // — and skipping it left a guest switched to 1:1
+                            // still capped to its window, which is the one thing
+                            // that mode exists not to do. Nothing is sent before
+                            // the first render either way, because the value
+                            // starts unchanged.
+                            if current != reported_viewport {
                                 reported_viewport = current;
                                 if write_stream_message(
                                     &mut send,
@@ -1479,8 +1487,11 @@ where
                 }
                 // Whatever the host is streaming to begin with, which is the
                 // primary unless something has already asked otherwise.
-                *shared.watching.lock().unwrap() =
-                    ss.displays.iter().find(|d| d.primary).map(|d| d.id);
+                *shared.watching.lock().unwrap() = ss
+                    .displays
+                    .iter()
+                    .find(|d| d.primary)
+                    .map(|d| tain_core::protocol::DisplayChoice::One(d.id));
                 *shared.displays.lock().unwrap() = ss.displays.clone();
                 // Sanitized on arrival: the host chose this string, we did not.
                 *shared.host_name.lock().unwrap() =
@@ -1740,13 +1751,12 @@ where
                 // Recording it either way is the point: a menu showing a
                 // selection the host never honoured is worse than no menu.
                 match &change.why {
-                    Some(why) => warn!(
-                        "Host is still showing display {} — {why}",
-                        change.id
-                    ),
-                    None => info!("Host switched to display {}", change.id),
+                    Some(why) => {
+                        warn!("Host is still showing {:?} — {why}", change.showing)
+                    }
+                    None => info!("Host switched to {:?}", change.showing),
                 }
-                *shared.watching.lock().unwrap() = Some(change.id);
+                *shared.watching.lock().unwrap() = Some(change.showing);
                 // A different display is a different picture of a different
                 // size, and the decoder holds reference frames for the old one.
                 let _ = keyframe_tx.send(Message::RequestKeyframe);
@@ -2059,7 +2069,7 @@ mod tests {
 
         let config = SessionConfig {
             capture: CaptureConfig {
-                display: None,
+                display: Default::default(),
                 fps: 30,
                 quality: QualityScale::Native,
                 show_cursor: false,

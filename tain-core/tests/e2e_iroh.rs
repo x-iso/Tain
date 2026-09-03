@@ -24,7 +24,7 @@ use std::time::Duration;
 fn test_config() -> SessionConfig {
     SessionConfig {
         capture: CaptureConfig {
-            display: None,
+            display: Default::default(),
             fps: 30,
             quality: QualityScale::Native,
             show_cursor: false,

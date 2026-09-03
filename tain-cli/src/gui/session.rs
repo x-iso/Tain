@@ -445,13 +445,32 @@ impl GuestSession {
     /// Rounded up to even numbers and given a floor: H.264 needs even
     /// dimensions, and a window dragged to nothing must not ask for a 0x0
     /// stream on the way past.
+    /// # Why the scaling mode decides whether there is a ceiling at all
+    ///
+    /// `Fit` draws the whole picture inside the window, so anything the host
+    /// sends beyond the window's own pixels is encoded, transmitted and thrown
+    /// away on arrival — the window is a real ceiling and saying so saves all
+    /// of that.
+    ///
+    /// `1:1` means the opposite: show the host's pixels at their own size and
+    /// pan around what does not fit. Capping to the window there is
+    /// self-defeating — the guest pans across an image that was downscaled
+    /// before it was sent, so "actual size" shows no more detail than Fit did
+    /// and the mode does nothing. It is also what makes "all screens at 1:1"
+    /// mean full resolution rather than a wall squeezed into one window.
     pub fn report_viewport(&self, size: egui::Vec2, pixels_per_point: f32) {
-        let to_px = |v: f32| ((v * pixels_per_point).round().max(2.0) as u32).min(u16::MAX as u32);
-        let (w, h) = (to_px(size.x) as u16, to_px(size.y) as u16);
-        let rounded = ((w + 1) & !1, (h + 1) & !1);
+        let wanted = match self.scaling {
+            ScalingMode::Actual => None,
+            ScalingMode::Fit => {
+                let to_px =
+                    |v: f32| ((v * pixels_per_point).round().max(2.0) as u32).min(u16::MAX as u32);
+                let (w, h) = (to_px(size.x) as u16, to_px(size.y) as u16);
+                Some(((w + 1) & !1, (h + 1) & !1))
+            }
+        };
         let mut slot = self.shared.viewport.lock().unwrap();
-        if *slot != Some(rounded) {
-            *slot = Some(rounded);
+        if *slot != wanted {
+            *slot = wanted;
         }
     }
 
@@ -811,8 +830,8 @@ impl GuestSession {
         self.shared.displays.lock().unwrap().clone()
     }
 
-    /// Which display is being streamed, once the host has said.
-    pub fn watching(&self) -> Option<u32> {
+    /// What is being streamed, once the host has said.
+    pub fn watching(&self) -> Option<tain_core::protocol::DisplayChoice> {
         *self.shared.watching.lock().unwrap()
     }
 
@@ -822,13 +841,13 @@ impl GuestSession {
     /// showing, which is what updates [`Self::watching`]. Nothing here assumes
     /// the request will be honoured, because a monitor can be unplugged between
     /// the menu being drawn and the click landing.
-    pub fn watch_display(&self, id: u32) {
+    pub fn watch_display(&self, choice: tain_core::protocol::DisplayChoice) {
         let control = self.shared.control.lock().unwrap();
         match control.as_ref() {
             Some(tx) => {
-                let _ = tx.send(tain_core::protocol::Message::WatchDisplay(id));
+                let _ = tx.send(tain_core::protocol::Message::WatchDisplay(choice));
             }
-            None => debug!("No session to ask for display {id}"),
+            None => debug!("No session to ask for {choice:?}"),
         }
     }
 

@@ -3,7 +3,7 @@
 //! Provides `HostServer` (accepts incoming connections, manages sessions) and
 //! `GuestClient` (connects to a host via passcode-protected ticket).
 //!
-//! The ALPN protocol name is `"tain/3"` — every connection carrying this ALPN
+//! The ALPN protocol name is `"tain/4"` — every connection carrying this ALPN
 //! is routed through our handler. iroh handles NAT traversal automatically:
 //! direct QUIC connections when possible, relay fallback otherwise.
 //!
@@ -88,8 +88,10 @@ pub use super::connection_code::ConnectionCode;
 /// bumping it is that mismatched builds cannot talk, which is exactly the
 /// outcome wanted.
 ///
-/// `tain/3` added the host's display list to `SessionStart`.
-pub const ALPN: &[u8] = b"tain/3";
+/// `tain/3` added the host's display list to `SessionStart`; `tain/4` made
+/// choosing a display a `DisplayChoice` rather than a bare id, so "all of
+/// them" could be asked for.
+pub const ALPN: &[u8] = b"tain/4";
 
 /// How long a starting host waits to reach a relay before listening anyway.
 ///
@@ -1286,7 +1288,7 @@ type SharedViewport = Arc<std::sync::Mutex<Option<(u16, u16)>>>;
 /// [`CapturePlan`] and for the same reason: the capture thread owns the
 /// capturer, so everything that reconfigures it arrives as state to notice
 /// rather than as a call.
-type WantedDisplay = Arc<std::sync::Mutex<Option<String>>>;
+type WantedDisplay = Arc<std::sync::Mutex<super::screen_capture::DisplayTarget>>;
 
 /// The host's settings, shared with every running session.
 ///
@@ -2142,8 +2144,13 @@ fn spawn_capture_thread(
                 if wanted != applied_display {
                     let mut config = capture_config.clone();
                     config.display = wanted.clone();
-                    let named =
-                        wanted.clone().unwrap_or_else(|| "the primary display".to_string());
+                    let named = match &wanted {
+                        super::screen_capture::DisplayTarget::One(name) => name.clone(),
+                        super::screen_capture::DisplayTarget::All => "every screen".to_string(),
+                        super::screen_capture::DisplayTarget::Primary => {
+                            "the primary display".to_string()
+                        }
+                    };
                     drop(capturer);
                     match super::screen_capture::create_capturer(config) {
                         Ok(mut fresh) => {
@@ -2339,52 +2346,95 @@ async fn run_reader<R>(
                     .then_some((cfg.client_width, cfg.client_height));
                 sessions.set_display_config(session_id, cfg);
             }
-            Ok(Message::WatchDisplay(id)) => {
+            Ok(Message::WatchDisplay(choice)) => {
+                use super::protocol::DisplayChoice;
+                use super::screen_capture::DisplayTarget;
+
                 // # Answered whether or not it worked
                 //
                 // The guest's menu shows a selection, and a selection that does
                 // not match what is being streamed is worse than no menu. So the
-                // reply carries the display actually being shown, and says why
-                // when that is not the one asked for.
+                // reply carries what is actually being shown, and says why when
+                // that is not what was asked for.
                 let available = super::screen_capture::displays();
-                let (shown, why) = match available.iter().find(|d| d.id == id) {
+                let (showing, why) = match choice {
+                    DisplayChoice::All if available.len() < 2 => {
+                        // Nothing to compose. Not an error — one screen shown
+                        // whole is what "all of them" means here — but the guest
+                        // is told so its menu does not claim otherwise.
+                        let why = "this host has one screen".to_string();
+                        (DisplayChoice::One(available.first().map_or(0, |d| d.id)), Some(why))
+                    }
+                    DisplayChoice::All => {
+                        info!("Session #{session_id}: guest asked for every screen");
+                        *wanted_display.lock().unwrap() = DisplayTarget::All;
+                        // The pointer maps against the whole desk now, which is
+                        // the bounding box of every display rather than any one
+                        // of them.
+                        let left = available.iter().map(|d| d.x).min().unwrap_or(0);
+                        let top = available.iter().map(|d| d.y).min().unwrap_or(0);
+                        let right = available
+                            .iter()
+                            .map(|d| d.x + i32::from(d.width))
+                            .max()
+                            .unwrap_or(0);
+                        let bottom = available
+                            .iter()
+                            .map(|d| d.y + i32::from(d.height))
+                            .max()
+                            .unwrap_or(0);
+                        injector.set_shown(super::input_inject::Shown {
+                            x: left,
+                            y: top,
+                            width: (right - left).clamp(0, u16::MAX as i32) as u16,
+                            height: (bottom - top).clamp(0, u16::MAX as i32) as u16,
+                        });
+                        (DisplayChoice::All, None)
+                    }
                     // Named `chosen`, not `display`: `use tracing::*` brings a
                     // `display` function into scope and the macros below resolve
                     // the identifier to it.
-                    Some(chosen) => {
-                        info!("Session #{session_id}: guest asked for {} ({id})", chosen.name);
-                        *wanted_display.lock().unwrap() = Some(chosen.name.clone());
-                        // The pointer has to move with the picture. Without
-                        // this, everything the guest sends is still scaled
-                        // against whichever display it was watching before.
-                        injector.set_shown(super::input_inject::Shown {
-                            x: chosen.x,
-                            y: chosen.y,
-                            width: chosen.width,
-                            height: chosen.height,
-                        });
-                        (chosen.id, None)
-                    }
-                    None => {
-                        // Far more likely a stale menu than a display the host
-                        // has forgotten, so nothing changes.
-                        let why = format!(
-                            "display {id} is not one of this host's {}",
-                            available.len()
-                        );
-                        warn!("Session #{session_id}: {why}");
-                        let current = wanted_display.lock().unwrap().clone();
-                        let showing = available
-                            .iter()
-                            .find(|d| Some(&d.name) == current.as_ref())
-                            .or_else(|| available.iter().find(|d| d.primary))
-                            .map(|d| d.id)
-                            .unwrap_or(id);
-                        (showing, Some(why))
-                    }
+                    DisplayChoice::One(id) => match available.iter().find(|d| d.id == id) {
+                        Some(chosen) => {
+                            info!("Session #{session_id}: guest asked for {} ({id})", chosen.name);
+                            *wanted_display.lock().unwrap() =
+                                DisplayTarget::One(chosen.name.clone());
+                            // The pointer has to move with the picture. Without
+                            // this, everything the guest sends is still scaled
+                            // against whichever display it was watching before.
+                            injector.set_shown(super::input_inject::Shown {
+                                x: chosen.x,
+                                y: chosen.y,
+                                width: chosen.width,
+                                height: chosen.height,
+                            });
+                            (DisplayChoice::One(chosen.id), None)
+                        }
+                        None => {
+                            // Far more likely a stale menu than a display the
+                            // host has forgotten, so nothing changes.
+                            let why =
+                                format!("display {id} is not one of this host's {}", available.len());
+                            warn!("Session #{session_id}: {why}");
+                            let current = wanted_display.lock().unwrap().clone();
+                            let showing = match &current {
+                                DisplayTarget::All => DisplayChoice::All,
+                                DisplayTarget::One(name) => DisplayChoice::One(
+                                    available
+                                        .iter()
+                                        .find(|d| &d.name == name)
+                                        .map_or(id, |d| d.id),
+                                ),
+                                DisplayTarget::Primary => DisplayChoice::One(
+                                    available.iter().find(|d| d.primary).map_or(id, |d| d.id),
+                                ),
+                            };
+                            (showing, Some(why))
+                        }
+                    },
                 };
                 let _ = out_tx.send(Message::DisplayChanged(super::protocol::DisplayChanged {
-                    id: shown,
+                    showing,
                     why,
                 }));
             }
@@ -3527,7 +3577,7 @@ mod tests {
     fn test_config() -> SessionConfig {
         SessionConfig {
             capture: CaptureConfig {
-                display: None,
+                display: Default::default(),
                 fps: 120,
                 quality: QualityScale::Native,
                 // 32x16 rather than 8x4: H.264 is the default codec and needs
