@@ -148,8 +148,9 @@ impl Duplication {
         let (output, width, height, hdr) = unsafe {
             let dxgi_device: IDXGIDevice = device.cast().context("device is not a IDXGIDevice")?;
             let adapter = dxgi_device.GetAdapter().context("no DXGI adapter")?;
-            let output = adapter.EnumOutputs(0).context("no display attached to adapter 0")?;
+            let (output, where_) = primary_output(&adapter)?;
             let output1: IDXGIOutput1 = output.cast().context("output is not IDXGIOutput1")?;
+            debug!("Capturing {where_}");
 
             let colour = super::capture_hdr::probe(&output);
             colour_log.display(colour);
@@ -456,6 +457,63 @@ unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16
 /// through the same call if not, and the legacy call only for a Windows too old
 /// to offer `IDXGIOutput5` — which is also a Windows too old to have an HDR
 /// desktop, so it is never the one being asked to do the impossible.
+/// The output showing the primary display, and a description for the log.
+///
+/// # Why this is not `EnumOutputs(0)`
+///
+/// It was, and on a single-monitor machine the two are the same thing, which is
+/// why nothing noticed. On any other machine `EnumOutputs(0)` is whichever
+/// output the adapter happens to list first — usually the primary and not
+/// guaranteed to be — while everything else in this application says the
+/// primary: `primary_display_size` reports it, the bandwidth estimate assumes
+/// it, and input injection lands the pointer on it.
+///
+/// Picking it explicitly makes those agree by construction. The primary display
+/// is the one at the origin of the virtual desktop: Windows defines it that way,
+/// so no GDI call is needed to recognise it.
+///
+/// Falls back to the first attached output, because a machine that somehow has
+/// no output at the origin should still stream something.
+fn primary_output(
+    adapter: &windows::Win32::Graphics::Dxgi::IDXGIAdapter,
+) -> Result<(windows::Win32::Graphics::Dxgi::IDXGIOutput, String)> {
+    let mut first = None;
+
+    for index in 0.. {
+        // SAFETY: enumeration terminates on the first error, which is how DXGI
+        // reports the end of the list.
+        let Ok(output) = (unsafe { adapter.EnumOutputs(index) }) else { break };
+        // SAFETY: reads a descriptor from a live output; nothing to release.
+        let Ok(desc) = (unsafe { output.GetDesc() }) else { continue };
+        if !desc.AttachedToDesktop.as_bool() {
+            continue;
+        }
+
+        let rect = desc.DesktopCoordinates;
+        let name = String::from_utf16_lossy(
+            &desc.DeviceName[..desc.DeviceName.iter().position(|&c| c == 0).unwrap_or(0)],
+        );
+        let where_ = format!(
+            "{name} at ({}, {}), {}x{}",
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top
+        );
+
+        if rect.left == 0 && rect.top == 0 {
+            return Ok((output, format!("{where_} — the primary display")));
+        }
+        if first.is_none() {
+            first = Some((output, where_));
+        }
+    }
+
+    let (output, where_) = first.context("no display attached to this adapter")?;
+    warn!("No display at the origin of the virtual desktop — capturing {where_} instead");
+    Ok((output, where_))
+}
+
 fn duplicate(
     device: &ID3D11Device,
     output1: &IDXGIOutput1,

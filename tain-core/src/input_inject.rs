@@ -182,9 +182,107 @@ mod windows_impl {
     /// out of the same range.
     const MAX_CONTACTS: u32 = crate::protocol::MAX_TOUCH_CONTACTS as u32;
 
+    /// A guest's normalized position as a pixel inside `shown`.
+    ///
+    /// Free and taking its rectangle explicitly so the arithmetic can be tested
+    /// against display arrangements this machine does not have — which is the
+    /// whole class of bug this replaces.
+    fn into_pixels(shown: RECT, x: u16, y: u16) -> POINT {
+        // A zero span would be a machine with no display. Clamp rather than
+        // divide by zero; the injection then fails on its own terms.
+        let span = |size: i32| (size.max(1) - 1) as i64;
+        let scale = |value: u16, size: i32| {
+            ((value as i64 * span(size)) / crate::protocol::ABSOLUTE_MAX as i64) as i32
+        };
+        POINT {
+            x: shown.left + scale(x, shown.right - shown.left),
+            y: shown.top + scale(y, shown.bottom - shown.top),
+        }
+    }
+
+    /// A desktop pixel as a position normalized across the whole desktop.
+    fn out_of_desktop(desktop: RECT, point: POINT) -> (i32, i32) {
+        // Note the clamp is not the one in `into_pixels`: there the span is a
+        // multiplier and zero is a fine answer, here it is the divisor. A
+        // machine reporting no display would otherwise divide by zero, which is
+        // a panic on the input path rather than an injection that fails.
+        let span = |size: i32| ((size - 1).max(1)) as i64;
+        // # Rounded up, because Windows rounds down
+        //
+        // `SendInput` turns this back into a pixel by truncating. Truncating
+        // here as well loses a pixel wherever the two divisions fall either side
+        // of a boundary — the pointer arrives one pixel up or left of where the
+        // guest put it, which is the difference between grabbing a window edge
+        // and missing it. Rounding to nearest still loses it half the time.
+        //
+        // The smallest value that truncates back to the intended pixel is its
+        // ceiling, and that value cannot reach the next pixel because a display
+        // is never wider than the normalized range. So the round trip is exact
+        // by construction rather than close enough.
+        let scale = |value: i32, origin: i32, size: i32| {
+            let span = span(size);
+            let numerator = (value - origin) as i64 * crate::protocol::ABSOLUTE_MAX as i64;
+            ((numerator + span - 1) / span) as i32
+        };
+        (
+            scale(point.x, desktop.left, desktop.right - desktop.left),
+            scale(point.y, desktop.top, desktop.bottom - desktop.top),
+        )
+    }
+
+    /// The bounding rectangle of every display, in physical pixels.
+    ///
+    /// The origin is not `(0, 0)`: a monitor left of or above the primary one
+    /// has negative coordinates, and the virtual desktop starts at whichever is
+    /// furthest out.
+    fn virtual_desktop() -> RECT {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+        // SAFETY: documented reads of system metrics, no arguments to get wrong
+        // and nothing to release.
+        let (left, top, width, height) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        RECT { left, top, right: left + width, bottom: top + height }
+    }
+
     impl WindowsInjector {
         pub fn new() -> Result<Self> {
             Ok(Self { touch: Mutex::new(TouchState::default()) })
+        }
+
+        /// The rectangle of the virtual desktop the guest is looking at.
+        ///
+        /// The primary display, because that is what capture streams — see
+        /// `capture_dxgi::primary_output`, which picks it explicitly so this and
+        /// the picture cannot disagree.
+        ///
+        /// It is a function rather than a field because a display can be added,
+        /// removed or rearranged while a session is running, and a pointer that
+        /// keeps landing where a monitor used to be is worse than one that costs
+        /// two system-metric reads per event.
+        ///
+        /// When a session can be watching any display this becomes what that
+        /// session is watching; the arithmetic below does not change.
+        fn shown(&self) -> RECT {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+            };
+            // SAFETY: documented reads of system metrics, no arguments to get
+            // wrong and nothing to release.
+            //
+            // The primary display is at the origin of the virtual desktop by
+            // definition on Windows, so these two spans are its whole rectangle.
+            let (width, height) =
+                unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+            RECT { left: 0, top: 0, right: width, bottom: height }
         }
 
         /// Submit one input record, mapping the Win32 failure convention to a Result.
@@ -204,40 +302,36 @@ mod windows_impl {
             }
         }
 
-        /// Normalized coordinates as pixels on the virtual desktop.
+        /// Normalized guest coordinates as pixels on the virtual desktop.
         ///
-        /// `SendInput` takes the normalized form directly, so nothing else here
-        /// needs this. Touch injection does not: `ptPixelLocation` is physical
-        /// pixels, and on a multi-monitor desktop the origin is not `(0, 0)` —
-        /// a monitor left of the primary one has negative coordinates.
+        /// # What the guest's numbers actually mean
+        ///
+        /// They are normalized against **the picture it was sent**, which is one
+        /// monitor. This used to spread them across the whole virtual desktop
+        /// instead, which is the same space only on a machine with one display.
+        /// On any other, a pointer landed proportionally further out the further
+        /// right it went, and on the wrong monitor entirely past the halfway
+        /// point — while the picture looked completely normal, so the symptom
+        /// read as "input is offset" rather than as anything to do with
+        /// monitors.
+        ///
+        /// So the guest's square maps onto [`Self::shown`], and only then into
+        /// desktop pixels. The origin matters: a monitor left of the primary one
+        /// has negative coordinates, so this is not a scale, it is a scale and
+        /// an offset.
         ///
         /// Reading them as *physical* pixels is what per-monitor DPI awareness
         /// buys; a process that ended up merely system aware would be handed a
         /// scaled virtual desktop here and put every touch in the wrong place
         /// on the secondary monitors. See `declare_dpi_awareness` in `tain-cli`.
-        fn to_desktop_pixels(x: u16, y: u16) -> POINT {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-                SM_YVIRTUALSCREEN,
-            };
+        fn to_desktop_pixels(&self, x: u16, y: u16) -> POINT {
+            into_pixels(self.shown(), x, y)
+        }
 
-            // SAFETY: documented reads of system metrics, no arguments to get
-            // wrong and nothing to release.
-            let (left, top, width, height) = unsafe {
-                (
-                    GetSystemMetrics(SM_XVIRTUALSCREEN),
-                    GetSystemMetrics(SM_YVIRTUALSCREEN),
-                    GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                    GetSystemMetrics(SM_CYVIRTUALSCREEN),
-                )
-            };
-            // A zero span would be a machine with no display. Clamp rather than
-            // divide by zero; the injection then fails on its own terms.
-            let span = |size: i32| (size.max(1) - 1) as i64;
-            let scale = |value: u16, size: i32| {
-                ((value as i64 * span(size)) / crate::protocol::ABSOLUTE_MAX as i64) as i32
-            };
-            POINT { x: left + scale(x, width), y: top + scale(y, height) }
+        /// Desktop pixels back to what `SendInput` wants: normalized across
+        /// every monitor, which is what `MOUSEEVENTF_VIRTUALDESK` means.
+        fn to_virtual_desktop(point: POINT) -> (i32, i32) {
+            out_of_desktop(virtual_desktop(), point)
         }
 
         /// Build the record Windows wants from the fields we keep.
@@ -293,12 +387,24 @@ mod windows_impl {
 
     impl InputInjector for WindowsInjector {
         fn move_mouse(&self, pos: MousePosition) -> Result<()> {
-            // Guest coordinates are already in the 0..65535 space SendInput wants,
-            // so there is nothing to scale. VIRTUALDESK spans all monitors.
+            // # Two conversions, not none
+            //
+            // Both spaces are `0..65535`, which is why this used to hand the
+            // guest's numbers straight to `SendInput` and looked right. They are
+            // not the same space: the guest's are across the picture it was
+            // sent, and `VIRTUALDESK` reads them as across every monitor. On one
+            // display those coincide. On two they do not, and the pointer lands
+            // on the wrong one.
+            //
+            // So: into desktop pixels through the rectangle actually being
+            // shown, then back out across the whole desktop, which is what the
+            // flag promises.
+            let point = self.to_desktop_pixels(pos.x, pos.y);
+            let (x, y) = Self::to_virtual_desktop(point);
             Self::send(Self::mouse(
                 MOUSEEVENTF_MOVE.0 | MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0,
-                pos.x as i32,
-                pos.y as i32,
+                x,
+                y,
                 0,
             ))
         }
@@ -430,7 +536,7 @@ mod windows_impl {
                 POINTER_FLAG_UPDATE.0 | POINTER_FLAG_INRANGE.0 | POINTER_FLAG_INCONTACT.0,
             );
 
-            let point = Self::to_desktop_pixels(input.x, input.y);
+            let point = self.to_desktop_pixels(input.x, input.y);
             let existing = state.contacts.iter().position(|c| c.id == input.id);
 
             match (input.phase, existing) {
@@ -532,6 +638,122 @@ mod windows_impl {
     }
 
     #[cfg(test)]
+    mod pointer_space_tests {
+        use super::*;
+
+        const MAX: u16 = crate::protocol::ABSOLUTE_MAX;
+
+        fn rect(left: i32, top: i32, width: i32, height: i32) -> RECT {
+            RECT { left, top, right: left + width, bottom: top + height }
+        }
+
+        /// Two monitors side by side: the picture is the left one.
+        ///
+        /// # The bug this pins
+        ///
+        /// Guest coordinates were handed to `SendInput` unchanged, because both
+        /// spaces are `0..65535` and on a single-monitor machine they are the
+        /// same space. With a second monitor they are not: the far right of the
+        /// picture is the middle of the desktop, so every position landed at
+        /// roughly twice its distance from the left edge and anything past the
+        /// halfway point landed on a monitor the guest could not even see.
+        #[test]
+        fn a_second_monitor_does_not_stretch_the_pointer_onto_it() {
+            let shown = rect(0, 0, 1920, 1080);
+            let desktop = rect(0, 0, 3840, 1080);
+
+            // The far right of the picture is the right edge of the *first*
+            // monitor, which is the middle of the desktop.
+            let right = out_of_desktop(desktop, into_pixels(shown, MAX, 0)).0;
+            let middle = i32::from(MAX) / 2;
+            assert!(
+                (right - middle).abs() <= 16,
+                "the right edge of the picture mapped to {right}, not about {middle} — \
+                 which is a pointer on the wrong monitor"
+            );
+
+            // And the two ends still reach the two ends of what is shown.
+            assert_eq!(into_pixels(shown, 0, 0).x, 0);
+            assert_eq!(into_pixels(shown, MAX, 0).x, 1919);
+        }
+
+        /// A monitor to the left of the primary one has negative coordinates.
+        ///
+        /// The reason this is an offset and not only a scale. The primary
+        /// display is always at the desktop origin, so a monitor placed left of
+        /// it moves the *desktop* origin negative and everything shown sits in
+        /// the right-hand half of it.
+        #[test]
+        fn a_monitor_left_of_the_primary_moves_the_origin_not_the_picture() {
+            let shown = rect(0, 0, 1920, 1080);
+            let desktop = rect(-1920, 0, 3840, 1080);
+
+            // The left edge of the picture is the middle of the desktop.
+            let left = out_of_desktop(desktop, into_pixels(shown, 0, 0)).0;
+            let middle = i32::from(MAX) / 2;
+            assert!(
+                (left - middle).abs() <= 16,
+                "the left edge of the picture mapped to {left}, not about {middle}"
+            );
+            // And the far right is the far right of the desktop.
+            assert_eq!(out_of_desktop(desktop, into_pixels(shown, MAX, 0)).0, i32::from(MAX));
+        }
+
+        /// Every pixel survives the trip out to normalized space and back.
+        ///
+        /// # Why every one, and not a few
+        ///
+        /// This is the chain a real pointer takes: the guest's position becomes
+        /// a host pixel, that becomes a normalized value for `SendInput`, and
+        /// Windows turns it back into a pixel by truncating. A pixel lost
+        /// anywhere in there puts the pointer one place off — enough to miss a
+        /// window edge or a one-pixel border, and invisible in any test that
+        /// samples a handful of values, because the loss happens only where two
+        /// divisions land either side of a boundary.
+        ///
+        /// It holds exactly rather than approximately — see `out_of_desktop` —
+        /// so exhausting the display is both affordable and the honest test of
+        /// the claim.
+        #[test]
+        fn every_pixel_survives_the_round_trip() {
+            for &(width, height) in
+                &[(2560, 1600), (1920, 1080), (3840, 2160), (1366, 768), (1, 1)]
+            {
+                let display = rect(0, 0, width, height);
+                for pixel in 0..width {
+                    let (x, _) = out_of_desktop(display, POINT { x: pixel, y: 0 });
+                    assert!(
+                        (0..=i32::from(MAX)).contains(&x),
+                        "{width}x{height}: pixel {pixel} left the normalized range at {x}"
+                    );
+                    let back = into_pixels(display, x as u16, 0).x;
+                    assert_eq!(back, pixel, "{width}x{height}: pixel {pixel} came back as {back}");
+                }
+            }
+        }
+
+        /// The same, on a display that is not at the desktop origin.
+        #[test]
+        fn a_display_away_from_the_origin_survives_it_too() {
+            // A 1920x1080 monitor to the right of a 2560-wide primary.
+            let desktop = rect(0, 0, 4480, 1600);
+            let shown = rect(2560, 0, 1920, 1080);
+            for pixel in shown.left..shown.right {
+                let (x, _) = out_of_desktop(desktop, POINT { x: pixel, y: 0 });
+                let back = into_pixels(desktop, x as u16, 0).x;
+                assert_eq!(back, pixel, "pixel {pixel} on the second monitor came back as {back}");
+            }
+        }
+
+        /// A machine reporting no display must not divide by zero.
+        #[test]
+        fn a_desktop_with_no_extent_is_survivable() {
+            let nothing = rect(0, 0, 0, 0);
+            let _ = out_of_desktop(nothing, into_pixels(nothing, MAX, MAX));
+        }
+    }
+
+    #[cfg(test)]
     mod touch_tests {
         use super::*;
 
@@ -547,22 +769,40 @@ mod windows_impl {
             assert!((1..=1024).contains(&to_windows_pressure(128)));
         }
 
+        /// Normalized extremes land on the edges of the *shown display*.
+        ///
+        /// This used to assert the edges of the whole virtual desktop, which is
+        /// the bug rather than the behaviour: it is only the same answer on a
+        /// machine with one display, which is what every machine that ran it
+        /// had. See `pointer_space_tests`, which covers the arrangements this
+        /// one cannot.
         #[test]
-        fn normalized_extremes_land_on_the_edges_of_the_virtual_desktop() {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-            };
-            // SAFETY: documented reads of system metrics.
-            let (left, width) = unsafe {
-                (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN))
-            };
-            if width <= 0 {
+        fn normalized_extremes_land_on_the_edges_of_the_shown_display() {
+            let Ok(injector) = WindowsInjector::new() else { return };
+            let shown = injector.shown();
+            if shown.right - shown.left <= 0 {
                 return; // No display; nothing to be right about.
             }
-            let start = WindowsInjector::to_desktop_pixels(0, 0);
-            let end = WindowsInjector::to_desktop_pixels(u16::MAX, u16::MAX);
-            assert_eq!(start.x, left, "zero should be the desktop's left edge");
-            assert_eq!(end.x, left + width - 1, "the maximum should be its right edge");
+
+            let start = injector.to_desktop_pixels(0, 0);
+            let end = injector.to_desktop_pixels(u16::MAX, u16::MAX);
+            assert_eq!(start.x, shown.left, "zero should be the shown display's left edge");
+            assert_eq!(
+                end.x,
+                shown.right - 1,
+                "the maximum should be the shown display's right edge, not the desktop's"
+            );
+
+            // On a machine with a second monitor, the two answers differ — and
+            // that difference is the whole point. Silent where there is only one.
+            let desktop = virtual_desktop();
+            if desktop.right > shown.right {
+                assert_ne!(
+                    end.x,
+                    desktop.right - 1,
+                    "the pointer reached the far edge of another monitor"
+                );
+            }
         }
     }
 }
