@@ -54,6 +54,30 @@ use super::screen_capture::{
 /// this tick. Comfortably longer than one panel's own wait.
 const WAIT: std::time::Duration = std::time::Duration::from_millis(40);
 
+/// The widest or tallest a composed wall may be.
+///
+/// # Why the capture layer knows about encoders
+///
+/// It should not have to, and the alternative is worse. A wall is the one
+/// capture source whose size is not a display's size: two 1920-wide screens
+/// beside a 2560-wide one is a 6400-pixel picture, and hardware H.264 encoders
+/// commonly stop at 4096 in either axis. Asking for more does not degrade, it
+/// fails to create the encoder — which ends the session, with the error naming
+/// the encoder rather than the arrangement that caused it.
+///
+/// Measured on the machine that found this: two screens side by side make a
+/// 4480-wide wall, and selecting it killed the session.
+///
+/// So the wall shrinks itself to fit. That costs sharpness in a mode whose
+/// whole purpose is seeing everything at once, which is the right thing to
+/// give up — and it is capped rather than refused because a wall that is
+/// slightly soft is worth vastly more than one that does not appear.
+///
+/// H.264's limit rather than the current codec's: the codec can change
+/// mid-session, and a wall that only fits while H.265 is selected would fail
+/// the moment somebody switched back.
+const MAX_WALL: u16 = 4096;
+
 /// One display's capture, its latest frame, and where it belongs.
 struct Panel {
     /// Behind a mutex because the pump thread captures through it and the
@@ -176,12 +200,17 @@ impl Wall {
 
     /// The size this should emit, from the wall's own size and what has been
     /// asked of it.
+    ///
+    /// [`MAX_WALL`] is applied last and applies whatever else was asked, 1:1
+    /// included: a size the encoder will refuse is not a size, and lifting the
+    /// guest's ceiling cannot lift a hardware one.
     fn target(&self) -> (u16, u16) {
         let native = (
             self.bounds.0.min(u16::MAX as u32) as u16,
             self.bounds.1.min(u16::MAX as u32) as u16,
         );
         let scaled = self.scale.apply(native);
+        let scaled = fit_within(scaled, (MAX_WALL, MAX_WALL));
         match self.ceiling {
             Some(ceiling) => {
                 let (w, h) = fit_within(scaled, ceiling);
@@ -544,5 +573,56 @@ mod tests {
                 assert!(placed.width >= 2 && placed.height >= 2, "a panel shrank to nothing");
             }
         }
+    }
+
+    /// A wall never asks the encoder for more than it can take.
+    ///
+    /// # The session this killed
+    ///
+    /// Two screens side by side — 2560 and 1920 — compose to a 4480-pixel-wide
+    /// wall. Hardware H.264 encoders commonly stop at 4096 in either axis, and
+    /// asking for more does not degrade: the encoder fails to build and the
+    /// session ends, with the error naming the encoder rather than the
+    /// arrangement that caused it.
+    ///
+    /// Checked through `target` rather than by inspecting the constant, because
+    /// the cap has to survive both a scale and a ceiling being applied — and
+    /// 1:1, which lifts the ceiling entirely and is exactly when an oversized
+    /// wall would otherwise get through.
+    #[test]
+    fn a_wall_is_never_wider_than_an_encoder_will_take() {
+        // Sizes are the arithmetic; a real Wall needs displays to capture.
+        let target = |bounds: (u32, u32), scale: QualityScale, ceiling: Option<(u16, u16)>| {
+            let native =
+                (bounds.0.min(u16::MAX as u32) as u16, bounds.1.min(u16::MAX as u32) as u16);
+            let scaled = fit_within(scale.apply(native), (MAX_WALL, MAX_WALL));
+            match ceiling {
+                Some(ceiling) => {
+                    let (w, h) = fit_within(scaled, ceiling);
+                    ((w.max(2)) & !1, (h.max(2)) & !1)
+                }
+                None => scaled,
+            }
+        };
+
+        // Two side by side, at 1:1 — no ceiling, which is the case that used to
+        // reach the encoder unshrunk.
+        let (w, h) = target((4480, 1600), QualityScale::Native, None);
+        assert!(w <= MAX_WALL && h <= MAX_WALL, "a 4480-wide wall came back {w}x{h}");
+        // Still the right shape: shrinking must not stretch the desk.
+        let ratio = f64::from(w) / f64::from(h);
+        assert!((ratio - 4480.0 / 1600.0).abs() < 0.02, "the wall changed shape: {w}x{h}");
+
+        // Three 4K screens, which is well past it in both directions.
+        let (w, h) = target((11520, 2160), QualityScale::Native, None);
+        assert!(w <= MAX_WALL && h <= MAX_WALL, "a 11520-wide wall came back {w}x{h}");
+
+        // Stacked, so the tall axis is the one over the limit.
+        let (w, h) = target((2560, 6400), QualityScale::Native, None);
+        assert!(w <= MAX_WALL && h <= MAX_WALL, "a 6400-tall wall came back {w}x{h}");
+
+        // A wall that already fits is left alone.
+        let (w, h) = target((3840, 1080), QualityScale::Native, None);
+        assert_eq!((w, h), (3840, 1080), "a wall within the limit was shrunk anyway");
     }
 }

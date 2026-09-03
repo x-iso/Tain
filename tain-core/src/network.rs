@@ -2186,7 +2186,30 @@ fn spawn_capture_thread(
                             "the primary display".to_string()
                         }
                     };
-                    drop(capturer);
+                    // # Drop first only when the two overlap
+                    //
+                    // DXGI allows one duplication *per output*, so switching
+                    // between two different screens does not conflict and the
+                    // old capturer can be kept until the new one exists. That
+                    // matters: a switch that fails then costs nothing, where
+                    // dropping first turns any failure into a session with no
+                    // capture at all.
+                    //
+                    // The wall contains every screen including the current one,
+                    // and switching to the display already being shown is the
+                    // same output twice. Both have to let go first.
+                    let overlaps = matches!(wanted, super::screen_capture::DisplayTarget::All)
+                        || matches!(applied_display, super::screen_capture::DisplayTarget::All)
+                        || wanted == applied_display;
+                    // Moved out either way, so every path below has to put
+                    // something back — which is what stops a failed switch
+                    // leaving the thread with no capturer.
+                    let kept = if overlaps {
+                        drop(capturer);
+                        None
+                    } else {
+                        Some(capturer)
+                    };
                     match super::screen_capture::create_capturer(config) {
                         Ok(mut fresh) => {
                             // The encoder settled on this at session start and
@@ -2201,11 +2224,21 @@ fn spawn_capture_thread(
                             applied_display = wanted;
                         }
                         Err(e) => {
-                            // Nothing to fall back to: the old capturer is
-                            // already gone. Rebuilding what was there before is
-                            // the only way to keep the session alive, and if
-                            // *that* fails there is no picture to be had.
                             warn!("Session #{session_id}: could not switch to {named}: {e:#}");
+                            // Do not ask again every tick for something that
+                            // just failed.
+                            *wanted_display.lock().unwrap() = applied_display.clone();
+
+                            if let Some(old) = kept {
+                                // Never let go of, so there is nothing to
+                                // recover: the session carries on showing what
+                                // it was showing.
+                                capturer = old;
+                                continue;
+                            }
+                            // It was let go of, because the two shared an
+                            // output. Rebuilding it is the only way to keep the
+                            // session alive.
                             let mut config = capture_config.clone();
                             config.display = applied_display.clone();
                             match super::screen_capture::create_capturer(config) {
@@ -2217,14 +2250,11 @@ fn spawn_capture_thread(
                                 }
                                 Err(e) => {
                                     error!(
-                                        "Session #{session_id}: capture is gone after a failed                                          display switch: {e:#}"
+                                        "Session #{session_id}: capture is gone after a                                          failed display switch: {e:#}"
                                     );
                                     return;
                                 }
                             }
-                            // Do not ask again every tick for something that
-                            // just failed.
-                            *wanted_display.lock().unwrap() = applied_display.clone();
                         }
                     }
                 }
