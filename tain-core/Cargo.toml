@@ -40,6 +40,8 @@ hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 openh264 = "0.9"
+iroh-mdns-address-lookup = "0.5.0"
+iroh-mainline-address-lookup = "0.5.0"
 
 # Screen capture backend — windows-capture via scap (optional, pinned to avoid transitive API conflicts)
 # scap = { version = "=0.0.8", optional = true }

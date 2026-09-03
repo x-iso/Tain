@@ -55,10 +55,14 @@ pub mod codec_mf;
 pub mod codec_mf_decode;
 #[cfg(target_os = "windows")]
 pub mod decode_rgba;
-// Gated on the build script finding an ffmpeg tree; see tain-core/build.rs.
-#[cfg(all(target_os = "windows", db_ffmpeg))]
+// Neither of these has anything to do with ffmpeg. `dns_cache` sat under the
+// gate below by accident, which made a build without an ffmpeg tree fail on
+// `network.rs` — which uses it unconditionally — rather than on anything to do
+// with video.
 pub mod dns_cache;
+pub mod discovery;
 pub mod ffmpeg_runtime;
+// Gated on the build script finding an ffmpeg tree; see tain-core/build.rs.
 #[cfg(all(target_os = "windows", db_ffmpeg))]
 pub mod decode_ffmpeg;
 #[cfg(all(target_os = "windows", db_ffmpeg))]

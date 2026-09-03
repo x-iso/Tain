@@ -160,6 +160,68 @@ async fn several_guests_arriving_together_are_all_answered() -> Result<()> {
     Ok(())
 }
 
+/// Two machines on one network must find each other with nothing else running.
+///
+/// # What this proves
+///
+/// Both endpoints are built from `presets::Minimal`, which sets a crypto
+/// provider and nothing else: no relay, no DNS address lookup, no n0
+/// infrastructure of any kind. The only thing either one has is what
+/// `discovery::attach` gives it. Neither is told the other's address.
+///
+/// So if a connection happens at all, it happened because one endpoint found
+/// the other by multicast on the local network — there is no other route in
+/// this configuration for it to have taken. That is the property worth pinning
+/// down: for two machines in the same building, which is what a remote desktop
+/// is mostly used for, none of the public internet has to be reachable.
+///
+/// The timeout doubles as the proof that mDNS and not the DHT answered: a DHT
+/// lookup has to bootstrap against the public internet first and cannot return
+/// inside this budget, and with no relay configured there is nothing else left.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_endpoints_on_one_network_find_each_other_without_any_server() -> Result<()> {
+    use iroh::endpoint::presets;
+
+    let host = iroh::Endpoint::builder(presets::Minimal)
+        .alpns(vec![b"tain/mdns-test".to_vec()])
+        .bind()
+        .await?;
+    let up = tain_core::discovery::attach(&host);
+    assert!(up.mdns, "multicast discovery did not start on this machine");
+    // Not asserted: the DHT is a WAN mechanism and has no bearing on whether
+    // two machines in one building can find each other. Printed because a run
+    // where it did not start is worth knowing about.
+    eprintln!("distributed (DHT) discovery started: {}", up.dht);
+    let host_id = host.id();
+
+    let guest = iroh::Endpoint::builder(presets::Minimal).bind().await?;
+    tain_core::discovery::attach(&guest);
+
+    let accepting = tokio::spawn(async move {
+        let incoming = host.accept().await.context("host endpoint closed")?;
+        incoming.await.context("handshake failed")?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // Addressed by endpoint id alone — no relay url, no ip, nothing on file.
+    let dialing = tokio::time::timeout(
+        Duration::from_secs(20),
+        guest.connect(iroh::EndpointAddr::new(host_id), b"tain/mdns-test"),
+    );
+
+    let conn = match dialing.await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => anyhow::bail!("dial failed with only mDNS to go on: {e:#}"),
+        Err(_) => anyhow::bail!(
+            "an endpoint on this very machine was not found by multicast within 20s — \
+             either this network drops multicast, or local discovery is not attached"
+        ),
+    };
+    assert_eq!(conn.remote_id(), host_id, "connected to the wrong endpoint");
+    accepting.await.context("accept task panicked")??;
+    Ok(())
+}
+
 /// A host that can be reached directly must be *carried* directly.
 ///
 /// # What this guards

@@ -249,6 +249,9 @@ impl HostServer {
             builder = builder.secret_key(iroh::SecretKey::from_bytes(&bytes));
         }
         let endpoint = builder.bind().await?;
+        // The host is the side worth finding: mDNS is what lets a guest on the
+        // same network reach it with no relay and no DNS at all.
+        super::discovery::attach(&endpoint);
 
         // # Coming online is a courtesy, not a requirement
         //
@@ -2530,6 +2533,10 @@ impl GuestClient {
             .dns_resolver(super::dns_cache::resolver())
             .bind()
             .await?;
+        // The guest needs these more than the host does: this is the side that
+        // has to *find* somebody, and mDNS answers that on a local network
+        // without the relay this dial would otherwise have to reach first.
+        super::discovery::attach(&endpoint);
 
         // Only worth naming as a step when there is nothing else to go on. With
         // a relay in the code or an address on file, this wait is a courtesy
@@ -3064,6 +3071,9 @@ impl Prober {
             .dns_resolver(super::dns_cache::resolver())
             .bind()
             .await?;
+        // A host on this network should show as online without the answer
+        // having to come back from another continent to say so.
+        super::discovery::attach(&endpoint);
         endpoint.online().await;
         Ok(Self { endpoint })
     }
