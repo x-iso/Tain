@@ -480,6 +480,15 @@ pub struct GuestSessionState {
     /// them. Empty until `SessionStart`, and from a host that cannot enumerate
     /// them at all — which means "unknown", not "none".
     pub displays: Arc<Mutex<Vec<tain_core::protocol::DisplayInfo>>>,
+    /// Which display is being streamed, once the host has said. `None` before
+    /// the first answer, which the UI shows as the primary.
+    pub watching: Arc<Mutex<Option<u32>>>,
+    /// Sends a control message to the host, while a session is live.
+    ///
+    /// The UI needs a way to *ask* for something rather than only to report,
+    /// and picking a display is the first such thing. Input has its own channel
+    /// because it is hot; this one carries the occasional request.
+    pub control: Arc<Mutex<Option<mpsc::UnboundedSender<Message>>>>,
     /// Where the host's pointer is and what it looks like.
     pub cursor: Arc<Mutex<CursorState>>,
     /// A blurred thumbnail of the host's screen, sent once when the session
@@ -570,6 +579,8 @@ impl GuestSessionState {
             grants: Arc::new(Mutex::new(ControlGrants::NONE)),
             remote_size: Arc::new(Mutex::new((640, 360))),
             displays: Arc::new(Mutex::new(Vec::new())),
+            watching: Arc::new(Mutex::new(None)),
+            control: Arc::new(Mutex::new(None)),
             cursor: Arc::new(Mutex::new(CursorState::default())),
             host_preview: Arc::new(Mutex::new(None)),
             #[cfg(all(target_os = "windows", db_ffmpeg))]
@@ -625,6 +636,8 @@ impl GuestSessionState {
         *self.host_name.lock().unwrap() = None;
         // The next host is a different machine with different monitors.
         self.displays.lock().unwrap().clear();
+        *self.watching.lock().unwrap() = None;
+        *self.control.lock().unwrap() = None;
         *self.health.lock().unwrap() = StreamHealth::default();
     }
 }
@@ -785,6 +798,9 @@ pub async fn run_guest_session(
         // it: the guest recorded the failure and asked, and the request was
         // dropped between two lines of its own code.
         let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Message>();
+        // Published so the window can ask the host for things — see
+        // `GuestSessionState::control`.
+        *shared.control.lock().unwrap() = Some(control_tx.clone());
 
         // # One acceptor for every side stream the host opens
         //
@@ -1461,6 +1477,10 @@ where
                             .join(", ")
                     );
                 }
+                // Whatever the host is streaming to begin with, which is the
+                // primary unless something has already asked otherwise.
+                *shared.watching.lock().unwrap() =
+                    ss.displays.iter().find(|d| d.primary).map(|d| d.id);
                 *shared.displays.lock().unwrap() = ss.displays.clone();
                 // Sanitized on arrival: the host chose this string, we did not.
                 *shared.host_name.lock().unwrap() =
@@ -1714,6 +1734,22 @@ where
                     None => warn!("Host announced a codec this build does not know: {}",
                         change.encoder_type),
                 }
+            }
+            Message::DisplayChanged(change) => {
+                // The host's answer, sent whether or not the request worked.
+                // Recording it either way is the point: a menu showing a
+                // selection the host never honoured is worse than no menu.
+                match &change.why {
+                    Some(why) => warn!(
+                        "Host is still showing display {} — {why}",
+                        change.id
+                    ),
+                    None => info!("Host switched to display {}", change.id),
+                }
+                *shared.watching.lock().unwrap() = Some(change.id);
+                // A different display is a different picture of a different
+                // size, and the decoder holds reference frames for the old one.
+                let _ = keyframe_tx.send(Message::RequestKeyframe);
             }
             Message::GuestApprovalRequest(gar) => {
                 info!("Waiting for the host to allow this connection: {}", gar.label);

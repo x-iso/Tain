@@ -970,6 +970,10 @@ where
     let acks: SharedAck = Arc::new(std::sync::Mutex::new(AckState::default()));
     let viewport: SharedViewport = Arc::new(std::sync::Mutex::new(None));
     let keyframe_wanted: KeyframeWanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Which display this session streams. Starts as whatever the config asked
+    // for, which is `None` — the primary.
+    let wanted_display: WantedDisplay =
+        Arc::new(std::sync::Mutex::new(config.capture.display.clone()));
     let mut reader = tokio::spawn(run_reader(
         recv,
         session_id,
@@ -979,6 +983,7 @@ where
         Arc::clone(&acks),
         Arc::clone(&viewport),
         Arc::clone(&keyframe_wanted),
+        Arc::clone(&wanted_display),
     ));
 
     // Audio rides the same outbound channel as host-initiated control messages,
@@ -1026,6 +1031,7 @@ where
         viewport,
         Arc::clone(&keyframe_wanted),
         cursor_tx,
+        Arc::clone(&wanted_display),
     );
 
     // Written from the select loop rather than handed to a task of its own,
@@ -1272,6 +1278,15 @@ type SharedAck = Arc<std::sync::Mutex<AckState>>;
 /// put fullscreen mid-session changes the answer, and streaming for the size it
 /// used to be is the same waste in the other direction.
 type SharedViewport = Arc<std::sync::Mutex<Option<(u16, u16)>>>;
+
+/// The display a guest has asked to watch, as a device name.
+///
+/// Written by the reader task when a `WatchDisplay` arrives, read by the
+/// capture thread on its next tick. The same shape as [`SharedViewport`] and
+/// [`CapturePlan`] and for the same reason: the capture thread owns the
+/// capturer, so everything that reconfigures it arrives as state to notice
+/// rather than as a call.
+type WantedDisplay = Arc<std::sync::Mutex<Option<String>>>;
 
 /// The host's settings, shared with every running session.
 ///
@@ -1689,6 +1704,7 @@ fn spawn_capture_pipeline(
     viewport: SharedViewport,
     keyframe_wanted: KeyframeWanted,
     cursor_tx: mpsc::UnboundedSender<super::cursor::CursorUpdate>,
+    wanted_display: WantedDisplay,
 ) -> (mpsc::Receiver<PipelineEvent>, std::thread::JoinHandle<()>) {
     let mut capturer = capturer;
     // Settle the pixel format before either thread starts. If the encoder wants
@@ -1719,6 +1735,9 @@ fn spawn_capture_pipeline(
         Arc::clone(&capture_plan),
         viewport,
         cursor_tx,
+        wanted_display,
+        config.capture.clone(),
+        format,
     );
 
     let handle = std::thread::Builder::new()
@@ -2083,6 +2102,10 @@ type CapturePlan = Arc<std::sync::Mutex<(QualityScale, u32)>>;
 /// 120 fps. Overlapping bounds it by the slower of the two instead. Per-frame
 /// latency is unchanged — a frame still waits for its own capture and its own
 /// encode — so this buys throughput without costing responsiveness.
+/// Allowed rather than grouped, as on `run_reader` above: every one of these is
+/// a distinct thing the capture thread needs and a struct would only be a name
+/// for "the arguments", read at one call site.
+#[allow(clippy::too_many_arguments)]
 fn spawn_capture_thread(
     session_id: u32,
     capturer: Box<dyn super::screen_capture::ScreenCaptureBackend>,
@@ -2090,6 +2113,9 @@ fn spawn_capture_thread(
     plan: CapturePlan,
     viewport: SharedViewport,
     cursor_tx: mpsc::UnboundedSender<super::cursor::CursorUpdate>,
+    wanted_display: WantedDisplay,
+    capture_config: super::screen_capture::CaptureConfig,
+    format: super::screen_capture::PixelFormat,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("tain-capture-{session_id}"))
@@ -2097,11 +2123,70 @@ fn spawn_capture_thread(
             let mut capturer = capturer;
             let mut applied_scale = plan.lock().unwrap().0;
             let mut applied_ceiling: Option<(u16, u16)> = None;
+            let mut applied_display = capture_config.display.clone();
             let mut next_frame_at = std::time::Instant::now();
             let (mut produced, mut unchanged, mut dropped) = (0u32, 0u32, 0u32);
             let mut produced_at = std::time::Instant::now();
 
             loop {
+                // # Switching display
+                //
+                // Rebuilt rather than reconfigured: a duplication belongs to one
+                // output for its whole life, so there is nothing to retarget.
+                // The old capturer is dropped first, which is what releases its
+                // duplication — a display being switched *away from* has to let
+                // go before anything else can take it, and on a switch back to
+                // the same display that would otherwise be the second
+                // duplication that DXGI refuses.
+                let wanted = wanted_display.lock().unwrap().clone();
+                if wanted != applied_display {
+                    let mut config = capture_config.clone();
+                    config.display = wanted.clone();
+                    let named =
+                        wanted.clone().unwrap_or_else(|| "the primary display".to_string());
+                    drop(capturer);
+                    match super::screen_capture::create_capturer(config) {
+                        Ok(mut fresh) => {
+                            // The encoder settled on this at session start and
+                            // cannot change its mind, so the new capturer has to
+                            // be asked for the same thing.
+                            super::screen_capture::negotiate_format(&mut *fresh, format);
+                            fresh.set_scale(applied_scale);
+                            fresh.set_size_ceiling(applied_ceiling);
+                            let (w, h) = fresh.frame_size();
+                            info!("Session #{session_id}: now streaming {named} ({w}x{h})");
+                            capturer = fresh;
+                            applied_display = wanted;
+                        }
+                        Err(e) => {
+                            // Nothing to fall back to: the old capturer is
+                            // already gone. Rebuilding what was there before is
+                            // the only way to keep the session alive, and if
+                            // *that* fails there is no picture to be had.
+                            warn!("Session #{session_id}: could not switch to {named}: {e:#}");
+                            let mut config = capture_config.clone();
+                            config.display = applied_display.clone();
+                            match super::screen_capture::create_capturer(config) {
+                                Ok(mut back) => {
+                                    super::screen_capture::negotiate_format(&mut *back, format);
+                                    back.set_scale(applied_scale);
+                                    back.set_size_ceiling(applied_ceiling);
+                                    capturer = back;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Session #{session_id}: capture is gone after a failed                                          display switch: {e:#}"
+                                    );
+                                    return;
+                                }
+                            }
+                            // Do not ask again every tick for something that
+                            // just failed.
+                            *wanted_display.lock().unwrap() = applied_display.clone();
+                        }
+                    }
+                }
+
                 let (scale, fps) = *plan.lock().unwrap();
                 if scale != applied_scale {
                     capturer.set_scale(scale);
@@ -2221,6 +2306,7 @@ async fn run_reader<R>(
     acks: SharedAck,
     viewport: SharedViewport,
     keyframe_wanted: KeyframeWanted,
+    wanted_display: WantedDisplay,
 ) where
     R: tokio::io::AsyncReadExt + Unpin + Send + 'static,
 {
@@ -2252,6 +2338,55 @@ async fn run_reader<R>(
                 *viewport.lock().unwrap() = (cfg.client_width >= 2 && cfg.client_height >= 2)
                     .then_some((cfg.client_width, cfg.client_height));
                 sessions.set_display_config(session_id, cfg);
+            }
+            Ok(Message::WatchDisplay(id)) => {
+                // # Answered whether or not it worked
+                //
+                // The guest's menu shows a selection, and a selection that does
+                // not match what is being streamed is worse than no menu. So the
+                // reply carries the display actually being shown, and says why
+                // when that is not the one asked for.
+                let available = super::screen_capture::displays();
+                let (shown, why) = match available.iter().find(|d| d.id == id) {
+                    // Named `chosen`, not `display`: `use tracing::*` brings a
+                    // `display` function into scope and the macros below resolve
+                    // the identifier to it.
+                    Some(chosen) => {
+                        info!("Session #{session_id}: guest asked for {} ({id})", chosen.name);
+                        *wanted_display.lock().unwrap() = Some(chosen.name.clone());
+                        // The pointer has to move with the picture. Without
+                        // this, everything the guest sends is still scaled
+                        // against whichever display it was watching before.
+                        injector.set_shown(super::input_inject::Shown {
+                            x: chosen.x,
+                            y: chosen.y,
+                            width: chosen.width,
+                            height: chosen.height,
+                        });
+                        (chosen.id, None)
+                    }
+                    None => {
+                        // Far more likely a stale menu than a display the host
+                        // has forgotten, so nothing changes.
+                        let why = format!(
+                            "display {id} is not one of this host's {}",
+                            available.len()
+                        );
+                        warn!("Session #{session_id}: {why}");
+                        let current = wanted_display.lock().unwrap().clone();
+                        let showing = available
+                            .iter()
+                            .find(|d| Some(&d.name) == current.as_ref())
+                            .or_else(|| available.iter().find(|d| d.primary))
+                            .map(|d| d.id)
+                            .unwrap_or(id);
+                        (showing, Some(why))
+                    }
+                };
+                let _ = out_tx.send(Message::DisplayChanged(super::protocol::DisplayChanged {
+                    id: shown,
+                    why,
+                }));
             }
             Ok(Message::Input(event)) => {
                 // Re-read grants per event: they can change at any point during

@@ -409,6 +409,20 @@ pub struct CodecChanged {
     pub encoder_type: String,
 }
 
+/// Host → guest: which display the stream is now showing.
+///
+/// Sent in answer to [`Message::WatchDisplay`], and sent whether or not the
+/// request could be honoured — a guest that asked for a monitor which has since
+/// been unplugged needs to know it is still looking at the old one, or its menu
+/// will show a selection that is not real.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplayChanged {
+    /// The display actually being streamed, as [`DisplayInfo::id`].
+    pub id: u32,
+    /// Why the request was not honoured, when it was not. `None` on success.
+    pub why: Option<String>,
+}
+
 /// Full-screen information broadcast at session start (host → guest).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenInfo {
@@ -568,6 +582,13 @@ pub enum Message {
     /// session — a visible hitch bought as insurance against something that
     /// announces itself perfectly well.
     RequestKeyframe,
+    /// Show me this display instead.
+    ///
+    /// The id comes from the list in [`SessionStart::displays`]. A guest may
+    /// only ask for one it was told about; anything else is refused rather than
+    /// guessed at, because an id the host does not recognise is far more likely
+    /// to be a stale menu than a display it has forgotten.
+    WatchDisplay(u32),
     /// Check a code without asking to connect. Answered with [`ProbeResult`],
     /// then the connection closes.
     Probe(Probe),
@@ -576,6 +597,8 @@ pub enum Message {
     SessionStart(SessionStart),
     /// The stream changed codec; rebuild the decoder. See [`CodecChanged`].
     CodecChanged(CodecChanged),
+    /// Which display the stream is showing. See [`DisplayChanged`].
+    DisplayChanged(DisplayChanged),
     Frame(FrameMessage),
     GuestApprovalRequest(GuestApprovalRequest),
     /// Input permissions for this session were granted or revoked.

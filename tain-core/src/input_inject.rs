@@ -8,6 +8,24 @@
 use anyhow::Result;
 use tracing::*;
 
+/// The rectangle of the host's desktop a guest is being shown.
+///
+/// Guest coordinates are normalized against the picture it receives, so this is
+/// what turns them back into desktop pixels — and on a multi-monitor host it is
+/// one display, not the whole desktop. Positions are physical pixels on the
+/// virtual desktop and may be negative: a display left of the primary one has a
+/// negative `x`.
+///
+/// Platform-neutral because [`InputInjector`] is, even though only the Windows
+/// backend has anything to do with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shown {
+    pub x: i32,
+    pub y: i32,
+    pub width: u16,
+    pub height: u16,
+}
+
 /// Absolute pointer position, normalized to `0..=65535` across the whole screen.
 #[derive(Debug, Clone, Copy)]
 pub struct MousePosition {
@@ -63,6 +81,17 @@ pub struct TouchInput {
 
 /// Trait for injecting input events into the host OS.
 pub trait InputInjector: Send + Sync {
+    /// Say which part of the desktop the guest is looking at.
+    ///
+    /// Everything a guest sends is normalized against the picture it was given,
+    /// so without this a backend has to guess which display that was — and the
+    /// only guess available is the primary one, which is wrong the moment a
+    /// guest selects another monitor.
+    ///
+    /// Defaults to doing nothing, because a backend that cannot inject at all
+    /// has nothing to be right or wrong about.
+    fn set_shown(&self, _shown: Shown) {}
+
     /// Move the pointer to an absolute position on the host display.
     fn move_mouse(&self, pos: MousePosition) -> Result<()>;
 
@@ -139,6 +168,10 @@ mod windows_impl {
     ];
 
     pub struct WindowsInjector {
+        /// Which part of the desktop the guest is looking at, once a session has
+        /// said. `None` until then, which means the primary display — the only
+        /// honest default, and the right one for every single-monitor host.
+        shown: Mutex<Option<Shown>>,
         /// The contacts Windows currently believes are down.
         ///
         /// Behind a mutex because the trait is `Sync` and this is the one piece
@@ -255,7 +288,7 @@ mod windows_impl {
 
     impl WindowsInjector {
         pub fn new() -> Result<Self> {
-            Ok(Self { touch: Mutex::new(TouchState::default()) })
+            Ok(Self { shown: Mutex::new(None), touch: Mutex::new(TouchState::default()) })
         }
 
         /// The rectangle of the virtual desktop the guest is looking at.
@@ -275,6 +308,17 @@ mod windows_impl {
             use windows::Win32::UI::WindowsAndMessaging::{
                 GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
             };
+
+            // What the session said it is streaming, when it has said.
+            if let Some(shown) = *self.shown.lock().unwrap_or_else(|e| e.into_inner()) {
+                return RECT {
+                    left: shown.x,
+                    top: shown.y,
+                    right: shown.x + i32::from(shown.width),
+                    bottom: shown.y + i32::from(shown.height),
+                };
+            }
+
             // SAFETY: documented reads of system metrics, no arguments to get
             // wrong and nothing to release.
             //
@@ -386,6 +430,10 @@ mod windows_impl {
     }
 
     impl InputInjector for WindowsInjector {
+        fn set_shown(&self, shown: Shown) {
+            *self.shown.lock().unwrap_or_else(|e| e.into_inner()) = Some(shown);
+        }
+
         fn move_mouse(&self, pos: MousePosition) -> Result<()> {
             // # Two conversions, not none
             //

@@ -803,6 +803,35 @@ impl GuestSession {
         super::progress::summary(self.progress(), &self.outcomes())
     }
 
+    /// Every display this session may see, as the host described them.
+    ///
+    /// Empty until `SessionStart`, and from a host that cannot enumerate its
+    /// displays — which means "one screen, the one being streamed", not none.
+    pub fn displays(&self) -> Vec<tain_core::protocol::DisplayInfo> {
+        self.shared.displays.lock().unwrap().clone()
+    }
+
+    /// Which display is being streamed, once the host has said.
+    pub fn watching(&self) -> Option<u32> {
+        *self.shared.watching.lock().unwrap()
+    }
+
+    /// Ask the host to show a different display.
+    ///
+    /// Fire and forget: the host answers with the display it is *actually*
+    /// showing, which is what updates [`Self::watching`]. Nothing here assumes
+    /// the request will be honoured, because a monitor can be unplugged between
+    /// the menu being drawn and the click landing.
+    pub fn watch_display(&self, id: u32) {
+        let control = self.shared.control.lock().unwrap();
+        match control.as_ref() {
+            Some(tx) => {
+                let _ = tx.send(tain_core::protocol::Message::WatchDisplay(id));
+            }
+            None => debug!("No session to ask for display {id}"),
+        }
+    }
+
     /// Which address lookup located this host, once one has.
     pub fn found_via(&self) -> Option<tain_core::discovery::Branch> {
         self.shared.health.lock().unwrap().found_via

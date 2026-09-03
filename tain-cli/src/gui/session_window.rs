@@ -549,6 +549,8 @@ impl SessionWindow {
             }
         }
 
+        render_display_picker(&mut content, session);
+
         content.add_space(12.0);
         render_input_toggles(&mut content, session);
 
@@ -1029,6 +1031,81 @@ fn input_state(loopback: bool, granted: bool, wanted: bool) -> theme::IconState 
     } else {
         theme::IconState::Off
     }
+}
+
+/// Which of the host's displays to watch.
+///
+/// # Why it is not shown for one display
+///
+/// A menu with a single entry is a control that cannot do anything, and most
+/// hosts have one monitor. It appears when there is a choice to make, which is
+/// also the only time anyone would look for it.
+///
+/// The label is the display's position in the host's own arrangement rather
+/// than its device name: `\\.\DISPLAY2` says nothing about *which* monitor that
+/// is, while "left" and "right" match what the person at the other end sees.
+fn render_display_picker(ui: &mut egui::Ui, session: &GuestSession) {
+    let displays = session.displays();
+    if displays.len() < 2 {
+        return;
+    }
+    let watching = session.watching();
+
+    ui.add_space(12.0);
+    let current = displays
+        .iter()
+        .find(|d| Some(d.id) == watching)
+        .map(|d| describe_display(d, &displays))
+        .unwrap_or_else(|| "Screen".to_string());
+
+    egui::ComboBox::from_id_salt("display-picker")
+        .selected_text(RichText::new(current).size(12.0).color(TEXT))
+        .width(112.0)
+        .show_ui(ui, |ui| {
+            for display in &displays {
+                let selected = Some(display.id) == watching;
+                let mut label = describe_display(display, &displays);
+                if display.hdr {
+                    label.push_str(" · HDR");
+                }
+                if ui.selectable_label(selected, label).clicked() && !selected {
+                    session.watch_display(display.id);
+                }
+            }
+        })
+        .response
+        .on_hover_text(
+            "Which of the host's screens to watch. The host is only asked; it answers with \
+             whichever screen it is actually showing, so a monitor unplugged since this menu \
+             was drawn cannot leave the picture and the label disagreeing.",
+        );
+}
+
+/// A display named the way the person at the host would recognise it.
+///
+/// Position first, because that is what identifies a monitor to a human — the
+/// device name is an index into something nobody can see. Size second, because
+/// two screens in the same relative position is not a thing, but two the same
+/// size very much is.
+fn describe_display(
+    display: &tain_core::protocol::DisplayInfo,
+    all: &[tain_core::protocol::DisplayInfo],
+) -> String {
+    if display.primary {
+        return format!("Main {}×{}", display.width, display.height);
+    }
+
+    // Relative to the primary, which is the one at the origin.
+    let where_ = match all.iter().find(|d| d.primary) {
+        Some(main) if display.x + i32::from(display.width) <= main.x => "Left",
+        Some(main) if display.x >= main.x + i32::from(main.width) => "Right",
+        Some(main) if display.y + i32::from(display.height) <= main.y => "Above",
+        Some(main) if display.y >= main.y + i32::from(main.height) => "Below",
+        // Overlapping or stacked oddly: fall back to something that at least
+        // distinguishes them.
+        _ => return format!("Screen {} {}×{}", display.id + 1, display.width, display.height),
+    };
+    format!("{where_} {}×{}", display.width, display.height)
 }
 
 /// The numbers, on their own row when asked for.
@@ -1730,5 +1807,71 @@ mod tests {
         assert!(actions.close.is_empty());
         assert!(!actions.close_all);
         window.reset();
+    }
+
+    fn screen(id: u32, x: i32, y: i32, w: u16, h: u16) -> tain_core::protocol::DisplayInfo {
+        tain_core::protocol::DisplayInfo {
+            id,
+            name: format!(r"\.\DISPLAY{}", id + 1),
+            width: w,
+            height: h,
+            x,
+            y,
+            primary: x == 0 && y == 0,
+            hdr: false,
+        }
+    }
+
+    /// A screen is named by where it is, not by what the driver calls it.
+    ///
+    /// `\.\DISPLAY2` identifies nothing to the person choosing: it is an index
+    /// into a list they cannot see, and it is not even stable when a monitor is
+    /// plugged in. Where a screen sits is what someone at the host recognises.
+    #[test]
+    fn screens_are_named_by_where_they_are() {
+        let all = vec![
+            screen(0, 0, 0, 2560, 1600),
+            screen(1, -1920, 0, 1920, 1080),
+            screen(2, 2560, 0, 1920, 1080),
+        ];
+
+        assert_eq!(describe_display(&all[0], &all), "Main 2560×1600");
+        assert_eq!(describe_display(&all[1], &all), "Left 1920×1080");
+        assert_eq!(describe_display(&all[2], &all), "Right 1920×1080");
+    }
+
+    /// Stacked screens are above and below, not left and right.
+    #[test]
+    fn a_screen_stacked_over_the_main_one_says_so() {
+        let all = vec![screen(0, 0, 0, 2560, 1600), screen(1, 0, -1080, 1920, 1080)];
+        assert_eq!(describe_display(&all[1], &all), "Above 1920×1080");
+
+        let all = vec![screen(0, 0, 0, 2560, 1600), screen(1, 0, 1600, 1920, 1080)];
+        assert_eq!(describe_display(&all[1], &all), "Below 1920×1080");
+    }
+
+    /// An arrangement that is none of those still names every screen distinctly.
+    ///
+    /// Monitors can overlap in Windows' layout, and two screens that both came
+    /// back "Screen" would make the menu useless in exactly the case where it
+    /// is hardest to guess.
+    #[test]
+    fn an_odd_arrangement_still_tells_the_screens_apart() {
+        // Diagonally offset: neither wholly beside nor wholly above.
+        let all = vec![
+            screen(0, 0, 0, 2560, 1600),
+            screen(1, 1000, 800, 1920, 1080),
+            screen(2, 1200, 900, 1920, 1080),
+        ];
+        let named: Vec<String> = all.iter().map(|d| describe_display(d, &all)).collect();
+        let unique: std::collections::HashSet<&String> = named.iter().collect();
+        assert_eq!(unique.len(), named.len(), "two screens share a name: {named:?}");
+    }
+
+    /// The main screen is the main screen whatever else is around it.
+    #[test]
+    fn the_primary_is_always_called_main() {
+        let alone = vec![screen(0, 0, 0, 1920, 1080)];
+        assert!(describe_display(&alone[0], &alone).starts_with("Main"));
     }
 }
