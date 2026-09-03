@@ -23,6 +23,10 @@ This file documents *why* the codebase is structured the way it is. Consult this
 - iroh handles NAT traversal, hole punching, and relay fallback out of the box — no manual STUN/TURN configuration needed.
 - Built on QUIC (via quinn), giving us multiplexed streams over a single connection with built-in TLS 1.3 encryption.
 - The `presets::N0` configuration provides free public relays, so peers behind symmetric NATs still connect.
+  - *Later, twice over:* the relay is no longer allowed to carry a session — see
+    **A Session Runs on a Direct Path or Not at All**. And `presets::N0` is no
+    longer called: `discovery::endpoint_builder` writes out what it does, so
+    each lookup can be attributed and two more can be added beside them.
 - iroh is actively maintained by n0.computer and has reached v1.0 (stable API).
 - Compared to libp2p: simpler API surface, less boilerplate for our use case.
 - Compared to WebRTC: iroh gives us raw QUIC streams which are more natural for binary protocol messaging than WebRTC data channels.
@@ -607,7 +611,14 @@ The identity is kept unconditionally, independent of either auto-reset setting. 
 - The stub capturer (always available, generates gradient frames) allows testing the full pipeline without screen permissions.
 - Adding a new backend only requires implementing the trait — no changes to protocol or network layers.
 
-**Gotcha**: `scap` crate returns BGRA frames natively on all platforms it supports, so our `ScreenFrame` struct uses BGRA order consistently regardless of which backend is active. If you add a non-BGRA backend (e.g., YUV420 from hardware encoder), convert to BGRA in the capturer before returning.
+**Gotcha**: `ScreenFrame` is BGRA regardless of backend, so a non-BGRA backend
+converts before returning.
+
+> **Partly overtaken.** `scap` was never adopted — see **Screen Capture: DXGI
+> Desktop Duplication** for why. And the capture path no longer insists on BGRA:
+> `capture_nv12` converts on the GPU so the encoder is handed NV12 directly,
+> which is what it wanted all along. BGRA remains the format the trait describes
+> and what a CPU-side capturer must produce.
 
 ## Input Coordinates: Normalized on the Wire
 
@@ -683,6 +694,12 @@ The identity is kept unconditionally, independent of either auto-reset setting. 
 
 ## CLI: clap Subcommands, Not Flags-Only
 
+> **Superseded.** `main.rs` reads bare `std::env::args` and declares no
+> subcommands. The binary is a GUI application with a handful of modes —
+> service, agent, console — entered by the service control manager or by a
+> single flag, not chosen from a command surface. `clap` is still a dependency
+> of `tain-cli`; nothing in the compiled path uses it.
+
 **Decision**: Use `clap` subcommands (`host`, `guest`) rather than a single command with many flags.
 
 **Rationale**:
@@ -693,6 +710,14 @@ The identity is kept unconditionally, independent of either auto-reset setting. 
 **Gotcha**: The `host` and `guest` subcommands share the global `--verbose` flag via `#[command(global = true)]`. This is a clap 4 feature — make sure all subcommand structs have matching field types for global flags.
 
 ## Future: GUI Layer (egui / Tauri)
+
+> **Done, and not as described.** The GUI is egui/eframe 0.29 on glow, it is the
+> only entry point, and nearly all the work since has gone into it. `guest.rs`
+> and `host.rs` still exist and are no longer reached from `main.rs`. The claim
+> below that the protocol and networking layers would need zero changes did not
+> survive contact: video moved to its own unidirectional stream, telemetry and
+> adaptive control were added in both directions, and approval grew per-device
+> grants.
 
 **Decision**: The current CLI demo uses stdin/stdout for input simulation. A real guest would render frames in an egui or Tauri window and capture real mouse/keyboard events from the OS.
 
@@ -705,3 +730,233 @@ The identity is kept unconditionally, independent of either auto-reset setting. 
 2. Captures mouse/keyboard events from egui's input system → sends as `Message::Input`
 
 The protocol layer (`protocol.rs`) and networking layer (`network.rs`) require zero changes for this migration — only the guest mode implementation needs updating.
+
+---
+
+# Networking and discovery
+
+## A Session Runs on a Direct Path or Not at All
+
+**Decision**: Wait for hole punching to produce a direct path, and refuse the
+session if it never comes. The relay carries the handshake and the address
+exchange that make the punch possible, and nothing else.
+
+**Rationale**: Every iroh connection begins relayed and upgrades if it can, so
+"connected" was never the same as "able to stream" and nothing checked the
+difference. A relay is a shared public server, rate limited, carrying everyone
+else who landed on it — ample for the few hundred kbit/s it exists to carry, and
+hopeless for ten to twenty Mbit/s of video.
+
+**Measured**: the relayed session collapsed to a third of full resolution at
+8 fps and stayed there, while the same pair of machines managed 41 fps in the
+other direction on a direct path to the same LAN. A session over a relay is not
+degraded, it is unusable, and failing to connect at least says so in a second
+rather than after a minute of watching a slideshow.
+
+**Cost when it works**: about a tenth of a second. A loopback connection is
+carried directly in ~100 ms against a 25-second budget.
+
+**Both ends check**, so an older build on the far end cannot make a host
+capture, encode and stream into a relay. The host allows a margin over the
+guest's deadline: both wait on the same punch, and whoever closes first decides
+what the user is told — which should be the guest, since it is the side with
+something to say about it.
+
+**Not covered**: reachability probing still uses the relay. It is control
+traffic, which is what a relay is for, and it closes too quickly to have waited
+for a punch anyway. A relay-only host therefore still shows as online, and
+explains itself when the connection is refused.
+
+## Finding a Peer Without Asking One Particular Server
+
+**Decision**: Run mDNS and mainline-DHT address lookup alongside the n0 ones.
+
+**Rationale**: `presets::N0` installs three lookup services, which reads like
+redundancy and is not — a pkarr publisher, a pkarr resolver over HTTPS, and DNS
+TXT, all three pointed at `dns.iroh.link`. With the four relays under
+`relay.n0.iroh.link`, the entire ability to find anybody rested on five names
+belonging to one organisation, resolved through whatever the local network says
+DNS is. The cache on the development machine had learned exactly those five,
+which is the whole DNS surface there is.
+
+That is a poor arrangement anywhere, not only where a network is interfered
+with: one operator's uptime, one DNS answer that can be wrong, and — for two
+machines in the same building, which is what a remote desktop is mostly used for
+— a round trip through the public internet to learn the address of a computer
+three metres away.
+
+**Measured**: two endpoints built from `presets::Minimal` with only these
+attached, told nothing about each other, connect in under a second. The DHT
+bootstraps in two seconds against 115 peers on a heavily filtered connection,
+and a publish-then-resolve round trip takes about eight seconds and sometimes
+two asks.
+
+**Attached after `bind`, not through the builder.** iroh calls
+`into_address_lookup` during `bind` and propagates the error, so a machine where
+multicast will not open or the DHT cannot bind its port would fail to start the
+application at all. These are extra ways to find a peer; not having one is worth
+a log line. `discovery::bind` does both halves, because an endpoint built
+without the attach has no resolving lookups at all — it would look perfectly
+healthy while being unable to find anybody.
+
+**Local disclosure**: mDNS announces this endpoint id on the local network. Not
+enough to connect, since a passcode is still required, but worth knowing on a
+network you do not own.
+
+## Publish an Address a Peer Can Dial, Not Only a Place to Meet
+
+**Decision**: Both directories Tain publishes to carry the relay *and* any
+address routable from outside. Private addresses are filtered out.
+
+**Rationale**: the default everywhere is relay-only, which is safe and leaves a
+peer with somewhere to meet and nothing to dial. Where punching then fails there
+is nothing else to try, and since a relayed session is refused, the connection
+fails outright.
+
+**Measured**: a tunnel on one machine and not the other. DNS answered, gave the
+relay, the connection came up on it, and no direct path ever opened. Waiting
+longer would not have helped and neither would waiting for the DHT — it had the
+same relay and no addresses of its own, because it had been told to publish
+none. The address that would have worked was never published by anybody.
+
+**Not unfiltered**: a `192.168` address is the worst of both — unreachable for
+the remote peer it would be published for, while telling anyone who reads the
+record how the local network is laid out. The case it would serve is answered by
+mDNS in under a second without publishing anything anywhere. Carrier-grade NAT
+is dropped alongside RFC1918, which `is_private` does not cover.
+
+**The trade**: a machine's public address goes into a public directory under a
+long-lived identity. It is the address any peer it connects to sees anyway; what
+is new is that it can be read without connecting.
+
+## Discovery Is Allowed to Be Slow
+
+**Decision**: retry a dial that fails with `NoAddress` for thirty seconds.
+
+**Rationale**: how fast a session runs is decided by the path it found, not by
+how long finding it took, so there is nothing to gain by giving up early.
+
+iroh already waits on lookups that are *still in flight* — mDNS keeps its stream
+open, and a host that appeared ten seconds into a dial is picked up on the first
+attempt. What it does not wait for is lookups that **complete** with nothing,
+which returns `NoAddress` at once with the whole budget unspent. A guest whose
+mDNS could not start and whose DNS is blocked has only the DHT, and one attempt
+called the host offline.
+
+**Only for `NoAddress`.** That is the difference between nobody having said
+where this host is, where more time is the entire fix, and a host that answered
+and refused, where retrying only turns a clear failure into a slow one.
+
+## Which Lookup Answered Is Worth Knowing, and iroh Does Not Say
+
+**Decision**: wrap every resolving lookup in a decorator that passes results
+through untouched and records which service produced the first one.
+
+**Rationale**: `Item::provenance()` exists on every result and nothing carries
+it out to where an application can see it — `TransportAddrInfo` has the address
+and whether it is in use, and no record of where it came from.
+
+Since a relayed session is refused, "direct" is the only thing a status chip
+could ever say and it carries no information. *How* the host was found does:
+whether the local network, the public lookup service, or the DHT is currently
+doing the work is the part that varies, and the part that explains a slow
+connect or a host that could not be reached.
+
+**Inference was rejected.** Attributing by elimination — assume DNS whenever
+neither of ours answered — would have been wrong often enough to matter: DNS
+answering first with mDNS a moment later is indistinguishable from the reverse
+unless something is watching, and this label is shown to a user as fact.
+
+**Cost**: wrapping the n0 services means adding them individually, so
+`discovery::endpoint_builder` writes out what `presets::N0` does rather than
+calling it. It is the one place that has to track that.
+
+**"Known" was not good enough** as a fourth answer. A connection code carries a
+relay, so most dials never need a lookup at all, and one word folded that common
+case together with arriving on a stale remembered address and arriving on the
+code's relay with nothing else contributing — which is the exact state that then
+fails at `Direct`. The three are told apart by what happened: a lookup noting an
+answer, or failing that whether the connection landed on a relay, which only the
+code could have supplied.
+
+# The connection graph
+
+## A Failure Must Stay on the Graph
+
+**Decision**: draw connecting as six stages that fill up, keep the graph on
+screen when it fails, and show what each stage produced.
+
+**Rationale**: the status line can only ever show the step happening now. That
+answers "what is it doing" and is no help with "how much of this is left", which
+is what someone watching a spinner is asking. The stages are deliberately
+coarser than `DialStep` — that enum exists to say precisely which thing failed,
+which wants detail; this is read at a glance, which wants the opposite.
+
+**A failure must stay put.** `GuestStatus::Failed` carries a message and nothing
+else, so by the time a failure is visible the step it failed on is gone. The
+furthest stage reached is kept in shared state, updated at the one place status
+changes. A graph that vanishes at the moment it becomes most informative is the
+wrong answer.
+
+**Results, not only steps.** A row of stage names says how far a connection got
+and nothing about what it found, leaving the interesting question answerable
+only by hovering something else. Every stage with an answer worth six characters
+carries it, and a stage that stopped says what it was left holding — `Find:
+code`, `Direct: relayed` is the whole diagnosis of the common failure.
+
+## Stats Are Anchored, Because They Are Read by Glancing
+
+**Decision**: fixed-width fields in a monospaced font, conditional ones appended
+last.
+
+**Rationale**: these are read while something is going wrong, which means
+glancing at the same spot repeatedly. Built the obvious way — join whatever
+happens to apply — every field moved whenever any field to its left changed
+width, and a figure that jumps as it updates has to be re-found every second
+instead of watched. Both byte-rate units are six characters wide, and the
+latency column holds itself open with a dash until the first measurement lands.
+
+# Adaptive control and codecs
+
+## A Guest That Has Not Started Decoding Is Not a Failing Link
+
+**Decision**: the host's delivered-frame check does not run until the guest has
+reported decoding something at least once.
+
+**Rationale**: a guest reports telemetry from the moment its stream opens, well
+before it has a decoder — it is still authenticating, sizing its window and
+negotiating a codec. Every one of those reports carries `decoded_fps: 0`, which
+is the honest answer when there is nothing to decode with. The host is already
+capturing and sending by then, and compared the two.
+
+**Measured**: the host began sending at 17:01:32 and the guest opened its
+session at 17:01:55. In those twenty-three seconds the host sent three hundred
+frames, saw none decoded, diagnosed a slow network and collapsed to 33%
+resolution at 8 fps — then held exactly 8.0 captured/s for another minute. The
+link was fine; every frame that reached the guest decoded.
+
+**Latched, not a simple non-zero test**: once a guest has decoded something, a
+later zero does mean the frames stopped arriving, which is the whole point of
+the check. This is the same guard `acks_stale` already carried, applied to the
+signal beside it.
+
+## Availability and Buildability Must Be Tied Together
+
+**Decision**: a test asserts that every codec `is_available()` reports can
+actually be built.
+
+**Rationale**: `is_available` is three things at once — what the settings list,
+what negotiation promises a guest, and what `effective_codec` stops falling back
+from. `create_encoder` is what has to build the thing, and nothing tied them
+together. AV1 shipped listed, offered, negotiated, and unbuildable: the match
+had no arm for it.
+
+**What that looked like**: a guest negotiated AV1, built a decoder, logged that
+it was decoding AV1 on the GPU, and had the host drop the connection 418 ms
+later. It read as "AV1 crashes", in both directions, because both machines had
+the same gap.
+
+**The existing test did not catch it** because it accepted *any* failure from a
+GPU-only codec as "the GPU declined a 16×16 frame", which absorbed "nobody wrote
+this arm". Telling those apart needs the error text, not the presence of an
+error.

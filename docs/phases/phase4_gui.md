@@ -1,16 +1,20 @@
 # Phase 4: egui GUI Layer (Guest Client)
 
-> ⚠️ **This document describes a design that was never built.** It is kept for the
-> architectural reasoning only. Do not treat any of it as a description of the code.
+> ⚠️ **Historical. Do not read this as a description of the code.**
 >
-> Specifically, none of the following exist: Host/Guest tabs, an FPS counter,
-> egui→VK keycode mapping, frame rendering, input capture, or an approval popup
-> modal. `tain-cli/src/guest.rs` is not compiled into the binary at all.
+> This described a design that was not built at the time. Since then most of it
+> *has* been built, and differently: frame rendering, egui→VK keycode mapping,
+> input capture, and per-device approval all exist, and sessions open in a
+> separate window with one tab each rather than in a Guest tab. `guest.rs` is
+> still not compiled into the binary.
 >
-> "Compiles clean, zero warnings" was true and meaningless — the warnings that would
-> have revealed nothing was wired up were suppressed with `#[allow(dead_code)]`.
-> See the Status table in `README.md` for what actually works, and prefer tests
-> over docs as the source of truth.
+> The original warning below is kept because its lesson outlived its subject:
+> "compiles clean, zero warnings" was true and meaningless — the warnings that
+> would have revealed nothing was wired up had been suppressed with
+> `#[allow(dead_code)]`.
+>
+> For what exists now, read `docs/structure.md` and the Status table in
+> `README.md`, and prefer the tests over any of them.
 
 **Original status claim**: ✅ Compiles clean (zero errors, zero warnings)  
 **Date**: July 29, 2025

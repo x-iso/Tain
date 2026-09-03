@@ -4,27 +4,33 @@ A peer-to-peer remote desktop application built in Rust, using [iroh](https://ir
 
 ## Features
 
-- **P2P via iroh 1.0** — Direct QUIC connections with automatic hole punching and relay fallback (works through NAT, VPNs, firewalls)
+- **P2P via iroh 1.x** — QUIC with hole punching. A session runs on a **direct path or not at all**: a relay carries the handshake and never the video
+- **Found without one server** — mDNS on the local network and the mainline DHT run alongside the public lookup service, so a peer is findable when DNS is blocked and instantly when it is in the same building
 - **Passcode-based auth** — Master passcodes grant immediate control; guest passcodes are streamed **nothing** until the host allows the connection, every time
-- **Multi-user support** — Multiple guests can connect to one host simultaneously, each independently approved
-- **H.264 video** — Software encoding via OpenH264, with selectable lossless and raw paths
-- **Saved connections** — Hosts you have connected to are remembered and reconnectable
-- **Cross-platform** — Works on Windows, macOS, and Linux via native screen capture APIs
+- **Multi-user support** — Several guests on one host at once, each independently approved
+- **Hardware video** — H.264, H.265 and AV1 through Media Foundation, decoded on the GPU through libavcodec, with software H.264, lossless and raw paths behind them
+- **Adapts to what it measures** — Frame rate, resolution and bitrate follow the pipeline and the link, and the session says which of them is holding it back
+- **Audio and cursor** — System audio over Opus; the host's pointer sent as data so it moves at the guest's frame rate
+- **Saved connections** — Hosts you have connected to are remembered, with their codes in the OS credential store
 
 ## Architecture
 
 ```text
-┌──────────────────┐    iroh P2P QUIC (ALPN: "rdp")     ┌──────────────────┐
-│        Host       │ ◄════════════════════════════════► │       Guest      │
-│                   │                                     │                  │
-│  Screen Capture   │  Frame stream (H.264 / raw BGRA)    │  Decoder         │
-│  H.264 Encoder    │ ────────────────────────────────►   │  Display Surface │
-│  Passcode Store   │                                     │                  │
-│  Session Manager  │  Input stream (mouse/keyboard)      │  Input Events    │
-│  Host Server      │ ◄═══════════════════════════════  │  (GUI window /   │
-│                   │                                     │   CLI simulation)│
+┌──────────────────┐   iroh P2P QUIC, ALPN "tain/2"    ┌──────────────────┐
+│       Host       │ ◄════════ direct path only ══════► │       Guest      │
+│                  │                                     │                  │
+│  DXGI capture    │  video stream (unidirectional)      │  GPU decode      │
+│  GPU NV12        │ ─────────────────────────────────►  │  GPU RGBA        │
+│  HW encoder      │                                     │  OpenGL, no      │
+│                  │                                     │  readback        │
+│  adaptive ctrl   │  control stream (bidirectional)     │                  │
+│  passcodes       │ ◄═════════════════════════════════► │  input, cursor,  │
+│  sessions        │    input · telemetry · audio        │  audio, session  │
 └──────────────────┘                                     └──────────────────┘
 ```
+
+Frames go down a stream of their own so a keyframe cannot queue in front of a
+mouse movement. See [docs/architecture/overview.md](docs/architecture/overview.md).
 
 ### Protocol Messages
 
@@ -106,24 +112,29 @@ The host can approve or deny individual guests without affecting others.
 ```
 ├── Cargo.toml              # Workspace root
 ├── README.md               # This file
-├── tain-core/               # Shared library crate
-│   ├── Cargo.toml
+├── tain-core/              # Everything that is not a window
 │   └── src/
-│       ├── lib.rs          # Crate root with module declarations
-│       ├── protocol.rs     # Message types (Frame, InputEvent, Auth, etc.)
-│       ├── network.rs      # HostServer + GuestClient using iroh endpoints
-│       ├── passcode.rs     # Master/guest passcode generation and validation
-│       ├── screen_capture.rs  # Screen frame capture (scap feature / stub)
-│       ├── encoder.rs          # Raw BGRA passthrough (H.264 placeholder for future hardware-accelerated impl)
-│       ├── input_inject.rs       # Platform-specific keyboard/mouse injection
-│       └── session.rs            # Multi-session management for concurrent guests
-└── tain-cli/                # CLI binary crate
-    ├── Cargo.toml
+│       ├── network.rs      # HostServer + GuestClient: accept, handshake, streams, adaptive loop
+│       ├── protocol.rs     # Every message that crosses the wire
+│       ├── discovery.rs    # mDNS + mainline DHT, and which branch found a host
+│       ├── dns_cache.rs    # Relay addresses remembered from last time
+│       ├── adaptive.rs     # Measures the pipeline, decides what to give up
+│       ├── capture_*.rs    # DXGI duplication, shared capture, NV12, HDR, agent pipe
+│       ├── codec_*.rs      # Media Foundation, OpenH264, delta+zstd
+│       ├── decode_*.rs     # libavcodec D3D11VA, NV12→RGBA on the GPU
+│       ├── audio_*.rs      # WASAPI loopback, Opus, jitter buffer, playback
+│       └── …               # passcodes, sessions, connection codes, cursor, input, service
+└── tain-cli/               # The `tain` binary: GUI, service, and per-desktop agent
     └── src/
-        ├── main.rs         # clap-based argument parsing, host/guest subcommands
-        ├── host.rs         # Host mode: passcode generation, approval management
-        └── guest.rs        # Guest mode: input simulation loop (CLI demo)
+        ├── main.rs         # Entry point; bare args, no subcommands
+        ├── service.rs      # Register, control and run as a Windows service
+        ├── agent.rs        # The per-desktop agent process
+        └── gui/            # app, session, session_window, network_bridge,
+                            # progress, gl_interop, immersive, settings, theme, …
 ```
+
+The full list, with what each module is for, is in
+[docs/structure.md](docs/structure.md).
 
 ## Building
 
@@ -182,11 +193,16 @@ release — a debug build's numbers are dominated by unoptimised pixel loops.
 | Component | Dependency | Purpose |
 |-----------|-----------|---------|
 | Networking | `iroh` 1.x | P2P QUIC connections, NAT traversal (hole punching + relay) |
+| Discovery | `iroh-mdns-address-lookup`, `iroh-mainline-address-lookup` | Finding a peer on the local network, or through the DHT, without DNS |
 | Serialization | `serde` + `bincode` (v1.x) | Efficient binary protocol messages (NOT v2, which requires serde feature flag) |
 | Screen capture | `windows` (DXGI) | Desktop Duplication on Windows; test pattern elsewhere |
-| Video encoding | `openh264` 0.9 | H.264 encode and decode, built from source — **needs `nasm`** |
+| Hardware video | `windows` (Media Foundation) | H.264, H.265 and AV1 encode on the GPU |
+| Hardware decode | ffmpeg / libavcodec | D3D11VA decode. **Optional** — found or fetched by `build.rs`, which sets the `db_ffmpeg` cfg only when the shim compiles |
+| Software video | `openh264` 0.9 | H.264 encode and decode, built from source — **needs `nasm`** |
+| Audio | `windows` (WASAPI) + Opus | System audio capture and playback |
 | Lossless codec | `zstd` | The delta+zstd path |
-| Passcode encoding | `bs58` | Base58 human-readable passcodes |
+| Passcode encoding | `bs58` (check) | Base58check codes, so a mangled paste fails loudly |
+| Secret storage | `keyring` 4 | Connection codes in the OS credential store, never in a file |
 | Async runtime | `tokio` 1.x | Required by iroh and used throughout |
 
 ## Usage
@@ -195,10 +211,11 @@ release — a debug build's numbers are dominated by unoptimised pixel loops.
 cargo run
 ```
 
-That launches the GUI, which is the only entry point today. There is **no argument
-parsing yet** — `host` / `guest` subcommands are not implemented, and `tain-cli/src/host.rs`
-and `tain-cli/src/guest.rs` are not currently compiled into the binary (`main.rs` declares
-only `mod gui;`).
+That launches the GUI, which is the only entry point you type. There are **no
+subcommands** — `main.rs` reads a couple of bare arguments rather than parsing a
+command surface, and the other modes it compiles (`service`, `agent`, `console`,
+`migrate`) are entered by the service control manager or by a single flag.
+`tain-cli/src/host.rs` and `guest.rs` still exist and are not compiled in.
 
 The middle and footer sections are empty until a real session exists, which makes
 their layout hard to iterate on. Debug builds accept an opt-in flag that fills them
@@ -208,14 +225,21 @@ with sample rows — it is compiled out of release builds entirely:
 TAIN_DEBUG=demo cargo run
 ```
 
-Flags are comma-separated and debug-only — all of them are compiled out of release
-builds:
+Flags are comma-separated. Most are compiled out of release builds; two are
+deliberately not, because the build whose numbers matter is the release one:
 
-| Flag | Effect |
-|------|--------|
-| `demo` | Fill the connection lists with sample rows |
-| `loopback` | Connect to our own host endpoint on startup, to smoke-test the video path on one machine |
-| `settings` | Open the settings window immediately |
+| Flag | Effect | Builds |
+|------|--------|--------|
+| `demo` | Fill the connection lists with sample rows | debug |
+| `settings` | Open the settings window immediately | debug |
+| `approval` | Open the approval dialog for the pending demo guest | debug |
+| `loopback` | Connect to our own host endpoint on startup, to exercise the video path on one machine | **all** |
+| `frametime` | Report where a frame of UI time went, once a second | **all** |
+
+`loopback` and `frametime` stay in release because measuring the pipeline needs
+both ends running, and a debug build's per-pixel decode is slow for reasons that
+say nothing about the shipped one — reporting debug numbers as if they described
+the real thing has sent an investigation down a wrong turn once already.
 
 ```bash
 TAIN_DEBUG=loopback,settings cargo run
@@ -328,9 +352,15 @@ begins accepting connections. The window shows:
 | Codec | State | Use it for |
 |-------|-------|------------|
 | **H.264 / AVC** | Default | Everything. ~an order of magnitude smaller than lossless on real desktop use |
+| **H.265 / HEVC** | Available where the GPU can | 30–50% smaller than H.264 at equal quality, for more encode cost |
+| **AV1** | Available where the GPU can | Smallest streams. Needs recent hardware — Arc, Ada, RDNA3 and up |
 | **Lossless (delta + zstd)** | Available | Pixel-exact text work on a fast link. Cheap on a still screen, expensive the moment it moves |
 | **Raw BGRA** | Available | Debugging, or a LAN where 400 MB/s is free |
-| H.265, AV1, VP9 | Planned | — |
+| VP9 | Planned | — |
+
+H.265 and AV1 are asked of the *machine*, not assumed: a host whose GPU cannot
+encode one advertises H.264 instead, so the two ends never negotiate something
+neither can run.
 
 H.264 is encoded in **software** by OpenH264 — no driver dependency, works anywhere.
 Selecting the `Hardware` backend is currently a preference, not a guarantee: no GPU
@@ -424,6 +454,18 @@ below means there is a test covering it, not that it compiles.
 | Immersive mode | ✅ Windows | Win key forwarded via a keyboard hook, pointer confined to the window |
 | Session window | ✅ Works | Separate window, one tab per session, several at once |
 | Approve / kick guests | ✅ Works | Person icon, with confirmation on both |
+| Hardware encode | ✅ Windows | H.264, H.265 and AV1 via Media Foundation, where the GPU has them |
+| Hardware decode | ✅ Windows | libavcodec D3D11VA; drawn straight from the GPU where interop exists |
+| Adaptive quality | ✅ Works | Frame rate, scale and bitrate follow measurement; the session names the bottleneck |
+| Audio | ✅ Windows | WASAPI loopback, Opus, jitter buffer that grows when the link breaks it |
+| Remote cursor | ✅ Works | Sent as data, so it moves at the guest's frame rate rather than the stream's |
+| HDR hosts | ✅ Windows | Tone-mapped back into range by shader, with a video-processor fallback |
+| Direct path required | ✅ Works | A relayed session is refused rather than run; both ends check |
+| Local discovery | ✅ Works | mDNS finds a host on the same network in under a second, with no relay or DNS |
+| DHT discovery | ✅ Works | Mainline DHT, ~8 s; works where DNS is blocked |
+| Connection graph | ✅ Works | Six stages with their results; a failure stays on screen where it happened |
+| Windows service | ✅ Windows | Runs before login, with a per-desktop agent for the lock screen and UAC |
+| Notifications | ✅ Windows | Tray notification when a guest connects, admin included |
 | Fullscreen + toolbar | ✅ Works | Scaling modes, auto-hiding overlay, toggleable |
 | Screen capture | ✅ Windows | DXGI Desktop Duplication at native resolution; test pattern elsewhere |
 | Video compression | ✅ Works | H.264 (software) by default, plus lossless delta+zstd and raw |
@@ -445,7 +487,8 @@ Duplication is *lost* rather than interrupted by resolution changes, driver rest
 UAC prompts, and the lock screen; the capturer rebuilds itself transparently and keeps
 serving the last good frame meanwhile.
 
-The default codec is **H.264**, encoded in software by OpenH264. See
+The default codec is **H.264**, encoded on the GPU through Media Foundation where
+that is available and by OpenH264 in software where it is not. See
 [Video Pipeline](#video-pipeline) above for the trade-offs and the CPU cost.
 
 The **lossless delta + zstd** path is still there and still worth choosing for
@@ -455,38 +498,53 @@ Pixel-exact, CPU-only, and an unchanged screen costs a few hundred bytes instead
 16 MB. Its weakness is motion — the delta stops being zeroes and the cost tracks
 whatever the screen did, which is why it is no longer the default.
 
-H.265, AV1 and VP9 are declared with encoder backend (auto/hardware/software), rate
-control (CBR/VBR/constant-quality), bitrate limit and keyframe interval, but are **not
-implemented** — they show as "(planned)" and unselectable. Choosing one falls back to
-H.264 rather than to raw, so an unavailable codec never silently costs you hundreds of
-MB/s.
+**H.265 and AV1 are implemented**, on the GPU only — there is no software path for
+either, and adding one would be a poor trade for a stream that has to stay
+interactive. Both are asked of the machine rather than assumed: a host whose GPU
+cannot encode one advertises H.264 instead, so the two ends never negotiate
+something neither can run. VP9 is still declared and unimplemented.
+
+Choosing an unavailable codec falls back to H.264 rather than to raw, so it never
+silently costs you hundreds of MB/s. The encoder backend
+(auto/hardware/software), rate control (CBR/VBR/constant-quality), bitrate limit
+and keyframe interval are all settings.
 
 ## Roadmap / Next Steps
 
-1. **Hardware H.264** — Media Foundation on Windows, VideoToolbox on macOS, VAAPI on
-   Linux. This is now the single highest-value item: even with SIMD assembly the
-   software encoder needs ~45 ms per frame at 2560×1600, so full resolution cannot hold
-   30 fps and the priority slider has to trade pixels away to compensate. A GPU encoder
-   would remove that trade entirely. The `Hardware` backend setting also currently
-   promises something it does not deliver.
-2. **Dirty-rectangle capture** — DXGI reports which regions changed; sending only those
-   would cut both encode cost and bandwidth further.
-3. **Capture on macOS and Linux** — ScreenCaptureKit and PipeWire; both are stubs today
-4. **Input injection on macOS and Linux** — `CGEventPost` and XTest
-5. **Passcode persistence** — codes are in-memory only and do not survive a restart.
-   This is why a saved connection's stored code usually stops working after a host
-   restart, even with autoreset off.
-6. **Clipboard sync, audio, multi-monitor**
+Done since this list was written: hardware H.264 (and H.265, and AV1) via Media
+Foundation, hardware decode via libavcodec D3D11VA, audio, passcode and identity
+persistence in the OS credential store, and a Windows service that runs before
+login.
+
+1. **Dirty-rectangle capture** — DXGI reports which regions changed; sending only
+   those would cut both encode cost and bandwidth further.
+2. **Capture on macOS and Linux** — ScreenCaptureKit and PipeWire; both are stubs today
+3. **Input injection on macOS and Linux** — `CGEventPost` and XTest
+4. **Hardware encode off Windows** — VideoToolbox and VAAPI, once there is
+   anything to capture on those platforms
+5. **Clipboard sync and multi-monitor**
+6. **H.265 keyframe handling** — inter frames on static content intermittently
+   come back a flat neutral grey. Characterised, not fixed; moving content is
+   correct on all three codecs.
 
 ## Testing between two machines
 
 1. Run Tain on both. Windows will prompt for **firewall access** the first time —
-   allow it on both, or iroh cannot hole-punch and will fall back to a slower relay.
+   allow it on both. Without it a direct path cannot be punched, and since a
+   relayed session is refused, the connection will fail rather than crawl.
 2. On the host, click **Copy admin passcode** (full control) or **Copy guest passcode**
    (view-only until approved).
 3. Get that code to the other machine and click **Paste passcode**, then the arrow.
 4. A guest code appears in the host's footer awaiting approval — click the mouse and
    keyboard icons to grant each independently.
 
-Both machines need internet access for the n0 relay to introduce them, even when they
-end up talking directly.
+**On the same network, neither machine needs the internet.** mDNS finds the host
+by multicast in under a second and the two punch directly, with no relay and no
+DNS involved. The session's toolbar says `LAN` when that is what happened.
+
+Across the internet they do need to be introduced, and there are three ways that
+can happen — the relay named in the connection code, the public lookup service,
+or the mainline DHT. The toolbar says which, and hovering it shows the whole
+path. If it says `code` and the connection then fails at `Direct`, the relay was
+the only route there was and nothing published an address worth dialling: a VPN
+or a strict NAT on either machine is the usual reason.

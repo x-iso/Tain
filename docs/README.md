@@ -1,33 +1,72 @@
-# P2P Remote Desktop — Architecture Documentation
+# Tain — Architecture Documentation
 
-This directory contains architectural documentation and codebase structure reference. It is kept up-to-date to serve as a context map for fresh sessions and future development.
+A context map for a fresh session. Kept current with the code; where it is not,
+the code and the tests win.
 
-## Quick Reference
+## Quick reference
 
 | File | Purpose |
 |------|---------|
-| [architecture/overview.md](architecture/overview.md) | High-level system design, data flow, protocol messages |
-| [structure.md](structure.md) | Complete file tree with module descriptions |
-| [decisions.md](decisions.md) | Key design decisions and rationale |
+| [structure.md](structure.md) | Every module, what it is for, and where to look first |
+| [architecture/overview.md](architecture/overview.md) | How a connection is made, what crosses the wire, how quality is decided |
+| [decisions.md](decisions.md) | Why things are the way they are, and what each change cost to learn |
 
-## How to Use This Documentation
+## How to use it
 
-- **Starting a new session**: Read `structure.md` for the codebase layout, then `architecture/overview.md` for how components interact.
-- **Making changes**: Check `decisions.md` first — it documents *why* things are built the way they are, so you don't repeat past mistakes.
-- **Adding features**: Update this directory as soon as structural or architectural changes occur. The goal is zero context loss between sessions.
+- **Starting a session**: `structure.md` for the layout, then
+  `architecture/overview.md` for how the pieces meet.
+- **Changing something**: `decisions.md` first. It records the sessions that
+  were spent finding out why an obvious approach does not work.
+- **After changing something**: update these files in the same commit. The point
+  is that the next session starts informed rather than re-deriving.
 
-## Key Constraints (Always True)
+## Constraints that hold everywhere
 
-1. **iroh 1.x** handles all networking — P2P QUIC with hole punching + relay fallback. Never bypass iroh for direct socket connections.
-2. **ALPN = `"rdp"`** is the application protocol identifier across all connections.
-3. **Messages are bincode-serialized** and sent over length-prefixed QUIC bidirectional streams.
-4. **Passcodes are 32-byte random secrets**, encoded as base58 with `MASTER-` or `GUEST-` prefix.
+1. **iroh 1.x does all networking.** Hole punching, relays, discovery. Never
+   open a raw socket to a peer.
+2. **A session runs on a direct path or not at all.** A relay carries the
+   handshake and the address exchange; it never carries video. See
+   `network::await_direct_path`.
+3. **ALPN is `"tain/2"`.** In `network::ALPN`.
+4. **Messages are length-prefixed bincode 1.x.** Not bincode 2.
+5. **Passcodes are 32-byte random secrets**, base58check with a `MASTER-` or
+   `GUEST-` prefix, carried inside a self-contained connection code along with
+   the host's endpoint id and relay.
+6. **Secrets are never written to a file.** Connection codes live in the OS
+   credential store, or nowhere.
+7. **A guest code is denied until a person allows it**, per connection, and
+   anything that is not an explicit allow is a denial.
 
-## Launch Behavior (Always True)
+## Running it
 
-**`cargo run` with no arguments** launches the unified egui GUI directly — Host tab active by default, background tokio task runs the host server and generates master/guest passcodes immediately. No subcommand needed.
+`cargo run` launches the GUI. There is no command surface — `main.rs` reads a
+couple of bare arguments (`--console` among them) rather than parsing
+subcommands, and the service and agent modes are entered by the service control
+manager rather than by hand.
 
-CLI-only modes are still available explicitly:
-- `cargo run host --generate-master`
-- `cargo run guest --passcode "MASTER-xxx" --ticket <hex>`
-- `cargo run host --gui` (same as default, but explicit)
+Debug-only flags, compiled out of release builds entirely:
+
+```bash
+TAIN_DEBUG=demo,loopback,settings cargo run
+```
+
+| Flag | Effect |
+|------|--------|
+| `demo` | Fill the connection lists with sample rows |
+| `loopback` | Connect to our own host endpoint on startup, to exercise the video path on one machine |
+| `settings` | Open the settings window immediately |
+
+## Testing
+
+```bash
+cargo test --workspace
+```
+
+Tests that need real hardware or real network traffic are `#[ignore]`d and named
+so they can be run one at a time. **Do not run `-- --ignored` wholesale** unless
+you mean to exercise encoders, decoders and the public DHT at once:
+
+```bash
+cargo test -p tain-core --test e2e_iroh reach_the_dht -- --ignored --nocapture
+cargo test --release -p tain-core --test pipeline_timing -- --ignored --nocapture
+```

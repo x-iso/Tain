@@ -1,161 +1,161 @@
 # Architecture Overview
 
-## System Design
+## Shape of the thing
 
 ```
-┌─────────────────────── HOST ───────────────────────┐         ┌─────────────────────── GUEST ───────────────────────┐
-│                                                      │         │                                                       │
-│  iroh Endpoint (ALPN: "rdp")                        │         │  iroh Endpoint (ALGN: "rdp")                       │
-│       │                                             │         │        │                                              │
-│       ├─► Accept incoming QUIC connections          │◄────────┤  Connect via EndpointId + ALPN                     │
-│       │    (one per guest session)                  │  iroh   │    P2P with NAT traversal                          │
-│       │                                             │  P2P    │                                                       │
-│       ├─► PasscodeStore                             │         │  Passcode (MASTER-xxxx or GUEST-xxxx)               │
-│       │    - Master: auto-approved, full control     │         │    Sent as first protocol message                  │
-│       │    - Guest: requires host approval for input │         │                                                       │
-│       │                                             │         │  InputInjector (mouse/keyboard events → OS)             │
-│       ├─► SessionManager                            │         │    Platform-specific APIs                          │
-│       │    - Tracks active sessions                 │         │                                                       │
-│       │    - Per-session control state              │         │                                                       │
-│       └─► ScreenCapturer → Encoder                  │         │  ScreenDecoder (receives + renders frames)          │
-│           sends Frame messages over QUIC             │         │                                                       │
-└──────────────────────────────────────────────────────┘         └───────────────────────────────────────────────────────┘
+┌───────────────── HOST ──────────────────┐        ┌───────────────── GUEST ─────────────────┐
+│                                          │        │                                          │
+│  DXGI Desktop Duplication                │        │  Decode (libavcodec D3D11VA, or CPU)     │
+│      │  shared by every session           │        │      │                                   │
+│      ▼                                    │        │      ▼                                   │
+│  NV12 on the GPU ──► hardware encoder     │        │  NV12 ──► RGBA on the GPU ──► OpenGL     │
+│      │              (H.264 / H.265 / AV1) │        │      (no readback, where interop works)  │
+│      ▼                                    │        │                                          │
+│  adaptive controller ◄── telemetry ───────┼────────┼──── measures decode, render, round trip  │
+│      │  decides fps, scale, bitrate        │        │                                          │
+│      ▼                                    │        │                                          │
+│  video stream (uni) ──────────────────────┼───────►│  frames                                  │
+│  control stream (bi) ◄────────────────────┼───────►│  input, telemetry, cursor, audio         │
+│                                           │        │                                          │
+│  PasscodeStore + SessionManager           │        │  session window, one tab per session     │
+└───────────────────────────────────────────┘        └──────────────────────────────────────────┘
+                              iroh QUIC, ALPN "tain/2"
+                        direct only — a relayed session is refused
 ```
 
-## Connection Flow
+## Connecting
 
-### 1. Host Startup
-```rust
-let server = HostServer::bind().await?;        // Creates iroh Endpoint with presets::N0
-// presets::N0 enables DNS/Pkarr discovery + public relay servers (free)
-server.endpoint_id()                           // Returns the unique EndpointId (public key)
-```
+Six stages, and the guest's UI draws them as a row that fills up
+(`gui/progress.rs`). Named here in the same order.
 
-### 2. Passcode Generation
-```rust
-let master_code = server.generate_master_passcode().await?;  // "MASTER-<base58>"
-let guest_code = server.generate_guest_passcode().await?;    // "GUEST-<base58>"
-```
+### 1. Start
 
-The encoded string is base58 of: `[type_byte] [32-byte random secret]` where type_byte distinguishes Master vs Guest.
+Both sides bind an iroh endpoint through `discovery::bind`, which is
+`presets::N0` written out plus two more lookups. It has to be written out
+because each resolving service is wrapped so the app can tell which one
+answered — see *Finding a host* below.
 
-### 3. Guest Connection
-```rust
-// Guest receives the host's EndpointId (from --show-ticket or manual sharing)
-let addr = EndpointAddr::new(host_endpoint_id);
-let conn = endpoint.connect(addr, b"rdp").await?;  // ALPN "rdp" matches host listener
-let (mut send, mut recv) = conn.open_bi().await?;  // Single bidirectional QUIC stream
+### 2. Find
 
-// First message must be Auth
-write_length_prefixed(&send, &Message::Auth { passcode: "...", session_id: 1 }).await?;
-```
+An endpoint id is a public key, not a route. Something has to turn one into the
+other, and there are four things that can:
 
-### 4. Host Accepts Connection
-```rust
-let conn = endpoint.accept().await?.await??;       // iroh Incoming → Connection
-let (mut send, mut recv) = conn.accept_bi().await?; // Single bidirectional stream
-let data = read_length_prefixed(&recv).await?.unwrap(); // Read Auth message
-let msg: Message = bincode::deserialize(&data)?;
+| Route | Cost | When it works |
+|-------|------|---------------|
+| The connection code | none | Always — the code carries the host's relay |
+| A remembered address | none | The host answered there before |
+| mDNS | < 1 s | Same local network |
+| The n0 lookup service | a few seconds | DNS or HTTPS reachable |
+| Mainline DHT | ~8 s, sometimes two asks | Almost anywhere; no operator to block |
 
-match &msg {
-    Message::Auth { passcode, session_id } => {
-        if let Some((PasscodeType::Master, secret)) = store.validate(passcode).await {
-            send SessionStart immediately → control_granted = true
-        } else if let Some((PasscodeType::Guest, secret)) = store.validate(passcode).await {
-            send GuestApprovalRequest → control_granted = false (until host approves)
-        }
-    }
-}
-```
+They race. Whichever answers first is credited, and shown to the user as the
+`Find` result — see `discovery::Found`.
 
-### 5. Multi-User Session Management
-Each guest gets an independent session tracked by `SessionManager`:
-```rust
-session_manager.add_session(secret, control_granted);  // Assigns unique session_id
-session_manager.set_control(session_id, true);         // Approve a pending guest
-session_manager.remove_session(session_id);            // Guest disconnected
-```
+A dial that fails with `NoAddress` is retried for 30 seconds rather than
+reported as a dead host: a lookup that has not been told anything yet returns
+*empty*, not slow, and the slowest lookup is the one most likely to be the only
+one working.
 
-## Protocol Messages (Wire Format)
+### 3. Direct
 
-All messages use **length-prefixed bincode** serialization:
-```
-[4 bytes: big-endian message length][bincode-serialized Message]
-```
+Every iroh connection begins on a relay and upgrades if it can. Tain waits for
+that upgrade — 25 seconds on the guest, a little longer on the host — and
+**refuses the session if it never comes**.
 
-### Message Enum (`protocol.rs`)
+A relay is a shared, rate-limited public server. It is ample for the handshake
+and the address exchange it exists to carry, and hopeless for the ten to twenty
+Mbit/s of a desktop stream: the measured relayed session collapsed to a third of
+full resolution at 8 fps and stayed there. Failing to connect at least says so.
 
-| Variant | Direction | Purpose |
-|---------|-----------|---------|
-| `Auth { passcode, session_id }` | Guest → Host | Initial authentication with encoded passcode |
-| `Config(DisplayConfig)` | Guest → Host | Client display capabilities (fps, bitrate, resolution) |
-| `Input(InputEvent)` | Guest → Host | Mouse move / button / scroll / key events |
-| `SessionStart(SessionStart)` | Host → Guest | Session established with screen info + encoder type |
-| `Frame(FrameMessage)` | Host → Guest | Encoded video frame (H.264 NAL units or raw BGRA pixels) |
-| `GuestApprovalRequest(...)` | Host → Guest | Asks host to approve/deny guest input control |
-| `SessionEnd { reason }` | Either | Graceful disconnection with human-readable reason |
-| `Ping(timestamp)` / `Pong(timestamp)` | Both | Keepalive and round-trip latency measurement |
+So both directories Tain publishes to — the n0 service and the DHT — carry the
+relay *and* any address routable from outside, so a peer has somewhere to dial
+as well as somewhere to meet. Private addresses are filtered out: unreachable
+for the peer they would be published for, and mDNS already answers that case.
 
-### InputEvent Variants (Guest → Host)
-```rust
-enum InputEvent {
-    MouseMove { x: u16, y: u16 },           // Absolute position in host screen coords
-    MouseButton { button: u8, pressed: bool }, // 0=left, 1=right, 2=middle
-    Scroll { dx: i16, dy: i16 },             // Horizontal + vertical scroll deltas
-    Key(KeyEvent)                            // Virtual key code + press/release flag
-}
-```
+### 4. Auth
 
-### FrameMessage Structure
-```rust
-struct FrameMessage {
-    sequence_number: u32,     // Monotonically increasing; guest uses this to detect drops
-    width: u16, height: u16,  // Display dimensions
-    timestamp_ms: u64,        // Milliseconds since session start (for latency measurement)
-    is_keyframe: bool,        // True = IDR/intra-only frame (decoder can resume here)
-    data: Vec<u8>,            // H.264 NAL units OR raw BGRA pixels (width*height*4 bytes)
-}
-```
+The guest opens a bidirectional stream and sends the whole connection code. The
+host authenticates on the secret inside it.
 
-## Video Pipeline
+A **master** code is admitted at once. A **guest** code gets nothing — no
+screen, no input — until a person allows it, and every outcome that is not an
+explicit allow denies. Approval is per connection.
 
-### Encoding Strategy
-The host encodes captured frames before sending them over the QUIC stream:
+### 5. Session
 
-1. **Capture**: `ScreenCaptureBackend::capture_next()` returns a `ScreenFrame` in BGRA format
-2. **Encode**: `VideoEncoder::encode_frame()` compresses (or passes through) the frame → `EncodedFrame`
-3. **Serialize**: The encoded data is wrapped in a `Message::Frame` and sent via QUIC
+The host answers with `SessionStart` and starts its capture, encoder and audio.
+It then opens a **unidirectional** stream for video. Frames go down that;
+everything else stays on the bidirectional one, so a keyframe cannot queue in
+front of a mouse movement. Where the uni stream cannot be opened, both share the
+control stream.
 
-### Encoder Selection
-- **Raw BGRA** (default, no compression): Zero encode latency but requires ~30+ Mbps for 1080p@60fps
-- **H.264** (placeholder): Not yet implemented — see `encoder.rs` comments for platform-specific hardware encoding options
+### 6. Video
 
-### Adaptive Bitrate
-The guest sends `DisplayConfig` with target_fps and max_bitrate_kbps. The host adjusts encoding parameters accordingly. This enables:
-- Gaming mode: high FPS, high bitrate → H.264 encoder
-- Desktop mode: lower FPS, compressed → AV1 or lower-bitrate H.264
+Frames arrive, decode, and are drawn. On a machine with `WGL_NV_DX_interop2` the
+decoded Direct3D texture is handed to OpenGL directly and never touches the CPU.
 
-## NAT Traversal (Handled by iroh)
+## Wire format
 
-iroh provides automatic hole punching and relay fallback — no manual STUN/TURN setup needed:
+Length-prefixed bincode: `[4 bytes big-endian length][bincode Message]`.
 
-1. **Direct connection** (fastest): Both peers are on the same network or have public IPs → direct QUIC
-2. **Hole punching**: When both peers are behind NAT but not symmetric → iroh sends coordinated probes to punch through NAT mappings
-3. **Relay fallback** (always works): If direct/hole-punch fails → data routes through iroh's public relay servers
+`Message` (see `protocol.rs`) carries, guest to host: `Auth`, `Config`, `Input`,
+`Telemetry`, `FrameAck`, `RequestKeyframe`, `Probe`. Host to guest:
+`SessionStart`, `Frame`, `CodecChanged`, `GuestApprovalRequest`, `ControlState`,
+`StreamStatus`, `Audio`, `Cursor`, `HostPreview`, `ProbeResult`. Either way:
+`SessionEnd`, `Ping`, `Pong`.
 
-The `presets::N0` configuration enables all three modes automatically with free public relays. For production deployments, commercial relay options are also available from [n0.computer](https://n0.computer).
+## Adapting
 
-## Security Model
+The host measures capture, encode and send-blocking; the guest reports decode,
+render, frames decoded, and round trip. `adaptive.rs` turns those into a
+bottleneck set and a plan — a frame rate, a scale, and a bitrate — and the
+`StreamStatus` message tells the guest what is holding the stream back, because
+a stuttering picture and an idle bandwidth graph look identical from the guest's
+side.
 
-- **Encryption**: All traffic is encrypted via QUIC/TLS 1.3 (built into iroh)
-- **Authentication**: Passcodes are 256-bit random secrets — brute-force resistant even when shared over chat
-- **Authorization levels**: Master passcodes grant immediate full control; guest passcodes start with input denied and require explicit host approval
-- **Revocation**: Host can revoke any passcode at any time via `revoke <encoded_code>` command
+Two traps are worth knowing about, because both were paid for once:
 
-## Platform-Specific Notes
+- **`decoded_fps`, not `displayed_fps`.** A guest on a 60 Hz monitor cannot
+  present more than sixty a second however perfect the link. Comparing against
+  what it *drew* reads a healthy stream as a lossy one.
+- **A guest that has not started decoding is not a failing link.** Telemetry
+  flows from the moment the stream opens, well before there is a decoder, and
+  every one of those reports says zero frames. Reading that as loss collapsed a
+  perfectly good LAN session to 8 fps for a full minute.
 
-| Feature | Windows | macOS | Linux (X11) |
-|---------|---------|-------|-------------|
-| Screen capture | Graphics Capture API (via scap) | ScreenCaptureKit (via scap) | PipeWire (via scap) or XShm |
-| Input injection | SendInput API | CGEventPost API | XTest extension FFI |
-| H.264 encoding | Media Foundation (DXVA2) | VideoToolbox FFI | VAAPI / GStreamer
+## Security model
+
+- **Encryption**: QUIC/TLS 1.3, from iroh.
+- **Identity**: the endpoint id is a public key; the handshake checks it, so a
+  wrong or stale address can only fail, never reach the wrong machine.
+- **Authentication**: 32-byte random secrets, base58**check** encoded so a
+  mangled paste fails loudly rather than dialling somewhere unintended.
+- **Authorisation**: master is immediate; guest is denied until allowed, with
+  mouse and keyboard granted separately and both off by default.
+- **Storage**: connection codes live in the OS credential store. Never a file.
+
+## What is published, and where
+
+Worth being explicit, since two of these leave the machine.
+
+| To | What | Who can read it |
+|----|------|-----------------|
+| Local network (mDNS) | This endpoint id and its addresses | Anyone on the same network |
+| n0 lookup service | Relay + routable addresses, signed | Anyone with the endpoint id |
+| Mainline DHT | The same, signed under the endpoint's own key | Anyone with the endpoint id |
+
+The endpoint id is in every connection code, so this is readable by anyone who
+has ever been given one. None of it grants access — a passcode is still
+required, and approval still applies.
+
+## Platform
+
+| Feature | Windows | macOS / Linux |
+|---------|---------|---------------|
+| Screen capture | DXGI Desktop Duplication | test pattern only |
+| Hardware encode | Media Foundation (H.264, H.265, AV1) | — |
+| Hardware decode | libavcodec D3D11VA | — |
+| Zero-copy display | `WGL_NV_DX_interop2` | — |
+| Audio | WASAPI loopback + Opus | — |
+| Input injection | `SendInput` | log-only stubs |
+| Networking, protocol, adaptive control | ✅ | ✅ |
