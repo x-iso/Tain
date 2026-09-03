@@ -92,14 +92,89 @@ pub struct Progress {
 /// node.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Outcomes {
-    /// Which lookup found the host. `None` once past `Find` means nothing had
-    /// to look: the code carried a relay, or an address was remembered.
+    /// Which lookup found the host, if one did.
     pub found_via: Option<Branch>,
+    /// Whether the connection is being carried by a relay.
+    ///
+    /// Only ever true while a session is failing or about to be: a relayed
+    /// session is refused. It is here because it is what separates the two
+    /// ways of arriving without a lookup — see [`Located`].
+    pub on_relay: bool,
     /// Where the direct path ended up, and how far away that is.
     pub peer: Option<String>,
     pub rtt_ms: Option<f32>,
     /// What the picture is actually running at.
     pub fps: Option<f32>,
+}
+
+/// How the host was reached, including the ways that involved no lookup.
+///
+/// # Why "known" was not good enough
+///
+/// The first version of this said "known" whenever no address lookup had
+/// answered, which folded together three situations that want different
+/// responses — and made the common case look like the interesting one.
+///
+/// A connection code carries a relay, so most dials never need a lookup at all
+/// and "known" was mostly saying "the code worked". It was also what a session
+/// showed after arriving on a *stale* remembered address, and after arriving on
+/// the code's relay with nothing else having contributed — which is the exact
+/// state that then fails at `Direct`, and the one place where knowing which of
+/// the three happened tells you what to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Located {
+    /// An address lookup answered. See [`Branch`].
+    Looked(Branch),
+    /// An address this host answered on before, tried first and reachable.
+    Remembered,
+    /// The relay named in the connection code, and nothing else.
+    Code,
+}
+
+impl Located {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Looked(branch) => branch.label(),
+            Self::Remembered => "saved",
+            Self::Code => "code",
+        }
+    }
+
+    pub fn describe(self) -> String {
+        match self {
+            Self::Looked(branch) => branch.describe().to_string(),
+            Self::Remembered => {
+                "Reached on an address this host answered on before, so nothing had to be \
+                 looked up. Addresses are raced, so a remembered one that has gone stale \
+                 simply loses rather than holding anything back."
+                    .to_string()
+            }
+            Self::Code => {
+                "Reached through the relay carried in the connection code. No address lookup \
+                 contributed anything, so the relay is the only route there was — which is \
+                 why a direct path has to be punched from it, and why there is nothing else \
+                 to fall back on if that fails."
+                    .to_string()
+            }
+        }
+    }
+}
+
+impl Outcomes {
+    /// How the host was reached, once `Find` is behind us.
+    ///
+    /// Derived rather than reported, because the three cases are distinguished
+    /// by what actually happened: a lookup noting an answer, or — failing that
+    /// — whether the connection landed on a relay, which only the code could
+    /// have supplied. A direct path with no lookup behind it can only have come
+    /// from a remembered address, since nothing else offers one.
+    pub fn located(&self) -> Located {
+        match self.found_via {
+            Some(branch) => Located::Looked(branch),
+            None if self.on_relay => Located::Code,
+            None => Located::Remembered,
+        }
+    }
 }
 
 impl Stage {
@@ -110,16 +185,27 @@ impl Stage {
     /// "nothing needed to look".
     pub fn outcome(self, outcomes: &Outcomes) -> Option<String> {
         match self {
-            Self::Find => Some(match outcomes.found_via {
-                Some(branch) => branch.label().to_string(),
-                None => "known".to_string(),
-            }),
+            Self::Find => Some(outcomes.located().label().to_string()),
             Self::Direct => outcomes.rtt_ms.map(|ms| format!("{ms:.0} ms")),
             Self::Video => outcomes.fps.map(|fps| format!("{fps:.0} fps")),
             // Starting, authenticating and opening a session either happen or
             // do not. A caption saying "done" under a node already drawn as
             // done is noise.
             Self::Start | Self::Auth | Self::Session => None,
+        }
+    }
+
+    /// The short reason to put under this node when it is where things stopped.
+    ///
+    /// A red dot says a connection failed here; this says what it was left
+    /// holding when it did, which for the common failure — arriving on a relay
+    /// and never getting off it — is the whole diagnosis.
+    pub fn stopped_on(self, outcomes: &Outcomes) -> Option<String> {
+        match self {
+            Self::Direct if outcomes.on_relay => Some("relayed".to_string()),
+            Self::Find => Some("not found".to_string()),
+            Self::Auth => Some("refused".to_string()),
+            _ => None,
         }
     }
 }
@@ -193,16 +279,21 @@ pub fn summary(progress: Option<Progress>, outcomes: &Outcomes) -> String {
         } else {
             ' '
         };
+        let stopped = index == progress.at && progress.failed;
         let detail = match stage {
-            Stage::Find if complete => match outcomes.found_via {
-                Some(branch) => format!("{} — {}", branch.label(), branch.describe()),
-                // Nothing had to look: a relay in the code, or an address
-                // remembered from a connection that already worked.
-                None => "already knew where to look".to_string(),
-            },
+            Stage::Find if complete => {
+                let located = outcomes.located();
+                format!("{} — {}", located.label(), located.describe())
+            }
             Stage::Direct if complete => match outcomes.peer.as_deref() {
                 Some(peer) => format!("peer to peer with {peer}"),
                 None => stage.describe().to_string(),
+            },
+            // What it was left holding when it stopped, which is more use than
+            // repeating what the step was supposed to do.
+            other if stopped => match other.stopped_on(outcomes) {
+                Some(reason) => format!("{reason} — {}", other.describe()),
+                None => other.describe().to_string(),
             },
             other => other.describe().to_string(),
         };
@@ -300,11 +391,49 @@ mod tests {
         assert_eq!(text.matches('✓').count(), Stage::ALL.len(), "a finished path is all ticks");
     }
 
-    /// Nothing to look up is a real answer, not a missing one.
+    /// The three ways of arriving are told apart, not lumped together.
+    ///
+    /// # Why this matters more than it looks
+    ///
+    /// All three used to read "known", which made the common case — a code that
+    /// carried a relay, needing no lookup at all — indistinguishable from the
+    /// one that then fails at `Direct`. Someone looking at a failed connection
+    /// could not tell "nothing looked because nothing needed to" from "nothing
+    /// looked, so the relay was the only route there ever was".
     #[test]
-    fn a_host_that_needed_no_lookup_says_so() {
-        let text = summary(progress(&GuestStatus::Streaming), &Outcomes::default());
-        assert!(text.contains("already knew"), "{text}");
+    fn how_the_host_was_reached_is_never_just_known() {
+        let looked = Outcomes { found_via: Some(Branch::Lan), ..Outcomes::default() };
+        assert_eq!(looked.located(), Located::Looked(Branch::Lan));
+        assert_eq!(looked.located().label(), "LAN");
+
+        // No lookup answered and the connection is on a relay: the only thing
+        // that could have supplied it is the relay in the code.
+        let by_code = Outcomes { found_via: None, on_relay: true, ..Outcomes::default() };
+        assert_eq!(by_code.located(), Located::Code);
+
+        // No lookup answered and the path is direct: nothing but a remembered
+        // address offers a direct address, so that is where it came from.
+        let remembered = Outcomes { found_via: None, on_relay: false, ..Outcomes::default() };
+        assert_eq!(remembered.located(), Located::Remembered);
+
+        // A lookup answering always wins, relay or not: it is what supplied
+        // the address, whatever the connection then settled on.
+        let both = Outcomes { found_via: Some(Branch::Dht), on_relay: true, ..Outcomes::default() };
+        assert_eq!(both.located(), Located::Looked(Branch::Dht));
+    }
+
+    /// A failure says what it was left holding, not what it meant to do.
+    #[test]
+    fn a_stopped_stage_reports_what_stopped_it() {
+        let relayed = Outcomes { on_relay: true, ..Outcomes::default() };
+        assert_eq!(Stage::Direct.stopped_on(&relayed).as_deref(), Some("relayed"));
+
+        // Reached Direct and stopped there, on a relay, with the code the only
+        // thing that had located the host: the whole of the failure, in a row.
+        let at = resting(&GuestStatus::Failed("no direct path".into()), Some(2)).expect("placed");
+        let text = summary(Some(at), &relayed);
+        assert!(text.contains("relayed"), "the failure does not say what it stopped on: {text}");
+        assert!(text.contains("code"), "the failure does not say how it got there: {text}");
     }
 
     /// A failure stays on the graph, at the step it failed on.

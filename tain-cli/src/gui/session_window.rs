@@ -1198,15 +1198,26 @@ fn render_progress_graph(
         );
 
         // What the stage produced, under its name — only once it is behind us,
-        // which is what lets `Find` say "known" rather than having to tell
-        // "nothing looked yet" from "nothing needed to".
-        if done && let Some(result) = stage.outcome(outcomes) {
+        // which is what lets `Find` report how the host was reached rather than
+        // having to tell "nothing looked yet" from "nothing needed to".
+        //
+        // A stage that stopped says what it was left holding instead, which for
+        // the common failure — arriving on a relay and never getting off it —
+        // is the whole diagnosis, and the thing the graph was silent about.
+        let caption = if stopped {
+            stage.stopped_on(outcomes).map(|reason| (reason, OFFLINE_RED))
+        } else if done {
+            stage.outcome(outcomes).map(|result| (result, LIVE_GREEN))
+        } else {
+            None
+        };
+        if let Some((text, colour)) = caption {
             painter.text(
                 egui::pos2(centre(index).x, y + NODE + OUTCOME_DROP),
                 egui::Align2::CENTER_CENTER,
-                result,
+                text,
                 egui::FontId::proportional(10.0),
-                LIVE_GREEN,
+                colour,
             );
         }
     }

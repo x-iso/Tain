@@ -784,6 +784,9 @@ impl GuestSession {
         let health = self.shared.health.lock().unwrap();
         super::progress::Outcomes {
             found_via: health.found_via,
+            // What separates arriving on the code's relay from arriving on a
+            // remembered address, when no lookup answered. See `Outcomes`.
+            on_relay: health.path.as_ref().is_some_and(|path| !path.is_direct()),
             peer: health.path.as_ref().map(|path| path.remote().to_string()),
             // The transport round trip rather than the application ping: it is
             // the property of the path that the `Direct` stage produced.

@@ -215,13 +215,13 @@ async fn a_host_that_appears_late_is_still_found() -> Result<()> {
     let path = guest.connection_path().context("connected with no path")?;
     assert!(path.is_direct(), "found late, but ended up on {}", path.remote());
 
-    // Two machines on one network are found by multicast, and the session
-    // window says so rather than saying the bare word "direct".
-    assert_eq!(
-        guest.found_via(),
-        Some(tain_core::discovery::Branch::Lan),
-        "a host on this machine should have been located on the local network"
-    );
+    // Deliberately not asserted: *which* lookup answered. Every service races,
+    // and this test has a working relay and working DNS alongside multicast —
+    // so mDNS winning is likely, not guaranteed, and under the load of the rest
+    // of this file running beside it, DNS has been observed getting there
+    // first. Attribution is pinned down in the test above instead, where
+    // multicast is the only thing that can possibly answer.
+    eprintln!("found late via {:?}", guest.found_via());
     Ok(())
 }
 
@@ -419,8 +419,10 @@ async fn two_endpoints_on_one_network_find_each_other_without_any_server() -> Re
     eprintln!("distributed (DHT) discovery started: {}", up.dht);
     let host_id = host.id();
 
+    // The guest's ledger is the one that matters: finding is something the
+    // dialling side does, and the host never looks itself up.
     let guest = iroh::Endpoint::builder(presets::Minimal).bind().await?;
-    tain_core::discovery::attach(&guest);
+    let finding = tain_core::discovery::attach(&guest);
 
     let accepting = tokio::spawn(async move {
         let incoming = host.accept().await.context("host endpoint closed")?;
@@ -429,20 +431,40 @@ async fn two_endpoints_on_one_network_find_each_other_without_any_server() -> Re
     });
 
     // Addressed by endpoint id alone — no relay url, no ip, nothing on file.
-    let dialing = tokio::time::timeout(
-        Duration::from_secs(20),
-        guest.connect(iroh::EndpointAddr::new(host_id), b"tain/mdns-test"),
-    );
-
-    let conn = match dialing.await {
-        Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => anyhow::bail!("dial failed with only mDNS to go on: {e:#}"),
-        Err(_) => anyhow::bail!(
-            "an endpoint on this very machine was not found by multicast within 20s — \
-             either this network drops multicast, or local discovery is not attached"
-        ),
+    //
+    // Retried for the same reason `connect_reporting` retries: a lookup that
+    // has not been told anything yet comes back *empty*, not slow, so one
+    // attempt measures whether multicast had answered by that instant rather
+    // than whether it answers. The n0 services are attached here too and fail
+    // (there is no relay in this preset), which can end the aggregate lookup
+    // before the multicast reply lands — most easily when the rest of this file
+    // is running beside it, several mDNS responders deep on one machine.
+    let started = std::time::Instant::now();
+    let deadline = Duration::from_secs(30);
+    let conn = loop {
+        match guest.connect(iroh::EndpointAddr::new(host_id), b"tain/mdns-test").await {
+            Ok(conn) => break conn,
+            Err(e) if started.elapsed() >= deadline => anyhow::bail!(
+                "an endpoint on this very machine was not found by multicast within \
+                 {deadline:?} — either this network drops multicast, or local discovery is \
+                 not attached: {e:#}"
+            ),
+            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
     };
     assert_eq!(conn.remote_id(), host_id, "connected to the wrong endpoint");
+
+    // # Attribution, pinned down where it is deterministic
+    //
+    // There is no relay in this preset and the n0 lookups cannot work, so
+    // multicast is the only service that could have produced this address.
+    // That makes this the one place the branch can be asserted rather than
+    // hoped for — every other test races several working services.
+    assert_eq!(
+        finding.found.branch(host_id),
+        Some(tain_core::discovery::Branch::Lan),
+        "multicast was the only thing that could have answered, so it must be credited"
+    );
     accepting.await.context("accept task panicked")??;
     Ok(())
 }
