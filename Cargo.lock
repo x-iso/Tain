@@ -5668,6 +5668,7 @@ dependencies = [
  "iroh",
  "iroh-mainline-address-lookup",
  "iroh-mdns-address-lookup",
+ "n0-mainline",
  "openh264",
  "rand 0.9.5",
  "serde",

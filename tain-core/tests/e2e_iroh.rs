@@ -160,6 +160,166 @@ async fn several_guests_arriving_together_are_all_answered() -> Result<()> {
     Ok(())
 }
 
+/// Can this machine reach the mainline DHT at all?
+///
+/// # Why this exists separately
+///
+/// The round trip below can fail for two quite different reasons — the network
+/// does not carry DHT traffic, or the record simply had not propagated yet —
+/// and they want opposite responses. This asks the narrower question with
+/// nothing else in the way: build a DHT node, and see whether it finds any
+/// peers to talk to.
+///
+/// A `false` here means distributed discovery is not available on this network
+/// and the round trip below cannot possibly pass. A `true` means it should.
+///
+/// ```bash
+/// cargo test -p tain-core --test e2e_iroh reach_the_dht -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "talks to public DHT bootstrap nodes"]
+async fn can_this_machine_reach_the_dht() -> Result<()> {
+    let dht = n0_mainline::Dht::builder().build().context("could not build a DHT node")?;
+
+    let started = std::time::Instant::now();
+    let ok = tokio::time::timeout(Duration::from_secs(60), dht.bootstrapped())
+        .await
+        .context("bootstrapping did not finish within 60s")?
+        .context("the DHT actor shut down while bootstrapping")?;
+
+    eprintln!("DHT bootstrapped: {ok} (after {:?})", started.elapsed());
+    if ok {
+        let peers = dht.to_bootstrap().await.unwrap_or_default();
+        eprintln!("routing table holds {} peers", peers.len());
+    }
+    assert!(
+        ok,
+        "this machine could not reach the mainline DHT — distributed discovery will not work \
+         here, and the address lookup that depends on it is doing nothing"
+    );
+    Ok(())
+}
+
+/// The DHT must actually answer, not merely start.
+///
+/// # Why this is separate, and ignored
+///
+/// The mDNS test proves local discovery works and deliberately proves nothing
+/// about the DHT — it returns in under a second, which is far too fast for a
+/// DHT lookup, so whatever answered there, it was not this. And `attach` only
+/// reports that the DHT *started*, which is a much weaker claim than that a
+/// lookup through it comes back.
+///
+/// This closes that gap, and it needs the real public mainline DHT to do it:
+/// bootstrapping against live nodes, publishing a signed record, and reading it
+/// back from a second, independent DHT node. That is real traffic to real
+/// third-party machines, which is why it does not run by default.
+///
+/// It is also the only way to answer the question that made the DHT worth
+/// adding: whether this particular network lets that traffic through at all.
+///
+/// ```bash
+/// cargo test -p tain-core --test e2e_iroh through_the_dht -- --ignored --nocapture
+/// ```
+///
+/// # How it isolates the DHT
+///
+/// The publisher is an ordinary endpoint: it has a relay, and the DHT publishes
+/// which relay that is (the crate's default filter is `relay_only`, so an
+/// endpoint with no relay would publish nothing worth finding — which is why
+/// this cannot use the bare `Minimal` preset the mDNS test uses).
+///
+/// The finder is where the isolation happens: every address lookup the N0
+/// preset installed is cleared, and only the DHT is put back. It keeps a relay
+/// transport and a DNS resolver, because it still has to *reach* whatever relay
+/// it is told about — but it has no way left to learn *which* relay that is
+/// except by asking the DHT. mDNS is not attached, so a local shortcut cannot
+/// stand in for the answer either.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "publishes to and reads from the public mainline DHT"]
+async fn an_endpoint_can_be_found_through_the_dht_alone() -> Result<()> {
+    use iroh::endpoint::presets;
+    use iroh_mainline_address_lookup::DhtAddressLookup;
+
+    const ALPN: &[u8] = b"tain/dht-test";
+    // Publishing a record and having it settle on enough nodes to be readable
+    // is not quick, and neither is bootstrapping two independent DHT nodes.
+    const BUDGET: Duration = Duration::from_secs(90);
+
+    let publisher = iroh::Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN.to_vec()])
+        .dns_resolver(tain_core::dns_cache::resolver())
+        .bind()
+        .await?;
+    let dht = DhtAddressLookup::builder()
+        .secret_key(publisher.secret_key().clone())
+        .build()
+        .context("the publisher could not start a DHT node")?;
+    publisher.address_lookup()?.add(dht);
+    let publisher_id = publisher.id();
+
+    // A relay to publish. Without one the record is empty and the lookup below
+    // would be testing nothing.
+    tokio::time::timeout(Duration::from_secs(30), publisher.online())
+        .await
+        .context("the publisher never came online, so it had no relay to publish")?;
+
+    let accepting = tokio::spawn(async move {
+        let incoming = publisher.accept().await.context("publisher endpoint closed")?;
+        incoming.await.context("handshake failed")?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let finder = iroh::Endpoint::builder(presets::N0)
+        .dns_resolver(tain_core::dns_cache::resolver())
+        .clear_address_lookup()
+        .bind()
+        .await?;
+    let finder_dht = DhtAddressLookup::builder()
+        .secret_key(finder.secret_key().clone())
+        .build()
+        .context("the finder could not start a DHT node")?;
+    finder.address_lookup()?.add(finder_dht);
+
+    // # Retried, not asked once
+    //
+    // A lookup against a DHT that has not yet been told anything comes back
+    // *empty*, not slow — the first version of this asked once, six seconds in,
+    // got "all address lookup services produced no results", and read like the
+    // network blocking DHT traffic. It was not: `can_this_machine_reach_the_dht`
+    // bootstraps here in two seconds against a hundred-odd peers. The record
+    // simply had not settled on the nodes that would later be asked for it.
+    //
+    // So this asks repeatedly until the budget runs out. That is also what
+    // makes a failure meaningful: with the bootstrap test passing beside it,
+    // the only thing left for this to be measuring is propagation.
+    let started = std::time::Instant::now();
+    let mut attempts = 0u32;
+    let mut last: Option<String> = None;
+    let conn = loop {
+        if started.elapsed() >= BUDGET {
+            anyhow::bail!(
+                "the DHT never returned a record for this endpoint in {BUDGET:?} \
+                 ({attempts} attempts); last answer: {}",
+                last.as_deref().unwrap_or("none")
+            );
+        }
+        attempts += 1;
+        match finder.connect(iroh::EndpointAddr::new(publisher_id), ALPN).await {
+            Ok(conn) => break conn,
+            Err(e) => {
+                last = Some(format!("{e:#}"));
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+    };
+
+    assert_eq!(conn.remote_id(), publisher_id, "found the wrong endpoint");
+    eprintln!("found through the DHT in {:?} ({attempts} attempts)", started.elapsed());
+    accepting.await.context("accept task panicked")??;
+    Ok(())
+}
+
 /// Two machines on one network must find each other with nothing else running.
 ///
 /// # What this proves

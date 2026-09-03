@@ -102,3 +102,7 @@ zstd = "0.13"
 
 [features]
 default = []
+
+[dev-dependencies]
+iroh-mainline-address-lookup = "0.5.0"
+n0-mainline = "0.6.0"
