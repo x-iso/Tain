@@ -409,6 +409,58 @@ pub struct CodecChanged {
     pub encoder_type: String,
 }
 
+/// Which of the host's screens a session is *allowed* to see.
+///
+/// Distinct from [`DisplayChoice`], which is what a guest has asked for: this
+/// is what the person at the host permitted, and it bounds the other. A guest
+/// is only ever offered the screens in here, and a request for one outside it
+/// is refused rather than honoured.
+///
+/// # Why "all" is a state and not a full list
+///
+/// A list of every screen means "these ones, which happen to be all of them",
+/// and stops being true the moment a monitor is plugged in — silently granting
+/// nothing, or silently granting the new screen, depending on how it is read.
+/// Saying *all* says what was meant: whatever this machine has, now and later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayGrant {
+    /// Every screen, including ones attached after this was decided.
+    All,
+    /// Only these, by [`DisplayInfo::id`].
+    Only(Vec<u32>),
+}
+
+impl DisplayGrant {
+    /// Nothing at all. A legitimate answer, and what a denial implies.
+    pub fn none() -> Self {
+        Self::Only(Vec::new())
+    }
+
+    /// Whether this session may see that screen.
+    pub fn allows(&self, id: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(ids) => ids.contains(&id),
+        }
+    }
+
+    /// Whether this permits no screen at all.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Only(ids) if ids.is_empty())
+    }
+
+    /// Whether every screen in `available` is permitted.
+    ///
+    /// What decides if "all screens" is a real option for this guest: composing
+    /// a wall out of a subset would show a desk with holes in it.
+    pub fn covers_all(&self, available: &[DisplayInfo]) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(ids) => available.iter().all(|d| ids.contains(&d.id)),
+        }
+    }
+}
+
 /// What a guest wants to see.
 ///
 /// An enum rather than an id with a reserved value, because "all of them" is a
@@ -469,8 +521,19 @@ pub struct DisplayInfo {
     /// ones after it. That is why a change of arrangement resends the whole
     /// list rather than a delta.
     pub id: u32,
-    /// What the host calls it, for a menu. `\\.\DISPLAY1` and the like.
+    /// What the host calls it. `\\.\DISPLAY1` and the like.
+    ///
+    /// An index into a list nobody can see, and it renumbers when a monitor is
+    /// plugged in — which is why it is not what gets shown to anyone. See
+    /// [`Self::monitor`].
     pub name: String,
+    /// What the monitor calls itself, from its EDID — "DELL U2717D" and the
+    /// like.
+    ///
+    /// `None` where it did not say, which is normal for a virtual display and
+    /// for panels with an empty EDID string. The caller falls back to position
+    /// and size, which is what it used before this existed.
+    pub monitor: Option<String>,
     /// Physical pixels, never DPI-virtualised.
     pub width: u16,
     pub height: u16,
@@ -743,6 +806,7 @@ mod tests {
                 DisplayInfo {
                     id: 0,
                     name: r"\\.\DISPLAY1".into(),
+                    monitor: None,
                     width: 2560,
                     height: 1600,
                     x: 0,
@@ -755,6 +819,7 @@ mod tests {
                 DisplayInfo {
                     id: 1,
                     name: r"\\.\DISPLAY2".into(),
+                    monitor: None,
                     width: 1920,
                     height: 1080,
                     x: -1920,
@@ -900,6 +965,79 @@ mod tests {
                 assert_eq!(cs.grants, ControlGrants::new(true, false));
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    fn screen(id: u32, primary: bool) -> DisplayInfo {
+        DisplayInfo {
+            id,
+            name: format!(r"\.\DISPLAY{}", id + 1),
+            monitor: None,
+            width: 1920,
+            height: 1080,
+            x: 0,
+            y: 0,
+            primary,
+            hdr: false,
+            virtual_display: false,
+        }
+    }
+
+    /// A grant permits what it names and nothing else.
+    #[test]
+    fn a_grant_bounds_what_a_guest_may_watch() {
+        let one = DisplayGrant::Only(vec![0]);
+        assert!(one.allows(0));
+        assert!(!one.allows(1), "a screen that was not ticked must not be watchable");
+
+        assert!(DisplayGrant::All.allows(0));
+        assert!(DisplayGrant::All.allows(99), "all means all, including ones not seen yet");
+
+        assert!(DisplayGrant::none().is_empty());
+        assert!(!DisplayGrant::none().allows(0));
+        assert!(!DisplayGrant::All.is_empty());
+    }
+
+    /// "All" survives a monitor being plugged in; a list does not.
+    ///
+    /// # Why the distinction is the whole point
+    ///
+    /// Ticking every box means "share this machine's screens", not "share
+    /// these two". Recording it as a list of the two that existed would
+    /// silently exclude a third plugged in an hour later — the guest's menu
+    /// would simply be missing it, with nothing saying why.
+    #[test]
+    fn ticking_every_box_keeps_meaning_every_box_later() {
+        let before = [screen(0, true), screen(1, false)];
+        let after = [screen(0, true), screen(1, false), screen(2, false)];
+
+        // What the dialog records when everything is ticked.
+        let all = DisplayGrant::All;
+        assert!(all.covers_all(&before) && all.covers_all(&after));
+        assert!(all.allows(2), "a screen attached later is still permitted");
+
+        // What it would have meant as a list.
+        let listed = DisplayGrant::Only(vec![0, 1]);
+        assert!(listed.covers_all(&before));
+        assert!(!listed.covers_all(&after), "a new screen must not be silently included");
+        assert!(!listed.allows(2));
+    }
+
+    /// A subset cannot be composed into a wall of the whole desk.
+    #[test]
+    fn a_partial_grant_does_not_cover_every_screen() {
+        let available = [screen(0, true), screen(1, false)];
+        assert!(!DisplayGrant::Only(vec![0]).covers_all(&available));
+        assert!(DisplayGrant::Only(vec![0, 1]).covers_all(&available));
+    }
+
+    /// A grant survives the wire intact.
+    #[test]
+    fn a_grant_survives_the_wire() {
+        for grant in [DisplayGrant::All, DisplayGrant::Only(vec![0, 3]), DisplayGrant::none()] {
+            let bytes = bincode::serialize(&grant).expect("serialize");
+            let back: DisplayGrant = bincode::deserialize(&bytes).expect("deserialize");
+            assert_eq!(back, grant);
         }
     }
 }

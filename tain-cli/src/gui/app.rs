@@ -980,6 +980,14 @@ struct Confirm {
     /// Which devices the checkboxes currently offer. Deliberately starts empty:
     /// the safe answer must be the one you get by not thinking about it.
     grants: ControlGrants,
+    /// The screens this machine has, read once when the dialog opens.
+    ///
+    /// Not re-read per frame: enumerating displays is a DXGI walk, and a list
+    /// that changed while somebody was ticking boxes would move the boxes.
+    screens: Vec<tain_core::protocol::DisplayInfo>,
+    /// Which of them are ticked. Ids rather than indices, so the set survives
+    /// the list being re-read.
+    share: std::collections::BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1021,7 +1029,25 @@ impl Confirm {
         action: ConfirmAction,
         grants: ControlGrants,
     ) -> Self {
-        Self { session_id, guest, guest_named_itself, action, grants }
+        // # Why the primary, and not everything
+        //
+        // Sharing a screen is the thing this dialog exists to permit, so the
+        // answer you get by not thinking about it has to be the smallest one
+        // that is still useful. Every screen is not that: a second monitor
+        // often has the things somebody would not have chosen to show.
+        //
+        // One screen and not zero, because a session that may see nothing is a
+        // connection with no purpose — the checkboxes are there to *reduce* the
+        // default, and to extend it deliberately.
+        let screens = tain_core::screen_capture::displays();
+        let share = screens
+            .iter()
+            .find(|d| d.primary)
+            .or_else(|| screens.first())
+            .map(|d| d.id)
+            .into_iter()
+            .collect();
+        Self { session_id, guest, guest_named_itself, action, grants, screens, share }
     }
 
     fn title(&self) -> &'static str {
@@ -1340,17 +1366,21 @@ impl GuestApp {
 
     /// Answer a guest that is waiting to be let in.
     fn resolve_approval(&mut self, session_id: u32, decision: ApprovalDecision) {
+        // Cloned rather than moved: the decision is both *sent* to the waiting
+        // session and used below to update this side's own view of it, and it
+        // stopped being `Copy` when it grew a list of screens.
         match self.pending_approvals.remove(&session_id) {
             Some(tx) => {
                 // The server is blocked on this: it has captured nothing and
                 // sent nothing, and will only start once we answer.
-                let _ = tx.send(decision);
+                let _ = tx.send(decision.clone());
             }
             None => {
                 // Already streaming — the prompt closed, or this is a live
                 // session whose permissions are being changed after the fact.
-                match decision {
-                    ApprovalDecision::Allow(grants) => {
+                match &decision {
+                    ApprovalDecision::Allow { grants, .. } => {
+                        let grants = *grants;
                         self.send(HostCommand::SetSessionControl { session_id, grants })
                     }
                     ApprovalDecision::Deny => self.kick(session_id),
@@ -1358,8 +1388,8 @@ impl GuestApp {
             }
         }
 
-        match decision {
-            ApprovalDecision::Allow(grants) => {
+        match &decision {
+            ApprovalDecision::Allow { grants, .. } => {
                 let mut incoming = self.state.incoming.lock().unwrap();
                 if let Some(c) = incoming.iter_mut().find(|c| c.session_id == session_id) {
                     c.status = ApprovalStatus::Allowed;
@@ -1377,7 +1407,7 @@ impl GuestApp {
 
     /// Change what a live, already-allowed session may drive.
     fn set_grants(&mut self, session_id: u32, grants: ControlGrants) {
-        self.resolve_approval(session_id, ApprovalDecision::Allow(grants));
+        self.resolve_approval(session_id, ApprovalDecision::Allow { grants, displays: tain_core::protocol::DisplayGrant::All });
     }
 
     fn apply(&mut self, edits: PendingEdits) {
@@ -1839,7 +1869,28 @@ impl GuestApp {
         let approving = confirm.action == ConfirmAction::Approve;
         let session_id = confirm.session_id;
         let mut grants = confirm.grants;
+        let screens = confirm.screens.clone();
+        let mut share = confirm.share.clone();
         let mut outcome = None;
+
+        /// A screen as somebody at this machine would recognise it.
+        ///
+        /// The monitor's own name first, because that is what is written on the
+        /// bezel. Falling back to a number, because a virtual display and some
+        /// panels do not say.
+        fn describe(screen: &tain_core::protocol::DisplayInfo) -> String {
+            let what = match &screen.monitor {
+                Some(monitor) => monitor.clone(),
+                None if screen.virtual_display => "Virtual display".to_string(),
+                None => format!("Screen {}", screen.id + 1),
+            };
+            let mut label =
+                format!("{}. {what} — {}×{}", screen.id + 1, screen.width, screen.height);
+            if screen.primary {
+                label.push_str(" (main)");
+            }
+            label
+        }
 
         egui::Window::new(title)
             .collapsible(false)
@@ -1851,6 +1902,56 @@ impl GuestApp {
                 if let Some(caveat) = caveat {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(caveat).size(11.0).color(TEXT_DIM));
+                }
+
+                // Screens first: what is shared at all comes before what may be
+                // driven, which is the order the decision is actually made in.
+                // Only when there is a choice — a machine with one screen has
+                // nothing to tick and a section saying so is noise.
+                if approving && screens.len() > 1 {
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("Share these screens:").size(12.0).color(TEXT));
+                    ui.add_space(2.0);
+
+                    let mut every = share.len() == screens.len();
+                    if ui
+                        .checkbox(&mut every, egui::RichText::new("All screens").color(TEXT))
+                        .on_hover_text(
+                            "Including any monitor plugged in later. Leave this off to                              share only the screens ticked below.",
+                        )
+                        .changed()
+                    {
+                        share = if every {
+                            screens.iter().map(|d| d.id).collect()
+                        } else {
+                            Default::default()
+                        };
+                    }
+
+                    for screen in &screens {
+                        let mut on = share.contains(&screen.id);
+                        if ui
+                            .checkbox(&mut on, egui::RichText::new(describe(screen)).color(TEXT))
+                            .changed()
+                        {
+                            if on {
+                                share.insert(screen.id);
+                            } else {
+                                share.remove(&screen.id);
+                            }
+                        }
+                    }
+
+                    if share.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "With none ticked they connect and see nothing.",
+                            )
+                            .size(11.0)
+                            .color(AMBER),
+                        );
+                    }
                 }
 
                 if approving {
@@ -1931,12 +2032,21 @@ impl GuestApp {
         // Keep the checkbox state across frames while the dialog is open.
         if let Some(confirm) = self.confirm.as_mut() {
             confirm.grants = grants;
+            confirm.share = share.clone();
         }
 
         match outcome {
             Some(Outcome::Allow(grants)) => {
                 self.confirm = None;
-                self.resolve_approval(session_id, ApprovalDecision::Allow(grants));
+                // Every screen ticked means *all*, not "these ones that happen
+                // to be all of them": a monitor plugged in later should follow
+                // what was meant rather than be silently excluded.
+                let displays = if screens.is_empty() || share.len() == screens.len() {
+                    tain_core::protocol::DisplayGrant::All
+                } else {
+                    tain_core::protocol::DisplayGrant::Only(share.iter().copied().collect())
+                };
+                self.resolve_approval(session_id, ApprovalDecision::Allow { grants, displays });
             }
             Some(Outcome::Deny) => {
                 self.confirm = None;
@@ -3638,11 +3748,11 @@ mod tests {
         app.pending_approvals.insert(7, tx);
         app.state.incoming.lock().unwrap().push(incoming(7, ApprovalStatus::Pending));
 
-        app.resolve_approval(7, ApprovalDecision::Allow(ControlGrants::ALL));
+        app.resolve_approval(7, ApprovalDecision::Allow { grants: ControlGrants::ALL, displays: tain_core::protocol::DisplayGrant::All });
 
         assert_eq!(
             rx.await.unwrap(),
-            ApprovalDecision::Allow(ControlGrants::ALL),
+            ApprovalDecision::Allow { grants: ControlGrants::ALL, displays: tain_core::protocol::DisplayGrant::All },
             "the server is blocked on this — it streams nothing until it arrives"
         );
         assert_eq!(app.state.incoming.lock().unwrap()[0].status, ApprovalStatus::Allowed);
@@ -3658,9 +3768,9 @@ mod tests {
         app.pending_approvals.insert(3, tx);
         app.state.incoming.lock().unwrap().push(incoming(3, ApprovalStatus::Pending));
 
-        app.resolve_approval(3, ApprovalDecision::Allow(ControlGrants::NONE));
+        app.resolve_approval(3, ApprovalDecision::Allow { grants: ControlGrants::NONE, displays: tain_core::protocol::DisplayGrant::All });
 
-        assert_eq!(rx.await.unwrap(), ApprovalDecision::Allow(ControlGrants::NONE));
+        assert_eq!(rx.await.unwrap(), ApprovalDecision::Allow { grants: ControlGrants::NONE, displays: tain_core::protocol::DisplayGrant::All });
         assert_eq!(app.state.incoming.lock().unwrap()[0].status, ApprovalStatus::Allowed);
     }
 
@@ -3687,7 +3797,10 @@ mod tests {
 
         app.set_grants(9, ControlGrants::new(true, false));
 
-        assert_eq!(rx.await.unwrap(), ApprovalDecision::Allow(ControlGrants::new(true, false)));
+        assert_eq!(rx.await.unwrap(), ApprovalDecision::Allow {
+                grants: ControlGrants::new(true, false),
+                displays: tain_core::protocol::DisplayGrant::All,
+            });
         let card = app.state.incoming.lock().unwrap()[0].clone();
         assert!(card.mouse_allowed);
         assert!(!card.keyboard_allowed);

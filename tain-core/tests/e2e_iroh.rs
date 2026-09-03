@@ -823,7 +823,7 @@ async fn a_guest_sees_nothing_until_the_host_allows_it() -> Result<()> {
     // Allowing the mouse alone must not hand over the keyboard as well.
     let partial = ControlGrants::new(true, false);
     req.approve_tx
-        .send(ApprovalDecision::Allow(partial))
+        .send(ApprovalDecision::Allow { grants: partial, displays: tain_core::protocol::DisplayGrant::All })
         .expect("server dropped the approval responder");
 
     let mut saw_start = false;
@@ -1021,7 +1021,7 @@ async fn reconnecting_with_the_same_code_asks_again() -> Result<()> {
             ),
         }
 
-        req.approve_tx.send(ApprovalDecision::Allow(ControlGrants::ALL)).ok();
+        req.approve_tx.send(ApprovalDecision::Allow { grants: ControlGrants::ALL, displays: tain_core::protocol::DisplayGrant::All }).ok();
 
         // Drain until frames start, then hang up so the next attempt is clean.
         for _ in 0..60 {

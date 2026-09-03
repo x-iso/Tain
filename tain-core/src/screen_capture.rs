@@ -182,6 +182,100 @@ pub enum DisplayTarget {
     All,
 }
 
+/// What the monitor calls itself, for a person choosing between them.
+///
+/// # Why not the device name
+///
+/// `\\.\DISPLAY2` is an index into a list nobody can see, and it renumbers.
+/// Somebody deciding which screens to share needs to recognise the monitor on
+/// their desk, and what does that is the name burned into its EDID — "DELL
+/// U2717D", "LG HDR 4K".
+///
+/// `None` where the monitor did not say, which is normal for a virtual display
+/// and for panels with an empty EDID string. The caller falls back to position
+/// and size, which is what it used before this existed.
+#[cfg(target_os = "windows")]
+fn monitor_name(device_name: &[u16; 32]) -> Option<String> {
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    };
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+
+    let (mut path_count, mut mode_count) = (0, 0);
+    // SAFETY: both out-parameters are owned locals.
+    if unsafe {
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+    } != ERROR_SUCCESS
+    {
+        return None;
+    }
+
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+    // SAFETY: both buffers are exactly the length just asked for, and the counts
+    // are passed by pointer so the call can shorten them.
+    if unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        )
+    } != ERROR_SUCCESS
+    {
+        return None;
+    }
+    paths.truncate(path_count as usize);
+
+    for path in paths {
+        // The source says which `\\.\DISPLAYn` this path drives; the target,
+        // which physical monitor is on the end of it. Both are needed, because
+        // the question is asked by device name and answered by monitor name.
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the header describes the struct it is embedded in, which is a
+        // local and outlives the call.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
+            continue;
+        }
+        if source.viewGdiDeviceName != *device_name {
+            continue;
+        }
+
+        let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        // SAFETY: as above.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } != 0 {
+            return None;
+        }
+
+        let name = &target.monitorFriendlyDeviceName;
+        let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        let name = String::from_utf16_lossy(&name[..end]).trim().to_string();
+        return (!name.is_empty()).then_some(name);
+    }
+    None
+}
+
 /// A display's real mode: size in physical pixels, and where it sits.
 ///
 /// Split out because it is the one part of [`displays`] that must not come from
@@ -297,6 +391,7 @@ pub fn displays() -> Vec<super::protocol::DisplayInfo> {
 
                     found.push(super::protocol::DisplayInfo {
                         id,
+                        monitor: monitor_name(&desc.DeviceName),
                         name,
                         width,
                         height,

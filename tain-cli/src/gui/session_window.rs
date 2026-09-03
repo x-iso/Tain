@@ -1843,6 +1843,7 @@ mod tests {
         tain_core::protocol::DisplayInfo {
             id,
             name: format!(r"\.\DISPLAY{}", id + 1),
+            monitor: None,
             width: w,
             height: h,
             x,

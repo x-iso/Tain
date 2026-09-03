@@ -3,7 +3,7 @@
 //! Provides `HostServer` (accepts incoming connections, manages sessions) and
 //! `GuestClient` (connects to a host via passcode-protected ticket).
 //!
-//! The ALPN protocol name is `"tain/5"` — every connection carrying this ALPN
+//! The ALPN protocol name is `"tain/6"` — every connection carrying this ALPN
 //! is routed through our handler. iroh handles NAT traversal automatically:
 //! direct QUIC connections when possible, relay fallback otherwise.
 //!
@@ -90,8 +90,9 @@ pub use super::connection_code::ConnectionCode;
 ///
 /// `tain/3` added the host's display list to `SessionStart`; `tain/4` made
 /// choosing a display a `DisplayChoice` rather than a bare id, so "all of
-/// them" could be asked for; `tain/5` added whether a display is virtual.
-pub const ALPN: &[u8] = b"tain/5";
+/// them" could be asked for; `tain/5` added whether a display is virtual;
+/// `tain/6` added the monitor's own name.
+pub const ALPN: &[u8] = b"tain/6";
 
 /// How long a starting host waits to reach a relay before listening anyway.
 ///
@@ -105,20 +106,26 @@ const HOST_ONLINE_WAIT: Duration = Duration::from_secs(10);
 /// This gates the *stream*, not just input: a guest sees nothing at all until
 /// the host allows it. Streaming first and asking afterwards would mean a code
 /// leaking once is enough to watch the screen forever.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Not `Copy`: the display grant is a list, and a list of screens is worth
+/// more than the convenience of copying a decision around.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     /// Stream the desktop. `grants` says which input devices may be driven —
-    /// [`ControlGrants::NONE`] is a legitimate answer, meaning view-only.
-    Allow(ControlGrants),
+    /// [`ControlGrants::NONE`] is a legitimate answer, meaning view-only — and
+    /// `displays` which screens may be seen at all.
+    Allow {
+        grants: ControlGrants,
+        displays: super::protocol::DisplayGrant,
+    },
     /// Refuse: the guest is disconnected without ever seeing a frame.
     Deny,
 }
 
 impl ApprovalDecision {
     /// Grants implied by this decision.
-    pub fn grants(self) -> ControlGrants {
+    pub fn grants(&self) -> ControlGrants {
         match self {
-            Self::Allow(grants) => grants,
+            Self::Allow { grants, .. } => *grants,
             Self::Deny => ControlGrants::NONE,
         }
     }
@@ -714,6 +721,10 @@ impl HostServer {
         let config = self.session_config();
         let live_config = Arc::clone(&self.config);
 
+        // A master code is the machine's own owner and sees every screen; a
+        // guest sees what the approval dialog chose, which replaces this.
+        let mut allowed = super::protocol::DisplayGrant::All;
+
         // Guests wait here. Nothing has been captured, encoded, or sent — a
         // refused guest never sees a pixel of this machine.
         let grants = if typ == PasscodeType::Guest {
@@ -731,8 +742,9 @@ impl HostServer {
                 .await;
 
             match decision {
-                ApprovalDecision::Allow(grants) => {
+                ApprovalDecision::Allow { grants, displays } => {
                     self.sessions.set_control(session_id, grants);
+                    allowed = displays;
                     grants
                 }
                 ApprovalDecision::Deny => {
@@ -790,7 +802,13 @@ impl HostServer {
         // question a host with a screen it expected to share actually has —
         // asked, the first time, of a dummy HDMI plug that produced no menu on
         // the far end with nothing anywhere saying why.
-        let available_displays = super::screen_capture::displays();
+        // Only what this session was allowed. A guest offered screens it may
+        // not watch would have a menu whose entries fail on click, which is
+        // worse than a shorter menu.
+        let available_displays: Vec<_> = super::screen_capture::displays()
+            .into_iter()
+            .filter(|d| allowed.allows(d.id))
+            .collect();
         if available_displays.is_empty() {
             warn!(
                 "Session #{session_id}: this host could not enumerate any display, so the \
@@ -888,6 +906,7 @@ impl HostServer {
             config,
             live_config,
             capturer,
+            allowed,
         )
         .await
     }
@@ -991,6 +1010,9 @@ pub async fn run_session<W, R, A, V>(
     config: SessionConfig,
     live_config: LiveConfig,
     capturer: Box<dyn super::screen_capture::ScreenCaptureBackend>,
+    // Which of the host's screens this session may see. Decided when it was
+    // allowed in; a master code gets every screen.
+    allowed: super::protocol::DisplayGrant,
 ) -> Result<()>
 where
     W: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
@@ -1011,6 +1033,10 @@ where
     // for, which is `None` — the primary.
     let wanted_display: WantedDisplay =
         Arc::new(std::sync::Mutex::new(config.capture.display.clone()));
+    // Which screens it is *allowed* to stream. A master code is the machine's
+    // owner and gets all of them; a guest gets what the approval dialog chose,
+    // which is written here when the decision arrives.
+    let allowed_displays: AllowedDisplays = Arc::new(std::sync::Mutex::new(allowed));
     let mut reader = tokio::spawn(run_reader(
         recv,
         session_id,
@@ -1021,6 +1047,7 @@ where
         Arc::clone(&viewport),
         Arc::clone(&keyframe_wanted),
         Arc::clone(&wanted_display),
+        Arc::clone(&allowed_displays),
     ));
 
     // Audio rides the same outbound channel as host-initiated control messages,
@@ -1324,6 +1351,12 @@ type SharedViewport = Arc<std::sync::Mutex<Option<(u16, u16)>>>;
 /// capturer, so everything that reconfigures it arrives as state to notice
 /// rather than as a call.
 type WantedDisplay = Arc<std::sync::Mutex<super::screen_capture::DisplayTarget>>;
+
+/// Which screens a session may see, as decided when it was allowed in.
+///
+/// Shared because two places need it: the reader, which refuses a request for a
+/// screen outside it, and the session start, which only offers what is in it.
+type AllowedDisplays = Arc<std::sync::Mutex<super::protocol::DisplayGrant>>;
 
 /// The host's settings, shared with every running session.
 ///
@@ -2379,6 +2412,7 @@ async fn run_reader<R>(
     viewport: SharedViewport,
     keyframe_wanted: KeyframeWanted,
     wanted_display: WantedDisplay,
+    allowed_displays: AllowedDisplays,
 ) where
     R: tokio::io::AsyncReadExt + Unpin + Send + 'static,
 {
@@ -2421,7 +2455,11 @@ async fn run_reader<R>(
                 // not match what is being streamed is worse than no menu. So the
                 // reply carries what is actually being shown, and says why when
                 // that is not what was asked for.
-                let available = super::screen_capture::displays();
+                let allowed = allowed_displays.lock().unwrap().clone();
+                let available: Vec<_> = super::screen_capture::displays()
+                    .into_iter()
+                    .filter(|d| allowed.allows(d.id))
+                    .collect();
                 let (showing, why) = match choice {
                     DisplayChoice::All if available.len() < 2 => {
                         // Nothing to compose. Not an error — one screen shown
@@ -3689,6 +3727,7 @@ mod tests {
                 config.clone(),
                 Arc::new(std::sync::Mutex::new(config)),
                 capturer,
+                crate::protocol::DisplayGrant::All,
             ));
         (guest_w, guest_r, handle)
     }
@@ -4094,10 +4133,10 @@ mod tests {
     fn denial_and_view_only_approval_are_different_answers() {
         // "Allowed, but no input" is not the same as "refused" — the first one
         // still streams the screen.
-        assert_eq!(ApprovalDecision::Allow(ControlGrants::NONE).grants(), ControlGrants::NONE);
+        assert_eq!(ApprovalDecision::Allow { grants: ControlGrants::NONE, displays: crate::protocol::DisplayGrant::All }.grants(), ControlGrants::NONE);
         assert_eq!(ApprovalDecision::Deny.grants(), ControlGrants::NONE);
-        assert_ne!(ApprovalDecision::Allow(ControlGrants::NONE), ApprovalDecision::Deny);
-        assert_eq!(ApprovalDecision::Allow(ControlGrants::ALL).grants(), ControlGrants::ALL);
+        assert_ne!(ApprovalDecision::Allow { grants: ControlGrants::NONE, displays: crate::protocol::DisplayGrant::All }, ApprovalDecision::Deny);
+        assert_eq!(ApprovalDecision::Allow { grants: ControlGrants::ALL, displays: crate::protocol::DisplayGrant::All }.grants(), ControlGrants::ALL);
     }
 
 }

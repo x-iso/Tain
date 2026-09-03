@@ -461,6 +461,7 @@ mod tests {
         DisplayInfo {
             id,
             name: format!(r"\\.\DISPLAY{}", id + 1),
+            monitor: None,
             width: w,
             height: h,
             x,
