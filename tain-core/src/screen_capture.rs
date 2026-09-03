@@ -121,6 +121,49 @@ pub fn primary_display_size() -> (u16, u16) {
     FALLBACK_DISPLAY
 }
 
+/// Adapters that exist to present a display nothing is plugged into.
+///
+/// # Why a list of names and not a property
+///
+/// There is no flag for this. An indirect display driver presents an adapter
+/// that looks like any other — `DXGI_ADAPTER_FLAG_SOFTWARE` means WARP, not
+/// this, and the memory figures that look distinctive on a discrete GPU look
+/// exactly like an integrated one. What actually identifies these is who wrote
+/// them.
+///
+/// So this is a list, matched case-insensitively as a substring, and it will be
+/// incomplete. Being wrong here costs a label, not a capture: an unrecognised
+/// virtual display works exactly as a real one does, which is the safe
+/// direction. `capture_dxgi::tests::what_owns_each_display` prints adapter
+/// descriptions, which is how to find a name that belongs here.
+#[cfg(target_os = "windows")]
+const VIRTUAL_ADAPTERS: &[&str] = &[
+    // The MIT driver descended from Microsoft's IddSampleDriver, and the sample
+    // itself. Sunshine and Parsec users mostly have one of these.
+    "iddsampledriver",
+    "idd sample",
+    "virtual display driver",
+    "mttvdd",
+    // Parsec's own, installed standalone by a good number of people.
+    "parsec virtual display",
+    // Long-standing USB-over-IP style virtual monitors.
+    "usbmmidd",
+    "amyuni",
+    // Generic enough to be worth having, specific enough not to match a GPU.
+    "indirect display",
+    "virtual monitor",
+];
+
+/// Whether an adapter description names a driver that presents virtual screens.
+///
+/// See [`VIRTUAL_ADAPTERS`] for why this is a name match.
+#[cfg(target_os = "windows")]
+fn is_virtual_adapter(description: &[u16; 128]) -> bool {
+    let end = description.iter().position(|&c| c == 0).unwrap_or(description.len());
+    let name = String::from_utf16_lossy(&description[..end]).to_ascii_lowercase();
+    VIRTUAL_ADAPTERS.iter().any(|known| name.contains(known))
+}
+
 /// Which of the host's screens a session is watching.
 ///
 /// Names rather than the wire's numeric ids: an id is an enumeration index and
@@ -210,6 +253,12 @@ pub fn displays() -> Vec<super::protocol::DisplayInfo> {
             let mut id = 0u32;
             for adapter_index in 0.. {
                 let Ok(adapter) = factory.EnumAdapters1(adapter_index) else { break };
+                // Asked once per adapter rather than per output: every display
+                // on an indirect-display adapter is a virtual one.
+                let virtual_display = adapter
+                    .GetDesc1()
+                    .is_ok_and(|desc| is_virtual_adapter(&desc.Description));
+
                 for output_index in 0.. {
                     let Ok(output) = adapter.EnumOutputs(output_index) else { break };
                     let Ok(desc) = output.GetDesc() else { continue };
@@ -258,6 +307,7 @@ pub fn displays() -> Vec<super::protocol::DisplayInfo> {
                         // separate query.
                         primary: x == 0 && y == 0,
                         hdr,
+                        virtual_display,
                     });
                     id += 1;
                 }
@@ -1004,6 +1054,8 @@ mod fit_tests {
 
 #[cfg(test)]
 mod display_tests {
+    #[cfg(target_os = "windows")]
+    use super::is_virtual_adapter;
     use super::{displays, primary_display_size};
 
     /// Whatever this machine reports, it has to be self-consistent.
@@ -1081,5 +1133,64 @@ mod display_tests {
             (width, height),
             "DXGI and EnumDisplaySettings disagree about the primary display"
         );
+    }
+
+    /// Known virtual display drivers are recognised; real GPUs are not.
+    ///
+    /// The false positive is the one that matters. Labelling a real monitor
+    /// "virtual" tells a guest that nobody is looking at a screen somebody is
+    /// looking at, and invites resizing it under them. Missing a virtual one
+    /// only costs a label.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn virtual_adapters_are_told_apart_from_real_ones() {
+        fn as_desc(name: &str) -> [u16; 128] {
+            let mut buf = [0u16; 128];
+            for (slot, unit) in buf.iter_mut().zip(name.encode_utf16()) {
+                *slot = unit;
+            }
+            buf
+        }
+
+        for name in [
+            "IddSampleDriver Device",
+            "Virtual Display Driver",
+            "MttVDD",
+            "Parsec Virtual Display Adapter",
+            "usbmmidd Device",
+            // Case is not the driver's to choose.
+            "VIRTUAL DISPLAY DRIVER",
+        ] {
+            assert!(is_virtual_adapter(&as_desc(name)), "{name} should read as virtual");
+        }
+
+        for name in [
+            "AMD Radeon(TM) 8060S Graphics",
+            "NVIDIA GeForce RTX 4090",
+            "Intel(R) UHD Graphics 770",
+            // WARP. Software, but not a virtual *display* — it has no outputs
+            // and capture reaches it by a different route entirely.
+            "Microsoft Basic Render Driver",
+        ] {
+            assert!(!is_virtual_adapter(&as_desc(name)), "{name} should not read as virtual");
+        }
+    }
+
+    /// This machine's own displays are described consistently.
+    ///
+    /// Not an assertion about the hardware — a machine with a virtual display
+    /// driver installed is a legitimate configuration and this must not fail on
+    /// one. What it checks is that the flag and the enumeration agree.
+    #[test]
+    fn whether_a_display_is_virtual_is_reported_for_every_one() {
+        for screen in displays() {
+            // Nothing to assert about the value; what matters is that asking
+            // does not panic and every display carries an answer.
+            eprintln!(
+                "{} — {}",
+                screen.name,
+                if screen.virtual_display { "virtual" } else { "real" }
+            );
+        }
     }
 }

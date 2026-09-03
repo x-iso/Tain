@@ -1080,6 +1080,9 @@ fn render_display_picker(ui: &mut egui::Ui, session: &GuestSession) {
                 let choice = DisplayChoice::One(display.id);
                 let selected = watching == Some(choice);
                 let mut label = describe_display(display, &displays);
+                if display.virtual_display {
+                    label.push_str(" · virtual");
+                }
                 if display.hdr {
                     label.push_str(" · HDR");
                 }
@@ -1108,6 +1111,12 @@ fn describe_display(
     display: &tain_core::protocol::DisplayInfo,
     all: &[tain_core::protocol::DisplayInfo],
 ) -> String {
+    // A virtual screen is named for what it is, not where it is. Nobody at the
+    // host is looking at it and it has no place on a desk, so "Right" would
+    // describe a position that means nothing to either end.
+    if display.virtual_display {
+        return format!("Virtual {}×{}", display.width, display.height);
+    }
     if display.primary {
         return format!("Main {}×{}", display.width, display.height);
     }
@@ -1836,6 +1845,7 @@ mod tests {
             y,
             primary: x == 0 && y == 0,
             hdr: false,
+            virtual_display: false,
         }
     }
 
@@ -1890,5 +1900,35 @@ mod tests {
     fn the_primary_is_always_called_main() {
         let alone = vec![screen(0, 0, 0, 1920, 1080)];
         assert!(describe_display(&alone[0], &alone).starts_with("Main"));
+    }
+
+    /// A virtual screen is named for what it is, not where it is.
+    ///
+    /// Nobody at the host is looking at it and it occupies no place on a desk,
+    /// so "Left" or "Right" would describe a position that means nothing to
+    /// either end — and a virtual display's coordinates are wherever Windows
+    /// happened to put it.
+    #[test]
+    fn a_virtual_screen_is_named_for_being_virtual() {
+        let mut virt = screen(1, 2560, 0, 1920, 1080);
+        virt.virtual_display = true;
+        let all = vec![screen(0, 0, 0, 2560, 1600), virt.clone()];
+
+        assert_eq!(describe_display(&virt, &all), "Virtual 1920×1080");
+        // The real one is still described by where it is.
+        assert_eq!(describe_display(&all[0], &all), "Main 2560×1600");
+    }
+
+    /// Being virtual wins over being the primary.
+    ///
+    /// A virtual display can be made primary — that is the point of it for game
+    /// streaming — and calling it "Main" would hide the thing worth knowing.
+    #[test]
+    fn a_virtual_primary_still_says_virtual() {
+        let mut virt = screen(0, 0, 0, 1920, 1080);
+        virt.virtual_display = true;
+        assert!(virt.primary);
+        let all = vec![virt.clone()];
+        assert!(describe_display(&virt, &all).starts_with("Virtual"));
     }
 }

@@ -3,7 +3,7 @@
 //! Provides `HostServer` (accepts incoming connections, manages sessions) and
 //! `GuestClient` (connects to a host via passcode-protected ticket).
 //!
-//! The ALPN protocol name is `"tain/4"` — every connection carrying this ALPN
+//! The ALPN protocol name is `"tain/5"` — every connection carrying this ALPN
 //! is routed through our handler. iroh handles NAT traversal automatically:
 //! direct QUIC connections when possible, relay fallback otherwise.
 //!
@@ -90,8 +90,8 @@ pub use super::connection_code::ConnectionCode;
 ///
 /// `tain/3` added the host's display list to `SessionStart`; `tain/4` made
 /// choosing a display a `DisplayChoice` rather than a bare id, so "all of
-/// them" could be asked for.
-pub const ALPN: &[u8] = b"tain/4";
+/// them" could be asked for; `tain/5` added whether a display is virtual.
+pub const ALPN: &[u8] = b"tain/5";
 
 /// How long a starting host waits to reach a relay before listening anyway.
 ///

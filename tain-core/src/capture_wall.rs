@@ -438,6 +438,7 @@ mod tests {
             y,
             primary: x == 0 && y == 0,
             hdr: false,
+            virtual_display: false,
         }
     }
 

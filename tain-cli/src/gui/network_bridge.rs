@@ -1472,13 +1472,14 @@ where
                         ss.displays
                             .iter()
                             .map(|d| format!(
-                                "{} {}x{} at ({}, {}){}{}",
+                                "{} {}x{} at ({}, {}){}{}{}",
                                 d.name,
                                 d.width,
                                 d.height,
                                 d.x,
                                 d.y,
                                 if d.primary { " primary" } else { "" },
+                                if d.virtual_display { " virtual" } else { "" },
                                 if d.hdr { " HDR" } else { "" },
                             ))
                             .collect::<Vec<_>>()

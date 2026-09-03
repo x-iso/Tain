@@ -485,6 +485,18 @@ pub struct DisplayInfo {
     /// Per display, because it is a per-display setting: one monitor in HDR
     /// beside one that is not is an ordinary arrangement, not a corner case.
     pub hdr: bool,
+    /// Whether this display exists only in software.
+    ///
+    /// A virtual display has no panel and nobody at the host is looking at it,
+    /// which makes it a different proposition from the rest of the list: it is
+    /// the one that can be resized to suit the guest without disturbing anyone,
+    /// and the one worth labelling so a guest does not pick it expecting to see
+    /// what the person at the other end sees.
+    ///
+    /// Recognised, not reported — see `screen_capture::displays`. A driver this
+    /// build has not been told about reads as an ordinary display, which is the
+    /// safe direction to be wrong in.
+    pub virtual_display: bool,
 }
 
 /// Host-to-guest: session has started and screen info is available.
@@ -737,6 +749,7 @@ mod tests {
                     y: 0,
                     primary: true,
                     hdr: true,
+                    virtual_display: false,
                 },
                 // Left of the primary, and higher up: both negative.
                 DisplayInfo {
@@ -748,6 +761,7 @@ mod tests {
                     y: -120,
                     primary: false,
                     hdr: false,
+                    virtual_display: false,
                 },
             ],
         };

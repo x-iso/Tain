@@ -27,7 +27,7 @@ the code and the tests win.
 2. **A session runs on a direct path or not at all.** A relay carries the
    handshake and the address exchange; it never carries video. See
    `network::await_direct_path`.
-3. **ALPN is `"tain/4"`.** In `network::ALPN`.
+3. **ALPN is `"tain/5"`.** In `network::ALPN`.
 4. **Messages are length-prefixed bincode 1.x.** Not bincode 2.
 5. **Passcodes are 32-byte random secrets**, base58check with a `MASTER-` or
    `GUEST-` prefix, carried inside a self-contained connection code along with

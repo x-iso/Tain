@@ -7,7 +7,7 @@
 //! ## Architecture
 //!
 //! ```text
-//! ┌──────────┐  iroh P2P QUIC (ALPN: "tain/4")   ┌──────────┐
+//! ┌──────────┐  iroh P2P QUIC (ALPN: "tain/5")   ┌──────────┐
 //! │  Host    │ ◄════════════════════════════► │  Guest   │
 //! │          │                                  │          │
 //! │ Screen   │  Frame stream (H.264/raw BGRA)   │ Decoder  │
