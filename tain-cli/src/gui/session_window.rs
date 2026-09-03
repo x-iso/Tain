@@ -1054,51 +1054,55 @@ fn render_display_picker(ui: &mut egui::Ui, session: &GuestSession) {
     use tain_core::protocol::DisplayChoice;
 
     ui.add_space(12.0);
-    let current = match watching {
-        Some(DisplayChoice::All) => "All screens".to_string(),
-        Some(DisplayChoice::One(id)) => displays
-            .iter()
-            .find(|d| d.id == id)
-            .map(|d| describe_display(d, &displays))
-            .unwrap_or_else(|| "Screen".to_string()),
-        None => "Screen".to_string(),
-    };
 
-    egui::ComboBox::from_id_salt("display-picker")
-        .selected_text(RichText::new(current).size(12.0).color(TEXT))
-        .width(120.0)
-        .show_ui(ui, |ui| {
-            // Every screen at once, first, because it is the answer to "what is
-            // on that machine" and the single screens are the refinement.
-            let all = watching == Some(DisplayChoice::All);
-            if ui.selectable_label(all, "All screens").clicked() && !all {
-                session.watch_display(DisplayChoice::All);
-            }
-            ui.separator();
+    // Every screen at once, first: it is the answer to "what is on that
+    // machine", and the individual screens are the refinement.
+    let all = watching == Some(DisplayChoice::All);
+    if theme::icon_toggle(
+        ui,
+        16.0,
+        if all { theme::IconState::On } else { theme::IconState::Off },
+        egui::include_image!("../../assets/overview.svg"),
+        "Every screen at once, laid out the way the host has them. Use 1:1 rather than Fit \
+         to see it at full resolution.",
+    )
+    .clicked()
+        && !all
+    {
+        session.watch_display(DisplayChoice::All);
+    }
+    ui.add_space(2.0);
 
-            for display in &displays {
-                let choice = DisplayChoice::One(display.id);
-                let selected = watching == Some(choice);
-                let mut label = describe_display(display, &displays);
-                if display.virtual_display {
-                    label.push_str(" · virtual");
-                }
-                if display.hdr {
-                    label.push_str(" · HDR");
-                }
-                if ui.selectable_label(selected, label).clicked() && !selected {
-                    session.watch_display(choice);
-                }
-            }
-        })
-        .response
-        .on_hover_text(
-            "Which of the host's screens to watch. \"All screens\" composes them into one \
-             picture laid out the way the host has them — use 1:1 rather than Fit to see it \
-             at full resolution.\n\nThe host is only asked; it answers with whatever it is \
-             actually showing, so a monitor unplugged since this menu was drawn cannot leave \
-             the picture and the label disagreeing.",
-        );
+    for (index, display) in displays.iter().enumerate() {
+        let choice = DisplayChoice::One(display.id);
+        let selected = watching == Some(choice);
+        let mut hover = describe_display(display, &displays);
+        if display.hdr {
+            hover.push_str(" · HDR");
+        }
+
+        // Numbered by position in the list, from one, rather than by the
+        // wire id. The id starts at zero and is an enumeration index; what
+        // belongs on a button is what a person would count.
+        let clicked = theme::numbered_icon_toggle(
+            ui,
+            16.0,
+            if selected { theme::IconState::On } else { theme::IconState::Off },
+            if display.virtual_display {
+                egui::include_image!("../../assets/virtualdisplay.svg")
+            } else {
+                egui::include_image!("../../assets/monitor.svg")
+            },
+            index as u32 + 1,
+            &hover,
+        )
+        .clicked();
+
+        if clicked && !selected {
+            session.watch_display(choice);
+        }
+        ui.add_space(2.0);
+    }
 }
 
 /// A display named the way the person at the host would recognise it.

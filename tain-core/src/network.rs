@@ -782,6 +782,41 @@ impl HostServer {
             }
         };
         let (capture_w, capture_h) = capturer.frame_size();
+
+        // # Said by the host, not only by the guest
+        //
+        // The guest logs what it was told, which answers "did the list arrive".
+        // It cannot answer "did this machine see the monitor", and that is the
+        // question a host with a screen it expected to share actually has —
+        // asked, the first time, of a dummy HDMI plug that produced no menu on
+        // the far end with nothing anywhere saying why.
+        let available_displays = super::screen_capture::displays();
+        if available_displays.is_empty() {
+            warn!(
+                "Session #{session_id}: this host could not enumerate any display, so the \
+                 guest gets no choice of screen"
+            );
+        } else {
+            info!(
+                "Session #{session_id}: offering {} display(s): {}",
+                available_displays.len(),
+                available_displays
+                    .iter()
+                    .map(|d| format!(
+                        "{} {}x{} at ({}, {}){}{}",
+                        d.name,
+                        d.width,
+                        d.height,
+                        d.x,
+                        d.y,
+                        if d.primary { " primary" } else { "" },
+                        if d.virtual_display { " virtual" } else { "" },
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         write_stream_message(
             &mut send,
             &Message::SessionStart(super::protocol::SessionStart {
@@ -799,7 +834,7 @@ impl HostServer {
                 // is a permission, and permissions are chosen in the approval
                 // dialog — so this is filtered once there is something to
                 // filter it by.
-                displays: super::screen_capture::displays(),
+                displays: available_displays,
             }),
         )
         .await?;

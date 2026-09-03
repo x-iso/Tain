@@ -285,6 +285,59 @@ pub fn icon_toggle(
     resp.on_hover_text(hover)
 }
 
+/// An [`icon_toggle`] with a number drawn inside it.
+///
+/// # Why the number is painted rather than drawn into the art
+///
+/// A screen's number is not known until the host says how many it has, so there
+/// is no fixed set of icons to draw — and rewriting the SVG at runtime to
+/// substitute a digit would mean re-rasterising a texture per display per
+/// theme change, to place a glyph that the UI font can already draw crisply at
+/// any size.
+///
+/// So the monitor is art and the digit is text, centred on the screen area of
+/// [`monitor.svg`] rather than on the icon: the shape has a stand below it, so
+/// the middle of the picture is not the middle of the screen. `SCREEN_CENTRE`
+/// is that offset as a fraction of the icon, taken from the artwork's own
+/// viewBox.
+pub fn numbered_icon_toggle(
+    ui: &mut Ui,
+    size: f32,
+    state: IconState,
+    src: egui::ImageSource<'_>,
+    number: u32,
+    hover: &str,
+) -> Response {
+    /// Where the middle of the screen sits within the monitor art, as a
+    /// fraction of its 24x23 viewBox. The panel spans y 3..17, so its centre is
+    /// well above the icon's own.
+    const SCREEN_CENTRE: (f32, f32) = (12.0 / 24.0, 10.0 / 23.0);
+
+    let resp = icon_toggle(ui, size, state, src, hover);
+    if ui.is_rect_visible(resp.rect) {
+        let at = resp.rect.min
+            + egui::vec2(
+                resp.rect.width() * SCREEN_CENTRE.0,
+                resp.rect.height() * SCREEN_CENTRE.1,
+            );
+        // Matching the art's own weight: the strokes are white at full
+        // strength when lit and dimmed when not, and a digit that ignored that
+        // would sit oddly bright on an unlit icon.
+        let colour = match state {
+            IconState::On => Color32::WHITE,
+            _ => Color32::from_white_alpha(150),
+        };
+        ui.painter().text(
+            at,
+            egui::Align2::CENTER_CENTER,
+            number.to_string(),
+            egui::FontId::proportional((size * 0.5).max(8.0)),
+            colour,
+        );
+    }
+    resp
+}
+
 /// What an [`icon_toggle`] is currently saying.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconState {
