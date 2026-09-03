@@ -183,6 +183,72 @@ impl<T: AddressLookup> AddressLookup for Noting<T> {
     }
 }
 
+/// Addresses worth putting in a public directory.
+///
+/// # What this is for
+///
+/// Both directories this publishes to — the n0 lookup service and the mainline
+/// DHT — default to publishing the relay and nothing else. That is a safe
+/// default and it has a cost: a peer that reads the record learns only which
+/// relay to meet at, and then has to hole punch. Where punching fails, there is
+/// nothing else to try, and the session is refused.
+///
+/// Measured, on the session that prompted this: a tunnel on one machine and not
+/// the other. DNS answered, gave the relay, the connection came up on it, and
+/// no direct path ever opened. Waiting longer would not have helped — nor would
+/// waiting for the DHT, which had the same relay and no addresses of its own to
+/// offer. The address that would have worked was never published by anybody.
+///
+/// # Why not simply everything
+///
+/// `AddrFilter::unfiltered` also publishes private addresses, and those are the
+/// worst of both: a `192.168.x` address is unreachable for the remote peer this
+/// is published *for*, while telling anyone who reads the record how the local
+/// network is laid out. The case they would serve — two machines in one
+/// building — is answered by mDNS in under a second without publishing
+/// anything anywhere.
+///
+/// So: the relay, and addresses that are actually routable from outside.
+fn publishable() -> iroh::address_lookup::AddrFilter {
+    iroh::address_lookup::AddrFilter::new(|addrs| {
+        std::borrow::Cow::Owned(addrs.iter().filter(|addr| worth_publishing(addr)).cloned().collect())
+    })
+}
+
+/// Whether a peer somewhere else on the internet could do anything with this.
+fn worth_publishing(addr: &iroh::TransportAddr) -> bool {
+    let ip = match addr {
+        // The whole point of the record: where to meet to punch.
+        iroh::TransportAddr::Relay(_) => return true,
+        iroh::TransportAddr::Ip(socket) => socket.ip(),
+        // A transport this build does not have. Publishing an address nothing
+        // here can produce is not a decision worth guessing at.
+        _ => return false,
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            // Carrier-grade NAT (100.64/10) is as unreachable from outside as
+            // RFC1918 and is not covered by `is_private`.
+            let carrier_grade = a == 100 && (64..128).contains(&b);
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || carrier_grade)
+        }
+        std::net::IpAddr::V6(v6) => {
+            // Unique local (fc00::/7) and link-local (fe80::/10) are the IPv6
+            // equivalents of the ranges dropped above.
+            let unique_local = (v6.octets()[0] & 0xfe) == 0xfc;
+            let link_local = v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80;
+            !(v6.is_loopback() || v6.is_unspecified() || unique_local || link_local)
+        }
+    }
+}
+
 /// A builder configured the way every endpoint here wants to be.
 ///
 /// This is `presets::N0` written out, because the services it installs have to
@@ -192,7 +258,12 @@ impl<T: AddressLookup> AddressLookup for Noting<T> {
 /// way worth surviving.
 pub fn endpoint_builder() -> iroh::endpoint::Builder {
     iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .address_lookup(iroh::address_lookup::PkarrPublisher::n0_dns())
+        // Publishes routable addresses as well as the relay — see
+        // `publishable`. This is the directory the DNS branch reads, and in the
+        // session that prompted the change it was the branch that answered.
+        .address_lookup(
+            iroh::address_lookup::PkarrPublisher::n0_dns().addr_filter(publishable()),
+        )
         .relay_mode(iroh::endpoint::default_relay_mode())
         // Relay hostnames answered from what was resolved last time, so a link
         // that cannot reach DNS can still reach the relays. See `dns_cache`.
@@ -277,14 +348,13 @@ pub fn attach(endpoint: &Endpoint) -> Attached {
     // trustworthy without a trusted server: the record is signed, and the key
     // it is signed with *is* the endpoint id being looked up.
     //
-    // The default address filter is `relay_only`, so what goes into the public
-    // DHT is which relay to find this endpoint at — not its IP addresses. That
-    // is the right default and it is left alone, and not only for privacy: the
-    // address that lets someone reach a machine behind NAT belongs to a NAT
-    // mapping, not to the machine, so it is worth nothing by the time anyone
-    // reads it. Resolving that live is the relay's job.
+    // The crate's default filter is `relay_only`, which publishes the relay and
+    // nothing else. That is replaced with `publishable` so a peer reading this
+    // record gets somewhere to dial as well as somewhere to meet — see that
+    // function for the session that made the difference matter.
     let dht = iroh_mainline_address_lookup::DhtAddressLookup::builder()
         .secret_key(endpoint.secret_key().clone())
+        .addr_filter(publishable())
         .build();
     match dht {
         Ok(dht) => {
@@ -296,4 +366,60 @@ pub fn attach(endpoint: &Endpoint) -> Attached {
     }
 
     up
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn ip(addr: &str) -> iroh::TransportAddr {
+        iroh::TransportAddr::Ip(addr.parse::<SocketAddr>().expect("test address"))
+    }
+
+    /// Only addresses another machine could actually reach get published.
+    ///
+    /// This decides what leaves this machine and goes into a public directory
+    /// under a long-lived identity, so it is worth being exact about. The two
+    /// failure directions are not symmetric: publishing too little means a peer
+    /// has nothing to dial and the session is refused, and publishing too much
+    /// means telling a global hash table how someone's home network is laid
+    /// out, for addresses that peer could never have used.
+    #[test]
+    fn only_addresses_a_stranger_could_reach_are_published() {
+        for public in ["93.184.216.34:41641", "8.8.8.8:1234", "[2606:2800:220:1::]:41641"] {
+            assert!(worth_publishing(&ip(public)), "{public} is reachable and should be published");
+        }
+
+        for private in [
+            "192.168.0.10:61369",  // RFC1918, and what mDNS already covers
+            "10.1.2.3:41641",      // RFC1918
+            "172.16.5.4:41641",    // RFC1918
+            "127.0.0.1:41641",     // loopback
+            "169.254.7.7:41641",   // link-local
+            "100.100.1.1:41641",   // carrier-grade NAT, which is_private misses
+            "0.0.0.0:41641",       // unspecified
+            "[::1]:41641",         // loopback
+            "[fd00::1]:41641",     // unique local
+            "[fe80::1]:41641",     // link-local
+        ] {
+            assert!(
+                !worth_publishing(&ip(private)),
+                "{private} cannot be reached from outside and must not be published"
+            );
+        }
+    }
+
+    /// The relay is the one thing that must always be published.
+    ///
+    /// It is what a peer meets at in order to punch. Filtering it out would
+    /// leave a record naming addresses and no way to arrange the punch that
+    /// makes them usable.
+    #[test]
+    fn the_relay_is_always_published() {
+        let relay = iroh::TransportAddr::Relay(
+            "https://euc1-1.relay.n0.iroh.link./".parse().expect("relay url"),
+        );
+        assert!(worth_publishing(&relay));
+    }
 }
