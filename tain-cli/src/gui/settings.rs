@@ -530,6 +530,9 @@ impl Settings {
     /// Capture configuration these settings imply.
     pub fn to_capture_config(&self) -> CaptureConfig {
         CaptureConfig {
+            // Which display a session streams is chosen per session, not in
+            // the global settings: two guests can be watching different ones.
+            display: None,
             fps: self.effective_fps(),
             quality: self.effective_quality(),
             show_cursor: self.show_cursor,

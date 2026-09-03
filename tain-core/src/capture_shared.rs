@@ -79,23 +79,42 @@ const MIN_ITERATION: std::time::Duration = std::time::Duration::from_millis(4);
 /// How often the idle pump re-checks whether it has been told to stop.
 const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// The live duplication, if any session has one open.
+/// The live duplications, keyed by the display each one is of.
 ///
-/// `Weak`, so the last session leaving really does release it — a held
-/// duplication is not merely idle, it is the thing that makes the *next* one
-/// fail.
-static DESKTOP: Mutex<Weak<Desktop>> = Mutex::new(Weak::new());
+/// # One per display, not one per machine
+///
+/// DXGI allows a process one duplication *of a given output*, not one in total,
+/// so two displays can be captured at once and two sessions watching the same
+/// display still have to share. The key is the device name the caller asked
+/// for, with the empty string standing for "the primary" — see
+/// [`crate::screen_capture::create_capturer`], which resolves that to a real
+/// name whenever the displays can be enumerated, so the two spellings of the
+/// same display do not normally both appear.
+///
+/// `Weak`, so the last session leaving a display really does release it — a
+/// held duplication is not merely idle, it is the thing that makes the *next*
+/// one fail.
+static DESKTOPS: Mutex<Option<HashMap<String, Weak<Desktop>>>> = Mutex::new(None);
 
-/// Attach to the shared duplication, starting it if this is the first session.
-pub fn attach() -> Result<Box<dyn ScreenCaptureBackend>> {
+/// Attach to the duplication of one display, starting it if nobody has it open.
+///
+/// `want` is a device name as [`crate::screen_capture::displays`] reports it;
+/// `None` means the primary display.
+pub fn attach(want: Option<String>) -> Result<Box<dyn ScreenCaptureBackend>> {
     // Held across both the upgrade and the subscriber count so that attaching
     // cannot race the last subscriber's departure. See [`Subscriber::drop`].
-    let mut slot = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
-    let desktop = match slot.upgrade() {
+    let mut slots = DESKTOPS.lock().unwrap_or_else(|e| e.into_inner());
+    let slots = slots.get_or_insert_with(HashMap::new);
+    let key = want.clone().unwrap_or_default();
+
+    let desktop = match slots.get(&key).and_then(Weak::upgrade) {
         Some(desktop) => desktop,
         None => {
-            let desktop = Desktop::start()?;
-            *slot = Arc::downgrade(&desktop);
+            let desktop = Desktop::start(want)?;
+            slots.insert(key, Arc::downgrade(&desktop));
+            // A display that has been unplugged leaves a dead entry behind.
+            // Cheap to sweep here, and this is the only place that grows the map.
+            slots.retain(|_, held| held.strong_count() > 0);
             desktop
         }
     };
@@ -128,6 +147,10 @@ struct Published {
 }
 
 struct Desktop {
+    /// Which entry of [`DESKTOPS`] this is, so the last subscriber to leave can
+    /// remove the right one. Storing it beats searching the map by pointer:
+    /// there is one correct answer and it is known at construction.
+    key: String,
     /// The capturer itself. Held by the pump for the length of one acquire, and
     /// by control calls ([`Subscriber::set_scale`] and friends) for as long as
     /// it takes to reconfigure — which is why those answer honestly instead of
@@ -151,7 +174,8 @@ struct Desktop {
 }
 
 impl Desktop {
-    fn start() -> Result<Arc<Self>> {
+    fn start(want: Option<String>) -> Result<Arc<Self>> {
+        let key = want.clone().unwrap_or_default();
         // Built on the pump thread, not here, so the D3D device and the
         // duplication are created and used on the same thread for their whole
         // life. Handing a live one across threads works, but only by accident of
@@ -162,7 +186,7 @@ impl Desktop {
         let handle = std::thread::Builder::new()
             .name("desktop-capture".into())
             .spawn(move || {
-                let capturer = DxgiCapturer::new();
+                let capturer = DxgiCapturer::new(want);
                 let failed = capturer.is_err();
                 if ready_tx.send(capturer).is_err() || failed {
                     return;
@@ -181,6 +205,7 @@ impl Desktop {
         let size = capturer.frame_size();
 
         let desktop = Arc::new(Self {
+            key,
             capturer: Mutex::new(capturer),
             published: Mutex::new(Published {
                 frame: None,
@@ -481,7 +506,7 @@ impl Drop for Subscriber {
         // arriving as this one leaves either finds a live desktop and joins it
         // or finds the slot already cleared and starts a fresh one. It cannot
         // find one that is halfway through shutting down.
-        let mut slot = DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots = DESKTOPS.lock().unwrap_or_else(|e| e.into_inner());
 
         {
             let mut published = self.desktop.published.lock().unwrap_or_else(|e| e.into_inner());
@@ -498,7 +523,9 @@ impl Drop for Subscriber {
         }
 
         if self.desktop.subscribers.fetch_sub(1, Ordering::AcqRel) == 1 {
-            *slot = Weak::new();
+            if let Some(slots) = slots.as_mut() {
+                slots.remove(&self.desktop.key);
+            }
             // Still holding the registry lock, deliberately: the next session
             // must not be able to ask for a duplication until this one is
             // actually released, which is what `stop` waits for.
@@ -517,8 +544,8 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive desktop session"]
     fn two_sessions_both_get_the_real_desktop() {
-        let mut first = attach().expect("first session");
-        let mut second = attach().expect("second session");
+        let mut first = attach(None).expect("first session");
+        let mut second = attach(None).expect("second session");
 
         assert!(first.is_real() && second.is_real());
         assert_eq!(first.frame_size(), second.frame_size());
@@ -545,7 +572,7 @@ mod tests {
     #[ignore = "requires an interactive desktop session"]
     fn a_session_can_start_the_instant_the_last_one_ends() {
         for round in 0..5 {
-            let capturer = attach().unwrap_or_else(|e| panic!("round {round}: {e}"));
+            let capturer = attach(None).unwrap_or_else(|e| panic!("round {round}: {e}"));
             assert!(capturer.is_real(), "round {round} did not get a real capture");
             drop(capturer);
         }
@@ -556,7 +583,7 @@ mod tests {
     fn queued_pointer_moves_collapse_to_the_newest_position() {
         use crate::cursor::{CursorPosition, CursorShape};
 
-        let Ok(desktop) = Desktop::start() else {
+        let Ok(desktop) = Desktop::start(None) else {
             eprintln!("no desktop duplication — skipping");
             return;
         };
@@ -606,8 +633,8 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive desktop session"]
     fn the_second_session_does_not_get_to_resize_the_first() {
-        let mut first = attach().expect("first session");
-        let mut second = attach().expect("second session");
+        let mut first = attach(None).expect("first session");
+        let mut second = attach(None).expect("second session");
 
         assert!(!second.set_scale(QualityScale::Low), "a later session resized the capture");
         assert!(first.set_scale(QualityScale::Low), "the owning session could not resize");

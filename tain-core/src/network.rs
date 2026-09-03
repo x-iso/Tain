@@ -3392,6 +3392,7 @@ mod tests {
     fn test_config() -> SessionConfig {
         SessionConfig {
             capture: CaptureConfig {
+                display: None,
                 fps: 120,
                 quality: QualityScale::Native,
                 // 32x16 rather than 8x4: H.264 is the default codec and needs

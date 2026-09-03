@@ -304,6 +304,7 @@ fn where_a_real_session_spends_its_time() {
     use tain_core::encoder::{create_encoder, EncoderBackend};
 
     let config = CaptureConfig {
+        display: None,
         fps: 60,
         quality: QualityScale::Native,
         show_cursor: true,
@@ -399,6 +400,7 @@ fn where_a_real_session_spends_its_time() {
 #[ignore = "requires a real desktop session"]
 fn how_long_a_real_capture_takes() {
     let config = CaptureConfig {
+        display: None,
         fps: 30,
         quality: QualityScale::Native,
         show_cursor: true,
@@ -615,6 +617,7 @@ fn a_real_session_both_ways() {
 
     let pass = |want: PixelFormat| {
         let config = CaptureConfig {
+        display: None,
             fps: 120,
             quality: QualityScale::Native,
             show_cursor: true,

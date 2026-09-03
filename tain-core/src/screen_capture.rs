@@ -263,6 +263,14 @@ pub fn displays() -> Vec<super::protocol::DisplayInfo> {
 /// Configuration for screen capture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureConfig {
+    /// Which display to capture, as a device name — `\\.\DISPLAY2` and the
+    /// like, exactly as [`displays`] reports it.
+    ///
+    /// `None` is the primary display, which is what a session that has not
+    /// asked for anything else gets. A name rather than the wire's numeric id
+    /// because the id is an enumeration index and renumbers when a monitor is
+    /// plugged in; the name does not.
+    pub display: Option<String>,
     /// Target frames per second.
     pub fps: u32,
     /// How much of the host's native resolution to stream.
@@ -279,7 +287,13 @@ pub struct CaptureConfig {
 
 impl Default for CaptureConfig {
     fn default() -> Self {
-        Self { fps: 30, quality: QualityScale::default(), show_cursor: true, native_override: None }
+        Self {
+            display: None,
+            fps: 30,
+            quality: QualityScale::default(),
+            show_cursor: true,
+            native_override: None,
+        }
     }
 }
 
@@ -704,8 +718,16 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
                 Box::new(super::capture_follow::DesktopFollowing::agent_only())
             } else {
                 use anyhow::Context;
-                let local =
-                    super::capture_shared::attach().context("could not start screen capture")?;
+                // Resolved to a real device name where the displays can be
+                // enumerated, so "the primary" and its own name do not become
+                // two registry entries for one display — which would mean two
+                // duplications of it, and the second one failing.
+                let want = config
+                    .display
+                    .clone()
+                    .or_else(|| displays().into_iter().find(|d| d.primary).map(|d| d.name));
+                let local = super::capture_shared::attach(want)
+                    .context("could not start screen capture")?;
                 // Wrapped so a consent prompt does not end the picture. See
                 // `capture_follow`: everything above this sees one capturer.
                 Box::new(super::capture_follow::DesktopFollowing::new(local))
@@ -752,7 +774,13 @@ mod tests {
     use super::*;
 
     fn config_for(native: (u16, u16), quality: QualityScale) -> CaptureConfig {
-        CaptureConfig { fps: 30, quality, show_cursor: false, native_override: Some(native) }
+        CaptureConfig {
+            display: None,
+            fps: 30,
+            quality,
+            show_cursor: false,
+            native_override: Some(native),
+        }
     }
 
     #[test]

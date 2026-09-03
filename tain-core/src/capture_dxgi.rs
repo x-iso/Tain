@@ -99,7 +99,7 @@ impl Duplication {
     ///
     /// The state that decides what is worth repeating has to outlive the thing
     /// being rebuilt, so it is passed in.
-    fn create(colour_log: &mut ColourLog) -> Result<Self> {
+    fn create(want: Option<&str>, colour_log: &mut ColourLog) -> Result<Self> {
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
 
@@ -148,7 +148,7 @@ impl Duplication {
         let (output, width, height, hdr) = unsafe {
             let dxgi_device: IDXGIDevice = device.cast().context("device is not a IDXGIDevice")?;
             let adapter = dxgi_device.GetAdapter().context("no DXGI adapter")?;
-            let (output, where_) = primary_output(&adapter)?;
+            let (output, where_) = choose_output(&adapter, want)?;
             let output1: IDXGIOutput1 = output.cast().context("output is not IDXGIOutput1")?;
             debug!("Capturing {where_}");
 
@@ -457,9 +457,13 @@ unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16
 /// through the same call if not, and the legacy call only for a Windows too old
 /// to offer `IDXGIOutput5` — which is also a Windows too old to have an HDR
 /// desktop, so it is never the one being asked to do the impossible.
-/// The output showing the primary display, and a description for the log.
+/// The output to duplicate, and a description for the log.
 ///
-/// # Why this is not `EnumOutputs(0)`
+/// `want` is a device name — `\\.\DISPLAY2` and the like, exactly as
+/// [`crate::screen_capture::displays`] reports it. `None` means the primary
+/// display.
+///
+/// # Why the primary is not `EnumOutputs(0)`
 ///
 /// It was, and on a single-monitor machine the two are the same thing, which is
 /// why nothing noticed. On any other machine `EnumOutputs(0)` is whichever
@@ -472,12 +476,19 @@ unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16
 /// is the one at the origin of the virtual desktop: Windows defines it that way,
 /// so no GDI call is needed to recognise it.
 ///
-/// Falls back to the first attached output, because a machine that somehow has
-/// no output at the origin should still stream something.
-fn primary_output(
+/// # Why a named display that is missing is an error
+///
+/// Falling back to the primary would put a different screen on the guest's
+/// monitor than the one it selected, with nothing on either end saying so. A
+/// display that has been unplugged should end that stream and say why. Asking
+/// for the primary and finding nothing at the origin is different — there is no
+/// selection to betray — so that takes the first attached output and warns.
+fn choose_output(
     adapter: &windows::Win32::Graphics::Dxgi::IDXGIAdapter,
+    want: Option<&str>,
 ) -> Result<(windows::Win32::Graphics::Dxgi::IDXGIOutput, String)> {
     let mut first = None;
+    let mut seen = Vec::new();
 
     for index in 0.. {
         // SAFETY: enumeration terminates on the first error, which is how DXGI
@@ -493,6 +504,10 @@ fn primary_output(
         let name = String::from_utf16_lossy(
             &desc.DeviceName[..desc.DeviceName.iter().position(|&c| c == 0).unwrap_or(0)],
         );
+        // Note these coordinates are DPI-virtualised in a process that has not
+        // declared awareness — see `screen_capture::displays`. They are only
+        // ever used here to recognise the origin and to describe the output in
+        // the log, and virtualisation preserves both.
         let where_ = format!(
             "{name} at ({}, {}), {}x{}",
             rect.left,
@@ -500,13 +515,32 @@ fn primary_output(
             rect.right - rect.left,
             rect.bottom - rect.top
         );
+        seen.push(name.clone());
 
-        if rect.left == 0 && rect.top == 0 {
-            return Ok((output, format!("{where_} — the primary display")));
+        match want {
+            Some(wanted) => {
+                if name == wanted {
+                    return Ok((output, where_));
+                }
+            }
+            None if rect.left == 0 && rect.top == 0 => {
+                return Ok((output, format!("{where_} — the primary display")));
+            }
+            None => {}
         }
+
         if first.is_none() {
             first = Some((output, where_));
         }
+    }
+
+    if let Some(wanted) = want {
+        anyhow::bail!(
+            "{wanted} is not attached to this adapter (it has {}). A display that has been \
+             unplugged or moved to another GPU cannot be captured, and quietly sending a \
+             different one would be worse.",
+            if seen.is_empty() { "none".to_string() } else { seen.join(", ") }
+        );
     }
 
     let (output, where_) = first.context("no display attached to this adapter")?;
@@ -652,12 +686,21 @@ pub struct DxgiCapturer {
     /// Outlives the duplication it describes, because the duplication is what
     /// keeps being rebuilt — see [`ColourLog`].
     colour_log: ColourLog,
+    /// The display this capturer is for, as a device name. `None` is the
+    /// primary.
+    ///
+    /// Kept because the duplication is rebuilt on every access loss, and a
+    /// rebuild that forgot which display it was for would silently move the
+    /// stream to another monitor the first time a UAC prompt appeared.
+    want: Option<String>,
 }
 
 impl DxgiCapturer {
-    pub fn new() -> Result<Self> {
+    /// `want` is a device name as `crate::screen_capture::displays` reports
+    /// it; `None` means the primary display.
+    pub fn new(want: Option<String>) -> Result<Self> {
         let mut colour_log = ColourLog::default();
-        let duplication = Duplication::create(&mut colour_log)?;
+        let duplication = Duplication::create(want.as_deref(), &mut colour_log)?;
         let (width, height) = (duplication.width, duplication.height);
         Ok(Self {
             duplication: Some(duplication),
@@ -672,6 +715,7 @@ impl DxgiCapturer {
             format: PixelFormat::Bgra,
             reported_loss: false,
             colour_log,
+            want,
         })
     }
 
@@ -690,7 +734,7 @@ impl DxgiCapturer {
     /// both deny duplication for as long as they are up.
     fn recover(&mut self) {
         self.duplication = None;
-        match Duplication::create(&mut self.colour_log) {
+        match Duplication::create(self.want.as_deref(), &mut self.colour_log) {
             Ok(duplication) => {
                 if duplication.width != self.width || duplication.height != self.height {
                     info!(
@@ -930,7 +974,7 @@ mod tests {
     #[test]
     #[ignore = "captures the real desktop; move the mouse while it runs"]
     fn the_pointer_is_reported_with_a_usable_shape() {
-        let Ok(mut capturer) = DxgiCapturer::new() else {
+        let Ok(mut capturer) = DxgiCapturer::new(None) else {
             eprintln!("no desktop duplication — skipping");
             return;
         };
@@ -1014,7 +1058,7 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive desktop session"]
     fn captures_a_real_frame_from_the_desktop() {
-        let mut capturer = DxgiCapturer::new().expect("could not start duplication");
+        let mut capturer = DxgiCapturer::new(None).expect("could not start duplication");
         let (w, h) = capturer.frame_size();
         assert!(w >= 640 && h >= 480, "implausible desktop size {w}x{h}");
 
@@ -1047,16 +1091,16 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive desktop session"]
     fn what_a_second_duplication_does() {
-        let first = DxgiCapturer::new().expect("first duplication");
+        let first = DxgiCapturer::new(None).expect("first duplication");
         println!("first: {:?}", first.frame_size());
 
-        match DxgiCapturer::new() {
+        match DxgiCapturer::new(None) {
             Ok(second) => println!("second: ok, {:?}", second.frame_size()),
             Err(e) => println!("second: {e}"),
         }
 
         drop(first);
-        match DxgiCapturer::new() {
+        match DxgiCapturer::new(None) {
             Ok(third) => println!("after dropping the first: ok, {:?}", third.frame_size()),
             Err(e) => println!("after dropping the first: {e}"),
         }

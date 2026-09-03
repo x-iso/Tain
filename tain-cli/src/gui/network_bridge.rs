@@ -2023,6 +2023,7 @@ mod tests {
 
         let config = SessionConfig {
             capture: CaptureConfig {
+                display: None,
                 fps: 30,
                 quality: QualityScale::Native,
                 show_cursor: false,

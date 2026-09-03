@@ -24,11 +24,12 @@ use std::time::Duration;
 fn test_config() -> SessionConfig {
     SessionConfig {
         capture: CaptureConfig {
-                fps: 30,
-                quality: QualityScale::Native,
-                show_cursor: false,
-                native_override: Some((64, 36)),
-            },
+            display: None,
+            fps: 30,
+            quality: QualityScale::Native,
+            show_cursor: false,
+            native_override: Some((64, 36)),
+        },
         encode: EncodeConfig::default(),
         approval_timeout: Duration::from_secs(5),
         auto_regen_guest_passcode: true,
