@@ -756,6 +756,27 @@ impl GuestSession {
         }
     }
 
+    /// The whole path from "Connect" to a moving picture, written out.
+    ///
+    /// What the session window shows on hover in place of the single word the
+    /// stats row has room for.
+    pub fn path_summary(&self) -> String {
+        let (branch, remote) = {
+            let health = self.shared.health.lock().unwrap();
+            (health.found_via, health.path.as_ref().map(|p| p.remote().to_string()))
+        };
+        super::progress::summary(
+            super::progress::progress(&self.status()),
+            branch,
+            remote.as_deref(),
+        )
+    }
+
+    /// Which address lookup located this host, once one has.
+    pub fn found_via(&self) -> Option<tain_core::discovery::Branch> {
+        self.shared.health.lock().unwrap().found_via
+    }
+
     /// Whether the connection is peer to peer. `None` until it is known.
     pub fn is_direct(&self) -> Option<bool> {
         Some(self.shared.health.lock().unwrap().path.as_ref()?.is_direct())

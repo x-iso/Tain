@@ -214,6 +214,14 @@ async fn a_host_that_appears_late_is_still_found() -> Result<()> {
 
     let path = guest.connection_path().context("connected with no path")?;
     assert!(path.is_direct(), "found late, but ended up on {}", path.remote());
+
+    // Two machines on one network are found by multicast, and the session
+    // window says so rather than saying the bare word "direct".
+    assert_eq!(
+        guest.found_via(),
+        Some(tain_core::discovery::Branch::Lan),
+        "a host on this machine should have been located on the local network"
+    );
     Ok(())
 }
 

@@ -239,19 +239,13 @@ impl HostServer {
         // leaves it empty, and an endpoint with no ALPNs rejects every incoming
         // connection during the TLS handshake ("peer doesn't support any known
         // protocol") — the listener appears healthy but can never accept.
-        let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            .alpns(vec![ALPN.to_vec()])
-            // Relay hostnames answered from what was resolved last time, so a
-            // link that cannot reach DNS can still reach the relays. See
-            // `dns_cache`.
-            .dns_resolver(super::dns_cache::resolver());
+        let mut builder = super::discovery::endpoint_builder().alpns(vec![ALPN.to_vec()]);
         if let Some(bytes) = identity {
             builder = builder.secret_key(iroh::SecretKey::from_bytes(&bytes));
         }
-        let endpoint = builder.bind().await?;
         // The host is the side worth finding: mDNS is what lets a guest on the
         // same network reach it with no relay and no DNS at all.
-        super::discovery::attach(&endpoint);
+        let (endpoint, _lookups) = super::discovery::bind(builder).await?;
 
         // # Coming online is a courtesy, not a requirement
         //
@@ -2391,6 +2385,8 @@ pub fn inject_input(
 pub struct GuestClient {
     endpoint: iroh::Endpoint,
     connection: Option<iroh::endpoint::Connection>,
+    /// Which address lookup located this host. See [`super::discovery::Found`].
+    found: super::discovery::Found,
 }
 
 /// Where a connection attempt has got to.
@@ -2544,14 +2540,11 @@ impl GuestClient {
         // a censored link actually presses, and the one where three seconds of
         // DNS per relay is the difference between connecting and not.
         on_step(DialStep::Starting);
-        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            .dns_resolver(super::dns_cache::resolver())
-            .bind()
-            .await?;
         // The guest needs these more than the host does: this is the side that
         // has to *find* somebody, and mDNS answers that on a local network
         // without the relay this dial would otherwise have to reach first.
-        super::discovery::attach(&endpoint);
+        let (endpoint, lookups) =
+            super::discovery::bind(super::discovery::endpoint_builder()).await?;
 
         // Only worth naming as a step when there is nothing else to go on. With
         // a relay in the code or an address on file, this wait is a courtesy
@@ -2693,7 +2686,15 @@ impl GuestClient {
             }
         }
 
-        Ok(Self { endpoint, connection: Some(conn) })
+        Ok(Self { endpoint, connection: Some(conn), found: lookups.found })
+    }
+
+    /// Which address lookup found this host.
+    ///
+    /// `None` when nothing had to look: a code carrying a relay, or an address
+    /// remembered from last time, is an answer the guest already had.
+    pub fn found_via(&self) -> Option<super::discovery::Branch> {
+        self.found.branch(self.connection.as_ref()?.remote_id())
     }
 
     /// Connect using a raw 32-byte endpoint ID.
@@ -3124,13 +3125,10 @@ pub enum ProbeOutcome {
 
 impl Prober {
     pub async fn bind() -> Result<Self> {
-        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            .dns_resolver(super::dns_cache::resolver())
-            .bind()
-            .await?;
         // A host on this network should show as online without the answer
         // having to come back from another continent to say so.
-        super::discovery::attach(&endpoint);
+        let (endpoint, _lookups) =
+            super::discovery::bind(super::discovery::endpoint_builder()).await?;
         endpoint.online().await;
         Ok(Self { endpoint })
     }

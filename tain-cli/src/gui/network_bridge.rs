@@ -152,6 +152,14 @@ pub struct StreamHealth {
     pub last_message: Option<std::time::Instant>,
     /// How the connection is carried, and the advice if it is a relay.
     pub path: Option<tain_core::network::ConnectionPath>,
+    /// Which address lookup located this host.
+    ///
+    /// `None` when nothing had to look — a code carrying a relay, or an address
+    /// remembered from last time, is an answer the guest already had. Shown in
+    /// place of the bare word "direct", because since a relayed session is
+    /// refused outright, "direct" is the only thing it could ever say and *how*
+    /// the host was found is the half that carries information.
+    pub found_via: Option<tain_core::discovery::Branch>,
     /// How far the host's clock is ahead of ours, in milliseconds.
     ///
     /// `None` until a pong has been seen. Estimated the way NTP does it, from
@@ -939,6 +947,10 @@ pub async fn run_guest_session(
                                     },
                                 );
                                 health.path = Some(path);
+                                // Re-read alongside the path: a lookup can
+                                // answer after the connection is up, and the
+                                // first one to answer is the one recorded.
+                                health.found_via = client.found_via();
                                 drop(health);
 
                                 // Said once, and only after hole punching has
