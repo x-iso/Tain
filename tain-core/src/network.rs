@@ -2525,6 +2525,21 @@ impl GuestClient {
         /// report and nothing to cancel.
         const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
+        /// How long to keep asking where a host is before calling it not found.
+        ///
+        /// Discovery is allowed to be slow. mDNS answers in under a second and
+        /// DNS in a few, but the mainline DHT — the one that still works when
+        /// the others are blocked — needed about eight seconds and a second ask
+        /// when measured, because a freshly published record has to settle on
+        /// the nodes that will be asked for it.
+        ///
+        /// Waiting costs nothing that matters. How fast the session then runs
+        /// is a property of the path it found, not of how long finding it took.
+        const FIND_WAIT: Duration = Duration::from_secs(30);
+
+        /// How long to leave between asking again.
+        const FIND_RETRY: Duration = Duration::from_secs(2);
+
         // The cached resolver, as everywhere else — this is the path a user on
         // a censored link actually presses, and the one where three seconds of
         // DNS per relay is the difference between connecting and not.
@@ -2589,34 +2604,61 @@ impl GuestClient {
         // rather than after it — a step nobody sees is not a step.
         on_step(if known_addrs.is_empty() { DialStep::ViaRelay } else { DialStep::Direct });
 
-        let conn = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN))
-            .await
-        {
-            Ok(Ok(conn)) => conn,
-            // A dial that failed while this endpoint had not finished coming
-            // online is the one case worth repeating: the first attempt had no
-            // relay to fall back on and the second may. Only then, and only
-            // once — retrying a refusal that had every chance of working turns
-            // a clear failure into a slow one.
-            Ok(Err(first)) if !online => {
-                warn!("First attempt failed before this endpoint was online ({first}) — retrying");
-                let _ = tokio::time::timeout(ONLINE_WAIT, endpoint.online()).await;
-                match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, ALPN)).await {
-                    Ok(result) => result.context("Failed to connect to host")?,
-                    Err(_) => anyhow::bail!(
-                        "That host did not answer within {DIAL_TIMEOUT:?}. It may be offline, \
-                         or the relay in its code may be unreachable from here — ask for a \
-                         fresh code if the host has moved network."
-                    ),
+        // # "Nobody knows yet" is not "nobody knows"
+        //
+        // `connect` already waits on lookups that are still in flight, so a
+        // host that becomes findable part way through a dial is found without
+        // any help from here — mDNS holds its stream open, and a host that
+        // appeared ten seconds into a dial was picked up on the first attempt.
+        //
+        // What it does not wait for is lookups that *complete* with nothing.
+        // Then it returns `NoAddress` at once, with the whole dial budget
+        // unspent. That is not a hypothetical: an endpoint findable only
+        // through the mainline DHT does exactly this, because a freshly
+        // published record has to settle on the nodes that later get asked for
+        // it — measured at about eight seconds and two asks. A guest whose
+        // mDNS could not start and whose DNS is blocked has only that lookup,
+        // and one attempt would call the host offline.
+        //
+        // Discovery taking a while does not matter. What the session runs at
+        // afterwards is decided by the path it found, not by how long finding
+        // it took — so where more time is the whole fix, this spends it.
+        //
+        // Only for `NoAddress`, though: that is the difference between nobody
+        // having said where this host is, and a host that answered and refused,
+        // where retrying only turns a clear failure into a slow one.
+        let deadline = std::time::Instant::now() + FIND_WAIT;
+        let mut attempts = 0u32;
+        let conn = loop {
+            attempts += 1;
+            match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN)).await {
+                Ok(Ok(conn)) => break conn,
+                Ok(Err(e)) => {
+                    // The other case worth repeating: a first attempt made
+                    // before this endpoint was online had no relay to fall back
+                    // on, and the next one may.
+                    let worth_waiting = not_found_yet(&e) || (!online && attempts == 1);
+                    if !worth_waiting || std::time::Instant::now() >= deadline {
+                        return Err(e).context("Failed to connect to host");
+                    }
+                    if attempts == 1 {
+                        debug!("Nowhere to reach this host yet ({e}) — still looking");
+                    }
+                    if !online {
+                        let _ = tokio::time::timeout(ONLINE_WAIT, endpoint.online()).await;
+                    }
+                    tokio::time::sleep(FIND_RETRY).await;
                 }
+                Err(_) => anyhow::bail!(
+                    "That host did not answer within {DIAL_TIMEOUT:?}. It may be offline, or \
+                     the relay in its code may be unreachable from here — ask for a fresh code \
+                     if the host has moved network."
+                ),
             }
-            Ok(Err(e)) => return Err(e).context("Failed to connect to host"),
-            Err(_) => anyhow::bail!(
-                "That host did not answer within {DIAL_TIMEOUT:?}. It may be offline, or the \
-                 relay in its code may be unreachable from here — ask for a fresh code if the \
-                 host has moved network."
-            ),
         };
+        if attempts > 1 {
+            debug!("Found the host on attempt {attempts}");
+        }
         info!("Connected to host: {}", conn.remote_id());
 
         // # The relay has now done its job
@@ -2816,6 +2858,21 @@ impl ConnectionPath {
             ),
         }
     }
+}
+
+/// Whether a dial failed because nobody has said where the host is *yet*.
+///
+/// The distinction the retry loop in `connect_reporting` turns on: this is the
+/// one failure that more time can fix on its own, because it means every
+/// address lookup came back empty rather than that anything was refused.
+fn not_found_yet(e: &iroh::endpoint::ConnectError) -> bool {
+    matches!(
+        e,
+        iroh::endpoint::ConnectError::Connect {
+            source: iroh::endpoint::ConnectWithOptsError::NoAddress { .. },
+            ..
+        }
+    )
 }
 
 /// Which path a connection settled on, once it has had time to settle.

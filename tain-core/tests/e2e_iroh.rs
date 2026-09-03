@@ -160,6 +160,63 @@ async fn several_guests_arriving_together_are_all_answered() -> Result<()> {
     Ok(())
 }
 
+/// A host nobody can place *yet* is not a host that is offline.
+///
+/// The host does not exist when the dial starts and appears ten seconds later.
+/// Nothing about the link is slow; what is slow is the host becoming findable
+/// at all, and the dial has to survive that and end up on a direct path.
+///
+/// # What this does and does not cover
+///
+/// It passes with or without the `NoAddress` retry in `connect_reporting`,
+/// which is worth stating plainly because the first version of this comment
+/// claimed otherwise. Instrumenting the loop showed the dial never failed at
+/// all: `connect` waits on lookups still in flight, mDNS keeps its stream open,
+/// and the host was picked up on the first attempt.
+///
+/// So what this pins down is that waiting — iroh's, and everything attached in
+/// `discovery` — actually works end to end, which is worth a test in its own
+/// right and would catch a regression that made a dial give up early.
+///
+/// The retry itself covers the narrower case where every lookup *completes*
+/// with nothing, and the evidence for that one is
+/// `an_endpoint_can_be_found_through_the_dht_alone`, which needed two asks.
+/// Reproducing it here would take a lookup service that can be made to answer
+/// on cue, and a fabricated one would only be testing the fake.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_appears_late_is_still_found() -> Result<()> {
+    // A known identity, so the guest can dial a host that does not exist yet.
+    let identity: [u8; 32] = rand::random();
+    let key = iroh::SecretKey::from_bytes(&identity).public();
+
+    let dialing = tokio::spawn(async move {
+        // No relay url and no remembered address: every way of placing this
+        // host has to come from discovery, and none of them can answer yet.
+        GuestClient::connect_via(&key, None, &[]).await
+    });
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let server = Arc::new(HostServer::bind_with_identity(Some(identity)).await?);
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            if let Err(e) = server.run().await {
+                eprintln!("host server stopped: {e}");
+            }
+        }
+    });
+
+    let guest = tokio::time::timeout(Duration::from_secs(45), dialing)
+        .await
+        .context("the dial never returned")?
+        .context("dial task panicked")?
+        .context("gave up on a host that became findable ten seconds in")?;
+
+    let path = guest.connection_path().context("connected with no path")?;
+    assert!(path.is_direct(), "found late, but ended up on {}", path.remote());
+    Ok(())
+}
+
 /// Can this machine reach the mainline DHT at all?
 ///
 /// # Why this exists separately
