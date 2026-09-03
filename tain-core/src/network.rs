@@ -3,7 +3,7 @@
 //! Provides `HostServer` (accepts incoming connections, manages sessions) and
 //! `GuestClient` (connects to a host via passcode-protected ticket).
 //!
-//! The ALPN protocol name is `"tain/2"` — every connection carrying this ALPN
+//! The ALPN protocol name is `"tain/3"` — every connection carrying this ALPN
 //! is routed through our handler. iroh handles NAT traversal automatically:
 //! direct QUIC connections when possible, relay fallback otherwise.
 //!
@@ -73,7 +73,23 @@ use super::passcode::redact;
 pub use super::connection_code::ConnectionCode;
 
 /// Application-layer protocol name used in iroh ALPN negotiation.
-pub const ALPN: &[u8] = b"tain/2";
+///
+/// # Bump this whenever the wire format changes incompatibly
+///
+/// `Message` is bincode, which is positional and has no version field: a peer
+/// handed a struct with a field it does not know about does not report a
+/// mismatch, it misreads the bytes or fails to deserialise somewhere further
+/// on. What that looks like from the outside is a connection that establishes
+/// and then dies for no stated reason.
+///
+/// The ALPN is the one place two peers agree on anything before that can
+/// happen. An unrecognised one is refused during the TLS handshake, with both
+/// ends saying so, which is a far better failure than a mystery — so the cost of
+/// bumping it is that mismatched builds cannot talk, which is exactly the
+/// outcome wanted.
+///
+/// `tain/3` added the host's display list to `SessionStart`.
+pub const ALPN: &[u8] = b"tain/3";
 
 /// How long a starting host waits to reach a relay before listening anyway.
 ///
@@ -777,6 +793,11 @@ impl HostServer {
                     dpi_scale: 1.0,
                 },
                 host_name: config.host_name.clone(),
+                // Every display, for now. Which of them a given guest may see
+                // is a permission, and permissions are chosen in the approval
+                // dialog — so this is filtered once there is something to
+                // filter it by.
+                displays: super::screen_capture::displays(),
             }),
         )
         .await?;

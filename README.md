@@ -16,7 +16,7 @@ A peer-to-peer remote desktop application built in Rust, using [iroh](https://ir
 ## Architecture
 
 ```text
-┌──────────────────┐   iroh P2P QUIC, ALPN "tain/2"    ┌──────────────────┐
+┌──────────────────┐   iroh P2P QUIC, ALPN "tain/3"    ┌──────────────────┐
 │       Host       │ ◄════════ direct path only ══════► │       Guest      │
 │                  │                                     │                  │
 │  DXGI capture    │  video stream (unidirectional)      │  GPU decode      │

@@ -418,16 +418,64 @@ pub struct ScreenInfo {
     pub dpi_scale: f32,
 }
 
+/// One of the host's displays, as the guest needs to know it.
+///
+/// # Why the guest is told about displays it is not being sent
+///
+/// So it can offer them. A guest cannot ask to watch the second monitor if
+/// nothing has told it there is one, and a host that shares two monitors cannot
+/// have them laid out correctly by a guest that does not know where they sit
+/// relative to each other.
+///
+/// The positions are the host's own virtual-desktop coordinates, which is what
+/// makes a wall of monitors reproducible: a display left of the primary one has
+/// a negative `x`, and laying them out by these values gives the arrangement
+/// the host actually has rather than an arbitrary row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    /// Names this display for the rest of the session.
+    ///
+    /// Stable only while the arrangement is: it is the order the graphics
+    /// driver enumerates outputs in, so plugging a monitor in can renumber the
+    /// ones after it. That is why a change of arrangement resends the whole
+    /// list rather than a delta.
+    pub id: u32,
+    /// What the host calls it, for a menu. `\\.\DISPLAY1` and the like.
+    pub name: String,
+    /// Physical pixels, never DPI-virtualised.
+    pub width: u16,
+    pub height: u16,
+    /// Where it sits on the host's virtual desktop. May be negative.
+    pub x: i32,
+    pub y: i32,
+    /// The display at the origin — the one the host boots to.
+    pub primary: bool,
+    /// Whether the desktop on it is HDR, which decides whether it has to be
+    /// tone-mapped before anything else can use it.
+    ///
+    /// Per display, because it is a per-display setting: one monitor in HDR
+    /// beside one that is not is an ordinary arrangement, not a corner case.
+    pub hdr: bool,
+}
+
 /// Host-to-guest: session has started and screen info is available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStart {
     pub session_id: u32,
+    /// The stream the guest is about to receive: the size of the frames
+    /// themselves, after scaling. Not a display — see [`Self::displays`].
     pub screen_info: ScreenInfo,
     /// Encoder type the host will use for frames ("h264" or "raw").
     pub encoder_type: String,
     /// What the host calls itself, if it publishes a name. The guest saves this
     /// against the connection so its list reads as machines rather than hex.
     pub host_name: Option<String>,
+    /// Every display this session is allowed to see.
+    ///
+    /// Empty from a host that cannot enumerate its displays, which is every
+    /// platform without a real capture backend. A guest must treat that as "one
+    /// screen, the one I am being sent" rather than as no screens at all.
+    pub displays: Vec<DisplayInfo>,
 }
 
 // ── Reachability probe ───────────────────────────────────────
@@ -624,6 +672,81 @@ pub const MAX_MESSAGE_SIZE: usize = 48 * 1024 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A monitor arranged left of or above the primary one survives the wire.
+    ///
+    /// # Why this is worth a test of its own
+    ///
+    /// Those positions are **negative**, and every other coordinate in this
+    /// protocol is unsigned — sizes, pointer positions, scroll deltas aside.
+    /// A display at `x: -1920` written as a `u16` or a `u32` does not fail to
+    /// serialise, it arrives as a very large positive number, and the guest
+    /// lays a monitor out somewhere off the right-hand edge of everything.
+    #[test]
+    fn a_display_left_of_the_primary_survives_the_wire() {
+        let start = SessionStart {
+            session_id: 7,
+            screen_info: ScreenInfo { width: 1920, height: 1080, dpi_scale: 1.0 },
+            encoder_type: "h265".into(),
+            host_name: Some("DESKPC".into()),
+            displays: vec![
+                DisplayInfo {
+                    id: 0,
+                    name: r"\\.\DISPLAY1".into(),
+                    width: 2560,
+                    height: 1600,
+                    x: 0,
+                    y: 0,
+                    primary: true,
+                    hdr: true,
+                },
+                // Left of the primary, and higher up: both negative.
+                DisplayInfo {
+                    id: 1,
+                    name: r"\\.\DISPLAY2".into(),
+                    width: 1920,
+                    height: 1080,
+                    x: -1920,
+                    y: -120,
+                    primary: false,
+                    hdr: false,
+                },
+            ],
+        };
+
+        let bytes = bincode::serialize(&Message::SessionStart(start.clone())).expect("serialize");
+        let Message::SessionStart(back) = bincode::deserialize(&bytes).expect("deserialize") else {
+            panic!("a SessionStart did not come back as one");
+        };
+
+        assert_eq!(back.displays, start.displays, "the display list did not survive intact");
+        let second = &back.displays[1];
+        assert_eq!((second.x, second.y), (-1920, -120), "negative positions were mangled");
+        // The two facts a guest lays monitors out from, and tone-maps by.
+        assert!(back.displays[0].primary && !second.primary);
+        assert!(back.displays[0].hdr && !second.hdr, "HDR is per display, not per session");
+    }
+
+    /// No displays is a real answer: "cannot say", not "none".
+    ///
+    /// A host with no enumeration backend sends an empty list, and it has to
+    /// round-trip as empty rather than failing — the guest's contract is to read
+    /// that as the one screen it is being sent.
+    #[test]
+    fn a_host_that_cannot_enumerate_its_displays_still_starts_a_session() {
+        let start = SessionStart {
+            session_id: 1,
+            screen_info: ScreenInfo { width: 640, height: 360, dpi_scale: 1.0 },
+            encoder_type: "h264".into(),
+            host_name: None,
+            displays: Vec::new(),
+        };
+        let bytes = bincode::serialize(&Message::SessionStart(start)).expect("serialize");
+        let Message::SessionStart(back) = bincode::deserialize(&bytes).expect("deserialize") else {
+            panic!("a SessionStart did not come back as one");
+        };
+        assert!(back.displays.is_empty());
+    }
 
     #[test]
     fn events_map_to_the_device_they_need_permission_for() {

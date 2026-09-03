@@ -19,7 +19,7 @@
 │                                           │        │                                          │
 │  PasscodeStore + SessionManager           │        │  session window, one tab per session     │
 └───────────────────────────────────────────┘        └──────────────────────────────────────────┘
-                              iroh QUIC, ALPN "tain/2"
+                              iroh QUIC, ALPN "tain/3"
                         direct only — a relayed session is refused
 ```
 

@@ -476,6 +476,10 @@ pub struct GuestSessionState {
     pub grants: Arc<Mutex<ControlGrants>>,
     /// Host screen dimensions, for scaling pointer coordinates.
     pub remote_size: Arc<Mutex<(u16, u16)>>,
+    /// Every display this session is allowed to see, as the host described
+    /// them. Empty until `SessionStart`, and from a host that cannot enumerate
+    /// them at all — which means "unknown", not "none".
+    pub displays: Arc<Mutex<Vec<tain_core::protocol::DisplayInfo>>>,
     /// Where the host's pointer is and what it looks like.
     pub cursor: Arc<Mutex<CursorState>>,
     /// A blurred thumbnail of the host's screen, sent once when the session
@@ -565,6 +569,7 @@ impl GuestSessionState {
             frame: Arc::new(Mutex::new(None)),
             grants: Arc::new(Mutex::new(ControlGrants::NONE)),
             remote_size: Arc::new(Mutex::new((640, 360))),
+            displays: Arc::new(Mutex::new(Vec::new())),
             cursor: Arc::new(Mutex::new(CursorState::default())),
             host_preview: Arc::new(Mutex::new(None)),
             #[cfg(all(target_os = "windows", db_ffmpeg))]
@@ -618,6 +623,8 @@ impl GuestSessionState {
         *self.frame.lock().unwrap() = None;
         *self.grants.lock().unwrap() = ControlGrants::NONE;
         *self.host_name.lock().unwrap() = None;
+        // The next host is a different machine with different monitors.
+        self.displays.lock().unwrap().clear();
         *self.health.lock().unwrap() = StreamHealth::default();
     }
 }
@@ -1430,6 +1437,31 @@ where
                 // Published so the render thread can try to open it for sharing.
                 shared.gpu_device.store(decoder.gpu_device(), Ordering::Relaxed);
                 *shared.remote_size.lock().unwrap() = (ss.screen_info.width, ss.screen_info.height);
+                // What this host has, which is not the same question as what it
+                // is currently sending. A host that cannot enumerate its
+                // displays sends none, and an empty list means "unknown" — the
+                // one screen being streamed — rather than "no screens".
+                if !ss.displays.is_empty() {
+                    info!(
+                        "Host has {} display(s): {}",
+                        ss.displays.len(),
+                        ss.displays
+                            .iter()
+                            .map(|d| format!(
+                                "{} {}x{} at ({}, {}){}{}",
+                                d.name,
+                                d.width,
+                                d.height,
+                                d.x,
+                                d.y,
+                                if d.primary { " primary" } else { "" },
+                                if d.hdr { " HDR" } else { "" },
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                *shared.displays.lock().unwrap() = ss.displays.clone();
                 // Sanitized on arrival: the host chose this string, we did not.
                 *shared.host_name.lock().unwrap() =
                     ss.host_name.as_deref().and_then(tain_core::sanitize_device_name);

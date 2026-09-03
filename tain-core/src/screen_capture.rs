@@ -121,6 +121,145 @@ pub fn primary_display_size() -> (u16, u16) {
     FALLBACK_DISPLAY
 }
 
+/// A display's real mode: size in physical pixels, and where it sits.
+///
+/// Split out because it is the one part of [`displays`] that must not come from
+/// DXGI — see the note at the call site.
+#[cfg(target_os = "windows")]
+fn display_mode(device_name: &[u16; 32]) -> Option<(u16, u16, i32, i32)> {
+    use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
+
+    let mut mode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: the name is a null-terminated UTF-16 array from `DXGI_OUTPUT_DESC`,
+    // which is what this call wants; `mode` is sized as the API requires and
+    // outlives the call.
+    let ok = unsafe {
+        EnumDisplaySettingsW(
+            windows::core::PCWSTR(device_name.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut mode,
+        )
+        .as_bool()
+    };
+    if !ok || mode.dmPelsWidth == 0 || mode.dmPelsHeight == 0 {
+        return None;
+    }
+
+    // SAFETY: `dmPosition` is valid whenever `DM_POSITION` is set, which
+    // `ENUM_CURRENT_SETTINGS` always sets for an attached display. Reading it
+    // otherwise yields zeroes, which is the primary display's own position and
+    // therefore harmless.
+    let position = unsafe { mode.Anonymous1.Anonymous2.dmPosition };
+    Some((
+        mode.dmPelsWidth.min(u16::MAX as u32) as u16,
+        mode.dmPelsHeight.min(u16::MAX as u32) as u16,
+        position.x,
+        position.y,
+    ))
+}
+
+/// Every display attached to this machine.
+///
+/// # Why DXGI and not `EnumDisplayMonitors`
+///
+/// GDI would give the geometry with less ceremony, and would then need DXGI
+/// anyway to answer the one question that cannot be asked any other way:
+/// whether the desktop on a given display is HDR. Asking one API for all of it
+/// keeps the answers consistent — a display that DXGI cannot describe is a
+/// display capture cannot use either, and it is better to leave it out of the
+/// list than to offer a guest something that will fail when it is selected.
+///
+/// Ordered as the driver enumerates them, which is what [`DisplayInfo::id`]
+/// indexes. Empty on a machine that cannot be asked, which callers must read as
+/// "unknown", never as "no displays" — see [`super::protocol::SessionStart`].
+pub fn displays() -> Vec<super::protocol::DisplayInfo> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+        // SAFETY: enumeration only. Every interface is created here, read, and
+        // dropped before returning; nothing outlives the call.
+        let found = unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+                warn!("No DXGI factory; cannot enumerate displays");
+                return Vec::new();
+            };
+
+            let mut found = Vec::new();
+            let mut id = 0u32;
+            for adapter_index in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(adapter_index) else { break };
+                for output_index in 0.. {
+                    let Ok(output) = adapter.EnumOutputs(output_index) else { break };
+                    let Ok(desc) = output.GetDesc() else { continue };
+                    // A display that is not on the desktop cannot be captured
+                    // and cannot be pointed at, so it is not one to offer.
+                    if !desc.AttachedToDesktop.as_bool() {
+                        continue;
+                    }
+
+                    let end = desc
+                        .DeviceName
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.DeviceName.len());
+                    let name = String::from_utf16_lossy(&desc.DeviceName[..end]);
+                    let hdr = super::capture_hdr::probe(&output)
+                        .is_some_and(super::capture_hdr::DisplayColour::is_hdr);
+
+                    // # Not `desc.DesktopCoordinates`
+                    //
+                    // Those are DPI-virtualised in a process that has not
+                    // declared awareness — measured: a 2560x1600 display at
+                    // 175% scaling reported as 1463x914, the same trap
+                    // `primary_display_size` documents and avoids for the same
+                    // reason. The application declares awareness and the agent
+                    // does too, so this would have been right where it runs and
+                    // wrong everywhere else, including under `cargo test`.
+                    //
+                    // The display *mode* is never virtualised, so asking for it
+                    // by device name gives an answer that does not depend on
+                    // what the calling process happened to declare.
+                    let Some((width, height, x, y)) = display_mode(&desc.DeviceName) else {
+                        warn!("{name} would not report its display mode; leaving it out");
+                        continue;
+                    };
+
+                    found.push(super::protocol::DisplayInfo {
+                        id,
+                        name,
+                        width,
+                        height,
+                        x,
+                        y,
+                        // Windows puts the primary display at the origin of the
+                        // virtual desktop by definition, so this needs no
+                        // separate query.
+                        primary: x == 0 && y == 0,
+                        hdr,
+                    });
+                    id += 1;
+                }
+            }
+            found
+        };
+
+        if found.is_empty() {
+            warn!("DXGI reported no display attached to the desktop");
+        }
+        found
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        debug!("No display enumeration on this platform");
+        Vec::new()
+    }
+}
+
 /// Configuration for screen capture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureConfig {
@@ -806,6 +945,89 @@ mod fit_tests {
         assert!(
             after * 4 <= before,
             "{w}x{h} is {after} pixels against {before} — expected a quarter or less"
+        );
+    }
+
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::{displays, primary_display_size};
+
+    /// Whatever this machine reports, it has to be self-consistent.
+    ///
+    /// # Why the assertions are shaped like this
+    ///
+    /// The list depends on hardware nobody writing the test has, so asserting a
+    /// count or a size would only pin down the machine it was written on. What
+    /// can be asserted is that the answers agree with each other: ids that name
+    /// one display each, exactly one display at the origin, and no display
+    /// claiming a size it cannot have.
+    ///
+    /// On a machine with no display backend the list is empty, and empty is a
+    /// legitimate answer — it means "cannot say", which callers are required to
+    /// treat as one unknown screen rather than as none.
+    #[test]
+    fn the_displays_this_machine_reports_agree_with_each_other() {
+        let found = displays();
+        if found.is_empty() {
+            return; // No backend, or no display. Nothing to be inconsistent about.
+        }
+
+        let ids: std::collections::HashSet<u32> = found.iter().map(|d| d.id).collect();
+        assert_eq!(ids.len(), found.len(), "two displays share an id: {found:?}");
+
+        let primaries = found.iter().filter(|d| d.primary).count();
+        assert_eq!(
+            primaries, 1,
+            "exactly one display sits at the origin of the virtual desktop, not {primaries}: \
+             {found:?}"
+        );
+
+        for display in &found {
+            assert!(display.width > 0 && display.height > 0, "{display:?} has no extent");
+            assert!(!display.name.is_empty(), "{display:?} has no name to put in a menu");
+        }
+
+        // The primary is the one at the origin, and nothing else may be there.
+        let primary = found.iter().find(|d| d.primary).expect("checked above");
+        assert_eq!((primary.x, primary.y), (0, 0), "the primary display is not at the origin");
+
+        // Displays do not overlap: two occupying the same pixel would make
+        // "which display is this position on" unanswerable, which is what the
+        // input mapping will need.
+        for (i, a) in found.iter().enumerate() {
+            for b in found.iter().skip(i + 1) {
+                let apart = a.x + i32::from(a.width) <= b.x
+                    || b.x + i32::from(b.width) <= a.x
+                    || a.y + i32::from(a.height) <= b.y
+                    || b.y + i32::from(b.height) <= a.y;
+                assert!(apart, "{} and {} overlap: {a:?} {b:?}", a.name, b.name);
+            }
+        }
+
+        eprintln!("this machine reports {} display(s):", found.len());
+        for display in &found {
+            eprintln!("  {display:?}");
+        }
+    }
+
+    /// The reported primary matches the one the rest of the code assumes.
+    ///
+    /// `primary_display_size` and capture both mean the primary display, and
+    /// they reach it by different routes — `EnumDisplaySettings` and DXGI. A
+    /// disagreement between them is how a pointer ends up scaled against one
+    /// display and injected into another.
+    #[test]
+    fn the_primary_display_is_the_same_one_both_ways() {
+        let Some(primary) = displays().into_iter().find(|d| d.primary) else {
+            return; // Nothing enumerated; nothing to cross-check.
+        };
+        let (width, height) = primary_display_size();
+        assert_eq!(
+            (primary.width, primary.height),
+            (width, height),
+            "DXGI and EnumDisplaySettings disagree about the primary display"
         );
     }
 }
