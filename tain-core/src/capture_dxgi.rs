@@ -103,15 +103,38 @@ impl Duplication {
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
 
-        // Try the real GPU first; WARP keeps capture working in VMs and on
-        // machines whose driver refuses hardware duplication.
+        // # The device has to be on the display's own adapter
+        //
+        // Duplication refuses a device from a different one, and "different" is
+        // the ordinary case on a hybrid-graphics laptop or anywhere a virtual
+        // display driver is installed — see [`adapter_for`].
+        //
+        // Passing an adapter requires `D3D_DRIVER_TYPE_UNKNOWN`; the pair is
+        // rejected with `E_INVALIDARG` otherwise, which is why this is a list of
+        // pairs rather than a list of driver types.
+        let on = adapter_for(want);
+        let attempts: &[(Option<&windows::Win32::Graphics::Dxgi::IDXGIAdapter>, _)] = match &on {
+            Some(adapter) => &[
+                (Some(adapter), windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN),
+                // The adapter was found and would not make a device. Falling
+                // back to the default one will not duplicate that display, but
+                // it will produce the same error the old code did rather than a
+                // new one, and WARP still covers the VM case.
+                (None, D3D_DRIVER_TYPE_HARDWARE),
+                (None, D3D_DRIVER_TYPE_WARP),
+            ],
+            // Try the real GPU first; WARP keeps capture working in VMs and on
+            // machines whose driver refuses hardware duplication.
+            None => &[(None, D3D_DRIVER_TYPE_HARDWARE), (None, D3D_DRIVER_TYPE_WARP)],
+        };
+
         let mut last_err = None;
-        for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
+        for (adapter, driver) in attempts {
             // SAFETY: all out-params are valid; a failed call leaves them None.
             let result = unsafe {
                 D3D11CreateDevice(
-                    None,
-                    driver,
+                    *adapter,
+                    *driver,
                     None,
                     // VIDEO_SUPPORT is what makes `ID3D11VideoDevice` available,
                     // and with it the GPU colour conversion. It costs nothing on
@@ -457,6 +480,67 @@ unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16
 /// through the same call if not, and the legacy call only for a Windows too old
 /// to offer `IDXGIOutput5` — which is also a Windows too old to have an HDR
 /// desktop, so it is never the one being asked to do the impossible.
+/// The adapter that owns the display we intend to capture.
+///
+/// # Why the default adapter is not good enough
+///
+/// Duplication requires the D3D device and the output to be on the *same*
+/// adapter, and `D3D11CreateDevice(None, HARDWARE, …)` picks whichever adapter
+/// the system considers default. On a machine with one GPU that is the only
+/// adapter and the question never arises.
+///
+/// It arises on two ordinary machines. A laptop with hybrid graphics has the
+/// internal panel on the integrated GPU and the external port wired to the
+/// discrete one, so half the displays belong to an adapter the default device
+/// cannot duplicate. And a virtual display driver presents an adapter of its
+/// own — which is what would otherwise stop this capturing a virtual screen at
+/// all.
+///
+/// `None` when nothing can be enumerated, which leaves the caller to create a
+/// device the old way. That is also the WARP path: a software adapter has no
+/// outputs to find here, and asking for one by name would fail rather than fall
+/// back.
+fn adapter_for(want: Option<&str>) -> Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+    // SAFETY: enumeration only; every interface is dropped or returned.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        for adapter_index in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(adapter_index) else { break };
+            for output_index in 0.. {
+                let Ok(output) = adapter.EnumOutputs(output_index) else { break };
+                let Ok(desc) = output.GetDesc() else { continue };
+                if !desc.AttachedToDesktop.as_bool() {
+                    continue;
+                }
+
+                let found = match want {
+                    Some(wanted) => {
+                        let end = desc
+                            .DeviceName
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.DeviceName.len());
+                        String::from_utf16_lossy(&desc.DeviceName[..end]) == wanted
+                    }
+                    // The primary, which is the display at the origin. These
+                    // coordinates are DPI-virtualised in a process that has not
+                    // declared awareness — see `screen_capture::displays` — but
+                    // scaling preserves the origin, which is all this asks.
+                    None => {
+                        desc.DesktopCoordinates.left == 0 && desc.DesktopCoordinates.top == 0
+                    }
+                };
+                if found {
+                    return adapter.cast().ok();
+                }
+            }
+        }
+        None
+    }
+}
+
 /// The output to duplicate, and a description for the log.
 ///
 /// `want` is a device name — `\\.\DISPLAY2` and the like, exactly as
@@ -1130,5 +1214,108 @@ mod tests {
         assert_eq!(packed.len(), width as usize * height as usize * 4);
         assert_eq!(&packed[0..12], &source[0..12], "first row");
         assert_eq!(&packed[12..24], &source[pitch..pitch + 12], "second row must skip padding");
+    }
+
+    /// Every display this host offers must have an adapter behind it.
+    ///
+    /// # The failure this catches
+    ///
+    /// `screen_capture::displays` enumerates across *all* adapters, and capture
+    /// used to create its device on whichever one the system calls default and
+    /// then look for the display among that adapter's outputs only. On a
+    /// machine with one GPU those are the same set and nothing showed. On a
+    /// hybrid-graphics laptop — internal panel on the integrated GPU, external
+    /// port wired to the discrete one — half the menu would have been offering
+    /// screens that could not be captured, failing at selection with "not
+    /// attached to this adapter".
+    ///
+    /// Silent on a machine with one adapter, which is the machine this was
+    /// written on. That is the point of asserting the relationship rather than
+    /// a count.
+    #[test]
+    fn every_display_offered_has_an_adapter_that_owns_it() {
+        for screen in crate::screen_capture::displays() {
+            assert!(
+                adapter_for(Some(&screen.name)).is_some(),
+                "{} is offered to guests but no adapter claims it",
+                screen.name
+            );
+        }
+    }
+
+    /// Asking for the primary finds an adapter without being told a name.
+    #[test]
+    fn the_primary_display_is_found_without_naming_it() {
+        // A machine with no display has nothing to find, and says so by
+        // enumerating nothing.
+        if crate::screen_capture::displays().is_empty() {
+            return;
+        }
+        assert!(adapter_for(None).is_some(), "no adapter owns the display at the origin");
+    }
+
+    /// A display that does not exist is not quietly answered with one that does.
+    #[test]
+    fn an_unknown_display_finds_no_adapter() {
+        assert!(adapter_for(Some(r"\.\DISPLAY_NOT_REAL")).is_none());
+    }
+
+    /// What this machine's adapters and outputs actually are.
+    ///
+    /// A diagnostic, not an assertion — the answer is the hardware. Run it on a
+    /// hybrid-graphics laptop and the two GPUs should each claim some of the
+    /// displays; run it with a virtual display driver installed and that should
+    /// appear as an adapter of its own.
+    ///
+    /// ```bash
+    /// cargo test -p tain-core what_owns_each_display -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "prints this machine's hardware rather than asserting"]
+    fn what_owns_each_display() {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+        // SAFETY: enumeration only; everything is dropped at the end.
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().expect("no DXGI factory");
+            for adapter_index in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(adapter_index) else { break };
+                let desc = adapter.GetDesc1().expect("adapter description");
+                let end = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                println!(
+                    "adapter {adapter_index}: {}",
+                    String::from_utf16_lossy(&desc.Description[..end])
+                );
+
+                let mut any = false;
+                for output_index in 0.. {
+                    let Ok(output) = adapter.EnumOutputs(output_index) else { break };
+                    let Ok(out) = output.GetDesc() else { continue };
+                    let end = out
+                        .DeviceName
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(out.DeviceName.len());
+                    let rect = out.DesktopCoordinates;
+                    println!(
+                        "  {} at ({}, {}) {}x{}{}",
+                        String::from_utf16_lossy(&out.DeviceName[..end]),
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        if out.AttachedToDesktop.as_bool() { "" } else { " — not on the desktop" },
+                    );
+                    any = true;
+                }
+                if !any {
+                    println!("  no outputs");
+                }
+            }
+        }
     }
 }
