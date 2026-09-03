@@ -77,14 +77,73 @@ pub struct Progress {
     pub at: usize,
     /// Whether the last stage has been reached and the picture is moving.
     pub done: bool,
+    /// Whether the connection stopped here rather than moving on.
+    pub failed: bool,
+}
+
+/// What each stage produced, for the caption under its node.
+///
+/// # Why the graph shows results and not only steps
+///
+/// A row of stage names says how far a connection got and nothing about what
+/// it found on the way, which leaves the most interesting question — *which*
+/// route located this host — answerable only by hovering something else. Every
+/// stage that has an answer worth six characters now carries it under its own
+/// node.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Outcomes {
+    /// Which lookup found the host. `None` once past `Find` means nothing had
+    /// to look: the code carried a relay, or an address was remembered.
+    pub found_via: Option<Branch>,
+    /// Where the direct path ended up, and how far away that is.
+    pub peer: Option<String>,
+    pub rtt_ms: Option<f32>,
+    /// What the picture is actually running at.
+    pub fps: Option<f32>,
+}
+
+impl Stage {
+    /// The short result to put under this node, once the stage is behind us.
+    ///
+    /// Only called for completed stages, which is what lets `Find` report
+    /// "known" rather than having to distinguish "nothing looked yet" from
+    /// "nothing needed to look".
+    pub fn outcome(self, outcomes: &Outcomes) -> Option<String> {
+        match self {
+            Self::Find => Some(match outcomes.found_via {
+                Some(branch) => branch.label().to_string(),
+                None => "known".to_string(),
+            }),
+            Self::Direct => outcomes.rtt_ms.map(|ms| format!("{ms:.0} ms")),
+            Self::Video => outcomes.fps.map(|fps| format!("{fps:.0} fps")),
+            // Starting, authenticating and opening a session either happen or
+            // do not. A caption saying "done" under a node already drawn as
+            // done is noise.
+            Self::Start | Self::Auth | Self::Session => None,
+        }
+    }
+}
+
+/// Where the graph should be drawn, for a session that may have failed.
+///
+/// `furthest` is the highest stage this session ever reached — see
+/// `SharedState::set_status`, which is where it is kept. A failure needs it
+/// because `GuestStatus::Failed` carries a message and nothing else, and a
+/// graph that vanishes at the moment it becomes most useful is the wrong
+/// answer: the step it stopped on is exactly what someone wants to see.
+pub fn resting(status: &GuestStatus, furthest: Option<usize>) -> Option<Progress> {
+    match status {
+        GuestStatus::Failed(_) => {
+            Some(Progress { at: furthest.unwrap_or(0), done: false, failed: true })
+        }
+        live => progress(live),
+    }
 }
 
 /// Where this status sits on the path, if it is on it at all.
 ///
-/// `None` for a session that has not started or has failed. A failure keeps its
-/// own message, which names the step that did not finish — the graph would only
-/// repeat it less precisely, and `GuestStatus::Failed` does not carry the step
-/// anyway.
+/// `None` for a session that has not started or has failed — see [`resting`],
+/// which is what the window calls, and which can place a failure.
 pub fn progress(status: &GuestStatus) -> Option<Progress> {
     let at = match status {
         GuestStatus::Connecting(DialStep::Starting) => 0,
@@ -105,7 +164,7 @@ pub fn progress(status: &GuestStatus) -> Option<Progress> {
         GuestStatus::Streaming => 5,
         GuestStatus::Disconnected | GuestStatus::Failed(_) => return None,
     };
-    Some(Progress { at, done: at == Stage::ALL.len() - 1 })
+    Some(Progress { at, done: at == Stage::ALL.len() - 1, failed: false })
 }
 
 /// The whole path, written out, with the branch that found the host.
@@ -114,29 +173,35 @@ pub fn progress(status: &GuestStatus) -> Option<Progress> {
 /// replaced by the single word that matters — see the session window. Reading
 /// it should answer "how did this connection come about" without needing the
 /// log.
-pub fn summary(progress: Option<Progress>, branch: Option<Branch>, remote: Option<&str>) -> String {
+pub fn summary(progress: Option<Progress>, outcomes: &Outcomes) -> String {
     let Some(progress) = progress else {
         return "Not connected.".to_string();
     };
 
-    let mut lines = Vec::with_capacity(Stage::ALL.len() + 2);
+    let mut lines = Vec::with_capacity(Stage::ALL.len());
     for (index, stage) in Stage::ALL.iter().enumerate() {
-        let mark = if index < progress.at || progress.done {
+        let complete = index < progress.at || progress.done;
+        let mark = if complete {
             '✓'
         } else if index == progress.at {
-            '·'
+            // The step it stopped on, versus the step it is working on.
+            if progress.failed {
+                '✗'
+            } else {
+                '·'
+            }
         } else {
             ' '
         };
         let detail = match stage {
-            Stage::Find => match branch {
+            Stage::Find if complete => match outcomes.found_via {
                 Some(branch) => format!("{} — {}", branch.label(), branch.describe()),
                 // Nothing had to look: a relay in the code, or an address
                 // remembered from a connection that already worked.
                 None => "already knew where to look".to_string(),
             },
-            Stage::Direct => match remote {
-                Some(remote) => format!("peer to peer with {remote}"),
+            Stage::Direct if complete => match outcomes.peer.as_deref() {
+                Some(peer) => format!("peer to peer with {peer}"),
                 None => stage.describe().to_string(),
             },
             other => other.describe().to_string(),
@@ -220,7 +285,12 @@ mod tests {
     #[test]
     fn the_summary_names_the_branch_that_found_the_host() {
         let done = progress(&GuestStatus::Streaming);
-        let text = summary(done, Some(Branch::Dht), Some("192.168.0.10:61369"));
+        let outcomes = Outcomes {
+            found_via: Some(Branch::Dht),
+            peer: Some("192.168.0.10:61369".into()),
+            ..Outcomes::default()
+        };
+        let text = summary(done, &outcomes);
 
         assert!(text.contains("DHT"), "the branch is the point of this: {text}");
         assert!(text.contains("192.168.0.10:61369"), "the peer address is missing: {text}");
@@ -233,7 +303,48 @@ mod tests {
     /// Nothing to look up is a real answer, not a missing one.
     #[test]
     fn a_host_that_needed_no_lookup_says_so() {
-        let text = summary(progress(&GuestStatus::Streaming), None, None);
+        let text = summary(progress(&GuestStatus::Streaming), &Outcomes::default());
         assert!(text.contains("already knew"), "{text}");
+    }
+
+    /// A failure stays on the graph, at the step it failed on.
+    ///
+    /// The whole reason `furthest` is carried: `GuestStatus::Failed` has only a
+    /// message, so without it the graph either vanishes — which is what it used
+    /// to do, exactly when it was most worth seeing — or claims the connection
+    /// never started.
+    #[test]
+    fn a_failure_is_shown_where_it_happened() {
+        let failed = GuestStatus::Failed("no direct path".into());
+
+        // Reached `Direct` and stopped there.
+        let at = resting(&failed, Some(2)).expect("a failure has a place on the path");
+        assert_eq!(at.at, 2, "the failure moved off the step it happened on");
+        assert!(at.failed);
+        assert!(!at.done, "a failure never counts as finished");
+
+        let text = summary(Some(at), &Outcomes::default());
+        assert!(text.contains('✗'), "the failed step is not marked: {text}");
+        assert_eq!(text.matches('✓').count(), 2, "the two steps that did work should stand");
+        // The step it failed on has not produced a result, so it must not
+        // claim one — this is what a summary written from `complete` avoids.
+        assert!(!text.contains("peer to peer"), "a failed step claimed a result: {text}");
+    }
+
+    /// Only a completed stage gets to report an outcome.
+    #[test]
+    fn an_unfinished_stage_reports_nothing() {
+        let outcomes = Outcomes {
+            found_via: Some(Branch::Lan),
+            rtt_ms: Some(3.0),
+            fps: Some(58.0),
+            ..Outcomes::default()
+        };
+        assert_eq!(Stage::Find.outcome(&outcomes).as_deref(), Some("LAN"));
+        assert_eq!(Stage::Direct.outcome(&outcomes).as_deref(), Some("3 ms"));
+        assert_eq!(Stage::Video.outcome(&outcomes).as_deref(), Some("58 fps"));
+        // Nothing to say, rather than something empty to draw.
+        assert_eq!(Stage::Start.outcome(&outcomes), None);
+        assert_eq!(Stage::Auth.outcome(&outcomes), None);
     }
 }

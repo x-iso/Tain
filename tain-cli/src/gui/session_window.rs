@@ -522,6 +522,33 @@ impl SessionWindow {
         let (w, h) = session.remote_size();
         content.label(RichText::new(format!("{w}×{h}")).size(12.0).color(TEXT));
 
+        // # Next to the size, not in the stats
+        //
+        // How the host was found belongs with what the session *is* rather than
+        // with what it is doing per second: it is decided once and never
+        // changes, while everything in the stats row moves. Sitting among
+        // numbers that update every second also made it read as one of them.
+        //
+        // A relayed session is refused before it starts, so there is no "direct"
+        // to report — the branch that found the host is the whole of what this
+        // has to say, and the full path is on hover.
+        match session.relay_warning() {
+            Some(advice) => {
+                content.add_space(10.0);
+                content
+                    .label(RichText::new("⚠ relayed").size(12.0).color(AMBER))
+                    .on_hover_text(advice);
+            }
+            None => {
+                if let Some(branch) = session.found_via() {
+                    content.add_space(10.0);
+                    content
+                        .label(RichText::new(branch.label()).size(12.0).color(LIVE_GREEN))
+                        .on_hover_text(session.path_summary());
+                }
+            }
+        }
+
         content.add_space(12.0);
         render_input_toggles(&mut content, session);
 
@@ -1028,37 +1055,6 @@ fn render_stats_row(ui: &mut egui::Ui, session: &GuestSession) {
             session.health_detail()
         ));
 
-    // A relayed path gets its own warning rather than a line in the stats,
-    // because no quality setting can compensate for it.
-    match session.relay_warning() {
-        Some(advice) => {
-            ui.add_space(10.0);
-            ui.label(RichText::new("⚠ relayed").size(12.0).color(AMBER))
-                .on_hover_text(advice);
-        }
-        None => {
-            // # The branch, not the word "direct"
-            //
-            // A relayed session is refused before it starts, so "direct" is the
-            // only thing this could ever say and it carries no information. How
-            // the host was *found* does: whether the local network, the public
-            // lookup service, or the DHT is currently the thing doing the work
-            // is the one part of this that varies, and the part that explains a
-            // slow connect or a host that could not be reached at all.
-            if session.is_direct() == Some(true) {
-                ui.add_space(10.0);
-                let (text, colour) = match session.found_via() {
-                    Some(branch) => (branch.label(), LIVE_GREEN),
-                    // Nothing had to look: the code carried a relay, or an
-                    // address from a connection that already worked.
-                    None => ("direct", TEXT_DIM),
-                };
-                ui.label(RichText::new(text).size(12.0).color(colour))
-                    .on_hover_text(session.path_summary());
-            }
-        }
-    }
-
     if let Some(ms) = session.audio_buffered_ms() {
         ui.add_space(10.0);
         // The target as well as the depth. The buffer grows itself when the link
@@ -1110,11 +1106,15 @@ fn render_waiting(ui: &mut egui::Ui, session: &GuestSession) {
         ui.label(RichText::new(session.status().label()).size(13.0).color(TEXT_DIM));
 
         // The line above says what is happening; this says how much of it is
-        // left, which is the other half of what someone watching a spinner
-        // wants to know. See `super::progress`.
-        if let Some(progress) = super::progress::progress(&session.status()) {
+        // left and what each step found, which is the rest of what someone
+        // watching a spinner wants to know. See `super::progress`.
+        //
+        // Drawn for a failed session too, frozen on the step that failed — that
+        // is the moment it is worth the most, and it used to be the moment it
+        // disappeared.
+        if let Some(progress) = session.progress() {
             ui.add_space(22.0);
-            render_progress_graph(ui, progress);
+            render_progress_graph(ui, progress, &session.outcomes());
         }
     });
 }
@@ -1126,11 +1126,17 @@ fn render_waiting(ui: &mut egui::Ui, session: &GuestSession) {
 /// would give six separate items that happen to sit next to each other, and
 /// getting the connecting track to line up between them is more work than
 /// painting the whole thing.
-fn render_progress_graph(ui: &mut egui::Ui, progress: super::progress::Progress) {
+fn render_progress_graph(
+    ui: &mut egui::Ui,
+    progress: super::progress::Progress,
+    outcomes: &super::progress::Outcomes,
+) {
     use super::progress::Stage;
 
     const NODE: f32 = 7.0;
     const LABEL_DROP: f32 = 16.0;
+    /// Where the result of a stage sits, under its name.
+    const OUTCOME_DROP: f32 = 30.0;
     /// Room for the widest label plus a little air. Below this the labels
     /// collide, so the row shrinks no further and takes the space it needs.
     const MIN_GAP: f32 = 52.0;
@@ -1144,35 +1150,40 @@ fn render_progress_graph(ui: &mut egui::Ui, progress: super::progress::Progress)
     let gap = room.clamp(MIN_GAP, IDEAL_GAP);
 
     let width = gap * spans + NODE * 2.0;
-    let (rect, response) = ui
-        .allocate_exact_size(egui::vec2(width, NODE * 2.0 + LABEL_DROP + 12.0), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, NODE * 2.0 + OUTCOME_DROP + 12.0),
+        egui::Sense::hover(),
+    );
     let painter = ui.painter();
 
     let y = rect.top() + NODE;
     let centre = |index: usize| egui::pos2(rect.left() + NODE + gap * index as f32, y);
 
     for (index, stage) in Stage::ALL.iter().enumerate() {
-        // Behind the current stage is done; the current one is lit; ahead is
-        // still only an outline. A finished path is entirely done.
+        // Behind the current stage is done; the current one is lit, or marked
+        // in red if this is where it stopped; ahead is still only an outline.
         let done = index < progress.at || progress.done;
-        let current = index == progress.at && !progress.done;
+        let here = index == progress.at && !progress.done;
+        let stopped = here && progress.failed;
+        let accent = if progress.failed { OFFLINE_RED } else { LIVE_GREEN };
 
         if index + 1 < count {
             // The track to the next node, filled only as far as we have got.
             let filled = index < progress.at || progress.done;
             painter.line_segment(
-                [
-                    egui::pos2(centre(index).x + NODE, y),
-                    egui::pos2(centre(index + 1).x - NODE, y),
-                ],
+                [egui::pos2(centre(index).x + NODE, y), egui::pos2(centre(index + 1).x - NODE, y)],
                 egui::Stroke::new(2.0, if filled { LIVE_GREEN } else { SEPARATOR }),
             );
         }
 
-        let (fill, stroke) = if done {
+        let (fill, stroke) = if stopped {
+            // Solid, because a failure is a state the connection is *in*, not
+            // one it is working through.
+            (OFFLINE_RED, OFFLINE_RED)
+        } else if done {
             (LIVE_GREEN, LIVE_GREEN)
-        } else if current {
-            (WINDOW_BG, LIVE_GREEN)
+        } else if here {
+            (WINDOW_BG, accent)
         } else {
             (WINDOW_BG, SEPARATOR)
         };
@@ -1183,8 +1194,21 @@ fn render_progress_graph(ui: &mut egui::Ui, progress: super::progress::Progress)
             egui::Align2::CENTER_CENTER,
             stage.label(),
             egui::FontId::proportional(11.0),
-            if done || current { TEXT } else { TEXT_DIM },
+            if done || here { TEXT } else { TEXT_DIM },
         );
+
+        // What the stage produced, under its name — only once it is behind us,
+        // which is what lets `Find` say "known" rather than having to tell
+        // "nothing looked yet" from "nothing needed to".
+        if done && let Some(result) = stage.outcome(outcomes) {
+            painter.text(
+                egui::pos2(centre(index).x, y + NODE + OUTCOME_DROP),
+                egui::Align2::CENTER_CENTER,
+                result,
+                egui::FontId::proportional(10.0),
+                LIVE_GREEN,
+            );
+        }
     }
 
     // The same path in words, for anyone who wants to know what a stage means.

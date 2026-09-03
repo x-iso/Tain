@@ -700,39 +700,57 @@ impl GuestSession {
     pub fn live_stats(&self) -> String {
         let health = self.shared.health.lock().unwrap();
         let live = health.live;
-        // Frames that arrived and were never drawn get their own figure rather
-        // than being folded into the rate. "58 fps" and "58 fps, 12 skipped" are
-        // the same number and completely different situations: the second one is
-        // a hitch every eighty milliseconds that nothing else here would show.
-        let mut parts = if live.skipped_fps >= 1.0 {
-            vec![format!("{:.0} fps (+{:.0} skipped)", live.displayed_fps, live.skipped_fps)]
-        } else {
-            vec![format!("{:.0} fps", live.displayed_fps)]
-        };
 
+        // # Anchored, so the eye can stay in one place
+        //
+        // These are read while something is going wrong, which means they are
+        // read by glancing at the same spot repeatedly. Built the obvious way —
+        // join whatever happens to apply — every field moved whenever any field
+        // to its left changed width, and a figure that jumps as it updates is
+        // one that has to be re-found every second instead of watched.
+        //
+        // So: the four that are always worth having come first, at fixed
+        // widths, and anything conditional is appended after them where it can
+        // shift nothing. Rendered in a monospaced font, which is what makes a
+        // fixed width in characters a fixed width on screen.
+        //
         // Two different latencies, and the difference between them is the
         // point: `lat` is what the user feels — capture on the host through to
         // arrival here, pipeline included — while `net` is only the round trip.
         // A large gap between them says the delay is in the encoder or the
         // decoder rather than the link, which is the first thing anyone
         // diagnosing a sluggish session needs to know.
-        if live.latency_ms > 0.0 {
-            parts.push(format!("lat {:.0} ms", live.latency_ms + live.render_ms));
-        }
-        parts.push(format!("net {:.0} ms", health.rtt_ms));
+        let mut parts = vec![
+            format!("{:>3.0} fps", live.displayed_fps),
+            match live.latency_ms > 0.0 {
+                true => format!("lat {:>4.0} ms", live.latency_ms + live.render_ms),
+                // Holds the column open rather than closing it and moving
+                // everything after it once the first measurement lands.
+                false => "lat    — ms".to_string(),
+            },
+            format!("net {:>4.0} ms", health.rtt_ms),
+            match live.received_kbps >= 1000.0 {
+                // Both units are six characters, so the switch between them
+                // does not move anything either.
+                true => format!("{:>6.1} Mbit/s", live.received_kbps / 1000.0),
+                false => format!("{:>6.0} kbit/s", live.received_kbps),
+            },
+        ];
 
+        // Frames that arrived and were never drawn get their own figure rather
+        // than being folded into the rate. "58 fps" and "58 fps, 12 skipped" are
+        // the same number and completely different situations: the second one is
+        // a hitch every eighty milliseconds that nothing else here would show.
+        if live.skipped_fps >= 1.0 {
+            parts.push(format!("+{:.0} skipped", live.skipped_fps));
+        }
         // Only when it is worth knowing. Under about 30 ms nobody perceives an
         // audio/video offset, and a number that is always there is noise.
         if live.av_offset_ms.abs() >= 30.0 {
             let behind = if live.av_offset_ms > 0.0 { "sound behind" } else { "sound ahead" };
             parts.push(format!("{behind} {:.0} ms", live.av_offset_ms.abs()));
         }
-        if live.received_kbps >= 1000.0 {
-            parts.push(format!("{:.1} Mbit/s", live.received_kbps / 1000.0));
-        } else {
-            parts.push(format!("{:.0} kbit/s", live.received_kbps));
-        }
-        parts.join(" · ")
+        parts.join("  ·  ")
     }
 
     /// How the connection is carried, when that is worth saying.
@@ -756,20 +774,30 @@ impl GuestSession {
         }
     }
 
+    /// Where the connection graph should be drawn, failures included.
+    pub fn progress(&self) -> Option<super::progress::Progress> {
+        super::progress::resting(&self.status(), self.shared.furthest())
+    }
+
+    /// What each stage of the connection produced.
+    pub fn outcomes(&self) -> super::progress::Outcomes {
+        let health = self.shared.health.lock().unwrap();
+        super::progress::Outcomes {
+            found_via: health.found_via,
+            peer: health.path.as_ref().map(|path| path.remote().to_string()),
+            // The transport round trip rather than the application ping: it is
+            // the property of the path that the `Direct` stage produced.
+            rtt_ms: health.path.as_ref().map(|path| path.rtt_ms()),
+            fps: Some(health.live.displayed_fps),
+        }
+    }
+
     /// The whole path from "Connect" to a moving picture, written out.
     ///
     /// What the session window shows on hover in place of the single word the
-    /// stats row has room for.
+    /// header has room for.
     pub fn path_summary(&self) -> String {
-        let (branch, remote) = {
-            let health = self.shared.health.lock().unwrap();
-            (health.found_via, health.path.as_ref().map(|p| p.remote().to_string()))
-        };
-        super::progress::summary(
-            super::progress::progress(&self.status()),
-            branch,
-            remote.as_deref(),
-        )
+        super::progress::summary(self.progress(), &self.outcomes())
     }
 
     /// Which address lookup located this host, once one has.
@@ -777,10 +805,6 @@ impl GuestSession {
         self.shared.health.lock().unwrap().found_via
     }
 
-    /// Whether the connection is peer to peer. `None` until it is known.
-    pub fn is_direct(&self) -> Option<bool> {
-        Some(self.shared.health.lock().unwrap().path.as_ref()?.is_direct())
-    }
 
     /// The longer breakdown, shown on hover.
     pub fn health_detail(&self) -> String {

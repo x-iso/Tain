@@ -466,6 +466,9 @@ impl StreamHealth {
 #[derive(Clone)]
 pub struct GuestSessionState {
     pub status: Arc<Mutex<GuestStatus>>,
+    /// The furthest stage this session ever reached, so a failure can be shown
+    /// where it happened. See [`GuestSessionState::set_status`].
+    furthest: Arc<Mutex<Option<usize>>>,
     /// Latest frame. The renderer `take()`s it, so a texture upload only happens
     /// when a new frame actually arrived rather than on every repaint.
     pub frame: Arc<Mutex<Option<FrameBuffer>>>,
@@ -558,6 +561,7 @@ impl GuestSessionState {
     pub fn new() -> Self {
         Self {
             status: Arc::new(Mutex::new(GuestStatus::Disconnected)),
+            furthest: Arc::new(Mutex::new(None)),
             frame: Arc::new(Mutex::new(None)),
             grants: Arc::new(Mutex::new(ControlGrants::NONE)),
             remote_size: Arc::new(Mutex::new((640, 360))),
@@ -585,10 +589,31 @@ impl GuestSessionState {
     }
 
     fn set_status(&self, status: GuestStatus) {
+        // # Remember how far this got
+        //
+        // `GuestStatus::Failed` carries a message and nothing else, so by the
+        // time a failure is visible the step it failed on is gone. Keeping the
+        // high-water mark here — the one place status changes — is what lets
+        // the connection graph stop where it stopped instead of disappearing at
+        // the moment it becomes worth looking at.
+        if let Some(progress) = super::progress::progress(&status) {
+            let mut furthest = self.furthest.lock().unwrap();
+            *furthest = Some(furthest.map_or(progress.at, |at: usize| at.max(progress.at)));
+        }
         *self.status.lock().unwrap() = status;
     }
 
+    /// The furthest stage this session ever reached. See [`set_status`].
+    ///
+    /// [`set_status`]: Self::set_status
+    pub fn furthest(&self) -> Option<usize> {
+        *self.furthest.lock().unwrap()
+    }
+
     pub fn reset(&self) {
+        // Cleared before the status, so the high-water mark belongs to the next
+        // attempt rather than carrying the last one's failure into it.
+        *self.furthest.lock().unwrap() = None;
         self.set_status(GuestStatus::Disconnected);
         *self.frame.lock().unwrap() = None;
         *self.grants.lock().unwrap() = ControlGrants::NONE;
