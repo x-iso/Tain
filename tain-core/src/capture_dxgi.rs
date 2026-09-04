@@ -756,6 +756,10 @@ pub struct DxgiCapturer {
     /// than replacing it: the controller sheds pixels under load, and the guest
     /// caps what is worth sending at all.
     ceiling: Option<(u16, u16)>,
+    /// Multiples the emitted size must land on, from the encoder. Two by two —
+    /// what chroma subsampling needs and nothing more — until one says
+    /// otherwise.
+    granularity: (u16, u16),
     /// What the frames coming out of here are laid out as.
     ///
     /// Negotiated once before the session starts and then fixed. It survives a
@@ -796,6 +800,7 @@ impl DxgiCapturer {
             out_height: height,
             scale: QualityScale::Native,
             ceiling: None,
+            granularity: (2, 2),
             format: PixelFormat::Bgra,
             reported_loss: false,
             colour_log,
@@ -876,10 +881,14 @@ impl DxgiCapturer {
     /// picture torn into diagonal stripes, not an error.
     fn apply_output_size(&mut self) -> bool {
         let scaled = self.scale.apply((self.width, self.height));
-        let (w, h) = match self.ceiling {
+        let fitted = match self.ceiling {
             Some(ceiling) => super::screen_capture::fit_within(scaled, ceiling),
             None => (scaled.0.max(2) & !1, scaled.1.max(2) & !1),
         };
+        // Last, because it is a constraint on what is emitted rather than a
+        // preference about it: a ceiling that lands on a size the encoder will
+        // not take is not a size.
+        let (w, h) = super::screen_capture::snap_to(fitted, self.granularity);
         if (w, h) == (self.out_width, self.out_height) {
             return true;
         }
@@ -1038,6 +1047,14 @@ impl ScreenCaptureBackend for DxgiCapturer {
             return true;
         }
         self.ceiling = ceiling;
+        self.apply_output_size()
+    }
+
+    fn set_size_granularity(&mut self, granularity: (u16, u16)) -> bool {
+        if self.granularity == granularity {
+            return true;
+        }
+        self.granularity = granularity;
         self.apply_output_size()
     }
 

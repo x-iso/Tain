@@ -482,6 +482,25 @@ impl ScreenCaptureBackend for Subscriber {
         applied
     }
 
+    /// The owner's to set, like the scale and the ceiling — but unlike those,
+    /// a second session refused here would be handed sizes its own encoder
+    /// cannot take. Nothing can be done about that from here: one duplication
+    /// emits one size. The encoder says so in its log line, and the two
+    /// sessions would have to be on different codecs for it to arise at all.
+    fn set_size_granularity(&mut self, granularity: (u16, u16)) -> bool {
+        if !self.owns_configuration() {
+            return false;
+        }
+        let mut capturer = self.desktop.capturer.lock().unwrap_or_else(|e| e.into_inner());
+        let applied = capturer.set_size_granularity(granularity);
+        if applied {
+            let size = capturer.frame_size();
+            drop(capturer);
+            self.desktop.published.lock().unwrap_or_else(|e| e.into_inner()).size = size;
+        }
+        applied
+    }
+
     fn request_format(&mut self, format: PixelFormat) -> bool {
         let mut capturer = self.desktop.capturer.lock().unwrap_or_else(|e| e.into_inner());
         // A later session asking for what is already being produced is not a

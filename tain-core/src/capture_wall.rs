@@ -111,6 +111,8 @@ pub struct Wall {
     out: (u16, u16),
     scale: QualityScale,
     ceiling: Option<(u16, u16)>,
+    /// Multiples the emitted size must land on, from the encoder.
+    granularity: (u16, u16),
     /// Reused between frames; this is several megabytes.
     buffer: Vec<u8>,
 }
@@ -189,6 +191,7 @@ impl Wall {
             out,
             scale: QualityScale::Native,
             ceiling: None,
+            granularity: (2, 2),
             buffer: Vec::new(),
         };
         // Before the first frame, not on the first resize: a display whose slot
@@ -211,14 +214,17 @@ impl Wall {
         );
         let scaled = self.scale.apply(native);
         let scaled = fit_within(scaled, (MAX_WALL, MAX_WALL));
-        match self.ceiling {
+        let fitted = match self.ceiling {
             Some(ceiling) => {
                 let (w, h) = fit_within(scaled, ceiling);
                 // Even, as every codec here needs.
                 ((w.max(2)) & !1, (h.max(2)) & !1)
             }
             None => scaled,
-        }
+        };
+        // Last, and after `MAX_WALL` for the same reason it is: a size the
+        // encoder will refuse is not a size.
+        super::screen_capture::snap_to(fitted, self.granularity)
     }
 
     /// Ask each display for the size its place on the wall actually needs.
@@ -427,6 +433,11 @@ impl ScreenCaptureBackend for Wall {
 
     fn set_size_ceiling(&mut self, ceiling: Option<(u16, u16)>) -> bool {
         self.ceiling = ceiling;
+        true
+    }
+
+    fn set_size_granularity(&mut self, granularity: (u16, u16)) -> bool {
+        self.granularity = granularity;
         true
     }
 

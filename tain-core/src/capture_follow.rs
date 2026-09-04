@@ -554,6 +554,12 @@ mod platform {
             self.local.as_mut().is_some_and(|local| local.set_size_ceiling(ceiling))
         }
 
+        /// Same delegation, and the same nothing to delegate to when the agent
+        /// is capturing — an agent frame is whatever size the desktop is.
+        fn set_size_granularity(&mut self, granularity: (u16, u16)) -> bool {
+            self.local.as_mut().is_some_and(|local| local.set_size_granularity(granularity))
+        }
+
         fn request_format(&mut self, format: PixelFormat) -> bool {
             // # Why a mixed stream is not a broken promise
             //

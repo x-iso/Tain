@@ -1228,6 +1228,24 @@ impl super::encoder::VideoEncoder for HardwareH264Encoder {
         PixelFormat::Nv12
     }
 
+    /// AV1 needs its width on the superblock grid; the rest take anything even.
+    ///
+    /// Measured, not read off a datasheet — see
+    /// [`super::encoder::VideoEncoder::size_granularity`] for what an AV1
+    /// transform handed an off-grid size actually does, which is nothing at all
+    /// while reporting success.
+    ///
+    /// Applied to every AV1 transform rather than only AMD's. The constraint is
+    /// the codec's own geometry, sixty-four being the superblock, so a vendor
+    /// that does not need it loses at most sixty-three columns of a desktop —
+    /// against a session that ends two seconds in on a vendor that does.
+    fn size_granularity(&self) -> (u16, u16) {
+        match self.config.effective_codec() {
+            super::encoder::VideoCodec::Av1 => (64, 16),
+            _ => (2, 2),
+        }
+    }
+
     fn encode_frame(
         &mut self,
         pixels: &[u8],
@@ -2474,6 +2492,102 @@ mod tests {
         .expect("reconfigure");
         enc.encode_frame(&frame, 640, 480, PixelFormat::Bgra).expect("encode");
         assert!(enc.is_using_hardware());
+    }
+
+    /// Which frame sizes this machine's hardware encoder will actually take.
+    ///
+    /// # Why this exists
+    ///
+    /// An AMD AV1 transform stalled — stopped asking for input, for longer than
+    /// [`ENCODER_STALL_TIMEOUT`] — a couple of seconds into every session that
+    /// ran at a size whose axes were not multiples of sixteen, and streamed
+    /// perfectly at 1920x1200. Every log said "the encoder has stalled" and
+    /// nothing said what it disagreed with, so the sizes are asked one at a
+    /// time and the answers written down.
+    #[test]
+    #[ignore = "diagnostic — run explicitly"]
+    fn what_frame_sizes_this_encoder_takes() {
+        use crate::encoder::{VideoCodec, VideoEncoder};
+
+        // Enough frames to get past the first one or two, which an async
+        // transform legitimately swallows before producing anything.
+        const FRAMES: usize = 12;
+
+        // Pairs that differ only in alignment, plus the real sizes from the
+        // reported sessions: 1920x1200 streamed, 1398x874 stalled.
+        const SIZES: [(u16, u16); 9] = [
+            (1920, 1200),
+            (1398, 874),
+            (1392, 864),
+            (1398, 864),
+            (1392, 874),
+            (2880, 1620),
+            (2880, 1616),
+            (1636, 1022),
+            (1632, 1024),
+        ];
+
+        // One encoder per size, built and dropped before the next — never two
+        // at once, because holding a second hardware transform on this hardware
+        // hung the run outright. `TAIN_SIZES=WxH,WxH` narrows it.
+        let sizes: Vec<(u16, u16)> = match std::env::var("TAIN_SIZES") {
+            Ok(list) => list
+                .split(',')
+                .filter_map(|s| s.split_once('x'))
+                .filter_map(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+                .collect(),
+            Err(_) => SIZES.to_vec(),
+        };
+        let codec = match std::env::var("TAIN_CODEC").as_deref() {
+            Ok("h264") => VideoCodec::H264,
+            Ok("h265") => VideoCodec::H265,
+            _ => VideoCodec::Av1,
+        };
+
+        let config = EncodeConfig { codec, ..EncodeConfig::default() };
+        println!("\n{} — a fresh encoder per size", codec.label());
+        for (w, h) in sizes {
+            let Ok(mut enc) = HardwareH264Encoder::new(&config, false) else {
+                println!("  no hardware {} encoder", codec.label());
+                return;
+            };
+            let frame = pattern(w, h);
+            let started = std::time::Instant::now();
+            let mut outcome = Ok(());
+            let mut packets = 0;
+            for _ in 0..FRAMES {
+                match enc.encode_frame(&frame, w, h, PixelFormat::Bgra) {
+                    Ok(f) if f.data.is_empty() => {}
+                    Ok(_) => packets += 1,
+                    Err(e) => {
+                        outcome = Err(e);
+                        break;
+                    }
+                }
+            }
+            let took = started.elapsed();
+            // Against the rule this measured: width on the superblock grid,
+            // height on sixteen. A size marked `off` and encoding fine, or one
+            // marked `on` and stalling, means the rule has moved.
+            let align = |w: u16, h: u16| {
+                if w.is_multiple_of(64) && h.is_multiple_of(16) { "on" } else { "off" }
+            };
+            match outcome {
+                Ok(()) => println!(
+                    "  {w}x{h} (grid {}) — {packets}/{FRAMES} packets in {took:?}",
+                    align(w, h),
+                ),
+                Err(e) => println!(
+                    "  {w}x{h} (grid {}) — FAILED after {packets} packets in {took:?}: {e}",
+                    align(w, h),
+                ),
+            }
+            // Dropped here, and given a moment: the transform hands its encode
+            // session back on drop, and the driver does not appear to be
+            // instant about it.
+            drop(enc);
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
     }
 
     #[test]

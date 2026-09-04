@@ -1791,6 +1791,17 @@ fn spawn_capture_pipeline(
     if format != super::screen_capture::PixelFormat::Bgra {
         info!("Session #{session_id}: capturing directly as {format:?}");
     }
+    // Settled here for the same reason, and it is not advisory: an encoder
+    // handed a size off its grid can fail in ways that look like anything but a
+    // size — see `VideoEncoder::size_granularity`.
+    let granularity = encoder.size_granularity();
+    if granularity != (2, 2) {
+        info!(
+            "Session #{session_id}: this encoder takes frames in multiples of {}x{}",
+            granularity.0, granularity.1
+        );
+    }
+    capturer.set_size_granularity(granularity);
 
     let (tx, rx) = mpsc::channel(FRAME_QUEUE_DEPTH);
     // Depth 1: one frame captured and waiting while the previous one encodes.
@@ -1814,6 +1825,7 @@ fn spawn_capture_pipeline(
         wanted_display,
         config.capture.clone(),
         format,
+        granularity,
     );
 
     let handle = std::thread::Builder::new()
@@ -2192,6 +2204,7 @@ fn spawn_capture_thread(
     wanted_display: WantedDisplay,
     capture_config: super::screen_capture::CaptureConfig,
     format: super::screen_capture::PixelFormat,
+    granularity: (u16, u16),
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("tain-capture-{session_id}"))
@@ -2255,6 +2268,7 @@ fn spawn_capture_thread(
                             // cannot change its mind, so the new capturer has to
                             // be asked for the same thing.
                             super::screen_capture::negotiate_format(&mut *fresh, format);
+                            fresh.set_size_granularity(granularity);
                             fresh.set_scale(applied_scale);
                             fresh.set_size_ceiling(applied_ceiling);
                             let (w, h) = fresh.frame_size();
@@ -2283,6 +2297,7 @@ fn spawn_capture_thread(
                             match super::screen_capture::create_capturer(config) {
                                 Ok(mut back) => {
                                     super::screen_capture::negotiate_format(&mut *back, format);
+                                    back.set_size_granularity(granularity);
                                     back.set_scale(applied_scale);
                                     back.set_size_ceiling(applied_ceiling);
                                     capturer = back;

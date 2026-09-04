@@ -708,6 +708,29 @@ pub trait VideoEncoder: Send + Sync {
     ///
     /// Default is a no-op, for encoders whose every frame already stands alone.
     fn request_keyframe(&mut self) {}
+
+    /// Multiples this encoder needs each axis of a frame to land on.
+    ///
+    /// # Why this is asked rather than assumed
+    ///
+    /// Two by two is what chroma subsampling needs and was, for a long time,
+    /// taken to be the whole story. It is not. AMD's AV1 transform requires the
+    /// **width** to be a multiple of sixty-four and the height a multiple of
+    /// sixteen, and does not say so: handed 1398x874 it activates, negotiates
+    /// its types, reports no error, and then never asks for a frame. The
+    /// session sees a stall two seconds later and the log says the encoder has
+    /// stalled, which is true and useless.
+    ///
+    /// Measured on the hardware, twenty-four sizes, and the rule fits all of
+    /// them — see `codec_mf`'s `what_frame_sizes_this_encoder_takes`. H.264 and
+    /// HEVC on the same GPU take every size offered, which is why this is per
+    /// encoder rather than a constant.
+    ///
+    /// The capture side rounds down to this and keeps the shape; see
+    /// [`crate::screen_capture::snap_to`].
+    fn size_granularity(&self) -> (u16, u16) {
+        (2, 2)
+    }
 }
 
 // ── Raw BGRA passthrough (no encoding: zero latency, highest bandwidth) ─

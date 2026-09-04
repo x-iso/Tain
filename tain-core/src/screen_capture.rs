@@ -587,6 +587,17 @@ pub trait ScreenCaptureBackend: Send + Sync {
         false
     }
 
+    /// Emit only sizes whose axes are multiples of these.
+    ///
+    /// The encoder's constraint, not the capturer's — see
+    /// [`crate::encoder::VideoEncoder::size_granularity`] for what asks for it
+    /// and why one encoder on one machine refuses sizes another takes happily.
+    ///
+    /// Returns whether it was honoured.
+    fn set_size_granularity(&mut self, _granularity: (u16, u16)) -> bool {
+        false
+    }
+
     /// Ask this backend to produce a different pixel format from now on.
     ///
     /// Returns whether it will. This is negotiated **once**, before the session
@@ -802,6 +813,37 @@ pub fn fit_within(src: (u16, u16), ceiling: (u16, u16)) -> (u16, u16) {
 
 fn even(v: u32) -> u16 {
     (v.clamp(2, u16::MAX as u32) as u16) & !1
+}
+
+/// Round an emitted size down to what an encoder will actually take.
+///
+/// # Why this is not just rounding both axes
+///
+/// AMD's AV1 transform wants width in multiples of sixty-four. Rounding each
+/// axis on its own would take 1382x864 to 1344x832 — the width loses 38 pixels
+/// and the height 32, which are different fractions, and the picture arrives at
+/// the guest stretched. The guest draws a frame at the size the frame says it
+/// is; nothing downstream knows what shape it was meant to be.
+///
+/// So only the width is rounded, and the height follows from it. The error left
+/// is half the height's granularity — under one percent at any size worth
+/// streaming — against nearly three percent for the naive version.
+///
+/// Never rounds up: this is applied after a ceiling, and growing past it would
+/// undo the cap that a guest's window, the wall's own limit, or an encoder's
+/// maximum had just imposed.
+pub fn snap_to(size: (u16, u16), granularity: (u16, u16)) -> (u16, u16) {
+    let (gw, gh) = (granularity.0.max(1) as u32, granularity.1.max(1) as u32);
+    let (w, h) = (size.0.max(1) as u32, size.1.max(1) as u32);
+
+    let out_w = (w / gw * gw).max(gw);
+    // From the shape that was asked for, at the width that survived rounding.
+    let ideal_h = (out_w * h).div_ceil(w);
+    // Nearest rather than down, so the shape is as close as the grid allows,
+    // then held inside the size we were given.
+    let out_h = ((ideal_h + gh / 2) / gh * gh).clamp(gh, (h / gh * gh).max(gh));
+
+    (out_w.min(u16::MAX as u32) as u16, out_h.min(u16::MAX as u32) as u16)
 }
 
 /// Average each destination pixel over the source pixels it covers.
@@ -1079,7 +1121,7 @@ mod tests {
 
 #[cfg(test)]
 mod fit_tests {
-    use super::fit_within;
+    use super::{fit_within, snap_to};
 
     #[test]
     fn a_ceiling_larger_than_the_source_changes_nothing() {
@@ -1117,6 +1159,67 @@ mod fit_tests {
                     "{src:?} into {ceiling:?} gave {w}x{h}"
                 );
             }
+        }
+    }
+
+    /// The sizes measured against the real AV1 transform, as a rule.
+    ///
+    /// Every one of these was tried on the hardware: the left column stalled
+    /// the encoder outright, and what `snap_to` turns it into did not.
+    #[test]
+    fn a_size_the_av1_encoder_refuses_is_snapped_to_one_it_takes() {
+        for (bad, _why) in [
+            ((1398u16, 874u16), "the session that reported this"),
+            ((1392, 864), "width off the grid even with both axes on 16"),
+            ((1632, 1024), "the same, one notch below a size that works"),
+            ((2880, 1620), "width fine, height off 16"),
+            ((1920, 1204), "the same, at the size a 2560x1600 primary lands on"),
+            ((1636, 1022), "the wall"),
+            ((1376, 816), "32-aligned is not 64-aligned"),
+        ] {
+            let (w, h) = snap_to(bad, (64, 16));
+            assert!(w.is_multiple_of(64), "{bad:?} snapped to {w}x{h}, width off the grid");
+            assert!(h.is_multiple_of(16), "{bad:?} snapped to {w}x{h}, height off the grid");
+            assert!(w <= bad.0 && h <= bad.1, "{bad:?} grew to {w}x{h}");
+        }
+
+        // Sizes the encoder already takes are left exactly alone, so this never
+        // costs a machine that did not need it anything.
+        for good in [(1920u16, 1200u16), (2880, 1616), (1280, 720), (2560, 1600), (1216, 688)] {
+            assert_eq!(snap_to(good, (64, 16)), good);
+        }
+    }
+
+    /// The whole reason the height is derived rather than rounded on its own.
+    #[test]
+    fn snapping_keeps_the_shape_it_was_given() {
+        for (w, h) in [(1382u16, 864u16), (1398, 874), (2456, 1382), (1636, 1022), (999, 733)] {
+            let before = f32::from(w) / f32::from(h);
+            let (sw, sh) = snap_to((w, h), (64, 16));
+            let after = f32::from(sw) / f32::from(sh);
+            let drift = (after - before).abs() / before;
+            assert!(
+                drift < 0.02,
+                "{w}x{h} became {sw}x{sh}: aspect moved {:.1}%, which is visible",
+                drift * 100.0
+            );
+        }
+    }
+
+    /// The default asks for nothing, and must therefore change nothing.
+    #[test]
+    fn the_ordinary_granularity_is_the_identity_on_an_even_size() {
+        for size in [(1920u16, 1200u16), (1398, 874), (640, 480), (2, 2)] {
+            assert_eq!(snap_to(size, (2, 2)), size);
+        }
+    }
+
+    /// A stream degraded to almost nothing must still be a picture.
+    #[test]
+    fn snapping_never_reaches_zero() {
+        for size in [(1u16, 1u16), (2, 2), (63, 15), (64, 16), (10, 4000)] {
+            let (w, h) = snap_to(size, (64, 16));
+            assert!(w >= 64 && h >= 16, "{size:?} snapped to {w}x{h}");
         }
     }
 
