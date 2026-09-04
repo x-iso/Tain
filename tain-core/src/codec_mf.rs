@@ -1027,10 +1027,73 @@ fn encode_with(
     }
 }
 
-/// How many times a hardware transform may be rebuilt after failing mid-stream.
+/// How many times a hardware transform may be rebuilt after failing mid-stream
+/// **without encoding anything in between**.
 ///
 /// See the restart path in [`HardwareH264Encoder::encode_frame`].
 const MAX_ENCODER_RESTARTS: u32 = 3;
+
+/// Frames a rebuilt transform must produce before the restart budget refills.
+///
+/// # Why the budget is not a lifetime count
+///
+/// It was, and a session died for it. Every display switch changes the frame
+/// size, which rebuilds the transform, and AMD's AV1 MFT has been seen to stall
+/// on the first frame after a rebuild. Three switches over half a minute — each
+/// one followed by hundreds of perfectly good frames — exhausted a budget meant
+/// for an encoder that cannot encode at all, and the session ended with
+/// "the encoder has stalled" while the encoder was working.
+///
+/// What that budget is really trying to say is *this transform never recovers*.
+/// So measure recovery: a restart that goes on to produce a run of frames
+/// worked, and the next stall is a new problem rather than the third act of the
+/// old one. Half a second at sixty frames a second, which a genuinely wedged
+/// transform never reaches — it stalls again inside
+/// [`ENCODER_STALL_TIMEOUT`] with nothing emitted.
+const FRAMES_TO_FORGIVE_A_RESTART: u32 = 30;
+
+/// A hardware transform's allowance for restarting itself after a stall.
+///
+/// A count with a memory. Split out from the encoder because the bug it
+/// replaces was in the counting rather than the encoding, and everything else
+/// on that path needs a GPU to reach.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RestartBudget {
+    spent: u32,
+    frames_since: u32,
+}
+
+impl RestartBudget {
+    /// Whether there is room for another restart.
+    fn has_room(self) -> bool {
+        self.spent < MAX_ENCODER_RESTARTS
+    }
+
+    /// Record a restart, returning how many have now been spent unrecovered.
+    fn spend(&mut self) -> u32 {
+        self.spent += 1;
+        self.frames_since = 0;
+        self.spent
+    }
+
+    /// Record a frame the transform actually produced.
+    ///
+    /// Returns true at the moment the budget refills, and only then, so the
+    /// caller can say so once instead of on every frame afterwards.
+    fn encoded_a_frame(&mut self) -> bool {
+        self.frames_since = self.frames_since.saturating_add(1);
+        if self.spent > 0 && self.frames_since >= FRAMES_TO_FORGIVE_A_RESTART {
+            self.spent = 0;
+            return true;
+        }
+        false
+    }
+
+    /// Forget everything: what is in the slot now is a different transform.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
 
 /// [`MediaFoundationEncoder`] behind the pipeline's [`VideoEncoder`] interface.
 ///
@@ -1058,9 +1121,15 @@ pub struct HardwareH264Encoder {
     /// ever touched from the capture thread, so this never contends.
     inner: std::sync::Mutex<Option<(Backend, u16, u16)>>,
     sequence_counter: std::sync::Mutex<u32>,
-    /// Hardware transforms rebuilt after a mid-stream failure, capped at
-    /// [`MAX_ENCODER_RESTARTS`]. Needs no lock — encoding takes `&mut self`.
-    restarts: u32,
+    /// Hardware transforms rebuilt after a mid-stream failure. Needs no lock —
+    /// encoding takes `&mut self`.
+    budget: RestartBudget,
+    /// Whether the current transform has yet to emit a packet.
+    ///
+    /// A transform's first output is an IDR, so while this is true a keyframe
+    /// has already been asked for and rebuilding to get one is pure churn —
+    /// which is what [`Self::request_keyframe`] uses it for.
+    fresh: bool,
     name: String,
 }
 
@@ -1080,7 +1149,8 @@ impl HardwareH264Encoder {
             allow_fallback,
             inner: std::sync::Mutex::new(None),
             sequence_counter: std::sync::Mutex::new(0),
-            restarts: 0,
+            budget: RestartBudget::default(),
+            fresh: true,
             name,
         })
     }
@@ -1124,12 +1194,32 @@ impl super::encoder::VideoEncoder for HardwareH264Encoder {
     /// Not `CODECAPI_AVEncVideoForceKeyFrame`: vendors disagree about whether it
     /// applies to the next input or the one after, and about whether setting it
     /// on a running transform is honoured at all. A rebuild is unambiguous on
-    /// every backend, and this happens only when a guest's decoder has actually
-    /// failed — which should be approximately never, and is already worse than
-    /// one rebuild.
+    /// every backend.
+    ///
+    /// # Why a transform that has emitted nothing is left alone
+    ///
+    /// This used to rebuild unconditionally, on the reasoning that a guest's
+    /// decoder failing should be approximately never. Switching displays made it
+    /// routine: the frame size changes under the guest, its decoder fails, it
+    /// asks for a keyframe — and the host was tearing the transform down twice
+    /// within a few tens of milliseconds, once for the request and once for the
+    /// new size. Four rebuilds in two seconds is what a run of switches actually
+    /// produced, and AMD's AV1 transform stalls when driven like that.
+    ///
+    /// A transform's first packet is an IDR. So while the current one has yet to
+    /// emit anything, the keyframe is already on its way and a rebuild buys
+    /// nothing but the stall.
     fn request_keyframe(&mut self) {
+        if self.fresh {
+            debug!(
+                "{}: a guest asked for a keyframe — the encoder is about to send one anyway",
+                self.name
+            );
+            return;
+        }
         warn!("{}: a guest asked for a keyframe — rebuilding the encoder", self.name);
         *self.inner.lock().unwrap() = None;
+        self.fresh = true;
     }
 
     /// NV12, so the capture side can convert on the GPU and skip the readback
@@ -1156,6 +1246,7 @@ impl super::encoder::VideoEncoder for HardwareH264Encoder {
             // them on exactly the hardware where that matters.
             *slot = None;
             *slot = Some((self.build(width, height)?, width, height));
+            self.fresh = true;
         }
 
         let was_hardware = matches!(slot.as_ref(), Some((Backend::Hardware(_), _, _)));
@@ -1168,21 +1259,21 @@ impl super::encoder::VideoEncoder for HardwareH264Encoder {
         // [`ENCODER_STALL_TIMEOUT`] catches. Propagating that ended the session
         // outright, so one driver hiccup cost the whole call.
         //
-        // A fresh transform usually comes back. The restart budget is small
-        // because a hardware encoder that needs restarting every few seconds is
-        // broken in a way this cannot paper over, and failing loudly at that
-        // point is more useful than a stream that stutters forever.
+        // A fresh transform usually comes back, and the budget for trying is
+        // spent per *unrecovered* failure — see [`FRAMES_TO_FORGIVE_A_RESTART`].
         if let Err(e) = &outcome
             && was_hardware
-            && self.restarts < MAX_ENCODER_RESTARTS
+            && self.budget.has_room()
         {
-            self.restarts += 1;
+            let spent = self.budget.spend();
             warn!(
-                "{} failed mid-stream ({e}) — rebuilding it (restart {} of {MAX_ENCODER_RESTARTS})",
-                self.name, self.restarts
+                "{} failed mid-stream ({e}) — rebuilding it \
+                 (restart {spent} of {MAX_ENCODER_RESTARTS})",
+                self.name
             );
             *slot = None;
             *slot = Some((self.build(width, height)?, width, height));
+            self.fresh = true;
             outcome = encode_with(
                 &mut slot.as_mut().expect("rebuilt above").0,
                 pixels,
@@ -1192,8 +1283,47 @@ impl super::encoder::VideoEncoder for HardwareH264Encoder {
             );
         }
 
+        // # The last resort is the CPU, not the end of the session
+        //
+        // A transform that has used up its restarts is out of ways to fix
+        // itself, but the session still has one: the same software encoder a
+        // machine with no hardware encoder at all would be using. It is slower
+        // and the adaptive controller will scale the picture down to pay for it,
+        // which is a stream someone can still work in — and the alternative here
+        // is hanging up on them.
+        //
+        // Not when the user chose the hardware backend by name. There a silent
+        // downgrade hides the very thing they asked to be told about.
+        if outcome.is_err() && was_hardware && self.allow_fallback {
+            let failure = outcome.as_ref().err().map(|e| format!("{e}")).unwrap_or_default();
+            warn!(
+                "{} could not be kept running ({failure}) — this stream falls back to the CPU",
+                self.name
+            );
+            let mut software = Backend::Software(Box::new(super::codec_h264::H264Encoder::new(
+                &self.config,
+            )?));
+            outcome = encode_with(&mut software, pixels, width, height, format);
+            *slot = Some((software, width, height));
+            self.fresh = true;
+            self.budget.reset();
+        }
+
         let (data, is_keyframe) = outcome?;
         drop(slot);
+
+        // Emitting anything means this transform is past its build, so a
+        // keyframe request from here on has to rebuild to be honoured.
+        if !data.is_empty() {
+            self.fresh = false;
+            if self.budget.encoded_a_frame() {
+                debug!(
+                    "{} has encoded {FRAMES_TO_FORGIVE_A_RESTART} frames since its last \
+                     restart — the budget is refilled",
+                    self.name
+                );
+            }
+        }
 
         let seq = {
             let mut counter = self.sequence_counter.lock().unwrap();
@@ -1498,6 +1628,49 @@ mod tests {
             }
         }
         data
+    }
+
+    /// The bug this replaces, stated as a test.
+    ///
+    /// Three display switches, each followed by a healthy run of frames, used
+    /// to exhaust a lifetime count and end the session with "the encoder has
+    /// stalled" while the encoder was working perfectly well.
+    #[test]
+    fn restarts_spaced_by_healthy_frames_never_run_out() {
+        let mut budget = RestartBudget::default();
+        for _ in 0..10 {
+            assert!(budget.has_room(), "a recovered restart must not be held against the next");
+            budget.spend();
+            for _ in 0..FRAMES_TO_FORGIVE_A_RESTART {
+                budget.encoded_a_frame();
+            }
+        }
+        assert!(budget.has_room());
+    }
+
+    /// And the case the budget exists for, which still has to end.
+    #[test]
+    fn restarts_that_never_encode_anything_run_out() {
+        let mut budget = RestartBudget::default();
+        for _ in 0..MAX_ENCODER_RESTARTS {
+            assert!(budget.has_room());
+            budget.spend();
+        }
+        assert!(!budget.has_room(), "a transform that never recovers has to stop being retried");
+    }
+
+    /// A run cut short by the next stall is not a recovery.
+    #[test]
+    fn a_short_run_of_frames_does_not_refill_the_budget() {
+        let mut budget = RestartBudget::default();
+        budget.spend();
+        for _ in 0..FRAMES_TO_FORGIVE_A_RESTART - 1 {
+            assert!(!budget.encoded_a_frame());
+        }
+        assert_eq!(budget.spent, 1);
+        assert!(budget.encoded_a_frame(), "the refill is reported exactly once");
+        assert_eq!(budget.spent, 0);
+        assert!(!budget.encoded_a_frame(), "and not again on the frames after it");
     }
 
     #[test]
