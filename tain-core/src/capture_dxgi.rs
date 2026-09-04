@@ -32,8 +32,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
-    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 use super::capture_hdr::{ColourLog, DisplayColour, HdrToSdr};
@@ -121,17 +121,36 @@ impl Duplication {
         // So the unit of retry is the whole thing — device, output, duplication
         // — and the first candidate that produces frames wins.
         let candidates = adapters_for(want);
-        let mut last_err: Option<anyhow::Error> = None;
+        // # Why every failure is carried, not just the last
+        //
+        // It reported the last one, and the last one is the least informative
+        // by construction: the candidates are ordered best-first, so the final
+        // entry is the software rasteriser or an adapter with no outputs at
+        // all. A host that could not capture reported
+        //
+        //   \.\DISPLAY1 is not attached to this adapter (it has none)
+        //
+        // which is true of the *fallback* and says nothing about the adapter
+        // that owns the display and was tried first. One report, in order, with
+        // every adapter named — because the useful line is whichever one is
+        // about the GPU the display is actually plugged into, and from here
+        // there is no way to know which that is.
+        let mut failures: Vec<String> = Vec::new();
         for candidate in candidates {
             match Self::create_on(&candidate, want, colour_log) {
                 Ok(built) => return Ok(built),
-                Err(e) => {
-                    debug!("Capture on {}: {e:#}", candidate.label);
-                    last_err = Some(e);
-                }
+                Err(e) => failures.push(format!("{}: {e:#}", candidate.label)),
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no display adapter could be asked")))
+        if failures.is_empty() {
+            anyhow::bail!("this machine reports no display adapters at all");
+        }
+        anyhow::bail!(
+            "no adapter could capture {}. Tried {}: {}",
+            want.unwrap_or("the primary display"),
+            failures.len(),
+            failures.join("; ")
+        )
     }
 
     /// One candidate adapter, tried all the way to a live duplication.
@@ -752,6 +771,27 @@ fn duplicate(
             anyhow::anyhow!(
                 "Screen capture was denied. This happens on the lock screen or while \
                  a UAC prompt is up — both run on a desktop we cannot see."
+            )
+        } else if e.code() == DXGI_ERROR_UNSUPPORTED {
+            // # What this actually means, and why the message says so
+            //
+            // `DXGI_ERROR_UNSUPPORTED` reads as "this feature is not supported
+            // on this system", which is misleading: duplication is supported,
+            // and the same machine duplicates the same display from other
+            // software every day. What it means here is that *this process* is
+            // rendering on one GPU while the desktop is composited by another,
+            // which is the ordinary state of a laptop with two of them.
+            //
+            // Nothing in this code can move the process to the other GPU — the
+            // driver reads that preference before `main` runs, from the
+            // executable and from a Windows setting. Saying which setting turns
+            // a dead end into something the person in front of the machine can
+            // act on, which is worth more than another sentence about DXGI.
+            anyhow::anyhow!(
+                "this GPU cannot duplicate that display ({e}). On a machine with two \
+                 graphics chips that usually means Tain is running on the wrong one — \
+                 in Settings > System > Display > Graphics, add Tain and set it to \
+                 Power saving, which is the GPU the desktop is drawn by."
             )
         } else {
             anyhow::anyhow!("DuplicateOutput failed: {e}")
