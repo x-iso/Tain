@@ -765,7 +765,9 @@ fn virtual_display_section(ui: &mut egui::Ui) {
             .on_hover_text(
                 "Windows will ask twice — once for administrator rights, and once about \
                  trusting the publisher. The second prompt is Windows' own and cannot be \
-                 skipped, which is rather the point of it.",
+                 skipped, which is rather the point of it. The name it shows is the \
+                 driver's author, not Tain: the package is installed exactly as they \
+                 signed it, because changing a byte of it would void the signature.",
             )
             .clicked()
             && let Err(e) = display_driver::request_install()

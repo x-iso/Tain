@@ -43,13 +43,91 @@ pub const UNINSTALL_FLAG: &str = "--uninstall-display-driver";
 /// copy somebody moved is one that stops working when they move it.
 pub const PACKAGE_DIR: &str = "drivers/virtual-display";
 
-/// The device this creates, and the driver bound to it.
+/// What the shipped `.inf` says it installs.
 ///
-/// A root-enumerated device — there is no hardware to discover, so Windows is
-/// told to make a node and then given a driver that claims this id. It has to
-/// match the `.inf` in [`PACKAGE_DIR`] exactly; a mismatch installs a device
-/// nothing will ever drive, which looks like a working install and is not.
-pub const HARDWARE_ID: &str = "Root\\TainVirtualDisplay";
+/// # Why these are read rather than chosen
+///
+/// They were constants, named after Tain, and that would not have worked. A
+/// driver package's `.cat` catalog holds a signed hash of every file in it,
+/// the `.inf` included — so the package installs *byte for byte* or not at
+/// all. Renaming the device to something of ours voids the signature, and a
+/// voided signature is not a cosmetic problem: Windows refuses the package, or
+/// demands the machine be put into test-signing mode, which is not a thing to
+/// ask of somebody who wanted a second monitor.
+///
+/// So the package is shipped exactly as its authors signed it, and this reads
+/// out of it what has to be handed to the device APIs. Which also means a
+/// different package can be dropped in without editing any of this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Package {
+    /// The `.inf` itself, which is what `newdev` is pointed at.
+    pub inf: std::path::PathBuf,
+    /// `ClassGuid` from `[Version]`, as text. The class the device is created
+    /// in has to be the one the driver expects to be installed into.
+    pub class: String,
+    /// The `Root\…` id the `.inf` claims, e.g. `Root\MttVDD`.
+    pub hardware_id: String,
+    /// What Windows will call the device, for the settings panel to repeat.
+    pub device_name: Option<String>,
+}
+
+/// Pull out of an `.inf` the three things installing it needs.
+///
+/// Deliberately not a general INF parser. The format has directives, include
+/// files, architecture-decorated sections and string substitution, and none of
+/// that is needed to answer "what class, what id, what is it called" — while a
+/// parser that tried would be a great deal of code to be subtly wrong in.
+///
+/// Pure, so the shape of a real `.inf` can be pinned in a test rather than
+/// discovered on somebody's machine at install time.
+pub fn parse_inf(text: &str) -> Option<Package> {
+    let mut class = None;
+    let mut hardware_id = None;
+    let mut device_name = None;
+
+    for line in text.lines() {
+        // Comments run to end of line and can follow a value.
+        let line = line.split(';').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let value = value.trim();
+            if key.eq_ignore_ascii_case("ClassGuid") && class.is_none() {
+                // `[Version]` can carry several directives on one line,
+                // comma-separated, so the value stops at the first comma.
+                class = Some(
+                    value.split(',').next().unwrap_or(value).trim().to_string(),
+                );
+            }
+            if key.eq_ignore_ascii_case("DeviceName") && device_name.is_none() {
+                device_name = Some(value.trim_matches('"').to_string());
+            }
+        }
+
+        // The hardware id is not a key: it is the last field of a device entry,
+        // `%DeviceName% = Install_Section, Root\Something`. Finding it by shape
+        // rather than by section avoids having to know which of the
+        // architecture-decorated `[Standard.NT…]` sections this build uses.
+        if hardware_id.is_none()
+            && let Some(found) = line
+                .split(',')
+                .map(str::trim)
+                .find(|part| part.len() > 5 && part[..5].eq_ignore_ascii_case("root\\"))
+        {
+            hardware_id = Some(found.to_string());
+        }
+    }
+
+    Some(Package {
+        inf: std::path::PathBuf::new(),
+        class: class?,
+        hardware_id: hardware_id?,
+        device_name,
+    })
+}
 
 /// Whether the driver is installed, and whether it can be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,7 +177,6 @@ impl DriverState {
 mod windows_impl {
     use super::*;
     use anyhow::{bail, Context, Result};
-    use std::path::PathBuf;
 
     /// The driver package this build ships, if it ships one.
     ///
@@ -107,7 +184,7 @@ mod windows_impl {
     /// dropping a folder in rather than also editing a name in here — and so
     /// that a folder containing something else entirely is reported as absent
     /// rather than half-found.
-    pub fn package() -> Option<PathBuf> {
+    pub fn package() -> Option<Package> {
         let beside = std::env::current_exe().ok()?.parent()?.join(PACKAGE_DIR);
         let mut infs = std::fs::read_dir(&beside)
             .ok()?
@@ -116,7 +193,7 @@ mod windows_impl {
             .filter(|path| {
                 path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("inf"))
             });
-        let first = infs.next()?;
+        let inf = infs.next()?;
         if infs.next().is_some() {
             tracing::warn!(
                 "{} holds more than one .inf — not guessing which is the driver",
@@ -124,33 +201,61 @@ mod windows_impl {
             );
             return None;
         }
-        Some(first)
+
+        // Read as bytes and lossily decoded: an `.inf` may be UTF-16 with a
+        // BOM, ANSI, or UTF-8, and refusing one for its encoding would be a
+        // strange way to fail to install a driver.
+        let bytes = std::fs::read(&inf).ok()?;
+        let text = decode(&bytes);
+        let mut found = parse_inf(&text).or_else(|| {
+            tracing::warn!("{} does not name a class and a Root\\ device", inf.display());
+            None
+        })?;
+        found.inf = inf;
+        Some(found)
+    }
+
+    /// Bytes to text, whatever the file was written in.
+    fn decode(bytes: &[u8]) -> String {
+        match bytes {
+            [0xFF, 0xFE, rest @ ..] => {
+                let words: Vec<u16> = rest
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+                String::from_utf16_lossy(&words)
+            }
+            _ => String::from_utf8_lossy(bytes).into_owned(),
+        }
     }
 
     /// Whether Windows has this driver's device installed.
     ///
-    /// Asked of the device tree rather than of the display list, because a
-    /// driver that is installed but presenting nothing has no display to find
-    /// and is still installed.
-    fn device_present() -> bool {
-        // The adapters this driver registers carry its name, which is the same
-        // match `virtual_display` uses to recognise one. A driver that has been
-        // installed but has never presented a monitor still registers its
-        // adapters, so this sees it either way.
+    /// Asked by name against the package's own device name rather than against
+    /// anything of ours: the driver is shipped as its authors signed it, so
+    /// what appears in the display list is *their* name — "Virtual Display
+    /// Driver", by Mike The Tech, for the package this ships today. Looking for
+    /// "Tain" would have found nothing, ever.
+    fn device_present(package: Option<&Package>) -> bool {
+        let wanted = package
+            .and_then(|p| p.device_name.as_deref())
+            .unwrap_or("virtual display driver")
+            .to_ascii_lowercase();
         tain_core::virtual_display::available()
             .iter()
-            .any(|screen| screen.adapter.to_ascii_lowercase().contains("tain"))
+            .any(|screen| screen.adapter.to_ascii_lowercase().contains(&wanted))
     }
 
     /// What the settings panel shows.
     pub fn state() -> DriverState {
-        if device_present() {
+        let package = package();
+        if device_present(package.as_ref()) {
             let ready = tain_core::virtual_display::available()
                 .iter()
                 .any(|screen| screen.ready);
             return if ready { DriverState::Ready } else { DriverState::Idle };
         }
-        if package().is_none() {
+        if package.is_none() {
             return DriverState::NotBundled;
         }
         DriverState::NotInstalled
@@ -182,19 +287,32 @@ mod windows_impl {
     /// Must already be running as administrator; this is what the elevated
     /// relaunch above ends up calling.
     pub fn install() -> Result<()> {
-        let inf = package().context("no driver package beside this executable")?;
-        let inf = inf
+        let package = package().context("no driver package beside this executable")?;
+        // Absolute, because `newdev` resolves a relative path against the
+        // system directory rather than against this process.
+        let inf = package
+            .inf
             .canonicalize()
-            .with_context(|| format!("could not resolve {}", inf.display()))?;
-        device::create(HARDWARE_ID)?;
-        device::bind(&inf, HARDWARE_ID)?;
-        tracing::info!("Installed the virtual display driver from {}", inf.display());
+            .with_context(|| format!("could not resolve {}", package.inf.display()))?;
+        device::create(&package.class, &package.hardware_id)?;
+        device::bind(&inf, &package.hardware_id)?;
+        tracing::info!(
+            "Installed {} ({}) from {}",
+            package.device_name.as_deref().unwrap_or("the virtual display driver"),
+            package.hardware_id,
+            inf.display()
+        );
         Ok(())
     }
 
     /// Remove the device node. Must already be running as administrator.
+    ///
+    /// Reads the id from the package for the same reason installing does: the
+    /// device is the package's, not ours, and a build shipping a different one
+    /// must remove the one it installed.
     pub fn uninstall() -> Result<()> {
-        let removed = device::remove(HARDWARE_ID)?;
+        let package = package().context("no driver package beside this executable")?;
+        let removed = device::remove(&package.class, &package.hardware_id)?;
         if removed == 0 {
             tracing::info!("No virtual display device to remove");
         } else {
@@ -209,7 +327,7 @@ mod windows_impl {
     /// do it — a root-enumerated device has no hardware to be discovered, so
     /// something has to assert that it exists.
     mod device {
-        use anyhow::{Context, Result};
+        use anyhow::{bail, Context, Result};
         use std::path::Path;
         use windows::core::PCWSTR;
         use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -227,9 +345,32 @@ mod windows_impl {
         /// to parent a dialog it will not show.
         const NO_PARENT: HWND = HWND(std::ptr::null_mut());
 
-        /// `GUID_DEVCLASS_DISPLAY` — the class a display adapter belongs to.
-        const DISPLAY_CLASS: windows::core::GUID =
-            windows::core::GUID::from_u128(0x4d36e968_e325_11ce_bfc1_08002be10318);
+        /// The class the `.inf` says its device belongs to.
+        ///
+        /// Read from the package rather than assumed to be
+        /// `GUID_DEVCLASS_DISPLAY`: a device has to be created in the class its
+        /// driver expects to be installed into, and a package is free to name
+        /// one — this is where a typo in somebody's `.inf` becomes a device no
+        /// driver will ever bind to, and taking the value from the file means
+        /// the two cannot disagree.
+        /// Parsed here rather than with `GUID::try_from`, which panics on
+        /// anything malformed. This value comes out of a file on disk, and a
+        /// file being wrong is a thing to report, not to abort on.
+        fn class_guid(text: &str) -> Result<windows::core::GUID> {
+            let digits: String = text
+                .trim()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .chars()
+                .filter(|c| *c != '-')
+                .collect();
+            if digits.len() != 32 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+                bail!("{} is not a class GUID", text.trim());
+            }
+            let bits = u128::from_str_radix(&digits, 16)
+                .with_context(|| format!("{} is not a class GUID", text.trim()))?;
+            Ok(windows::core::GUID::from_u128(bits))
+        }
 
         fn wide(s: &str) -> Vec<u16> {
             s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -246,8 +387,9 @@ mod windows_impl {
         /// Idempotent: a second call makes a second device node, so this checks
         /// first. Two nodes claiming one driver is not fatal, but it doubles
         /// the adapters and leaves one of them impossible to remove by name.
-        pub fn create(hardware_id: &str) -> Result<()> {
-            if count(hardware_id)? > 0 {
+        pub fn create(class: &str, hardware_id: &str) -> Result<()> {
+            let class = class_guid(class)?;
+            if count(&class, hardware_id)? > 0 {
                 tracing::info!("The virtual display device is already registered");
                 return Ok(());
             }
@@ -255,19 +397,23 @@ mod windows_impl {
             // SAFETY: every pointer below is either null or points at a local
             // that outlives the call; the info list is destroyed on both paths.
             unsafe {
-                let list = SetupDiCreateDeviceInfoList(Some(&DISPLAY_CLASS), NO_PARENT)
+                let list = SetupDiCreateDeviceInfoList(Some(&class), NO_PARENT)
                     .context("could not start a device installation")?;
 
                 let result = (|| -> Result<()> {
-                    let class = wide("Display");
+                    // The device *name* is a prefix Windows appends an index
+                    // to when generating the instance id, not the class — a
+                    // separate thing from `class` above that happens to read
+                    // the same, which is how the two got confused once already.
+                    let name_prefix = wide("Display");
                     let mut info = SP_DEVINFO_DATA {
                         cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
                         ..Default::default()
                     };
                     SetupDiCreateDeviceInfoW(
                         list,
-                        PCWSTR(class.as_ptr()),
-                        &DISPLAY_CLASS,
+                        PCWSTR(name_prefix.as_ptr()),
+                        &class,
                         PCWSTR::null(),
                         NO_PARENT,
                         DICD_GENERATE_ID,
@@ -330,20 +476,22 @@ mod windows_impl {
         }
 
         /// Remove every device with this hardware id. Returns how many.
-        pub fn remove(hardware_id: &str) -> Result<u32> {
-            with_devices(hardware_id, |list, info| {
+        pub fn remove(class: &str, hardware_id: &str) -> Result<u32> {
+            let class = class_guid(class)?;
+            with_devices(&class, hardware_id, |list, info| {
                 // SAFETY: both come from the enumeration above and are live.
                 unsafe { SetupDiCallClassInstaller(DIF_REMOVE, list, Some(info as *const _)) }
                     .context("Windows refused to remove the device")
             })
         }
 
-        fn count(hardware_id: &str) -> Result<u32> {
-            with_devices(hardware_id, |_, _| Ok(()))
+        fn count(class: &windows::core::GUID, hardware_id: &str) -> Result<u32> {
+            with_devices(class, hardware_id, |_, _| Ok(()))
         }
 
         /// Walk the display class for devices with this hardware id.
         fn with_devices(
+            class: &windows::core::GUID,
             hardware_id: &str,
             mut act: impl FnMut(HDEVINFO, &SP_DEVINFO_DATA) -> Result<()>,
         ) -> Result<u32> {
@@ -353,7 +501,7 @@ mod windows_impl {
             // below points at a local that outlives its call.
             unsafe {
                 let list = SetupDiGetClassDevsW(
-                    Some(&DISPLAY_CLASS),
+                    Some(class),
                     PCWSTR::null(),
                     NO_PARENT,
                     DIGCF_PRESENT,
@@ -425,10 +573,21 @@ mod windows_impl {
                 );
             }
 
+            /// The class comes out of the file, braces and all.
             #[test]
-            fn the_display_class_guid_is_the_documented_one() {
-                assert_eq!(format!("{:?}", DISPLAY_CLASS).to_lowercase(),
-                    "4d36e968-e325-11ce-bfc1-08002be10318");
+            fn a_class_guid_is_read_from_the_inf_rather_than_assumed() {
+                let parsed = class_guid("{4D36E968-E325-11CE-BFC1-08002BE10318}")
+                    .expect("a well-formed class");
+                assert_eq!(
+                    format!("{parsed:?}").to_lowercase(),
+                    "4d36e968-e325-11ce-bfc1-08002be10318"
+                );
+                // Every way a file can be wrong, reported rather than fatal.
+                for bad in ["Display", "", "{}", "{4D36E968}", "{ZZZZZZZZ-E325-11CE-BFC1-08002BE10318}"] {
+                    assert!(class_guid(bad).is_err(), "{bad:?} was accepted as a GUID");
+                }
+                // And without the braces, which an .inf is free to omit.
+                assert!(class_guid("4D36E968-E325-11CE-BFC1-08002BE10318").is_ok());
             }
         }
     }
@@ -469,6 +628,65 @@ pub use stub::{install, request_install, request_uninstall, state, uninstall};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape of the `.inf` this ships, so a change to it fails here.
+    ///
+    /// Abridged from the real one, keeping every feature that makes reading it
+    /// awkward: several directives on the `[Version]` line, a trailing comment,
+    /// architecture-decorated section names, and the id as the last field of a
+    /// device entry rather than the value of a key.
+    const REAL_INF: &str = r#"
+[Version]
+Signature="$WINDOWS NT$"
+Class=Display
+ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider=%ManufacturerName%
+CatalogFile=MttVDD.cat
+DriverVer=
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%DeviceName% = MyDevice_Install, Root\MttVDD ; the device we create
+
+[Strings]
+ManufacturerName = "Mike The Tech"
+DeviceName = "Virtual Display Driver"
+"#;
+
+    #[test]
+    fn the_shipped_inf_names_its_own_device() {
+        let package = parse_inf(REAL_INF).expect("the .inf describes a device");
+        assert_eq!(package.hardware_id, "Root\\MttVDD");
+        assert_eq!(package.class, "{4D36E968-E325-11CE-BFC1-08002BE10318}");
+        assert_eq!(package.device_name.as_deref(), Some("Virtual Display Driver"));
+    }
+
+    /// The id is the package's, never ours.
+    ///
+    /// It was a constant reading `Root\TainVirtualDisplay`, which would have
+    /// registered a device no driver claims — an install that reports success
+    /// and produces nothing. The `.cat` signs the `.inf`, so renaming anything
+    /// in the package is not available: it installs byte for byte or not at all.
+    #[test]
+    fn nothing_about_the_device_is_named_after_tain() {
+        let package = parse_inf(REAL_INF).expect("the .inf describes a device");
+        assert!(
+            !package.hardware_id.to_ascii_lowercase().contains("tain"),
+            "the hardware id has to be the one the signed .inf declares"
+        );
+    }
+
+    /// An `.inf` for something else must not be taken for a driver.
+    #[test]
+    fn a_file_that_names_no_device_is_not_a_package() {
+        assert!(parse_inf("[Version]\nSignature=\"$WINDOWS NT$\"\n").is_none());
+        assert!(parse_inf("").is_none());
+        // A class but no root device: an `.inf` for hardware that is discovered
+        // rather than asserted, which this cannot install.
+        assert!(parse_inf("ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}\n").is_none());
+    }
 
     /// A state nobody can act on must not look like one they can.
     #[test]
