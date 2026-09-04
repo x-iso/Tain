@@ -960,3 +960,37 @@ the same gap.
 GPU-only codec as "the GPU declined a 16×16 frame", which absorbed "nobody wrote
 this arm". Telling those apart needs the error text, not the presence of an
 error.
+
+## The Virtual Display Driver Is Vendored, Not Fetched
+
+**Decision**: the driver package ships in `drivers/virtual-display/` beside the
+executable. The Install button in Settings installs what is there; it does not
+download anything.
+
+**Rationale**: fetching on click was considered and the numbers decided it. The
+driver-only package is **132 KB** — a fetch would add an HTTP client and a zip
+reader as direct dependencies, plus download progress, hash verification and
+network error handling, to avoid committing a file smaller than several of this
+project's icons.
+
+It also fails hardest where it is least affordable. A censored connection cannot
+reach GitHub's release CDN, and "the machine has no monitor and no internet" is
+exactly the case a virtual display exists for. A vendored package works on a
+machine that has never been online.
+
+**What a fetch would have had to do anyway**, and what is therefore recorded in
+`drivers/virtual-display/README.md` instead: the exact release tag, the asset
+name, and its SHA-256. "Download the latest" is not verifiable in advance — the
+hash of a release that does not exist yet cannot be pinned — so the choice was
+never *fetch* versus *vendor*, it was *pin* versus *trust whatever arrives*.
+Pinning is the part that matters, and once a version is pinned there is little
+left for the download to buy.
+
+**What it costs**: a driver fixed upstream is stale until Tain ships a build
+with the new one. Acceptable at this size and for this kind of component, and
+the drop-in folder is the escape hatch — anyone can put a newer package there
+without waiting, which is the same path the vendored one takes.
+
+**Not changed by this**: the package is installed exactly as its authors signed
+it, and Windows names them rather than Tain in its publisher dialog. That is
+true whichever way the bytes arrive.
