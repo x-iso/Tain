@@ -94,6 +94,8 @@ struct Panel {
     y: u32,
     /// The display's own size, for working out its share of the wall.
     source: (u16, u16),
+    /// What the display is called, for a log line that has to name which one.
+    name: String,
     /// The latest frame this display produced, if it has produced one.
     frame: Mutex<Option<ScreenFrame>>,
 }
@@ -115,6 +117,39 @@ pub struct Wall {
     granularity: (u16, u16),
     /// Reused between frames; this is several megabytes.
     buffer: Vec<u8>,
+    /// Displays already complained about for not taking their slot size.
+    ///
+    /// Once each: it happens on every frame for as long as the other session
+    /// lasts, and a log line per frame is how a diagnosis gets buried.
+    resized: std::collections::BTreeSet<String>,
+    /// The arrangement this wall was built from.
+    ///
+    /// A wall is a picture of where the screens *are*, and that is a fact about
+    /// the machine at the moment it was composed. Someone dragging a monitor to
+    /// the other side of the primary in Display Settings, or plugging one in,
+    /// changes it — and this wall would go on drawing the old layout, because
+    /// its panels, their offsets and its bounding box were all decided at
+    /// construction.
+    ///
+    /// Worse than looking wrong: the pointer maps guest coordinates through the
+    /// desk's bounding box, so a stale layout puts the pointer somewhere the
+    /// user did not click.
+    ///
+    /// It cannot fix itself — the panels are attached to particular displays —
+    /// so it reports instead, and the session rebuilds it. See [`Self::stale`].
+    layout: Vec<(String, i32, i32, u16, u16)>,
+}
+
+/// The arrangement, as a value that can be compared.
+///
+/// Name, position and size of every display, in the order they enumerate. Not
+/// a hash: the comparison happens a few times a second at most, and a value
+/// that can be printed is worth more here than one that is small.
+pub fn layout_now() -> Vec<(String, i32, i32, u16, u16)> {
+    super::screen_capture::displays()
+        .into_iter()
+        .map(|screen| (screen.name, screen.x, screen.y, screen.width, screen.height))
+        .collect()
 }
 
 impl Wall {
@@ -154,6 +189,7 @@ impl Wall {
             };
 
             let panel = Arc::new(Panel {
+                name: screen.name.clone(),
                 capturer: Mutex::new(capturer),
                 x: (screen.x - left).max(0) as u32,
                 y: (screen.y - top).max(0) as u32,
@@ -193,6 +229,8 @@ impl Wall {
             ceiling: None,
             granularity: (2, 2),
             buffer: Vec::new(),
+            resized: std::collections::BTreeSet::new(),
+            layout: layout_now(),
         };
         // Before the first frame, not on the first resize: a display whose slot
         // is smaller than itself has to be told so, and at native scale a wall
@@ -239,6 +277,26 @@ impl Wall {
         (placed.width, placed.height)
     }
 
+    /// Whether the desk has been rearranged since this wall was built.
+    ///
+    /// Cheap enough to ask per frame — it is an enumeration of display devices,
+    /// which is what `capture_next` is already waiting tens of milliseconds for
+    /// — but asked on a timer anyway, because "cheap" and "sixty times a
+    /// second" are a bad combination when the answer changes twice a year.
+    pub fn stale(&self) -> bool {
+        layout_now() != self.layout
+    }
+
+    /// Say once that a display is not producing the size it was asked for.
+    fn warn_once_about_resize(&mut self, name: &str, got: (u16, u16), slot: (u16, u16)) {
+        if self.resized.insert(name.to_string()) {
+            warn!(
+                "{name} is producing {}x{} for a {}x{} slot — scaling it to fit. Its                  capture is probably owned by another session.",
+                got.0, got.1, slot.0, slot.1
+            );
+        }
+    }
+
     /// Lay the panels into the buffer.
     ///
     /// # Why BGRA only
@@ -263,6 +321,7 @@ impl Wall {
             self.buffer.fill(0);
         }
 
+        let mut mismatched = Vec::new();
         for panel in &self.panels {
             let frame = panel.frame.lock().unwrap_or_else(|e| e.into_inner());
             let Some(frame) = frame.as_ref() else { continue };
@@ -279,20 +338,58 @@ impl Wall {
                 continue;
             }
 
-            let src_stride = usize::from(frame.width) * 4;
-            let columns = usize::from(frame.width).min(usize::from(out_w) - x);
-            let rows = usize::from(frame.height).min(usize::from(out_h) - y);
+            // # A panel that is not the size of its slot has to be made so
+            //
+            // This copied at 1:1 and clipped, which is right exactly when every
+            // panel emits the size it was asked for — and `resize_panels` asks.
+            // It is not always answered. A display's capture is *shared*, and
+            // only one subscriber owns its configuration: with another session
+            // already watching that screen directly, the wall's request to
+            // resize it is refused, and the panel keeps producing whatever the
+            // other session wanted.
+            //
+            // The result was a wall where one screen occupied the wrong area of
+            // the picture — drawn small with black beside it, or clipped — and
+            // that is not merely ugly. The pointer maps guest coordinates
+            // through the wall to the desk on the assumption that the wall is a
+            // *uniform* scale of the desktop's bounding box. One panel at a
+            // different scale breaks that assumption for itself and for
+            // everything to its right, which is the mismatched mouse position
+            // that was reported.
+            //
+            // So the slot is authoritative and the frame is fitted to it. The
+            // equal case is still a memcpy, which is what it is in the ordinary
+            // run where every panel did as it was asked.
+            let slot = (placed.width, placed.height);
+            let scaled;
+            let (pixels, src_w, src_h) = if (frame.width, frame.height) == slot {
+                (&frame.data[..], frame.width, frame.height)
+            } else {
+                // Noted rather than logged here: `self.panels` is borrowed by
+                // this loop, and saying so needs `&mut self`.
+                mismatched.push((panel.name.clone(), (frame.width, frame.height), slot));
+                scaled = super::screen_capture::box_downscale(frame, slot.0, slot.1);
+                (&scaled[..], slot.0, slot.1)
+            };
+
+            let src_stride = usize::from(src_w) * 4;
+            let columns = usize::from(src_w).min(usize::from(out_w) - x);
+            let rows = usize::from(src_h).min(usize::from(out_h) - y);
             for row in 0..rows {
                 let from = row * src_stride;
                 let to = (y + row) * stride + x * 4;
                 let (Some(src), Some(dst)) = (
-                    frame.data.get(from..from + columns * 4),
+                    pixels.get(from..from + columns * 4),
                     self.buffer.get_mut(to..to + columns * 4),
                 ) else {
                     break;
                 };
                 dst.copy_from_slice(src);
             }
+        }
+
+        for (name, got, slot) in mismatched {
+            self.warn_once_about_resize(&name, got, slot);
         }
 
         ScreenFrame::new(
@@ -461,6 +558,10 @@ impl ScreenCaptureBackend for Wall {
     fn set_size_granularity(&mut self, granularity: (u16, u16)) -> bool {
         self.granularity = granularity;
         true
+    }
+
+    fn layout_changed(&self) -> bool {
+        self.stale()
     }
 
     fn request_format(&mut self, format: PixelFormat) -> bool {
@@ -649,6 +750,61 @@ mod tests {
         // A wall that already fits is left alone.
         let (w, h) = target((3840, 1080), QualityScale::Native, None);
         assert_eq!((w, h), (3840, 1080), "a wall within the limit was shrunk anyway");
+    }
+
+    /// Every panel fills its slot exactly, whatever size it arrived at.
+    ///
+    /// # The bug this is for
+    ///
+    /// Composition copied each panel at 1:1 and clipped, which is right only
+    /// while every panel emits the size it was asked for. A display's capture
+    /// is shared, and only one subscriber owns its configuration — so with
+    /// another session already watching that screen directly, the wall's resize
+    /// request is refused and the panel keeps producing the other session's
+    /// size.
+    ///
+    /// The picture then had one screen drawn small with black beside it. That
+    /// is not merely ugly: the pointer maps guest coordinates through the wall
+    /// on the assumption that it is a *uniform* scale of the desk, so one panel
+    /// at a different scale moves the pointer for itself and for everything to
+    /// its right.
+    ///
+    /// Checked as geometry rather than by composing: `place` is what decides
+    /// where a panel goes, and the property is that the slots tile the wall in
+    /// the same proportions the displays tile the desk.
+    #[test]
+    fn every_panel_keeps_its_share_of_the_wall() {
+        // A 2560x1600 beside a 1920x1080, the arrangement that found this.
+        let desk = (4480u32, 1600u32);
+        let out = (2240u16, 800u16);
+        let screens = [((2560u16, 1600u16), (0u32, 0u32)), ((1920, 1080), (2560, 0))];
+
+        for (source, at) in screens {
+            let placed = place(source, at, desk, out);
+
+            // Where it lands, as a fraction of the wall, must be where the
+            // display sits as a fraction of the desk — within the rounding that
+            // even-sized panels cost.
+            let want_x = f64::from(at.0) / f64::from(desk.0) * f64::from(out.0);
+            let want_w = f64::from(source.0) / f64::from(desk.0) * f64::from(out.0);
+            let want_h = f64::from(source.1) / f64::from(desk.1) * f64::from(out.1);
+
+            assert!(
+                (f64::from(placed.x) - want_x).abs() <= 2.0,
+                "{source:?} at {at:?} landed at x={} not {want_x:.0}",
+                placed.x
+            );
+            assert!(
+                (f64::from(placed.width) - want_w).abs() <= 2.0,
+                "{source:?} got width {} not {want_w:.0}",
+                placed.width
+            );
+            assert!(
+                (f64::from(placed.height) - want_h).abs() <= 2.0,
+                "{source:?} got height {} not {want_h:.0}",
+                placed.height
+            );
+        }
     }
 
     /// The encoder's grid reaches the wall too.

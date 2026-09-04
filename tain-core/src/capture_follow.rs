@@ -560,6 +560,12 @@ mod platform {
             self.local.as_mut().is_some_and(|local| local.set_size_granularity(granularity))
         }
 
+        /// Forwarded, or this wrapper hides a wall's staleness from the session
+        /// that has to act on it — which is how `set_size_ceiling` went missing.
+        fn layout_changed(&self) -> bool {
+            self.local.as_ref().is_some_and(|local| local.layout_changed())
+        }
+
         fn request_format(&mut self, format: PixelFormat) -> bool {
             // # Why a mixed stream is not a broken promise
             //

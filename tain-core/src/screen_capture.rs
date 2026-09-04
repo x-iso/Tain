@@ -592,6 +592,20 @@ pub trait ScreenCaptureBackend: Send + Sync {
         false
     }
 
+    /// Whether what this is capturing has been rearranged underneath it.
+    ///
+    /// Only the composed wall answers yes. It is a picture of *where the screens
+    /// are*, decided when it was built — so a monitor moved in Display Settings,
+    /// or plugged in, leaves it drawing an arrangement that no longer exists.
+    /// The pointer maps through that arrangement, so a stale one puts clicks
+    /// where the user did not put them.
+    ///
+    /// It cannot repair itself: its panels are attached to particular displays.
+    /// Saying so is what gets it rebuilt.
+    fn layout_changed(&self) -> bool {
+        false
+    }
+
     /// Emit only sizes whose axes are multiples of these.
     ///
     /// The encoder's constraint, not the capturer's — see

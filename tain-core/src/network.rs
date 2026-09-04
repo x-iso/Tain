@@ -1061,6 +1061,11 @@ where
     let keyframe_wanted: KeyframeWanted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Which display this session streams. Starts as whatever the config asked
     // for, which is `None` — the primary.
+    // One injector for the session, not one per thread: the capture thread has
+    // to update what the pointer maps against when the desk is rearranged, and
+    // `set_shown` takes `&self` precisely so that it can be shared.
+    let injector: Arc<dyn super::input_inject::InputInjector> =
+        Arc::from(super::input_inject::create_injector());
     let wanted_display: WantedDisplay =
         Arc::new(std::sync::Mutex::new(config.capture.display.clone()));
     // Which screens it is *allowed* to stream. A master code is the machine's
@@ -1079,6 +1084,7 @@ where
         Arc::clone(&wanted_display),
         Arc::clone(&allowed_displays),
         config.virtual_display_follows_guest,
+        Arc::clone(&injector),
     ));
 
     // Audio rides the same outbound channel as host-initiated control messages,
@@ -1127,6 +1133,7 @@ where
         Arc::clone(&keyframe_wanted),
         cursor_tx,
         Arc::clone(&wanted_display),
+        Arc::clone(&injector),
     );
 
     // Written from the select loop rather than handed to a task of its own,
@@ -1892,6 +1899,7 @@ fn spawn_capture_pipeline(
     keyframe_wanted: KeyframeWanted,
     cursor_tx: mpsc::UnboundedSender<super::cursor::CursorUpdate>,
     wanted_display: WantedDisplay,
+    injector: Arc<dyn super::input_inject::InputInjector>,
 ) -> (mpsc::Receiver<PipelineEvent>, std::thread::JoinHandle<()>) {
     let mut capturer = capturer;
     // Settle the pixel format before either thread starts. If the encoder wants
@@ -1937,6 +1945,7 @@ fn spawn_capture_pipeline(
         config.capture.clone(),
         format,
         granularity,
+        Arc::clone(&injector),
     );
 
     let handle = std::thread::Builder::new()
@@ -2353,6 +2362,7 @@ fn spawn_capture_thread(
     capture_config: super::screen_capture::CaptureConfig,
     format: super::screen_capture::PixelFormat,
     granularity: (u16, u16),
+    injector: Arc<dyn super::input_inject::InputInjector>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("tain-capture-{session_id}"))
@@ -2375,6 +2385,48 @@ fn spawn_capture_thread(
                 // go before anything else can take it, and on a switch back to
                 // the same display that would otherwise be the second
                 // duplication that DXGI refuses.
+                // # A wall drawn from an arrangement that no longer exists
+                //
+                // The composed wall is a picture of *where the screens are*,
+                // decided when it was built. Someone dragging a monitor to the
+                // other side of the primary, or plugging one in, leaves it
+                // drawing the old layout — and the pointer maps through that
+                // layout, so clicks land somewhere nobody aimed.
+                //
+                // It cannot repair itself: its panels are attached to
+                // particular displays. Asking for the same target again is what
+                // rebuilds it, through the switch below that already knows how.
+                if capturer.layout_changed() {
+                    info!(
+                        "Session #{session_id}: the displays have been rearranged —                          rebuilding the composed view"
+                    );
+                    applied_display = super::screen_capture::DisplayTarget::Primary;
+                    // Cleared so the rebuilt wall is asked for its own size
+                    // again rather than keeping the old arrangement's.
+                    applied_ceiling = None;
+
+                    // And the pointer, which maps through the desk's bounding
+                    // box. Rebuilding the picture without this leaves clicks
+                    // landing against the arrangement that has just gone —
+                    // which is the half of the bug that is not visible, because
+                    // the picture looks right while the pointer does not.
+                    let desk = super::screen_capture::displays();
+                    if !desk.is_empty() {
+                        let left = desk.iter().map(|d| d.x).min().unwrap_or(0);
+                        let top = desk.iter().map(|d| d.y).min().unwrap_or(0);
+                        let right =
+                            desk.iter().map(|d| d.x + i32::from(d.width)).max().unwrap_or(0);
+                        let bottom =
+                            desk.iter().map(|d| d.y + i32::from(d.height)).max().unwrap_or(0);
+                        injector.set_shown(super::input_inject::Shown {
+                            x: left,
+                            y: top,
+                            width: (right - left).clamp(0, u16::MAX as i32) as u16,
+                            height: (bottom - top).clamp(0, u16::MAX as i32) as u16,
+                        });
+                    }
+                }
+
                 let wanted = wanted_display.lock().unwrap().clone();
                 if wanted != applied_display {
                     let mut config = capture_config.clone();
@@ -2584,10 +2636,10 @@ async fn run_reader<R>(
     wanted_display: WantedDisplay,
     allowed_displays: AllowedDisplays,
     follows_guest: bool,
+    injector: Arc<dyn super::input_inject::InputInjector>,
 ) where
     R: tokio::io::AsyncReadExt + Unpin + Send + 'static,
 {
-    let injector = super::input_inject::create_injector();
     // Which virtual display this session took for its own size, if it took one.
     // Per session rather than shared: see `follow_guest_size`.
     let claimed_display: ClaimedDisplay = Arc::new(std::sync::Mutex::new(None));
