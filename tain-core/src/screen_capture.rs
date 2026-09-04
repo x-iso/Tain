@@ -726,6 +726,36 @@ struct Scaled {
     inner: Box<dyn ScreenCaptureBackend>,
     width: u16,
     height: u16,
+    /// Everything the emitted size is derived from, so it can be derived again
+    /// when any one of them moves.
+    ///
+    /// It used to keep only the answer, and each setter recomputed from
+    /// whatever it happened to know — which is how a ceiling and a granularity
+    /// came to be accepted by this type and then quietly dropped.
+    scale: QualityScale,
+    ceiling: Option<(u16, u16)>,
+    granularity: (u16, u16),
+}
+
+impl Scaled {
+    /// Work the emitted size out again from the backend's current size.
+    ///
+    /// Against the backend's *current* size, not a remembered one: the display
+    /// can change mode mid-session, and scaling a stale figure would ask for a
+    /// frame the source no longer produces.
+    fn recompute(&mut self) {
+        let scaled = self.scale.apply(self.inner.frame_size());
+        let fitted = match self.ceiling {
+            Some(ceiling) => fit_within(scaled, ceiling),
+            None => scaled,
+        };
+        let (width, height) = snap_to(fitted, self.granularity);
+        if (width, height) != (self.width, self.height) {
+            debug!("Capture rescaled to {width}x{height} ({})", self.scale.label());
+            self.width = width;
+            self.height = height;
+        }
+    }
 }
 
 impl ScreenCaptureBackend for Scaled {
@@ -756,15 +786,20 @@ impl ScreenCaptureBackend for Scaled {
     }
 
     fn set_scale(&mut self, scale: QualityScale) -> bool {
-        // Against the backend's *current* size, not a remembered one: the
-        // display can change mode mid-session, and scaling a stale figure would
-        // ask for a frame the source no longer produces.
-        let (width, height) = scale.apply(self.inner.frame_size());
-        if (width, height) != (self.width, self.height) {
-            debug!("Capture rescaled to {width}x{height} ({})", scale.label());
-            self.width = width;
-            self.height = height;
-        }
+        self.scale = scale;
+        self.recompute();
+        true
+    }
+
+    fn set_size_ceiling(&mut self, ceiling: Option<(u16, u16)>) -> bool {
+        self.ceiling = ceiling;
+        self.recompute();
+        true
+    }
+
+    fn set_size_granularity(&mut self, granularity: (u16, u16)) -> bool {
+        self.granularity = granularity;
+        self.recompute();
         true
     }
 
@@ -973,11 +1008,39 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
     // resample of every source pixel on the capture thread. That was the "Slow
     // capture" the host reported the moment the controller dropped below full
     // resolution — which is exactly when it could least afford it.
+    //
+    // # Why `set_scale` saying yes is the whole answer
+    //
+    // This also required the backend to come back at exactly the size worked
+    // out above, on the reasoning that a backend claiming to have scaled and
+    // then not doing it should not be believed. But a backend is entitled to a
+    // different answer: the composed wall caps itself at what an encoder will
+    // take, and a display capping to the guest's viewport lands wherever that
+    // leaves it. Neither is a lie, and both failed the equality.
+    //
+    // So the wall was wrapped in this after having already scaled itself, and
+    // the scale was applied twice — 4480x1600 came out as 2520x900, which is
+    // 75% of 75%, resampled on the CPU for the privilege. Worse, `Scaled` is
+    // what the rest of the session then talks to, and until a moment ago it
+    // answered "not honoured" to the encoder's size granularity and to the
+    // guest's viewport, both silently.
+    //
+    // `set_scale` returning true is the backend saying it handled it. That is
+    // the contract, the default is `false` for backends that cannot, and taking
+    // it at its word is what stops this wrapper being layered on top of work
+    // that is already done.
     let mut backend = backend;
-    if backend.set_scale(config.quality) && backend.frame_size() == (width, height) {
+    if backend.set_scale(config.quality) {
         return Ok(backend);
     }
-    Ok(Box::new(Scaled { inner: backend, width, height }))
+    Ok(Box::new(Scaled {
+        inner: backend,
+        width,
+        height,
+        scale: config.quality,
+        ceiling: None,
+        granularity: (2, 2),
+    }))
 }
 
 #[cfg(test)]
@@ -1048,16 +1111,57 @@ mod tests {
     #[test]
     fn scaling_is_applied_exactly_once() {
         let cfg = config_for((1920, 1080), QualityScale::Medium);
-        let mut scaled = Scaled {
-            inner: Box::new(StubCapturer::new(&cfg)),
-            width: cfg.dimensions().0,
-            height: cfg.dimensions().1,
-        };
+        let mut scaled = scaled_over(&cfg, QualityScale::Medium);
 
         assert_eq!(scaled.frame_size(), (960, 540));
         let frame = scaled.capture_next().unwrap().unwrap();
         assert_eq!((frame.width, frame.height), (960, 540));
         assert_eq!(frame.data.len(), 960 * 540 * 4);
+
+        // And still once when the controller asks again for what is already in
+        // force. This wrapper used to scale its *own* output — so a wall that
+        // had already scaled itself, wrapped here and then told the scale,
+        // emitted 75% of 75%: 4480x1600 arrived at the encoder as 2520x900,
+        // resampled on the CPU for the privilege.
+        scaled.set_scale(QualityScale::Medium);
+        assert_eq!(scaled.frame_size(), (960, 540), "the scale was applied twice");
+    }
+
+    fn scaled_over(cfg: &CaptureConfig, scale: QualityScale) -> Scaled {
+        Scaled {
+            inner: Box::new(StubCapturer::new(cfg)),
+            width: cfg.dimensions().0,
+            height: cfg.dimensions().1,
+            scale,
+            ceiling: None,
+            granularity: (2, 2),
+        }
+    }
+
+    /// Both of these reached this wrapper and were dropped without a word.
+    ///
+    /// The trait's defaults answer "not honoured" and do nothing, so a backend
+    /// wrapped here streamed at the quality slider's fraction whatever the
+    /// guest's window was, and on whatever size grid, however loudly the
+    /// encoder had said which sizes it takes.
+    #[test]
+    fn the_ceiling_and_the_grid_reach_this_wrapper_too() {
+        let cfg = config_for((1920, 1080), QualityScale::Native);
+        let mut scaled = scaled_over(&cfg, QualityScale::Native);
+        assert_eq!(scaled.frame_size(), (1920, 1080));
+
+        assert!(scaled.set_size_ceiling(Some((1280, 720))));
+        assert_eq!(scaled.frame_size(), (1280, 720), "the guest's window was ignored");
+
+        assert!(scaled.set_size_granularity((64, 16)));
+        let (w, h) = scaled.frame_size();
+        assert!(w.is_multiple_of(64) && h.is_multiple_of(16), "off the grid at {w}x{h}");
+        assert!(w <= 1280 && h <= 720, "the grid pushed it past the ceiling: {w}x{h}");
+
+        // And a frame really comes out that size, rather than the size being a
+        // claim the resampler does not honour.
+        let frame = scaled.capture_next().unwrap().unwrap();
+        assert_eq!((frame.width, frame.height), (w, h));
     }
 
     #[test]
