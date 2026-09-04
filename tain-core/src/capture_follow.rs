@@ -531,6 +531,29 @@ mod platform {
             self.local.as_mut().is_some_and(|local| local.set_scale(scale))
         }
 
+        /// # This was missing, and every Windows host paid for it
+        ///
+        /// The trait's default answers "not honoured" and does nothing, and
+        /// this wrapper sits in front of the local capturer on **every** host
+        /// session — so the guest's viewport, the one cap that knows how many
+        /// pixels are actually going to be looked at, reached nothing. A host
+        /// streamed the quality slider's fraction of its native size and no
+        /// less, and a guest in a 1856x1020 window was sent 2880x1620 off a 4K
+        /// screen: two and a half times the pixels, paid for in capture,
+        /// colour conversion, encode, bitrate, decode and upload, and then
+        /// scaled away before anyone saw them.
+        ///
+        /// Invisible because it fails quiet: the composed wall implements it,
+        /// so "every screen" was capped correctly while single-screen capture
+        /// was not, which reads as the wall being fast rather than the rest
+        /// being slow.
+        ///
+        /// Nothing to forward to when the agent is doing the capturing. It
+        /// sends what it sends, and the size follows the desktop back.
+        fn set_size_ceiling(&mut self, ceiling: Option<(u16, u16)>) -> bool {
+            self.local.as_mut().is_some_and(|local| local.set_size_ceiling(ceiling))
+        }
+
         fn request_format(&mut self, format: PixelFormat) -> bool {
             // # Why a mixed stream is not a broken promise
             //
@@ -688,6 +711,45 @@ mod tests {
         // the same as agreeing.
         let mut refusing = DesktopFollowing::new(Box::new(Local { asked, answer: false }));
         assert!(!refusing.request_format(PixelFormat::Nv12));
+    }
+
+    /// The guest's viewport must reach the local backend, not stop here.
+    ///
+    /// It stopped here for the life of this wrapper, silently: the trait's
+    /// default answers "not honoured" and does nothing, so every Windows host
+    /// streamed the quality slider's fraction of its native size however small
+    /// the window looking at it. See `set_size_ceiling` for what that cost.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_guest_viewport_reaches_the_local_backend() {
+        use std::sync::{Arc, Mutex};
+
+        type Asked = Arc<Mutex<Vec<Option<(u16, u16)>>>>;
+
+        struct Local {
+            asked: Asked,
+        }
+
+        impl ScreenCaptureBackend for Local {
+            fn capture_next(&mut self) -> anyhow::Result<Option<ScreenFrame>> {
+                Ok(None)
+            }
+
+            fn frame_size(&self) -> (u16, u16) {
+                (64, 64)
+            }
+
+            fn set_size_ceiling(&mut self, ceiling: Option<(u16, u16)>) -> bool {
+                self.asked.lock().unwrap().push(ceiling);
+                true
+            }
+        }
+
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut following = DesktopFollowing::new(Box::new(Local { asked: Arc::clone(&asked) }));
+        assert!(following.set_size_ceiling(Some((1856, 1020))));
+        assert!(following.set_size_ceiling(None), "and removing it has to arrive too");
+        assert_eq!(*asked.lock().unwrap(), vec![Some((1856, 1020)), None]);
     }
 
     /// Only a *change* of route may release contacts.
