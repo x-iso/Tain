@@ -986,10 +986,19 @@ never *fetch* versus *vendor*, it was *pin* versus *trust whatever arrives*.
 Pinning is the part that matters, and once a version is pinned there is little
 left for the download to buy.
 
+**And it is embedded, not shipped beside the executable.** A folder next to the
+binary was the first answer and it was a maintainer's path wearing a user's
+clothes: anybody able to extract a driver package into the right directory could
+have run the driver's own installer and skipped Tain. A feature that works only
+for the people who did not need it is not a feature. So `build.rs` compiles the
+package into the binary and the install button writes it out — which is what
+this project already does with 66 MB of ffmpeg DLLs. Tain stays one file.
+
 **What it costs**: a driver fixed upstream is stale until Tain ships a build
-with the new one. Acceptable at this size and for this kind of component, and
-the drop-in folder is the escape hatch — anyone can put a newer package there
-without waiting, which is the same path the vendored one takes.
+with the new one. Acceptable at this size and for this kind of component. A
+folder beside the executable still overrides the embedded package, for trying a
+newer one without a rebuild — a developer's escape hatch, and named as one
+rather than offered in the interface.
 
 **Not changed by this**: the package is installed exactly as its authors signed
 it, and Windows names them rather than Tain in its publisher dialog. That is
