@@ -208,23 +208,7 @@ impl Wall {
     /// included: a size the encoder will refuse is not a size, and lifting the
     /// guest's ceiling cannot lift a hardware one.
     fn target(&self) -> (u16, u16) {
-        let native = (
-            self.bounds.0.min(u16::MAX as u32) as u16,
-            self.bounds.1.min(u16::MAX as u32) as u16,
-        );
-        let scaled = self.scale.apply(native);
-        let scaled = fit_within(scaled, (MAX_WALL, MAX_WALL));
-        let fitted = match self.ceiling {
-            Some(ceiling) => {
-                let (w, h) = fit_within(scaled, ceiling);
-                // Even, as every codec here needs.
-                ((w.max(2)) & !1, (h.max(2)) & !1)
-            }
-            None => scaled,
-        };
-        // Last, and after `MAX_WALL` for the same reason it is: a size the
-        // encoder will refuse is not a size.
-        super::screen_capture::snap_to(fitted, self.granularity)
+        wall_target(self.bounds, self.scale, self.ceiling, self.granularity)
     }
 
     /// Ask each display for the size its place on the wall actually needs.
@@ -396,6 +380,36 @@ fn spawn_pump(
         .with_context(|| format!("could not start {thread_name}"))
 }
 
+/// What a wall of `bounds` emits, given everything asked of it.
+///
+/// Free rather than a method so the test can reach it. It used to be inline in
+/// [`Wall::target`] with the test carrying its own copy of the arithmetic —
+/// which is a test that agrees with a comment rather than with the code, and it
+/// went on agreeing after the encoder's size granularity was added to one of
+/// them and not the other.
+fn wall_target(
+    bounds: (u32, u32),
+    scale: QualityScale,
+    ceiling: Option<(u16, u16)>,
+    granularity: (u16, u16),
+) -> (u16, u16) {
+    let native = (bounds.0.min(u16::MAX as u32) as u16, bounds.1.min(u16::MAX as u32) as u16);
+    // `MAX_WALL` before the guest's ceiling and whatever else was asked, 1:1
+    // included: lifting the guest's ceiling cannot lift a hardware one.
+    let scaled = fit_within(scale.apply(native), (MAX_WALL, MAX_WALL));
+    let fitted = match ceiling {
+        Some(ceiling) => {
+            let (w, h) = fit_within(scaled, ceiling);
+            // Even, as every codec here needs.
+            ((w.max(2)) & !1, (h.max(2)) & !1)
+        }
+        None => scaled,
+    };
+    // Last, and for the same reason `MAX_WALL` is applied at all: a size the
+    // encoder will refuse is not a size.
+    super::screen_capture::snap_to(fitted, granularity)
+}
+
 impl ScreenCaptureBackend for Wall {
     fn capture_next(&mut self) -> Result<Option<ScreenFrame>> {
         let target = self.target();
@@ -422,8 +436,16 @@ impl ScreenCaptureBackend for Wall {
         Ok(Some(self.compose()))
     }
 
+    /// What the *next* frame will be, not what the last one was.
+    ///
+    /// `out` only moves when a frame is composed, so this used to answer with
+    /// the size the wall was built at until one had been. The session log said
+    /// "now streaming every screen (4800x1620)" — a size no encoder was ever
+    /// offered, since neither the wall's own limit nor the guest's ceiling nor
+    /// the encoder's grid had been applied yet — and reading that as the size
+    /// being sent cost an evening.
     fn frame_size(&self) -> (u16, u16) {
-        self.out
+        self.target()
     }
 
     fn set_scale(&mut self, scale: QualityScale) -> bool {
@@ -603,18 +625,9 @@ mod tests {
     /// wall would otherwise get through.
     #[test]
     fn a_wall_is_never_wider_than_an_encoder_will_take() {
-        // Sizes are the arithmetic; a real Wall needs displays to capture.
+        // The real arithmetic; a real Wall needs displays to capture.
         let target = |bounds: (u32, u32), scale: QualityScale, ceiling: Option<(u16, u16)>| {
-            let native =
-                (bounds.0.min(u16::MAX as u32) as u16, bounds.1.min(u16::MAX as u32) as u16);
-            let scaled = fit_within(scale.apply(native), (MAX_WALL, MAX_WALL));
-            match ceiling {
-                Some(ceiling) => {
-                    let (w, h) = fit_within(scaled, ceiling);
-                    ((w.max(2)) & !1, (h.max(2)) & !1)
-                }
-                None => scaled,
-            }
+            wall_target(bounds, scale, ceiling, (2, 2))
         };
 
         // Two side by side, at 1:1 — no ceiling, which is the case that used to
@@ -636,5 +649,34 @@ mod tests {
         // A wall that already fits is left alone.
         let (w, h) = target((3840, 1080), QualityScale::Native, None);
         assert_eq!((w, h), (3840, 1080), "a wall within the limit was shrunk anyway");
+    }
+
+    /// The encoder's grid reaches the wall too.
+    ///
+    /// It did not, and the wall was the one place a session could still be
+    /// handed a size its AV1 encoder refuses — the arrangement in the report:
+    /// a 2560x1600 beside a 3840x2160, composed, capped to 4096 wide, and
+    /// landing on a height of 1382, which stalls the transform two seconds in.
+    #[test]
+    fn a_wall_lands_on_the_grid_the_encoder_asked_for() {
+        let desk = (6400u32, 2160u32);
+        for scale in QualityScale::ALL {
+            for ceiling in [None, Some((1536u16, 874u16)), Some((2560, 1440))] {
+                let (w, h) = wall_target(desk, scale, ceiling, (64, 16));
+                assert!(w.is_multiple_of(64), "{scale:?}/{ceiling:?} gave {w}x{h}");
+                assert!(h.is_multiple_of(16), "{scale:?}/{ceiling:?} gave {w}x{h}");
+                assert!(w <= MAX_WALL && h <= MAX_WALL, "{scale:?}/{ceiling:?} gave {w}x{h}");
+                if let Some((cw, ch)) = ceiling {
+                    assert!(w <= cw && h <= ch, "{scale:?}/{ceiling:?} gave {w}x{h}");
+                }
+            }
+        }
+
+        // And the ordinary granularity still changes nothing.
+        assert_eq!(
+            wall_target(desk, QualityScale::Native, None, (2, 2)),
+            (4096, 1382),
+            "asking for nothing must leave the wall as it was"
+        );
     }
 }
