@@ -1545,6 +1545,27 @@ fn follow_guest_size(
     let _ = screen;
 }
 
+/// Whether the guest's silence is evidence that the link has stopped carrying.
+///
+/// Three things have to be true at once, and each rules out a different way of
+/// being wrong about a connection that is perfectly fine:
+///
+/// - **Something is outstanding.** Silence says nothing about a link that was
+///   given nothing to carry. A still desktop produces no frames, so nothing
+///   goes out and nothing comes back — and everything sent having been
+///   acknowledged is the opposite of a link in trouble.
+/// - **Something has been acknowledged before.** A session in its first seconds
+///   has not been acknowledged either, and that is a stream still starting
+///   rather than one that stopped.
+/// - **Nothing has been acknowledged recently.** The signal itself.
+///
+/// Pure, because getting it wrong is invisible: the result is a resolution that
+/// falls while the encoder is idle and the round trip reads three milliseconds,
+/// and the only clue is a diagnosis that cannot be true.
+fn acks_are_stale(outstanding: u32, has_ever_acked: bool, reporting: bool) -> bool {
+    outstanding > 0 && has_ever_acked && !reporting
+}
+
 /// What to size the window against: how long an ack really takes, or the round
 /// trip until one has been timed.
 fn ack_or_rtt_ms(acks: &SharedAck, telemetry: &SharedTelemetry) -> f32 {
@@ -2201,9 +2222,32 @@ fn spawn_capture_pipeline(
                 // five-millisecond connection was taken down to 640x360 at
                 // 8 fps before its first frame was ever confirmed — and then
                 // spent seventy seconds climbing back out.
+                //
+                // # And only when there is something to acknowledge
+                //
+                // Silence is evidence about the link only if the link was given
+                // something to carry. A still desktop produces no frames — the
+                // capture path says so itself, counting "nothing changed"
+                // separately from "nothing sent" — so nothing goes out, nothing
+                // comes back, and five seconds later this called a healthy
+                // connection stale.
+                //
+                // Reported as a resolution that drops while the encoder has
+                // headroom and the round trip reads three milliseconds, which is
+                // exactly what it looks like from outside: the one diagnosis
+                // that cannot be true is the one being made. Worse on precisely
+                // the screens this is most wanted for — a virtual display or a
+                // dummy plug showing a still picture sends nothing for minutes.
+                //
+                // So a frame has to be outstanding. Everything sent having been
+                // acknowledged is the *opposite* of a link in trouble.
                 let acks_stale = {
                     let state = acks.lock().unwrap();
-                    state.has_ever_acked() && !state.is_reporting()
+                    acks_are_stale(
+                        sent_sequence.saturating_sub(state.sequence),
+                        state.has_ever_acked(),
+                        state.is_reporting(),
+                    )
                 };
                 let observation = window.observe(elapsed, guest, acks_stale);
                 window.clear();
@@ -3917,6 +3961,41 @@ mod tests {
                  stopped"
             );
         }
+    }
+
+    /// A still desktop is not a broken link.
+    ///
+    /// # The bug this is for
+    ///
+    /// `acks_stale` was silence alone, and silence is what a healthy connection
+    /// sounds like when the host has nothing to send. A static screen produces
+    /// no frames — the capture path counts "nothing changed" separately for
+    /// exactly this reason — so nothing went out, nothing came back, and five
+    /// seconds later the controller was told the link had stopped carrying.
+    ///
+    /// What that looked like: a resolution falling while the encoder sat idle
+    /// and the round trip read three milliseconds, with "Slow network" on a
+    /// stream doing 0 kbit/s. And worst on the screens the feature is most
+    /// wanted for — a virtual display or a dummy plug showing a still picture
+    /// sends nothing for minutes at a time.
+    #[test]
+    fn silence_is_only_evidence_when_something_was_sent() {
+        // Everything acknowledged, nothing since: the ordinary still desktop.
+        assert!(
+            !acks_are_stale(0, true, false),
+            "a link with nothing outstanding cannot be failing to carry it"
+        );
+
+        // A frame is out there and has gone unacknowledged. The real signal.
+        assert!(acks_are_stale(1, true, false));
+
+        // Still flowing.
+        assert!(!acks_are_stale(1, true, true));
+
+        // A session in its first seconds has acknowledged nothing yet, which is
+        // a stream starting rather than one that stopped — the fault this
+        // guard was added for, and it still holds.
+        assert!(!acks_are_stale(5, false, false));
     }
 
     fn test_config() -> SessionConfig {
