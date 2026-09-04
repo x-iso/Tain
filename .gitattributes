@@ -1,0 +1,14 @@
+# A vendored driver package is signed. Git must not touch a byte of it.
+#
+# `core.autocrlf` is `input` on at least one machine here, which rewrites CRLF
+# to LF on the way into a commit. That is exactly the edit the package cannot
+# survive: `mttvdd.cat` holds a hash of the files beside it, so a line ending
+# changed in transit voids the signature, and Windows then refuses the package
+# or wants the machine in test-signing mode.
+#
+# It very nearly happened. `MttVDD.inf` came through untouched only because it
+# is UTF-16 and git guessed binary from the NUL bytes; `vdd_settings.xml` is
+# ASCII and was normalised on the first commit. Guessing is not a guarantee,
+# and the next package to be vendored may have a plain-text file that is
+# catalogued.
+third_party/VirtualDisplayDriver/** -text
