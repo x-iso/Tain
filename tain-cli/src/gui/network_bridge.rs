@@ -1330,8 +1330,22 @@ impl FrameDecoder {
         if let Self::Delta(decoder) = self {
             decoder.reset();
         }
-        // The H.264 decoder resynchronises on the next IDR by itself; there is
-        // no equivalent state to clear.
+        // # Why the hardware decoder needs telling too
+        //
+        // Its inter-frame state does resynchronise on the next IDR by itself,
+        // and for years that was the whole story here. What does not is the
+        // D3D11VA surface pool: libavcodec sizes it once, from the first
+        // resolution, and a stream that grows past it decodes into textures too
+        // small to hold the picture. Nothing about that recovers on a keyframe,
+        // so a guest sat frozen on the last frame it could draw — asking for
+        // keyframes it could not use — for the rest of the session.
+        //
+        // A no-op unless a frame has actually been seen to outgrow the pool, so
+        // the ordinary reset after a dropped packet still costs nothing.
+        #[cfg(all(target_os = "windows", db_ffmpeg))]
+        if let Self::H264Ffmpeg(decoder) | Self::Hevc(decoder) = self {
+            decoder.reset();
+        }
     }
 }
 

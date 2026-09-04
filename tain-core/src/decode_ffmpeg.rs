@@ -164,6 +164,8 @@ unsafe impl Sync for KeptTexture {}
 /// H.264 decoding on the GPU, for real this time.
 pub struct FfmpegDecoder {
     handle: *mut DbDecoder,
+    /// What [`Self::reset`] has to reopen. See it for why that is ever needed.
+    codec_id: i32,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     /// GPU colour conversion, cached against the size it was built for.
@@ -203,6 +205,10 @@ pub struct FfmpegDecoder {
     /// picks the frame up. That queued frame is always from the generation
     /// immediately before the current one.
     retired: Retired<RgbaConverter>,
+    /// Set when a frame arrives too large for the pool it was decoded into.
+    ///
+    /// Read by [`Self::reset`], which is the only thing that can fix it.
+    outgrown: bool,
     /// Whether the caller will draw the converted texture itself.
     ///
     /// Set by the guest once its render thread has established that this driver
@@ -281,11 +287,13 @@ impl FfmpegDecoder {
         info!("{asked_for} decoding on the GPU via libavcodec {name} (D3D11VA)");
         Ok(Self {
             handle,
+            codec_id,
             device,
             context,
             converter: None,
             converter_generation: 0,
             retired: Retired::default(),
+            outgrown: false,
             present_on_gpu: false,
             rgba: Vec::new(),
             name,
@@ -367,6 +375,46 @@ impl FfmpegDecoder {
         let texture = unsafe { ID3D11Texture2D::from_raw_borrowed(&texture) }
             .context("decoded surface is not an ID3D11Texture2D")?;
 
+        // # The picture has outgrown the surfaces it is being decoded into
+        //
+        // libavcodec allocates the D3D11VA surface pool once, from the first
+        // resolution it sees, and the native AV1 decoder does not reallocate it
+        // when the stream grows. So a session that switches to a larger screen
+        // — or simply has its quality restored by the adaptive controller —
+        // starts reporting a picture bigger than the texture holding it: 1536
+        // by 864 arriving in a 1408 by 896 surface, measured.
+        //
+        // Whatever is in that texture is not the frame. Blitting it produced
+        // `E_INVALIDARG` from `VideoProcessorBlt` — because the source rect
+        // does not fit — on every frame from then on, which is a guest frozen
+        // on the last picture it managed to draw while asking for a keyframe
+        // every two seconds forever. Exactly what was reported when switching
+        // to the second monitor.
+        //
+        // It cannot be repaired here: the decode already happened into a
+        // surface too small for it. Saying so is what gets the decoder rebuilt
+        // — the caller resets and asks for a keyframe, and `reset` reopens the
+        // decoder so libavcodec allocates a pool for the size now arriving.
+        //
+        // Shrinking is fine and stays fine: a smaller picture inside a larger
+        // surface is the ordinary case, which is why this only ever bit sizes
+        // going up and why a session could run for minutes before it did.
+        let surface = {
+            let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: reading the description of a texture we were handed.
+            unsafe { texture.GetDesc(&mut desc) };
+            (desc.Width, desc.Height)
+        };
+        if u32::from(w) > surface.0 || u32::from(h) > surface.1 {
+            self.outgrown = true;
+            anyhow::bail!(
+                "the stream grew to {w}x{h} and the decoder is still filling {}x{} surfaces \
+                 — it has to be reopened",
+                surface.0,
+                surface.1
+            );
+        }
+
         self.ensure_converter(w, h)?;
         let Some((converter, _, _)) = self.converter.as_mut() else {
             anyhow::bail!("no colour converter for {w}x{h}");
@@ -431,6 +479,59 @@ impl FfmpegDecoder {
             height: h as usize,
             rgba: std::mem::take(&mut self.rgba),
         }))
+    }
+
+    /// Start the decoder again, so it allocates surfaces for what is arriving.
+    ///
+    /// # Why a whole new decoder rather than a flush
+    ///
+    /// `avcodec_flush_buffers` drops the reference frames and nothing else; the
+    /// D3D11VA surface pool it hands pictures into is part of the hardware
+    /// frames context, which is built when the decoder opens and sized from the
+    /// resolution it opened at. Flushing leaves it exactly as it was, which is
+    /// the thing that is wrong — see the check in `convert`.
+    ///
+    /// Only when it has to be. A reset is also what a decode error asks for,
+    /// and those are ordinary — a dropped packet, a frame that arrived out of
+    /// order — where reopening would throw away a decoder that is working. So
+    /// the pool is only rebuilt when a frame has actually been seen to outgrow
+    /// it, and every other reset is the cheap kind.
+    ///
+    /// The next frames decode to nothing until a keyframe arrives, which the
+    /// caller is already asking for by the time it gets here.
+    pub fn reset(&mut self) {
+        if !self.outgrown {
+            return;
+        }
+        self.outgrown = false;
+
+        let mut err = [0u8; 256];
+        // SAFETY: the device outlives the handle, and the error buffer is valid
+        // for its stated length — as in `open`, which this repeats deliberately
+        // rather than sharing: everything else `open` does (loading the runtime,
+        // creating the device, naming the decoder) is already done and must not
+        // happen twice.
+        let replacement = unsafe {
+            db_decoder_new(self.device.as_raw(), self.codec_id, err.as_mut_ptr(), err.len() as i32)
+        };
+        if replacement.is_null() {
+            let end = err.iter().position(|&b| b == 0).unwrap_or(err.len());
+            // Kept rather than replaced with nothing: the old decoder is still
+            // able to decode the size it was opened for, and the session
+            // recovers if the stream goes back to it. A decoder that has been
+            // freed can do nothing at all.
+            warn!(
+                "Could not reopen the decoder for the new frame size: {}",
+                String::from_utf8_lossy(&err[..end])
+            );
+            return;
+        }
+
+        // SAFETY: the outgoing handle came from `db_decoder_new` and is freed
+        // exactly once, here, having been replaced above.
+        unsafe { db_decoder_free(self.handle) };
+        self.handle = replacement;
+        info!("Decoder reopened for the stream's new size");
     }
 
     /// The D3D11 device the decoded textures belong to.
@@ -972,5 +1073,113 @@ mod tests {
             }
         }
         assert!(decoded > 0, "nothing decoded across 30 encoded frames");
+    }
+
+    /// A display switch, as the decoder sees it.
+    ///
+    /// Switching screens changes the frame size mid-stream, and a guest that
+    /// cannot follow that shows the *previous* screen frozen while asking for a
+    /// keyframe every two seconds forever — which is exactly what was reported.
+    /// The host is provably still sending: this asks whether the packets are
+    /// decodable at the far end.
+    #[test]
+    #[ignore = "diagnostic — run explicitly"]
+    fn a_size_change_mid_stream_keeps_decoding() {
+        use crate::codec_mf::HardwareH264Encoder;
+        use crate::encoder::{VideoCodec, VideoEncoder};
+        use crate::{EncodeConfig, PixelFormat};
+
+        let codec = match std::env::var("TAIN_CODEC").as_deref() {
+            Ok("h264") => VideoCodec::H264,
+            Ok("h265") => VideoCodec::H265,
+            _ => VideoCodec::Av1,
+        };
+        let config = EncodeConfig { codec, ..EncodeConfig::default() };
+        let Ok(mut encoder) = HardwareH264Encoder::new(&config, false) else {
+            eprintln!("no hardware {} encoder — skipping", codec.label());
+            return;
+        };
+        let Ok(mut decoder) = FfmpegDecoder::for_codec(codec) else {
+            eprintln!("no hardware {} decoder — skipping", codec.label());
+            return;
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .try_init();
+        println!("\n{} — {} into {}", codec.label(), encoder.name(), decoder.name);
+
+        // The two sizes from the reported session: the primary at its ceiling,
+        // then the second screen at its own.
+        let sizes: Vec<(u16, u16)> = match std::env::var("TAIN_SIZES") {
+            Ok(list) => list
+                .split(',')
+                .filter_map(|s| s.split_once('x'))
+                .filter_map(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+                .collect(),
+            Err(_) => vec![(1344, 848), (1536, 864), (1344, 848)],
+        };
+
+        let mut pass = true;
+        for (w, h) in sizes {
+            let mut src = vec![0u8; w as usize * h as usize * 4];
+            for (i, px) in src.chunks_exact_mut(4).enumerate() {
+                px[0] = (i % 200) as u8;
+                px[1] = 90;
+                px[2] = 210;
+                px[3] = 255;
+            }
+
+            let (mut sent, mut decoded, mut errors) = (0, 0, Vec::new());
+            for _ in 0..30 {
+                let frame = match encoder.encode_frame(&src, w, h, PixelFormat::Bgra) {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        errors.push(format!("encode: {e}"));
+                        break;
+                    }
+                };
+                if frame.data.is_empty() {
+                    continue;
+                }
+                sent += 1;
+                match decoder.decode(&frame.data) {
+                    Ok(Some(picture)) => {
+                        decoded += 1;
+                        if (picture.width, picture.height) != (w as usize, h as usize) {
+                            errors.push(format!(
+                                "decoded {}x{} for a {w}x{h} frame",
+                                picture.width, picture.height
+                            ));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        // What the guest does with a failed frame: reset, ask
+                        // for a keyframe, keep reading. The host's next packet
+                        // is the keyframe, because `request_keyframe` here is
+                        // answered on the very next encode.
+                        errors.push(format!("decode: {e:#}"));
+                        decoder.reset();
+                        encoder.request_keyframe();
+                    }
+                }
+            }
+            // A handful of failures at the moment the size changes is the
+            // recovery working: the pool is outgrown, the decoder is reopened,
+            // and the frames after the next keyframe decode. Never recovering
+            // is the bug.
+            let ok = decoded > 0;
+            pass &= ok;
+            println!(
+                "  {w}x{h} — {sent} packets, {decoded} decoded{}",
+                if errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} refused ({})", errors.len(), errors[0])
+                }
+            );
+        }
+        assert!(pass, "the stream stopped decoding when the frame size changed");
     }
 }
