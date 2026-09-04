@@ -387,6 +387,15 @@ mod windows_impl {
         elevate(UNINSTALL_FLAG)
     }
 
+    /// Relaunch this executable elevated, with one flag.
+    ///
+    /// Public so the display driver can use it: installing a driver needs the
+    /// same administrator rights and the same relaunch, and two
+    /// half-remembered variants of a `runas` dance is one too many.
+    pub fn elevate_with(flag: &str) -> Result<()> {
+        elevate(flag)
+    }
+
     fn elevate(flag: &str) -> Result<()> {
         let exe = wide(&exe_path()?);
         let verb = wide("runas");

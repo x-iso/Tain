@@ -105,6 +105,8 @@ pub fn show(
                     security_section(ui, settings);
                     ui.add_space(18.0);
                     unattended_section(ui, settings);
+                    ui.add_space(18.0);
+                    virtual_display_section(ui);
                     ui.add_space(10.0);
                     shortcut_section(ui, settings, panel);
                 });
@@ -706,6 +708,98 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
         });
         ui.end_row();
     });
+}
+
+/// Installing and removing the virtual display driver.
+///
+/// # Why this is its own section rather than a line in the one above
+///
+/// Both install something and both need administrator rights, which is most of
+/// what they have in common. The service makes an *existing* desktop reachable
+/// when nobody is signed in; this creates a desktop that was not there. Someone
+/// who wants one very often does not want the other — a headless box wants
+/// both, a laptop being used as a spare screen wants only this — and a single
+/// "install everything" button would make that impossible to say.
+///
+/// # Why the state is read every frame
+///
+/// It changes underneath this window: the install runs in a separate elevated
+/// process, so the moment it finishes is not a moment this code hears about.
+/// Asking each frame costs an enumeration of display adapters, which is
+/// microseconds, and means the panel is right without anything to keep in step.
+fn virtual_display_section(ui: &mut egui::Ui) {
+    use crate::display_driver::{self, DriverState};
+
+    heading(ui, "Virtual display");
+
+    let state = display_driver::state();
+
+    ui.label(
+        RichText::new(
+            "A display that exists only in software. Lets a machine with no monitor be \
+             streamed at all, gives a guest a screen at its own resolution instead of a \
+             scaled copy of this one, and turns a spare tablet or laptop into a second \
+             screen.",
+        )
+        .size(11.0)
+        .color(TEXT_DIM),
+    );
+    ui.add_space(6.0);
+
+    ui.label(
+        RichText::new(state.summary())
+            .size(11.0)
+            .color(if state.is_usable() { TEXT } else { TEXT_DIM }),
+    );
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        // Both buttons always drawn, as in the section above: a button that
+        // disappears reads as a feature that is missing rather than one that
+        // does not apply right now.
+        if ui
+            .add_enabled(
+                state == DriverState::NotInstalled,
+                egui::Button::new("Install driver"),
+            )
+            .on_hover_text(
+                "Windows will ask twice — once for administrator rights, and once about \
+                 trusting the publisher. The second prompt is Windows' own and cannot be \
+                 skipped, which is rather the point of it.",
+            )
+            .clicked()
+            && let Err(e) = display_driver::request_install()
+        {
+            tracing::warn!("Could not start the display driver installer: {e:#}");
+        }
+
+        if ui
+            .add_enabled(state.is_installed(), egui::Button::new("Remove driver"))
+            .on_hover_text(
+                "Removes the driver and any display it was presenting. Everything else \
+                 keeps working. Windows will ask for permission.",
+            )
+            .clicked()
+            && let Err(e) = display_driver::request_uninstall()
+        {
+            tracing::warn!("Could not start the display driver uninstaller: {e:#}");
+        }
+    });
+
+    // Said only where it is the answer. On a machine that can install, this
+    // line is noise; on one that cannot, its absence is a button that does
+    // nothing for a reason nobody can see.
+    if state == DriverState::NotBundled {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!(
+                "Expected a driver package in {} beside the Tain executable.",
+                display_driver::PACKAGE_DIR
+            ))
+            .size(11.0)
+            .color(TEXT_DIM),
+        );
+    }
 }
 
 /// Installing and removing the Tain service.

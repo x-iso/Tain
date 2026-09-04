@@ -9,6 +9,7 @@
 
 mod agent;
 mod console;
+mod display_driver;
 mod gui;
 mod logging;
 mod migrate;
@@ -137,6 +138,34 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 error!("Could not remove the Tain service: {e:#}");
+                Err(e)
+            }
+        };
+    }
+
+    // The same arrangement for the virtual display driver: the button in
+    // Settings relaunches this executable elevated, and this is that process.
+    if args.iter().any(|a| a == display_driver::INSTALL_FLAG) {
+        return match display_driver::install() {
+            Ok(()) => {
+                info!("Virtual display driver installed");
+                Ok(())
+            }
+            Err(e) => {
+                error!("Could not install the virtual display driver: {e:#}");
+                Err(e)
+            }
+        };
+    }
+
+    if args.iter().any(|a| a == display_driver::UNINSTALL_FLAG) {
+        return match display_driver::uninstall() {
+            Ok(()) => {
+                info!("Virtual display driver removed");
+                Ok(())
+            }
+            Err(e) => {
+                error!("Could not remove the virtual display driver: {e:#}");
                 Err(e)
             }
         };

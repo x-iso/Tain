@@ -56,6 +56,10 @@ windows = { version = "0.58", features = [
     "Win32_System_LibraryLoader",
     # ShellExecuteW with the runas verb, to elevate for install and uninstall.
     "Win32_UI_Shell",
+    # SetupAPI, to create the virtual display's device node and bind a driver
+    # to it. There is no higher-level way: a root-enumerated device has no
+    # hardware to be discovered, so something has to assert that it exists.
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_System_StationsAndDesktops",
