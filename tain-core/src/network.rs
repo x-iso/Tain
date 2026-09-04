@@ -3144,7 +3144,10 @@ impl GuestClient {
         // Only worth naming as a step when there is nothing else to go on. With
         // a relay in the code or an address on file, this wait is a courtesy
         // and the user should not be told the connection depends on it.
-        if relay_url.is_none_or(str::is_empty) && known_addrs.is_empty() {
+        // No longer excused by having an address on file. That address is not
+        // tried until everything else has come back empty, so a dial with one
+        // still depends on this wait and the graph should say so.
+        if relay_url.is_none_or(str::is_empty) {
             on_step(DialStep::ReachingRelay);
         }
         let online = tokio::time::timeout(ONLINE_WAIT, endpoint.online()).await.is_ok();
@@ -3169,28 +3172,36 @@ impl GuestClient {
             None => info!("Connecting to host (no relay in the code — looking it up)"),
         }
 
-        // # Where this host answered last time
+        // # Where this host answered last time is the last thing to try
         //
-        // An address that worked once is worth trying again, and trying it
-        // costs nothing: iroh races every candidate it is given and keeps
-        // whichever answers first. A stale one loses the race and is forgotten;
-        // it cannot reach the wrong machine, because the endpoint id is a
-        // public key and the handshake checks it.
+        // These used to be added here, alongside the relay, on the reasoning
+        // that iroh races every candidate and a stale one simply loses. That is
+        // wrong, and was reported as such: deleting the saved address made a
+        // connection succeed that had been failing repeatedly with it.
         //
-        // What it buys is a connection that needs no relay at all. On a link
-        // where the relays are unreachable — which is the whole reason there is
-        // a tunnel in the first place — that is the difference between
-        // connecting and not.
-        for known in known_addrs {
-            addr.addrs.insert(iroh::TransportAddr::Ip(*known));
-        }
-        if !known_addrs.is_empty() {
-            info!("Also trying {} address(es) this host answered on before", known_addrs.len());
-        }
+        // An address is not evidence about the present. A host that has moved
+        // network, been given a different port by its NAT, or gone behind a
+        // tunnel leaves an address behind that still *routes* — to a NAT that
+        // now maps it to somebody else, or to nothing at all. Those do not lose
+        // the race quickly; they take the dial with them while the path that
+        // would have worked goes unused.
+        //
+        // So the order is: everything that can say where the host is *now* —
+        // the relay in the code, mDNS, DNS, the DHT — and only if all of that
+        // comes back with nothing, the address from last time. Which is what it
+        // is actually good for: a machine whose relays are unreachable and
+        // whose lookups are all blocked, where an old address is the only thing
+        // left and worth a try precisely because there is no alternative.
+        //
+        // It cannot reach the wrong machine either way: the endpoint id is a
+        // public key and the handshake checks it. Being safe was never the
+        // question — being preferred was.
+        let fallback: Vec<iroh::TransportAddr> =
+            known_addrs.iter().map(|a| iroh::TransportAddr::Ip(*a)).collect();
 
         // Whichever way this is going to be reached, said before the wait
         // rather than after it — a step nobody sees is not a step.
-        on_step(if known_addrs.is_empty() { DialStep::ViaRelay } else { DialStep::Direct });
+        on_step(DialStep::ViaRelay);
 
         // # "Nobody knows yet" is not "nobody knows"
         //
@@ -3217,6 +3228,7 @@ impl GuestClient {
         // where retrying only turns a clear failure into a slow one.
         let deadline = std::time::Instant::now() + FIND_WAIT;
         let mut attempts = 0u32;
+        let mut using_fallback = false;
         let conn = loop {
             attempts += 1;
             match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN)).await {
@@ -3226,6 +3238,24 @@ impl GuestClient {
                     // before this endpoint was online had no relay to fall back
                     // on, and the next one may.
                     let worth_waiting = not_found_yet(&e) || (!online && attempts == 1);
+
+                    // Nothing said where this host is, and there is an address
+                    // from last time. Now it is worth having — this is the
+                    // "nothing else at all" it was kept for. Added once and
+                    // then left in place, so the remaining retries include it.
+                    if !using_fallback && !fallback.is_empty() && not_found_yet(&e) {
+                        using_fallback = true;
+                        for known in &fallback {
+                            addr.addrs.insert(known.clone());
+                        }
+                        info!(
+                            "Nothing could say where this host is — trying {} address(es)                              it answered on before",
+                            fallback.len()
+                        );
+                        on_step(DialStep::Direct);
+                        continue;
+                    }
+
                     if !worth_waiting || std::time::Instant::now() >= deadline {
                         return Err(e).context("Failed to connect to host");
                     }
