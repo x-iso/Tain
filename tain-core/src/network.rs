@@ -1510,6 +1510,15 @@ impl Window {
 /// How often the host says what it did with the last few seconds.
 const TALLY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The shortest gap between two keyframes a guest can ask the encoder for.
+///
+/// Long enough that one has demonstrably arrived and been tried — a keyframe
+/// and the round trip back are tens of milliseconds on any link worth streaming
+/// over — and short enough to be invisible to a guest asking for a good reason,
+/// which asks once. See where it is read for what a guest asking for a bad
+/// reason did to the host.
+const KEYFRAME_FLOOR: Duration = Duration::from_millis(500);
+
 /// What the host produced, and what became of it.
 ///
 /// The mirror of the guest's `FrameTally`, and it exists for the same reason:
@@ -1857,6 +1866,9 @@ fn spawn_capture_pipeline(
             // into a number of frames.
             // One picture per session, from the first frame that arrives.
             let mut sent_preview = false;
+            // When the last keyframe went out, so a guest cannot ask for them
+            // faster than they are worth sending. See where this is read.
+            let mut keyframe_sent_at: Option<std::time::Instant> = None;
 
             loop {
                 // Blocks until the capture thread has something, which is also
@@ -1964,8 +1976,42 @@ fn spawn_capture_pipeline(
 
                     // Honoured here rather than where it arrives: this is the
                     // only thread that owns the encoder.
+                    //
+                    // # Why a guest cannot ask faster than this
+                    //
+                    // A guest asks for a keyframe when a frame fails to decode,
+                    // and a guest whose decoder is genuinely stuck fails on
+                    // every frame — so it asks on every frame. Measured at
+                    // three a second, and on some encoders a keyframe means
+                    // rebuilding the transform, which is hundreds of
+                    // milliseconds of the capture thread each time.
+                    //
+                    // The host then went from serving a guest with a broken
+                    // picture to having no picture to serve: throughput fell to
+                    // a ninth, and AMD's AV1 transform — rebuilt six times in
+                    // under two seconds — stalled and took the session with it.
+                    // One end's fault became both ends' outage.
+                    //
+                    // Nothing is lost by refusing. A keyframe sent a fifth of a
+                    // second ago is still arriving; if it did not help, another
+                    // one will not either, and the guest's problem is somewhere
+                    // this cannot reach. The request is dropped rather than
+                    // deferred for the same reason — it asks for a keyframe
+                    // *now*, and one already is.
                     if keyframe_wanted.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                        encoder.request_keyframe();
+                        match keyframe_sent_at {
+                            Some(at) if at.elapsed() < KEYFRAME_FLOOR => {
+                                trace!(
+                                    "Session #{session_id}: a keyframe went out {:?} ago — \
+                                     not rebuilding the encoder for another",
+                                    at.elapsed()
+                                );
+                            }
+                            _ => {
+                                encoder.request_keyframe();
+                                keyframe_sent_at = Some(std::time::Instant::now());
+                            }
+                        }
                     }
                     let encode_started = std::time::Instant::now();
                     let encoded = match encoder.encode_frame(
