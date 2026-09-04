@@ -69,10 +69,24 @@ not a Win32 call — it is this driver's own control channel, read out of
 - `PING`, `GETSETTINGS`, `RELOAD_DRIVER`, `GETALLGPUS`, `GETASSIGNEDGPU`,
   `VDDPATH`, and option verbs this project has no reason to use.
 
-Settings live in `vdd_settings.xml` at `C:\VirtualDisplayDriver\`, unless
-`HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver` points elsewhere. `<monitors>
-<count>` is what `SETDISPLAYCOUNT` writes; `<resolutions>` is the mode list each
-presented monitor offers.
+Settings live in `vdd_settings.xml`, in the folder named by the registry value
+`HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver\VDDPATH`. From the driver's own
+source:
+
+    RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\MikeTheTech\VirtualDisplayDriver", 0, KEY_READ, &hKey)
+    RegQueryValueExW(hKey, L"VDDPATH", NULL, NULL, (LPBYTE)szPath, &dwBufferSize)
+    wstring confpath = L"C:\VirtualDisplayDriver";        // when that fails
+    wstring settingsname = confpath + L"\vdd_settings.xml";
+
+Tain points it at `%ProgramData%\Tain\VirtualDisplay` — machine-wide
+application data belongs there, and the driver runs under a service account
+with no user profile in scope. Only when nothing has already chosen: a machine
+where this driver was installed by its own installer keeps whatever it is using,
+because that folder may hold settings somebody edited.
+
+`<monitors><count>` is what `SETDISPLAYCOUNT` writes; `<resolutions>` is the
+mode list each presented monitor offers. The folder also takes `option.txt`,
+`adapter.txt` and a `Logs\` directory.
 
 Everything after a monitor exists — onto the desktop, at a size, and away again
 — is `tain_core::virtual_display`, which works with any driver's monitor and

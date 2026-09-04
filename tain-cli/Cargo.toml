@@ -60,6 +60,9 @@ windows = { version = "0.58", features = [
     # to it. There is no higher-level way: a root-enumerated device has no
     # hardware to be discovered, so something has to assert that it exists.
     "Win32_Devices_DeviceAndDriverInstallation",
+    # Telling the display driver where to keep its settings, which it reads
+    # from HKLM at every start. See `display_driver::settings`.
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_System_StationsAndDesktops",
