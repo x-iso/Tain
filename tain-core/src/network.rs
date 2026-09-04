@@ -621,6 +621,12 @@ impl HostServer {
         let session_id = self.sessions.add_session(secret, initial_grants, typ);
         let label = client_name.clone().unwrap_or_else(|| format!("Guest #{session_id}"));
         self.sessions.set_label(session_id, label.clone());
+        // Recorded once. The address does not change for the life of the
+        // connection, and the number that does — the round trip — comes back
+        // from the guest continuously and is kept separately.
+        if let Some(path) = path_of(&conn) {
+            self.sessions.set_route(session_id, format!("{} — {}", path.label(), path.remote()));
+        }
         info!(
             "Session #{} authenticated as {:?} ({} passcode)",
             session_id,
@@ -2283,7 +2289,8 @@ fn spawn_capture_thread(
                                 }
                                 Err(e) => {
                                     error!(
-                                        "Session #{session_id}: capture is gone after a                                          failed display switch: {e:#}"
+                                        "Session #{session_id}: capture is gone after a \
+                                         failed display switch: {e:#}"
                                     );
                                     return;
                                 }
@@ -2571,7 +2578,11 @@ async fn run_reader<R>(
                 // from the other machine and steer this one's encoder, so a
                 // peer sending NaN or a negative decode time must not be able to
                 // drive the stream into its floor.
-                *telemetry.lock().unwrap() = Some(sanitize_telemetry(report));
+                let report = sanitize_telemetry(report);
+                *telemetry.lock().unwrap() = Some(report);
+                // Also kept per session, so the host's own UI can say how the
+                // link is doing without the guest being the only one who knows.
+                sessions.set_link(session_id, report);
             }
             Ok(Message::Ping(ts)) => {
                 let host_ms = std::time::SystemTime::now()

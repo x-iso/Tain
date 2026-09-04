@@ -50,6 +50,18 @@ pub struct SessionInfo {
     /// and which stage is holding it back. `None` until the first evaluation
     /// window closes.
     pub stream_status: Option<super::protocol::StreamStatus>,
+    /// The address the guest actually reached this host on.
+    ///
+    /// Only ever a direct path — a relayed connection is refused rather than
+    /// streamed — so this is the answer to "how is this guest connected", which
+    /// the host had in a log line and nowhere a person would look.
+    pub route: Option<String>,
+    /// The guest's own view of the link, as it last reported it.
+    ///
+    /// The host cannot measure this half: round trip and decode rate are things
+    /// only the far end knows. Kept beside `stream_status`, which is this end's
+    /// half of the same picture.
+    pub link: Option<super::protocol::GuestTelemetry>,
 }
 
 impl Default for SessionManager {
@@ -87,6 +99,8 @@ impl SessionManager {
             passcode_type,
             label: format!("Guest #{id}"),
             stream_status: None,
+            route: None,
+            link: None,
         });
 
         info!("Session #{} added (mouse={}, keyboard={})", id, grants.mouse, grants.keyboard);
@@ -244,6 +258,38 @@ impl SessionManager {
         } else {
             false
         }
+    }
+
+    /// Record the address a guest reached this host on.
+    pub fn set_route(&self, session_id: u32, route: String) -> bool {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(info) = state.sessions.get_mut(&session_id) {
+            info.route = Some(route);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record the guest's latest report on the link.
+    pub fn set_link(&self, session_id: u32, link: super::protocol::GuestTelemetry) -> bool {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(info) = state.sessions.get_mut(&session_id) {
+            info.link = Some(link);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Everything known about one session, for a UI that wants to show it.
+    ///
+    /// One call rather than an accessor per field: the host's connection card
+    /// reads five of these at once, and taking the lock five times to build one
+    /// tooltip is five chances to disagree with itself.
+    pub fn info(&self, session_id: u32) -> Option<SessionInfo> {
+        let state = self.inner.lock().unwrap();
+        state.sessions.get(&session_id).cloned()
     }
 
     /// Get the number of active sessions.

@@ -89,6 +89,12 @@ pub struct IncomingConnection {
     /// whoever holds that code is doing everything a guest would need
     /// permission for.
     pub is_admin: bool,
+    /// What the card's tooltip says about the link, rebuilt every frame.
+    ///
+    /// Held as finished text rather than the numbers behind it because it is
+    /// read in exactly one place and rebuilt from the session table anyway —
+    /// keeping the parts would mean keeping them in step for no reader.
+    pub link: String,
 }
 
 /// Approval state for an incoming connection.
@@ -364,6 +370,9 @@ pub fn seed_demo_data(state: &AppState) {
             keyboard_allowed: true,
             status: ApprovalStatus::Allowed,
             is_admin: false,
+            link: "direct — 192.168.0.10:57374\n12 ms round trip\n\
+                   Sending 60 fps at 18 Mbit/s\nGuest is decoding 59 fps into 1856x1020"
+                .into(),
         },
         IncomingConnection {
             session_id: 2,
@@ -373,6 +382,7 @@ pub fn seed_demo_data(state: &AppState) {
             keyboard_allowed: false,
             status: ApprovalStatus::Pending,
             is_admin: false,
+            link: String::new(),
         },
         IncomingConnection {
             session_id: 3,
@@ -383,6 +393,9 @@ pub fn seed_demo_data(state: &AppState) {
             status: ApprovalStatus::Allowed,
             // So the admin styling is visible without a second machine.
             is_admin: true,
+            link: "direct — 10.8.0.3:41233\n84 ms round trip\n\
+                   Sending 40 fps at 9 Mbit/s — held back by slow encoding"
+                .into(),
         },
     ];
 }
@@ -1300,6 +1313,9 @@ impl GuestApp {
                     status: ApprovalStatus::Pending,
                     // Only guest connections are ever asked about.
                     is_admin: false,
+                    // Nothing is streaming yet, so there is nothing to say
+                    // about the link; `reconcile_incoming` fills this in.
+                    link: String::new(),
                 });
                 // Hold the responder until the user decides. Dropping it here
                 // would answer "no decision", which the server reads as a denial.
@@ -1731,6 +1747,7 @@ impl GuestApp {
                     // Already connected and streaming; nothing is pending.
                     status: ApprovalStatus::Allowed,
                     is_admin,
+                    link: String::new(),
                 });
             }
 
@@ -1756,12 +1773,13 @@ impl GuestApp {
             self.announced.retain(|id| active.contains(id));
 
             for card in incoming.iter_mut() {
-                let Some(grants) = sessions.grants(card.session_id) else { continue };
-                card.mouse_allowed = grants.mouse;
-                card.keyboard_allowed = grants.keyboard;
+                let Some(info) = sessions.info(card.session_id) else { continue };
+                card.mouse_allowed = info.grants.mouse;
+                card.keyboard_allowed = info.grants.keyboard;
                 // A pending card keeps its status until the user decides — the
                 // server holds no grants while waiting, so mirroring them would
                 // read as a decision nobody made.
+                card.link = describe_link(&info);
             }
             incoming.iter().map(|c| c.session_id).collect()
         };
@@ -2741,6 +2759,13 @@ impl GuestApp {
         let sense = if pending { egui::Sense::click() } else { egui::Sense::hover() };
         let card_resp = ui.interact(rect, id, sense);
         ui.data_mut(|d| d.insert_temp(id, card_resp.hovered()));
+        // On the card rather than on a control, because it describes the whole
+        // connection rather than anything that can be clicked. Withheld while
+        // empty: an established session that has not reported yet would
+        // otherwise flash a blank tooltip on the way past.
+        if !conn.link.is_empty() {
+            card_resp.clone().on_hover_text(&conn.link);
+        }
         if card_resp.clicked() {
             edits.confirm.push((conn.session_id, ConfirmAction::Approve));
         }
@@ -2780,6 +2805,75 @@ fn elide(name: &str, max: usize) -> String {
     // One character of the budget is spent saying that there was more.
     let kept: String = name.chars().take(max.saturating_sub(1)).collect();
     kept + "\u{2026}"
+}
+
+/// What a connection card's tooltip says about the link behind it.
+///
+/// # Why the host is told any of this
+///
+/// The host could see that someone was connected and nothing else. Everything
+/// about *how* — the address they came in on, the round trip, whether the
+/// stream is running at what was asked for — existed only in the log file, and
+/// only for someone who knew to go looking. But the host is the one who can act
+/// on it: a guest complaining the picture is soft is a different conversation
+/// depending on whether this machine is encode-bound or the link is 200 ms away.
+///
+/// Built from whatever has arrived. A card exists before the guest has reported
+/// anything, so every line here is optional and the ones with nothing behind
+/// them are left out rather than printed empty.
+fn describe_link(info: &tain_core::SessionInfo) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(route) = &info.route {
+        lines.push(route.clone());
+    }
+    if let Some(link) = info.link {
+        // The guest's own measurement. The host cannot take this one: a round
+        // trip needs both ends, and only the far one sees the reply come back.
+        lines.push(format!("{:.0} ms round trip", link.rtt_ms));
+    }
+    if let Some(status) = info.stream_status {
+        let mut line = format!(
+            "Sending {} fps at {}",
+            status.fps,
+            bitrate_label(status.bitrate_kbps)
+        );
+        if status.degraded {
+            let held = tain_core::BottleneckSet::from_bits(status.bottlenecks)
+                .iter()
+                .map(|b| b.label().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Degraded with nothing named means the ceiling itself is the
+            // limit, which is a setting rather than a fault.
+            if held.is_empty() {
+                line.push_str(" — below what was asked for");
+            } else {
+                line.push_str(&format!(" — held back by {held}"));
+            }
+        }
+        lines.push(line);
+    }
+    if let Some(cfg) = &info.display_config
+        && let Some(decoded) = info.link
+    {
+        lines.push(format!(
+            "Guest is decoding {:.0} fps into {}x{}",
+            decoded.decoded_fps, cfg.client_width, cfg.client_height
+        ));
+    }
+
+    lines.join("\n")
+}
+
+/// kbps as something with a unit on it, because five figures of kbit/s is not
+/// a number anyone reads at a glance.
+fn bitrate_label(kbps: u32) -> String {
+    if kbps >= 1000 {
+        format!("{:.1} Mbit/s", kbps as f32 / 1000.0)
+    } else {
+        format!("{kbps} kbit/s")
+    }
 }
 
 /// Plain-language summary of a session's input permissions.
@@ -3328,6 +3422,7 @@ mod tests {
             keyboard_allowed: false,
             status: ApprovalStatus::Pending,
             is_admin: false,
+            link: String::new(),
         };
 
         let mut card = egui::Rect::NOTHING;
@@ -3399,6 +3494,7 @@ mod tests {
                 keyboard_allowed: false,
                 status: ApprovalStatus::Allowed,
                 is_admin: false,
+                link: String::new(),
             };
 
             let mut width = 0.0f32;
@@ -3501,6 +3597,7 @@ mod tests {
             keyboard_allowed: false,
             status,
             is_admin: false,
+            link: String::new(),
         }
     }
 
@@ -3649,6 +3746,84 @@ mod tests {
         let app = GuestApp::new(AppState::new());
         *app.state.previous_connections.lock().unwrap() = ConnectionStore::new();
         app
+    }
+
+    fn bare_session() -> tain_core::SessionInfo {
+        tain_core::SessionInfo {
+            secret: [0u8; 32],
+            grants: tain_core::ControlGrants::NONE,
+            display_config: None,
+            passcode_type: tain_core::PasscodeType::Guest,
+            label: "Guest #1".into(),
+            stream_status: None,
+            route: None,
+            link: None,
+        }
+    }
+
+    /// A card exists before the guest has reported anything.
+    #[test]
+    fn a_connection_with_nothing_to_say_says_nothing() {
+        assert!(describe_link(&bare_session()).is_empty());
+    }
+
+    #[test]
+    fn the_link_summary_leaves_out_what_has_not_arrived() {
+        let mut info = bare_session();
+        info.route = Some("direct — 192.168.0.10:57374".into());
+        let text = describe_link(&info);
+        assert_eq!(text, "direct — 192.168.0.10:57374", "no round trip has been reported");
+
+        info.link = Some(tain_core::GuestTelemetry {
+            decode_ms: 3.0,
+            render_ms: 1.0,
+            displayed_fps: 60.0,
+            decoded_fps: 59.0,
+            rtt_ms: 11.6,
+        });
+        let text = describe_link(&info);
+        assert!(text.contains("12 ms round trip"), "got {text:?}");
+        assert!(
+            !text.contains("decoding"),
+            "the guest's window size is not known yet: {text:?}"
+        );
+
+        info.display_config = Some(tain_core::protocol::DisplayConfig {
+            target_fps: 0,
+            max_bitrate_kbps: 0,
+            client_width: 1856,
+            client_height: 1020,
+        });
+        assert!(describe_link(&info).contains("59 fps into 1856x1020"));
+    }
+
+    /// A degraded stream names what is holding it back — that is the whole
+    /// reason the host is shown this rather than left to read the log.
+    #[test]
+    fn a_degraded_stream_says_what_is_limiting_it() {
+        let mut info = bare_session();
+        let mut held = tain_core::BottleneckSet::NONE;
+        held.insert(tain_core::Bottleneck::SlowEncode);
+        info.stream_status = Some(tain_core::protocol::StreamStatus {
+            session_id: 1,
+            bottlenecks: held.bits(),
+            fps: 40,
+            bitrate_kbps: 9216,
+            degraded: true,
+        });
+        let text = describe_link(&info);
+        assert!(text.contains("40 fps at 9.2 Mbit/s"), "got {text:?}");
+        assert!(text.contains("held back by"), "got {text:?}");
+
+        // Healthy, so there is nothing to blame.
+        info.stream_status = Some(tain_core::protocol::StreamStatus {
+            session_id: 1,
+            bottlenecks: 0,
+            fps: 60,
+            bitrate_kbps: 800,
+            degraded: false,
+        });
+        assert_eq!(describe_link(&info), "Sending 60 fps at 800 kbit/s");
     }
 
     #[test]
