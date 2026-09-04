@@ -37,6 +37,9 @@ fn test_config() -> SessionConfig {
         audio_bitrate_kbps: 160,
         host_name: Some("Test Host".into()),
         priority: Default::default(),
+        // These stream a synthetic frame with no display behind it; a test
+        // that resized the developer's desktop would be memorable.
+        virtual_display_follows_guest: false,
     }
 }
 

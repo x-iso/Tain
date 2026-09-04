@@ -262,6 +262,27 @@ pub struct Settings {
     /// folding the two into one decision would mean anybody who wanted the
     /// first silently got the second.
     pub unattended_access: bool,
+    /// Size a virtual display is created at, when it is not following a guest.
+    ///
+    /// Zero means "the same as the primary display", which is the sensible
+    /// default and the one that needs no explaining: a new screen that matches
+    /// the one already there.
+    #[serde(default)]
+    pub virtual_display_size: (u16, u16),
+    /// Whether a virtual display takes the size of the guest watching it.
+    ///
+    /// # Why this is per display and not per session
+    ///
+    /// The whole point of the feature is a screen at the *guest's* resolution
+    /// rather than a scaled copy of the host's. With two guests and two virtual
+    /// displays, each should follow the one watching it — so the rule is that a
+    /// virtual display is claimed by the first guest to watch it, and follows
+    /// that guest's window until the session ends.
+    ///
+    /// Off by default. Resizing somebody's desktop because they connected is a
+    /// surprising thing to do without being asked.
+    #[serde(default)]
+    pub virtual_display_follows_guest: bool,
     /// How large this application's own interface is, relative to the DPI
     /// scale the monitor asks for. `1.0` follows the monitor exactly.
     ///
@@ -376,6 +397,8 @@ impl Default for Settings {
             h264_profile: ProfileSetting::default(),
             gpu_present: false,
             unattended_access: false,
+            virtual_display_size: (0, 0),
+            virtual_display_follows_guest: false,
             ui_scale: 1.0,
             rate_control: RateControlSetting::default(),
             latency_priority: LatencyPriority::default().value(),
@@ -561,6 +584,7 @@ impl Settings {
             audio_bitrate_kbps: self.audio_bitrate_kbps,
             host_name: self.device_name(),
             priority: self.priority(),
+            virtual_display_follows_guest: self.virtual_display_follows_guest,
         }
     }
 

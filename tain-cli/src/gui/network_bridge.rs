@@ -2135,6 +2135,7 @@ mod tests {
             audio_bitrate_kbps: 160,
             host_name: Some("Test Host".into()),
             priority: Default::default(),
+            virtual_display_follows_guest: false,
         };
 
         let server = Arc::new(HostServer::bind().await.unwrap().with_config(config));

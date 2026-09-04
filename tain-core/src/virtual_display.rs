@@ -265,19 +265,71 @@ mod windows_impl {
         found
     }
 
+    /// Make the desktop extend rather than clone.
+    ///
+    /// # Why this is needed at all
+    ///
+    /// A monitor arriving does not choose its own topology — Windows does, from
+    /// what it remembers about that display and what the machine was last doing.
+    /// It very often chooses **clone**, and a cloned display is a second copy of
+    /// the first: same coordinates, same picture, nothing new to capture and
+    /// nowhere for a pointer to go. Reported for a virtual display and for a
+    /// dummy plug alike, and both times the fix was a trip to Settings.
+    ///
+    /// A position cannot undo it. `ChangeDisplaySettingsExW` moves a display
+    /// within a topology; it does not change which topology is in force, so
+    /// placing a cloned display somewhere else is a request Windows is entitled
+    /// to ignore — and does. `SetDisplayConfig` is the call that owns that
+    /// question.
+    ///
+    /// Applies to the whole desktop, because a topology is a property of the
+    /// desktop and not of one display. That is a real cost: a machine
+    /// deliberately mirroring two screens will stop. It is the lesser one — the
+    /// alternative is a virtual display that exists, reports a size, and shows
+    /// somebody their own primary monitor.
+    pub fn extend_desktop() -> Result<()> {
+        use windows::Win32::Devices::Display::{
+            SetDisplayConfig, SDC_APPLY, SDC_TOPOLOGY_EXTEND,
+        };
+        // SAFETY: no paths or modes are supplied, which is what asks Windows to
+        // use the topology it has stored for these displays.
+        let result = unsafe { SetDisplayConfig(None, None, SDC_TOPOLOGY_EXTEND | SDC_APPLY) };
+        if result != 0 {
+            bail!("could not switch the desktop to extend ({result})");
+        }
+        debug!("Desktop topology set to extend");
+        Ok(())
+    }
+
+    /// Where every attached display sits, apart from one.
+    ///
+    /// The exclusion is what lets a display already on the desktop be moved:
+    /// see [`attach`].
+    pub fn occupied_except(skip: &str) -> Vec<Placed> {
+        placements(Some(skip))
+    }
+
     /// Where every attached display currently sits, for [`next_position`].
     ///
     /// Read here rather than taken from `displays()` so that attaching does not
     /// depend on DXGI having been able to describe every screen: a display this
     /// cannot see is one whose space could be handed to something else.
     pub fn occupied() -> Vec<Placed> {
+        placements(None)
+    }
+
+    fn placements(skip: Option<&str>) -> Vec<Placed> {
         let mut found = Vec::new();
         for index in 0.. {
             let Some(dev) = device(index) else { break };
             if dev.StateFlags & ATTACHED_TO_DESKTOP == 0 {
                 continue;
             }
-            let name = wide(&text(&dev.DeviceName));
+            let device_name = text(&dev.DeviceName);
+            if skip.is_some_and(|s| s == device_name) {
+                continue;
+            }
+            let name = wide(&device_name);
             let mut mode = DEVMODEW {
                 dmSize: std::mem::size_of::<DEVMODEW>() as u16,
                 ..Default::default()
@@ -420,7 +472,14 @@ mod windows_impl {
         // Its own space, worked out from what is on the desktop *now* — which
         // is why this is not cached: a monitor can be plugged in between one
         // attach and the next.
-        let (x, y) = next_position(&occupied());
+        //
+        // Excluding this one, which is not pedantry: a display that arrived in
+        // clone mode is already *attached*, so it is part of `occupied()` and
+        // would be placed to the right of itself. Its own edge is not a
+        // constraint on where it goes.
+        let elsewhere: Vec<Placed> =
+            occupied_except(name).into_iter().collect();
+        let (x, y) = next_position(&elsewhere);
 
         let mut mode = DEVMODEW {
             dmSize: std::mem::size_of::<DEVMODEW>() as u16,
@@ -474,7 +533,10 @@ mod windows_impl {
 }
 
 #[cfg(target_os = "windows")]
-pub use windows_impl::{attach, available, describe, detach, has_monitor, modes, occupied};
+pub use windows_impl::{
+    attach, available, describe, detach, extend_desktop, has_monitor, modes, occupied,
+    occupied_except,
+};
 
 #[cfg(not(target_os = "windows"))]
 mod stub {

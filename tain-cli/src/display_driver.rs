@@ -847,6 +847,34 @@ mod windows_impl {
     /// spinner; giving up too early reports a failure that did not happen.
     const MONITOR_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
+    /// The sizes a virtual display can actually be set to, largest first.
+    ///
+    /// Taken from a presented monitor rather than from the settings file: the
+    /// file is what the driver was *asked* for, and a list read back from the
+    /// device is what it will accept. Offering a size the driver refuses is a
+    /// menu entry that fails on click.
+    ///
+    /// Empty until a monitor exists, which is why the picker falls back to the
+    /// primary display's size — there is nothing to enumerate before the first
+    /// one is created.
+    pub fn offered_sizes() -> Vec<(u16, u16)> {
+        let Some(screen) =
+            tain_core::virtual_display::available().into_iter().find(|screen| screen.ready)
+        else {
+            return Vec::new();
+        };
+        let mut sizes: Vec<(u16, u16)> = tain_core::virtual_display::modes(&screen.name)
+            .into_iter()
+            .map(|mode| (mode.width, mode.height))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // Largest first: somebody opening this list is far more often reaching
+        // for a big one than a small one.
+        sizes.sort_by_key(|(w, h)| std::cmp::Reverse(u32::from(*w) * u32::from(*h)));
+        sizes
+    }
+
     /// How many virtual monitors the driver is presenting right now.
     pub fn monitor_count() -> usize {
         tain_core::virtual_display::available()
@@ -884,9 +912,26 @@ mod windows_impl {
             .find(|screen| screen.ready && !before.contains(&screen.name))
             .context("the driver presented a monitor that could not be identified")?;
 
-        if !fresh.attached {
-            tain_core::virtual_display::attach(&fresh.name, size, 60)?;
+        // # Placed whether or not Windows already attached it
+        //
+        // This used to skip a display that was already attached, on the
+        // reasoning that there was nothing left to do. There was: Windows
+        // chooses a topology when a monitor arrives and very often chooses
+        // **clone**, which is attached, reports a size, and is a second copy of
+        // the primary at the same coordinates. Nothing to capture, nowhere for
+        // a pointer to go, and the only way out was a trip to Settings —
+        // reported for the virtual display and for a dummy HDMI plug alike.
+        //
+        // So the topology is set first, because a position cannot undo a clone
+        // — `ChangeDisplaySettingsExW` moves a display *within* a topology and
+        // is entitled to ignore the request otherwise — and then it is placed
+        // regardless of what it was already doing.
+        if let Err(e) = tain_core::virtual_display::extend_desktop() {
+            // Not fatal. A machine with one display has nothing to extend, and
+            // the placement below is the part that has to work.
+            tracing::debug!("Could not set the desktop to extend: {e:#}");
         }
+        tain_core::virtual_display::attach(&fresh.name, size, 60)?;
         tracing::info!("Virtual display {} is on the desktop at {}x{}", fresh.name, size.0, size.1);
         Ok(fresh.name)
     }
@@ -1239,8 +1284,8 @@ mod windows_impl {
 
 #[cfg(target_os = "windows")]
 pub use windows_impl::{
-    add_display, install, monitor_count, remove_display, request_install, request_uninstall,
-    state, uninstall,
+    add_display, install, monitor_count, offered_sizes, remove_display, request_install,
+    request_uninstall, state, uninstall,
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -1279,12 +1324,17 @@ mod stub {
     pub fn remove_display() -> Result<()> {
         bail!("virtual displays are a Windows feature")
     }
+
+    pub fn offered_sizes() -> Vec<(u16, u16)> {
+        Vec::new()
+    }
+
 }
 
 #[cfg(not(target_os = "windows"))]
 pub use stub::{
-    add_display, install, monitor_count, remove_display, request_install, request_uninstall,
-    state, uninstall,
+    add_display, install, monitor_count, offered_sizes, remove_display, request_install,
+    request_uninstall, state, uninstall,
 };
 
 #[cfg(test)]

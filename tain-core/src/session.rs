@@ -33,6 +33,48 @@ struct SessionState {
     next_session_id: u32,
 }
 
+/// Which session has taken which virtual display, for its own size.
+///
+/// Process-wide rather than per `SessionManager`, because the thing being
+/// arbitrated is process-wide: there is one desktop, and a display can only be
+/// one size at a time.
+static CLAIMED_DISPLAYS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+/// Claim a virtual display for a session, or say who already has it.
+///
+/// Returns `None` when the claim succeeded — including when this session
+/// already held it, so a guest resizing its window keeps following.
+///
+/// # Why first come rather than most recent
+///
+/// A display has one size. Two sessions both resizing the same one to their own
+/// window would take it from each other for as long as both were connected,
+/// and the picture would move under both of them. The first to ask keeps it;
+/// the second is told no and streams scaled, which is what every session did
+/// before any of this existed.
+pub fn claim_virtual_display(name: &str, session_id: u32) -> Option<u32> {
+    let mut guard = CLAIMED_DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let claims = guard.get_or_insert_with(HashMap::new);
+    match claims.get(name) {
+        Some(&holder) if holder != session_id => Some(holder),
+        _ => {
+            claims.insert(name.to_string(), session_id);
+            None
+        }
+    }
+}
+
+/// Let go of everything a session claimed, when it ends.
+///
+/// Without this a display stays spoken for until the process exits, and the
+/// next guest to watch it would be told it belongs to a session that is gone.
+pub fn release_virtual_displays(session_id: u32) {
+    let mut guard = CLAIMED_DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(claims) = guard.as_mut() {
+        claims.retain(|_, holder| *holder != session_id);
+    }
+}
+
 /// Information about a single guest connection.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -150,6 +192,9 @@ impl SessionManager {
         if info.is_some() {
             info!("Session #{} removed", session_id);
         }
+        // Whatever it had taken for its own size goes back, or the next guest
+        // to watch that display is refused on behalf of a session that is gone.
+        release_virtual_displays(session_id);
         info
     }
 

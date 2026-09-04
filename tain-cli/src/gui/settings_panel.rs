@@ -106,7 +106,7 @@ pub fn show(
                     ui.add_space(18.0);
                     unattended_section(ui, settings);
                     ui.add_space(18.0);
-                    virtual_display_section(ui);
+                    virtual_display_section(ui, settings);
                     ui.add_space(10.0);
                     shortcut_section(ui, settings, panel);
                 });
@@ -727,7 +727,7 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
 /// process, so the moment it finishes is not a moment this code hears about.
 /// Asking each frame costs an enumeration of display adapters, which is
 /// microseconds, and means the panel is right without anything to keep in step.
-fn virtual_display_section(ui: &mut egui::Ui) {
+fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
     use crate::display_driver::{self, DriverState};
 
     heading(ui, "Virtual display");
@@ -825,8 +825,65 @@ fn virtual_display_section(ui: &mut egui::Ui) {
         .size(11.0)
         .color(if count > 0 { TEXT } else { TEXT_DIM }),
     );
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 
+    // # The size, and who decides it
+    //
+    // Three answers, in the order somebody would think of them: match whoever
+    // is watching, match the screen already here, or say. The first is the
+    // reason the feature exists — a display made the size of the guest's window
+    // is sharp at 1:1, where a scaled copy of a 2560x1600 desktop never is.
+    ui.checkbox(
+        &mut settings.virtual_display_follows_guest,
+        "Match the resolution of whoever connects",
+    )
+    .on_hover_text(
+        "A virtual display takes the size of the guest watching it, so their window \
+         is drawn 1:1 instead of scaled. Each display follows the first guest to \
+         watch it, so a second guest gets a second display at their own size.",
+    );
+
+    ui.add_space(4.0);
+    ui.add_enabled_ui(!settings.virtual_display_follows_guest, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Size").size(11.0).color(TEXT_DIM));
+
+            // Offered from what a display actually reports, so the list cannot
+            // contain a mode the driver will refuse. Falls back to the primary
+            // display's size, which is what zero means.
+            let primary = tain_core::screen_capture::primary_display_size();
+            let mut sizes = display_driver::offered_sizes();
+            if !sizes.contains(&primary) {
+                sizes.insert(0, primary);
+            }
+
+            let chosen = settings.virtual_display_size;
+            let label = if chosen == (0, 0) {
+                format!("Same as this screen ({}x{})", primary.0, primary.1)
+            } else {
+                format!("{}x{}", chosen.0, chosen.1)
+            };
+
+            egui::ComboBox::from_id_salt("virtual-display-size")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut settings.virtual_display_size,
+                        (0, 0),
+                        format!("Same as this screen ({}x{})", primary.0, primary.1),
+                    );
+                    for size in sizes {
+                        ui.selectable_value(
+                            &mut settings.virtual_display_size,
+                            size,
+                            format!("{}x{}", size.0, size.1),
+                        );
+                    }
+                });
+        });
+    });
+
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
         // The driver restarts itself to change the count, so both of these
         // block for a moment. Disabled rather than spinner'd: the wait is a
@@ -841,11 +898,13 @@ fn virtual_display_section(ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            // The primary display's size, so the new one matches what is
-            // already there. A guest that wants its own resolution changes it
-            // afterwards; guessing the guest's window here would be guessing
-            // which guest.
-            let size = tain_core::screen_capture::primary_display_size();
+            // What the settings above say. Zero means "the same as this
+            // screen", and a display that follows its guest still has to start
+            // somewhere — it is resized when one arrives, not before.
+            let size = match settings.virtual_display_size {
+                (0, 0) => tain_core::screen_capture::primary_display_size(),
+                chosen => chosen,
+            };
             match display_driver::add_display(size) {
                 Ok(name) => tracing::info!("Added virtual display {name}"),
                 Err(e) => tracing::warn!("Could not add a virtual display: {e:#}"),

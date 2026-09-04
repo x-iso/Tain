@@ -178,6 +178,27 @@ pub struct SessionConfig {
     ///
     /// Not a quality setting: see [`super::encoder::LatencyPriority`].
     pub priority: super::encoder::LatencyPriority,
+    /// Resize a *virtual* display to match the guest watching it.
+    ///
+    /// # Why this is worth doing at all
+    ///
+    /// A guest window of 1856x1020 shown a 2560x1600 desktop is scaled twice —
+    /// down on the host to fit the link, up on the guest to fill the window —
+    /// and text never looks right through either. A display made the size of
+    /// the window is drawn 1:1, which is the whole reason a host would create
+    /// one for a guest rather than share the screen it already has.
+    ///
+    /// # Why only a virtual one, and only the first guest's
+    ///
+    /// A real monitor belongs to whoever is sitting at it. Resizing it because
+    /// somebody connected would rearrange a desk nobody asked to have
+    /// rearranged, so this never touches one.
+    ///
+    /// And a display can only be one size, so with two guests watching the same
+    /// virtual display the second would take it away from the first, repeatedly,
+    /// for as long as both were connected. The first to watch it keeps it; a
+    /// second guest wanting their own size wants a second virtual display.
+    pub virtual_display_follows_guest: bool,
 }
 
 impl Default for SessionConfig {
@@ -191,6 +212,9 @@ impl Default for SessionConfig {
             audio_bitrate_kbps: 160,
             host_name: None,
             priority: crate::LatencyPriority::default(),
+            // Off: resizing somebody's desktop because a guest connected is a
+            // surprising thing to do without being asked for it.
+            virtual_display_follows_guest: false,
         }
     }
 }
@@ -1054,6 +1078,7 @@ where
         Arc::clone(&keyframe_wanted),
         Arc::clone(&wanted_display),
         Arc::clone(&allowed_displays),
+        config.virtual_display_follows_guest,
     ));
 
     // Audio rides the same outbound channel as host-initiated control messages,
@@ -1434,6 +1459,83 @@ fn send_window(ack_ms: f32, fps: u32) -> u32 {
     // sends one frame per acknowledgement and the link never fills.
     let slack = ((SEND_WINDOW_SLACK_MS / frame_ms).ceil() as u32).max(1);
     in_transit.saturating_add(slack).clamp(2, SEND_WINDOW_MAX)
+}
+
+/// Which virtual display a session has taken for its own, if any.
+///
+/// One per session, and it never moves once set: a display can only be one
+/// size, so a second session claiming the same one would take it from the first
+/// and the two would fight over it for as long as both were connected.
+type ClaimedDisplay = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Resize the virtual display this guest is watching to match its window.
+///
+/// # What this deliberately will not do
+///
+/// **A real monitor is never touched.** It belongs to whoever is sitting at it,
+/// and resizing one because somebody connected rearranges a desk nobody asked
+/// to have rearranged. Only a display the host created for this purpose is
+/// fair game, which is what `virtual_display::available` answers.
+///
+/// **A display already claimed by another session is never taken.** The first
+/// guest to watch one keeps it. A second guest who wants their own size wants a
+/// second virtual display, and the host creates those deliberately.
+///
+/// Failures are logged and dropped. The session works either way — the picture
+/// is scaled rather than 1:1, which is what every session did before this
+/// existed — and ending one over a display that would not resize would be a
+/// worse outcome than the thing being fixed.
+fn follow_guest_size(
+    session_id: u32,
+    wanted: &WantedDisplay,
+    size: (u16, u16),
+    claimed: &ClaimedDisplay,
+) {
+    let watching = wanted.lock().unwrap().clone();
+    let super::screen_capture::DisplayTarget::One(name) = watching else {
+        // The wall, or the primary by default. Neither is one display to
+        // resize, and "every screen" has no single size to give it.
+        return;
+    };
+
+    let Some(screen) = super::virtual_display::available()
+        .into_iter()
+        .find(|screen| screen.name == name && screen.ready)
+    else {
+        debug!("Session #{session_id}: {name} is not a virtual display — leaving its size");
+        return;
+    };
+
+    {
+        let mut claimed = claimed.lock().unwrap();
+        match claimed.as_deref() {
+            // Already ours, so this is the guest's window changing size rather
+            // than a first claim. Still worth following.
+            Some(mine) if mine == name => {}
+            Some(other) => {
+                debug!("Session #{session_id}: already following {other}, not taking {name}");
+                return;
+            }
+            None => {
+                if let Some(taken) = super::session::claim_virtual_display(&name, session_id) {
+                    debug!(
+                        "Session #{session_id}: {name} already belongs to session #{taken}"
+                    );
+                    return;
+                }
+                *claimed = Some(name.clone());
+            }
+        }
+    }
+
+    match super::virtual_display::attach(&name, size, 60) {
+        Ok(()) => info!(
+            "Session #{session_id}: {name} resized to {}x{} to match the guest",
+            size.0, size.1
+        ),
+        Err(e) => warn!("Session #{session_id}: could not resize {name}: {e:#}"),
+    }
+    let _ = screen;
 }
 
 /// What to size the window against: how long an ack really takes, or the round
@@ -2481,10 +2583,14 @@ async fn run_reader<R>(
     keyframe_wanted: KeyframeWanted,
     wanted_display: WantedDisplay,
     allowed_displays: AllowedDisplays,
+    follows_guest: bool,
 ) where
     R: tokio::io::AsyncReadExt + Unpin + Send + 'static,
 {
     let injector = super::input_inject::create_injector();
+    // Which virtual display this session took for its own size, if it took one.
+    // Per session rather than shared: see `follow_guest_size`.
+    let claimed_display: ClaimedDisplay = Arc::new(std::sync::Mutex::new(None));
     // Whether the last touch to arrive was refused. A gesture in progress when
     // the guest's control is withdrawn has to be let go of here: the guest
     // cannot lift those contacts, because the message that would do it is the
@@ -2511,7 +2617,19 @@ async fn run_reader<R>(
                 // treating that as a ceiling would stream a 0x0 picture.
                 *viewport.lock().unwrap() = (cfg.client_width >= 2 && cfg.client_height >= 2)
                     .then_some((cfg.client_width, cfg.client_height));
+                let window = (cfg.client_width, cfg.client_height);
                 sessions.set_display_config(session_id, cfg);
+
+                // The guest's window has just been reported, which is the only
+                // moment its size is known. See `follow_guest_size`.
+                if follows_guest && window.0 >= 2 && window.1 >= 2 {
+                    follow_guest_size(
+                        session_id,
+                        &wanted_display,
+                        window,
+                        &claimed_display,
+                    );
+                }
             }
             Ok(Message::WatchDisplay(choice)) => {
                 use super::protocol::DisplayChoice;
@@ -3767,6 +3885,10 @@ mod tests {
             auto_regen_guest_passcode: false,
             host_name: None,
             priority: crate::LatencyPriority::default(),
+            // Off in tests: these run against a synthetic capture with no
+            // display behind it, and a test that resized the developer's
+            // desktop would be a memorable way to find that out.
+            virtual_display_follows_guest: false,
         }
     }
 
