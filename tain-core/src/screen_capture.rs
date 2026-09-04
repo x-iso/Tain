@@ -157,8 +157,13 @@ const VIRTUAL_ADAPTERS: &[&str] = &[
 /// Whether an adapter description names a driver that presents virtual screens.
 ///
 /// See [`VIRTUAL_ADAPTERS`] for why this is a name match.
+///
+/// The array is what both callers already hold: DXGI's `Description` and GDI's
+/// `DISPLAY_DEVICEW::DeviceString` are the same shape, which is why
+/// [`super::virtual_display`] can ask the same question of a display that is
+/// not attached and therefore has no DXGI output at all.
 #[cfg(target_os = "windows")]
-fn is_virtual_adapter(description: &[u16; 128]) -> bool {
+pub(crate) fn is_virtual_adapter(description: &[u16; 128]) -> bool {
     let end = description.iter().position(|&c| c == 0).unwrap_or(description.len());
     let name = String::from_utf16_lossy(&description[..end]).to_ascii_lowercase();
     VIRTUAL_ADAPTERS.iter().any(|known| name.contains(known))

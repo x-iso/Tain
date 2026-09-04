@@ -32,6 +32,7 @@ pub mod connection_code;
 pub mod network;
 pub mod passcode;
 pub mod screen_capture;
+pub mod virtual_display;
 pub mod cursor;
 pub mod preview;
 pub mod wallpaper;
