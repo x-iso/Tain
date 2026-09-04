@@ -135,9 +135,22 @@ fn embed_display_driver() {
         files.sort();
         for file in files {
             let Some(name) = file.file_name().and_then(|n| n.to_str()) else { continue };
-            // Documentation for whoever fills the folder, not part of the
-            // signed package — embedding it would be harmless and confusing.
-            if name.eq_ignore_ascii_case("README.md") {
+            // # Skipped by name, not selected by name
+            //
+            // The folder holds the signed package plus the notes that have to
+            // travel with it — a licence, a provenance record. Those are not
+            // part of what Windows installs and should not be written into the
+            // staging directory beside the `.inf`.
+            //
+            // A list of what to *keep* would have been tidier and is the wrong
+            // risk: a package with a file type not on it would install missing
+            // a piece, which fails at the point of use and reports success.
+            // Carrying an extra text file into the staging directory is
+            // untidy, and Windows ignores it.
+            let documentation = name.eq_ignore_ascii_case("LICENSE")
+                || name.to_ascii_lowercase().ends_with(".md")
+                || name.to_ascii_lowercase().ends_with(".txt");
+            if documentation {
                 continue;
             }
             entries.push(format!(
@@ -165,7 +178,10 @@ fn embed_display_driver() {
 ///
 /// Beside `third_party/ffmpeg` and fetched the same way, because it is the same
 /// kind of thing: a third-party binary this project needs and does not build.
-const DRIVER_DIR: &str = "third_party/virtual-display-driver";
+///
+/// Named as the release archive unpacks it, so re-fetching a newer one is a
+/// matter of replacing the folder rather than also remembering to rename it.
+const DRIVER_DIR: &str = "third_party/VirtualDisplayDriver";
 
 fn ffmpeg_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("FFMPEG_DIR") {

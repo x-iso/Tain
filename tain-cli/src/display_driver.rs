@@ -29,6 +29,34 @@
 //! the unprivileged app relaunches itself under `runas` with a flag, which is
 //! the only way to get administrator rights, and doing it the same way twice
 //! beats two half-remembered variants.
+//!
+//! # How this driver is told to present a monitor
+//!
+//! Read out of `MttVDD.dll` rather than from documentation, because there is
+//! none. It hosts a named pipe — `\\.\pipe\MTTVirtualDisplayPipe`, built with
+//! `CreateNamedPipeW` — and answers a small set of verbs:
+//!
+//! - `SETDISPLAYCOUNT` is the one that matters. Its log line is *"Display Count
+//!   Changed, Restarting Driver"*, so asking for a count is the whole of
+//!   creating and destroying monitors: the driver writes the number into its
+//!   settings file and restarts itself. No device disable/enable of ours, and
+//!   nothing needing administrator rights after the install.
+//! - `PING`, `GETSETTINGS`, `RELOAD_DRIVER` for state and lifecycle.
+//! - `GETALLGPUS`, `GETASSIGNEDGPU`, `VDDPATH` for which adapter it renders on
+//!   and where its settings live.
+//! - The rest set options this project has no reason to touch —
+//!   `HARDWARECURSOR`, `HDRPLUS`, `CUSTOMEDID`, `PREVENTSPOOF`, `LOGGING`.
+//!
+//! Its settings are `vdd_settings.xml`, at `C:\VirtualDisplayDriver\` unless
+//! `HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver` says otherwise — the driver
+//! reads that key with `RegQueryValueExW` and falls back to the fixed path.
+//! `<monitors><count>` is what `SETDISPLAYCOUNT` writes; `<resolutions>` is the
+//! mode list each presented monitor offers.
+//!
+//! Which means the two halves of the feature meet cleanly: this module gets the
+//! driver installed and a monitor presented, and everything after that — onto
+//! the desktop, at a size, and away again — is
+//! [`tain_core::virtual_display`], which needs no driver of any particular kind.
 
 /// Argument that makes this executable install the driver and exit.
 pub const INSTALL_FLAG: &str = "--install-display-driver";
@@ -785,6 +813,66 @@ DeviceName = "Virtual Display Driver"
         // A class but no root device: an `.inf` for hardware that is discovered
         // rather than asserted, which this cannot install.
         assert!(parse_inf("ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}\n").is_none());
+    }
+
+    /// The package actually built into this binary, read as it will be.
+    ///
+    /// The test above pins the *shape* of an `.inf` against a hand-written one,
+    /// which proves the parser handles what I believed the file looks like. This
+    /// proves it handles the file. They are different claims, and the second is
+    /// the one that decides whether the install button works.
+    ///
+    /// Skips rather than fails with nothing vendored: a source tree that has not
+    /// fetched the driver still has to build and test green.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_embedded_package_parses() {
+        let Some(package) = super::windows_impl::package() else {
+            println!("no driver vendored — nothing to parse");
+            return;
+        };
+
+        // Everything the install path hands to Windows.
+        assert_eq!(package.hardware_id, "Root\\MttVDD");
+        assert_eq!(package.class, "{4D36E968-E325-11CE-BFC1-08002BE10318}");
+        assert_eq!(package.device_name.as_deref(), Some("Virtual Display Driver"));
+        assert!(package.embedded, "it came out of the binary");
+
+        // # The two ways this file could have been misread
+        //
+        // It is UTF-16 with a BOM, which read as UTF-8 gives a string with a NUL
+        // between every character and matches nothing.
+        //
+        // And it declares *two* hardware ids — `Root\MttVDD` for the device
+        // Windows creates, and a bare `MttVDD` the sample application uses.
+        // Taking the wrong one registers a device nothing enumerates.
+        assert!(
+            !package.hardware_id.contains('\0'),
+            "the .inf was decoded as the wrong text encoding"
+        );
+    }
+
+    /// Everything a signed package needs must be embedded, not just the `.inf`.
+    ///
+    /// The catalog signs the others and Windows looks for it beside the `.inf`;
+    /// the driver binary is what the `.inf` copies. Embedding the description
+    /// without the thing it describes would install nothing and say it worked.
+    #[test]
+    fn the_whole_package_is_embedded_or_none_of_it() {
+        let names: Vec<String> =
+            embedded::FILES.iter().map(|(n, _)| n.to_ascii_lowercase()).collect();
+        if names.is_empty() {
+            return;
+        }
+        for suffix in [".inf", ".cat", ".dll"] {
+            assert!(
+                names.iter().any(|n| n.ends_with(suffix)),
+                "nothing ending in {suffix} was embedded: {names:?}"
+            );
+        }
+        for (name, bytes) in embedded::FILES {
+            assert!(!bytes.is_empty(), "{name} was embedded empty");
+        }
     }
 
     /// A state nobody can act on must not look like one they can.
