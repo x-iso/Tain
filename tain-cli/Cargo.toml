@@ -63,6 +63,10 @@ windows = { version = "0.58", features = [
     # Telling the display driver where to keep its settings, which it reads
     # from HKLM at every start. See `display_driver::settings`.
     "Win32_System_Registry",
+    # Talking to the display driver's control pipe, which is how a virtual
+    # monitor is created. See `display_driver::pipe`.
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_System_StationsAndDesktops",

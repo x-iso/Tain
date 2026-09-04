@@ -671,6 +671,249 @@ mod windows_impl {
         }
     }
 
+    /// The driver's control pipe: how a virtual monitor comes to exist.
+    ///
+    /// # The protocol, read out of the driver's source
+    ///
+    /// There is no documentation for it. What the server does:
+    ///
+    /// ```text
+    /// wchar_t buffer[128];
+    /// ReadFile(hPipe, buffer, sizeof(buffer) - sizeof(wchar_t), &bytesRead, NULL);
+    /// buffer[bytesRead / sizeof(wchar_t)] = L'\0';
+    /// if (wcsncmp(buffer, L"PING", 4) == 0) { SendToPipe("PONG"); }
+    /// swscanf_s(buffer + 15, L"%d", &newDisplayCount);   // after SETDISPLAYCOUNT
+    /// ```
+    ///
+    /// So: **UTF-16**, no framing beyond the message itself, commands matched by
+    /// prefix, and an argument read straight off the end of the verb. A count is
+    /// `SETDISPLAYCOUNT` followed by the number — `swscanf_s` skips whitespace,
+    /// so a space between them is optional and is written anyway, because a
+    /// message that reads correctly is worth more than one byte.
+    ///
+    /// # Why no administrator rights are needed here
+    ///
+    /// The pipe is created with `D:(A;;GA;;;WD)` — full access to Everyone.
+    /// Which is the driver's decision rather than one this can tighten: it also
+    /// means any process on the machine can add and remove monitors. Worth
+    /// knowing; not worth pretending otherwise.
+    pub mod pipe {
+        use anyhow::{bail, Context, Result};
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+            OPEN_EXISTING,
+        };
+
+        const PIPE: &str = r"\\.\pipe\MTTVirtualDisplayPipe";
+
+        /// A driver that has just been asked to change its display count
+        /// restarts, so its pipe goes away and comes back. Long enough to cover
+        /// that; short enough that a driver which is simply not there does not
+        /// hold the interface.
+        const RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(6);
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        /// Open the pipe, say one thing, and read whatever comes back.
+        ///
+        /// The reply is best-effort: `SETDISPLAYCOUNT` restarts the driver, so
+        /// the read after it usually fails with the pipe closing underneath —
+        /// which is success, not failure, and is why a read error is not one.
+        fn say(command: &str) -> Result<Vec<u8>> {
+            let path = wide(PIPE);
+            // SAFETY: the path outlives the call; the handle is closed below.
+            let handle: HANDLE = unsafe {
+                CreateFileW(
+                    PCWSTR(path.as_ptr()),
+                    GENERIC_READ.0 | GENERIC_WRITE.0,
+                    FILE_SHARE_MODE(0),
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    None,
+                )
+            }
+            .with_context(|| format!("could not open {PIPE} — is the driver installed?"))?;
+
+            let message = command.encode_utf16().collect::<Vec<u16>>();
+            // SAFETY: `message` outlives the call; the byte view is its own
+            // storage, and the handle is live until the close below.
+            let written = unsafe {
+                let bytes = std::slice::from_raw_parts(
+                    message.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&message[..]),
+                );
+                let mut done = 0u32;
+                WriteFile(handle, Some(bytes), Some(&mut done), None)
+            };
+
+            let mut reply = Vec::new();
+            if written.is_ok() {
+                let mut buffer = [0u8; 256];
+                let mut read = 0u32;
+                // SAFETY: the buffer outlives the call and its length is given.
+                if unsafe { ReadFile(handle, Some(&mut buffer), Some(&mut read), None) }.is_ok() {
+                    reply.extend_from_slice(&buffer[..read as usize]);
+                }
+            }
+
+            // SAFETY: opened above and not closed anywhere else.
+            let _ = unsafe { CloseHandle(handle) };
+            written.with_context(|| format!("could not send {command} to the driver"))?;
+            Ok(reply)
+        }
+
+        /// Whether the driver is running and answering.
+        ///
+        /// Answers `PONG`, and the reply is looked for in both encodings: the
+        /// server writes it with a helper that takes a narrow string, and
+        /// whether that reaches the wire as ASCII or as wide characters is not
+        /// worth depending on when both are two lines to check.
+        pub fn is_live() -> bool {
+            let Ok(reply) = say("PING") else { return false };
+            let narrow = String::from_utf8_lossy(&reply).to_ascii_uppercase();
+            let wide: Vec<u16> = reply
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            let widened = String::from_utf16_lossy(&wide).to_ascii_uppercase();
+            narrow.contains("PONG") || widened.contains("PONG")
+        }
+
+        /// Ask the driver to present this many monitors.
+        ///
+        /// The driver writes the number into its settings and restarts itself —
+        /// "Display Count Changed, Restarting Driver" — so this returns before
+        /// the monitors exist. [`super::wait_for_monitors`] is the other half.
+        pub fn set_display_count(count: u32) -> Result<()> {
+            // A space, though `swscanf_s` does not need one: the driver logs
+            // the message it received, and a log line reading
+            // "SETDISPLAYCOUNT 2" is worth a byte over "SETDISPLAYCOUNT2".
+            say(&format!("SETDISPLAYCOUNT {count}"))?;
+            tracing::info!("Asked the display driver for {count} monitor(s)");
+            Ok(())
+        }
+
+        /// Wait for the driver's pipe to come back after a restart.
+        ///
+        /// Polled rather than waited on: `WaitNamedPipe` waits for an *instance*
+        /// of a pipe that exists, and during the restart it does not exist at
+        /// all, which that call reports immediately as a failure.
+        pub fn wait_until_live() -> Result<()> {
+            let until = std::time::Instant::now() + RETRY_FOR;
+            while std::time::Instant::now() < until {
+                if is_live() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            bail!("the display driver did not answer within {RETRY_FOR:?}")
+        }
+    }
+
+    /// Wait until the driver has presented at least this many monitors.
+    ///
+    /// Adapters exist from the moment the driver is installed and mean nothing;
+    /// what is being waited for is a monitor *behind* one — see
+    /// [`tain_core::virtual_display`], whose `ready` is that question.
+    fn wait_for_monitors(at_least: usize, within: std::time::Duration) -> Result<()> {
+        let until = std::time::Instant::now() + within;
+        loop {
+            let ready = tain_core::virtual_display::available()
+                .iter()
+                .filter(|screen| screen.ready)
+                .count();
+            if ready >= at_least {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= until {
+                bail!(
+                    "the driver reported {ready} monitor(s) after {within:?}, wanted {at_least}"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// How long a driver restart is given to produce its monitors.
+    ///
+    /// Generous: the driver tears itself down and comes back, Windows
+    /// re-enumerates the adapters, and a machine doing something else at the
+    /// time is slower still. Waiting a few seconds too long costs a progress
+    /// spinner; giving up too early reports a failure that did not happen.
+    const MONITOR_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// How many virtual monitors the driver is presenting right now.
+    pub fn monitor_count() -> usize {
+        tain_core::virtual_display::available()
+            .iter()
+            .filter(|screen| screen.ready)
+            .count()
+    }
+
+    /// Add a virtual display and put it on the desktop.
+    ///
+    /// Two steps that belong together and are usually confused for one: the
+    /// driver has to *present* a monitor, and Windows has to be told to put it
+    /// on the desktop. A monitor nobody attached exists, offers modes, and shows
+    /// nothing.
+    ///
+    /// Needs no administrator rights. Installing the driver did; this does not.
+    pub fn add_display(size: (u16, u16)) -> Result<String> {
+        let before: std::collections::BTreeSet<String> = tain_core::virtual_display::available()
+            .into_iter()
+            .filter(|screen| screen.ready)
+            .map(|screen| screen.name)
+            .collect();
+
+        pipe::set_display_count(before.len() as u32 + 1)?;
+        // The driver restarts, so its pipe goes before it comes back. Waiting
+        // for that first means the monitor wait is not also waiting for a
+        // process to start.
+        pipe::wait_until_live()?;
+        wait_for_monitors(before.len() + 1, MONITOR_WAIT)?;
+
+        // The new one, by elimination. Named by device rather than by index
+        // because the numbers move when a monitor is plugged in.
+        let fresh = tain_core::virtual_display::available()
+            .into_iter()
+            .find(|screen| screen.ready && !before.contains(&screen.name))
+            .context("the driver presented a monitor that could not be identified")?;
+
+        if !fresh.attached {
+            tain_core::virtual_display::attach(&fresh.name, size, 60)?;
+        }
+        tracing::info!("Virtual display {} is on the desktop at {}x{}", fresh.name, size.0, size.1);
+        Ok(fresh.name)
+    }
+
+    /// Take the most recently added virtual display away again.
+    ///
+    /// Detached first, so the desktop stops using it before it stops existing —
+    /// a monitor removed from under a window leaves the window somewhere
+    /// nobody chose.
+    pub fn remove_display() -> Result<()> {
+        let present: Vec<_> = tain_core::virtual_display::available()
+            .into_iter()
+            .filter(|screen| screen.ready)
+            .collect();
+        let Some(last) = present.last() else {
+            return Ok(());
+        };
+
+        if last.attached && let Err(e) = tain_core::virtual_display::detach(&last.name) {
+            // Not fatal: the count is about to drop and take it with it.
+            tracing::warn!("Could not detach {} first: {e:#}", last.name);
+        }
+        pipe::set_display_count(present.len().saturating_sub(1) as u32)?;
+        pipe::wait_until_live()?;
+        Ok(())
+    }
+
     /// Create the device node and bind the driver to it.
     ///
     /// Must already be running as administrator; this is what the elevated
@@ -995,7 +1238,10 @@ mod windows_impl {
 }
 
 #[cfg(target_os = "windows")]
-pub use windows_impl::{install, request_install, request_uninstall, state, uninstall};
+pub use windows_impl::{
+    add_display, install, monitor_count, remove_display, request_install, request_uninstall,
+    state, uninstall,
+};
 
 #[cfg(not(target_os = "windows"))]
 mod stub {
@@ -1021,10 +1267,25 @@ mod stub {
     pub fn uninstall() -> Result<()> {
         bail!("virtual displays are a Windows feature")
     }
+
+    pub fn monitor_count() -> usize {
+        0
+    }
+
+    pub fn add_display(_size: (u16, u16)) -> Result<String> {
+        bail!("virtual displays are a Windows feature")
+    }
+
+    pub fn remove_display() -> Result<()> {
+        bail!("virtual displays are a Windows feature")
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub use stub::{install, request_install, request_uninstall, state, uninstall};
+pub use stub::{
+    add_display, install, monitor_count, remove_display, request_install, request_uninstall,
+    state, uninstall,
+};
 
 #[cfg(test)]
 mod tests {

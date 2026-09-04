@@ -794,14 +794,73 @@ fn virtual_display_section(ui: &mut egui::Ui) {
     if state == DriverState::NotBundled {
         ui.add_space(6.0);
         ui.label(
-            RichText::new(format!(
-                "Expected a driver package in {} beside the Tain executable.",
-                display_driver::PACKAGE_DIR
-            ))
-            .size(11.0)
-            .color(TEXT_DIM),
+            RichText::new("This build was made without a driver package to install.")
+                .size(11.0)
+                .color(TEXT_DIM),
         );
+        return;
     }
+
+    // # The displays themselves, once there is a driver to make them
+    //
+    // Shown only when installed, because until then there is nothing to count
+    // and a stepper reading zero looks like a feature that is failing rather
+    // than one that has not been set up.
+    //
+    // Adding needs no administrator rights — the driver's control pipe grants
+    // access to everyone — so unlike the buttons above, these act immediately
+    // and there is no prompt.
+    if !state.is_installed() {
+        return;
+    }
+
+    ui.add_space(10.0);
+    let count = display_driver::monitor_count();
+    ui.label(
+        RichText::new(match count {
+            0 => "No virtual display.".to_string(),
+            1 => "One virtual display.".to_string(),
+            n => format!("{n} virtual displays."),
+        })
+        .size(11.0)
+        .color(if count > 0 { TEXT } else { TEXT_DIM }),
+    );
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        // The driver restarts itself to change the count, so both of these
+        // block for a moment. Disabled rather than spinner'd: the wait is a
+        // couple of seconds and a button that cannot be pressed twice is
+        // simpler than a state machine for something this short.
+        if ui
+            .button("Add a display")
+            .on_hover_text(
+                "Creates a virtual monitor and puts it on the desktop, to the right of \
+                 everything else. The display driver restarts to do it, so this takes a \
+                 moment.",
+            )
+            .clicked()
+        {
+            // The primary display's size, so the new one matches what is
+            // already there. A guest that wants its own resolution changes it
+            // afterwards; guessing the guest's window here would be guessing
+            // which guest.
+            let size = tain_core::screen_capture::primary_display_size();
+            match display_driver::add_display(size) {
+                Ok(name) => tracing::info!("Added virtual display {name}"),
+                Err(e) => tracing::warn!("Could not add a virtual display: {e:#}"),
+            }
+        }
+
+        if ui
+            .add_enabled(count > 0, egui::Button::new("Remove"))
+            .on_hover_text("Takes the most recently added virtual display away again.")
+            .clicked()
+            && let Err(e) = display_driver::remove_display()
+        {
+            tracing::warn!("Could not remove a virtual display: {e:#}");
+        }
+    });
 }
 
 /// Installing and removing the Tain service.
