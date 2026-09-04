@@ -81,8 +81,12 @@ pub struct GuestSession {
     /// hard to use. Worth turning off when watching rather than driving, since
     /// two pointers on one screen is confusing.
     pub show_remote_cursor: bool,
-    /// Whether the grants have been read once to seed the toggles above.
-    grants_seeded: bool,
+    /// Whether the pointer toggle has been seeded from a grant that allowed it.
+    ///
+    /// Per axis, not one flag for both: see [`GuestSession::seed_input_toggles`].
+    mouse_seeded: bool,
+    /// Whether the keyboard toggle has been seeded from a grant that allowed it.
+    keyboard_seeded: bool,
 
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     input_tx: Option<mpsc::UnboundedSender<InputEvent>>,
@@ -211,7 +215,8 @@ impl GuestSession {
             volume: 1.0,
             was_streaming: false,
             show_remote_cursor: true,
-            grants_seeded: false,
+            mouse_seeded: false,
+            keyboard_seeded: false,
             task: Some(task),
             input_tx: Some(input_tx),
             texture: None,
@@ -301,7 +306,8 @@ impl GuestSession {
             volume: 1.0,
             was_streaming: false,
             show_remote_cursor: true,
-            grants_seeded: false,
+            mouse_seeded: false,
+            keyboard_seeded: false,
             task: None,
             input_tx: None,
             texture: None,
@@ -423,20 +429,33 @@ impl GuestSession {
         self.want_keyboard && self.grants().keyboard && !self.loopback
     }
 
-    /// Match the toggles to the host's grants, once, when they first arrive.
+    /// Match each toggle to the host's grants, once, when that grant arrives.
     ///
-    /// Only the first time: after that the toggles are the user's, and a grant
-    /// arriving again — the host re-approving, say — must not silently switch
-    /// input back on for someone who deliberately turned it off.
+    /// Only the first time per axis: after that the toggle is the user's, and a
+    /// grant arriving again — the host re-approving, say — must not silently
+    /// switch input back on for someone who deliberately turned it off.
+    ///
+    /// # Why the two axes are seeded separately
+    ///
+    /// One flag covered both, and it was set as soon as *either* was granted.
+    /// So a host who approved the pointer at connect and the keyboard a minute
+    /// later left the guest with a keyboard button that was enabled, correctly
+    /// showed as permitted, and did nothing until it was clicked — because the
+    /// toggle behind it had been fixed at off by a grant that said nothing
+    /// about keyboards.
+    ///
+    /// The rule the single flag was reaching for is "do not overrule the user",
+    /// and a user who has never been offered the keyboard has not decided
+    /// anything about it. So each axis remembers its own first grant.
     pub fn seed_input_toggles(&mut self) {
-        if self.grants_seeded {
-            return;
-        }
         let grants = self.grants();
-        if grants.mouse || grants.keyboard {
-            self.want_mouse = grants.mouse;
-            self.want_keyboard = grants.keyboard;
-            self.grants_seeded = true;
+        if grants.mouse && !self.mouse_seeded {
+            self.want_mouse = true;
+            self.mouse_seeded = true;
+        }
+        if grants.keyboard && !self.keyboard_seeded {
+            self.want_keyboard = true;
+            self.keyboard_seeded = true;
         }
     }
 
@@ -1376,6 +1395,30 @@ mod tests {
         session.set_test_grants(true, true);
         session.seed_input_toggles();
         assert!(session.want_mouse, "grants arriving late must still seed the toggles");
+    }
+
+    /// The bug this replaces: a grant for one axis fixed the other at off.
+    ///
+    /// A host that approves the pointer at connect and the keyboard later left
+    /// the guest with a keyboard button that looked permitted and did nothing.
+    #[test]
+    fn a_grant_that_arrives_mid_session_seeds_its_own_toggle() {
+        let mut session = GuestSession::test_stub();
+        session.set_test_grants(true, false);
+        session.seed_input_toggles();
+        assert!(session.want_mouse);
+        assert!(!session.want_keyboard, "nothing was granted, so nothing is on");
+
+        // The host adds keyboard partway through.
+        session.set_test_grants(true, true);
+        session.seed_input_toggles();
+        assert!(session.want_keyboard, "the first keyboard grant has to reach the toggle");
+
+        // And it is the user's from then on.
+        session.want_keyboard = false;
+        session.set_test_grants(true, true);
+        session.seed_input_toggles();
+        assert!(!session.want_keyboard, "re-approval must not undo a deliberate refusal");
     }
 
     /// Two fingers must keep the two lowest slots, however many have been
