@@ -100,47 +100,70 @@ impl Duplication {
     /// The state that decides what is worth repeating has to outlive the thing
     /// being rebuilt, so it is passed in.
     fn create(want: Option<&str>, colour_log: &mut ColourLog) -> Result<Self> {
+        // # Why every candidate gets a whole attempt, not just a device
+        //
+        // This picked one adapter, made a device on it, and duplicated once. If
+        // that duplication failed there was nothing left to try — and it does
+        // fail, on exactly the machines this reasoning exists for. A host with
+        // two GPUs reported:
+        //
+        //   DuplicateOutput failed: The specified device interface or feature
+        //   level is not supported on this system. (0x887A0004)
+        //
+        // `DXGI_ERROR_UNSUPPORTED`, which on a hybrid system means *this device
+        // cannot duplicate that output* — and the only useful response is to
+        // ask a different adapter. Whether an output can be duplicated from a
+        // given adapter is not something that can be worked out in advance:
+        // both adapters enumerate the panel on many laptops, and which one owns
+        // the desktop depends on the mux, the driver, and which GPU Windows has
+        // assigned this process to.
+        //
+        // So the unit of retry is the whole thing — device, output, duplication
+        // — and the first candidate that produces frames wins.
+        let candidates = adapters_for(want);
+        let mut last_err: Option<anyhow::Error> = None;
+        for candidate in candidates {
+            match Self::create_on(&candidate, want, colour_log) {
+                Ok(built) => return Ok(built),
+                Err(e) => {
+                    debug!("Capture on {}: {e:#}", candidate.label);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no display adapter could be asked")))
+    }
+
+    /// One candidate adapter, tried all the way to a live duplication.
+    fn create_on(
+        candidate: &Candidate,
+        want: Option<&str>,
+        colour_log: &mut ColourLog,
+    ) -> Result<Self> {
+        let on = candidate.adapter.as_ref();
+        let label = &candidate.label;
+        let driver = candidate.driver;
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
 
-        // # The device has to be on the display's own adapter
-        //
-        // Duplication refuses a device from a different one, and "different" is
-        // the ordinary case on a hybrid-graphics laptop or anywhere a virtual
-        // display driver is installed — see [`adapter_for`].
-        //
-        // Passing an adapter requires `D3D_DRIVER_TYPE_UNKNOWN`; the pair is
-        // rejected with `E_INVALIDARG` otherwise, which is why this is a list of
-        // pairs rather than a list of driver types.
-        let on = adapter_for(want);
-        let attempts: &[(Option<&windows::Win32::Graphics::Dxgi::IDXGIAdapter>, _)] = match &on {
-            Some(adapter) => &[
-                (Some(adapter), windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN),
-                // The adapter was found and would not make a device. Falling
-                // back to the default one will not duplicate that display, but
-                // it will produce the same error the old code did rather than a
-                // new one, and WARP still covers the VM case.
-                (None, D3D_DRIVER_TYPE_HARDWARE),
-                (None, D3D_DRIVER_TYPE_WARP),
-            ],
-            // Try the real GPU first; WARP keeps capture working in VMs and on
-            // machines whose driver refuses hardware duplication.
-            None => &[(None, D3D_DRIVER_TYPE_HARDWARE), (None, D3D_DRIVER_TYPE_WARP)],
-        };
-
+        // VIDEO_SUPPORT is what makes `ID3D11VideoDevice` available, and with it
+        // the GPU colour conversion. Asked for first and given up rather than
+        // insisted on: a driver that refuses it still duplicates the desktop,
+        // and losing the conversion costs a CPU pass per frame where losing the
+        // adapter costs the session. It used to fall through to a *different*
+        // adapter here, which cannot duplicate the display that was asked for.
         let mut last_err = None;
-        for (adapter, driver) in attempts {
+        for flags in [
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        ] {
             // SAFETY: all out-params are valid; a failed call leaves them None.
             let result = unsafe {
                 D3D11CreateDevice(
-                    *adapter,
-                    *driver,
+                    on,
+                    driver,
                     None,
-                    // VIDEO_SUPPORT is what makes `ID3D11VideoDevice` available,
-                    // and with it the GPU colour conversion. It costs nothing on
-                    // a driver that has it and is why the loop below still tries
-                    // WARP: a device without it simply keeps the CPU path.
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                    flags,
                     None,
                     D3D11_SDK_VERSION,
                     Some(&mut device),
@@ -154,8 +177,9 @@ impl Duplication {
             }
         }
 
-        let device = device
-            .ok_or_else(|| anyhow::anyhow!("Could not create a D3D11 device: {last_err:?}"))?;
+        let device = device.ok_or_else(|| {
+            anyhow::anyhow!("Could not create a D3D11 device on {label}: {last_err:?}")
+        })?;
         let context = context.context("D3D11 device came back without a context")?;
 
         // Capture runs on its own thread and the video processor and the encoder
@@ -173,13 +197,18 @@ impl Duplication {
             let adapter = dxgi_device.GetAdapter().context("no DXGI adapter")?;
             let (output, where_) = choose_output(&adapter, want)?;
             let output1: IDXGIOutput1 = output.cast().context("output is not IDXGIOutput1")?;
-            debug!("Capturing {where_}");
 
             let colour = super::capture_hdr::probe(&output);
             colour_log.display(colour);
             let hdr_desktop = colour.is_some_and(DisplayColour::is_hdr);
 
-            let mut duplication = duplicate(&device, &output1, hdr_desktop)?;
+            let mut duplication = duplicate(&device, &output1, hdr_desktop)
+                .with_context(|| format!("on {label}"))?;
+            // Said once per duplication, and worth every line of it: a host
+            // with two GPUs that could not capture at all produced a log naming
+            // neither the adapter it used nor the ones it did not, which is
+            // most of what made the fault hard to reach from another country.
+            info!("Capturing {where_} on {label}");
             // Take the size from the duplication itself rather than the output:
             // it is what we actually capture, and it avoids pulling in the GDI
             // feature that `IDXGIOutput::GetDesc` needs for its HMONITOR field.
@@ -500,45 +529,125 @@ unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16
 /// device the old way. That is also the WARP path: a software adapter has no
 /// outputs to find here, and asking for one by name would fail rather than fall
 /// back.
-fn adapter_for(want: Option<&str>) -> Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter> {
+pub(crate) struct Candidate {
+    /// `None` means "whatever D3D picks for this driver type".
+    pub adapter: Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter>,
+    /// What to call it in a log line. The whole reason a dual-GPU failure was
+    /// hard to diagnose remotely is that nothing said which one was being used.
+    pub label: String,
+    /// Only meaningful when there is no adapter: passing one requires
+    /// `D3D_DRIVER_TYPE_UNKNOWN` and the pair is rejected otherwise.
+    pub driver: windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE,
+}
+
+/// Every adapter worth asking to duplicate this display, best first.
+///
+/// # Why this is a list and not an answer
+///
+/// It was an answer — the one adapter that enumerates the output — and on a
+/// single-GPU machine that is right and sufficient. On a hybrid laptop it is a
+/// guess wearing a fact's clothes. Both adapters commonly enumerate the same
+/// panel, only one of them can actually duplicate it, and which one depends on
+/// the mux, the driver, and which GPU Windows has assigned this process to.
+/// None of that is visible from here, and asking is cheap.
+///
+/// Order: adapters that enumerate the wanted output, in DXGI's own order, then
+/// every other adapter, then the default device, then WARP. The first two are
+/// the answer on real hardware; the last two are what keeps a virtual machine
+/// and a machine with a broken driver working, which they did before this.
+fn adapters_for(want: Option<&str>) -> Vec<Candidate> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 
-    // SAFETY: enumeration only; every interface is dropped or returned.
+    let describe = |adapter: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1| {
+        // SAFETY: reads a descriptor from a live adapter.
+        match unsafe { adapter.GetDesc1() } {
+            Ok(desc) => {
+                let end = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                String::from_utf16_lossy(&desc.Description[..end])
+            }
+            Err(_) => "an unnamed adapter".to_string(),
+        }
+    };
+
+    let mut owning = Vec::new();
+    let mut others = Vec::new();
+
+    // SAFETY: enumeration only; every interface is dropped or moved into the
+    // list returned.
     unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        for adapter_index in 0.. {
-            let Ok(adapter) = factory.EnumAdapters1(adapter_index) else { break };
-            for output_index in 0.. {
-                let Ok(output) = adapter.EnumOutputs(output_index) else { break };
-                let Ok(desc) = output.GetDesc() else { continue };
-                if !desc.AttachedToDesktop.as_bool() {
-                    continue;
+        if let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() {
+            for adapter_index in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(adapter_index) else { break };
+                let name = describe(&adapter);
+
+                let mut owns = false;
+                for output_index in 0.. {
+                    let Ok(output) = adapter.EnumOutputs(output_index) else { break };
+                    let Ok(desc) = output.GetDesc() else { continue };
+                    if !desc.AttachedToDesktop.as_bool() {
+                        continue;
+                    }
+                    let matches = match want {
+                        Some(wanted) => {
+                            let end = desc
+                                .DeviceName
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(desc.DeviceName.len());
+                            String::from_utf16_lossy(&desc.DeviceName[..end]) == wanted
+                        }
+                        // The primary, which is the display at the origin.
+                        // These coordinates are DPI-virtualised in a process
+                        // that has not declared awareness — see
+                        // `screen_capture::displays` — but scaling preserves
+                        // the origin, which is all this asks.
+                        None => {
+                            desc.DesktopCoordinates.left == 0
+                                && desc.DesktopCoordinates.top == 0
+                        }
+                    };
+                    if matches {
+                        owns = true;
+                        break;
+                    }
                 }
 
-                let found = match want {
-                    Some(wanted) => {
-                        let end = desc
-                            .DeviceName
-                            .iter()
-                            .position(|&c| c == 0)
-                            .unwrap_or(desc.DeviceName.len());
-                        String::from_utf16_lossy(&desc.DeviceName[..end]) == wanted
-                    }
-                    // The primary, which is the display at the origin. These
-                    // coordinates are DPI-virtualised in a process that has not
-                    // declared awareness — see `screen_capture::displays` — but
-                    // scaling preserves the origin, which is all this asks.
-                    None => {
-                        desc.DesktopCoordinates.left == 0 && desc.DesktopCoordinates.top == 0
-                    }
+                let Ok(generic) = adapter.cast() else { continue };
+                let candidate = Candidate {
+                    adapter: Some(generic),
+                    label: name,
+                    driver: windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
                 };
-                if found {
-                    return adapter.cast().ok();
+                if owns {
+                    owning.push(candidate);
+                } else {
+                    others.push(candidate);
                 }
             }
         }
-        None
     }
+
+    let mut all = owning;
+    all.append(&mut others);
+    all.push(Candidate {
+        adapter: None,
+        label: "the default adapter".into(),
+        driver: D3D_DRIVER_TYPE_HARDWARE,
+    });
+    // Software rasterisation, which duplicates nothing a GPU would but keeps a
+    // virtual machine — and a host whose driver refuses hardware duplication —
+    // producing frames. Last, because it is slow, and present, because it was
+    // the difference between a working session and none on those machines.
+    all.push(Candidate {
+        adapter: None,
+        label: "the software rasteriser".into(),
+        driver: D3D_DRIVER_TYPE_WARP,
+    });
+    all
 }
 
 /// The output to duplicate, and a description for the log.
@@ -1252,9 +1361,17 @@ mod tests {
     #[test]
     fn every_display_offered_has_an_adapter_that_owns_it() {
         for screen in crate::screen_capture::displays() {
+            let candidates = adapters_for(Some(&screen.name));
+            // The last two are always there — the default device and the
+            // software rasteriser — so an owner means more than that.
             assert!(
-                adapter_for(Some(&screen.name)).is_some(),
+                candidates.len() > 2,
                 "{} is offered to guests but no adapter claims it",
+                screen.name
+            );
+            assert!(
+                candidates[0].adapter.is_some(),
+                "{} put a fallback ahead of a real adapter",
                 screen.name
             );
         }
@@ -1268,13 +1385,32 @@ mod tests {
         if crate::screen_capture::displays().is_empty() {
             return;
         }
-        assert!(adapter_for(None).is_some(), "no adapter owns the display at the origin");
+        let candidates = adapters_for(None);
+        assert!(
+            candidates.first().is_some_and(|c| c.adapter.is_some()),
+            "no adapter owns the display at the origin"
+        );
     }
 
-    /// A display that does not exist is not quietly answered with one that does.
+    /// A display that does not exist claims no adapter as its owner.
+    ///
+    /// The fallbacks are still offered, because a machine that cannot enumerate
+    /// its adapters at all is a machine where trying the default device is the
+    /// only thing left — but nothing is allowed to *claim* a display it does
+    /// not have.
     #[test]
-    fn an_unknown_display_finds_no_adapter() {
-        assert!(adapter_for(Some(r"\.\DISPLAY_NOT_REAL")).is_none());
+    fn an_unknown_display_is_owned_by_nothing() {
+        let real: std::collections::BTreeSet<String> =
+            crate::screen_capture::displays().into_iter().map(|s| s.name).collect();
+        let owners = adapters_for(Some(r"\.\DISPLAY_NOT_REAL"));
+        let claimed = owners.iter().filter(|c| c.adapter.is_some()).count();
+        // Every adapter present is offered as a fallback, but none as an owner:
+        // on this machine the ordering puts owners first, and there are none.
+        assert_eq!(
+            claimed,
+            adapters_for(real.iter().next().map(|s| s.as_str())).len().saturating_sub(2),
+            "a display that does not exist changed how many adapters are offered"
+        );
     }
 
     /// What this machine's adapters and outputs actually are.
