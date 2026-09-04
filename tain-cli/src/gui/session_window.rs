@@ -552,23 +552,7 @@ impl SessionWindow {
         render_display_picker(&mut content, session);
 
         content.add_space(12.0);
-        render_input_toggles(&mut content, session);
-
-        content.add_space(12.0);
-        // The stats toggle sits with the other toggles rather than at the far
-        // end: it controls this bar, not the session.
-        let stats_on = self.show_stats;
-        if theme::icon_toggle(
-            &mut content,
-            16.0,
-            if stats_on { theme::IconState::On } else { theme::IconState::Off },
-            egui::include_image!("../../assets/fps-metrics.svg"),
-            if stats_on { "Hide connection stats" } else { "Show connection stats" },
-        )
-        .clicked()
-        {
-            self.show_stats = !stats_on;
-        }
+        render_input_toggles(&mut content, session, &mut self.show_stats);
 
         let mut toggle_fullscreen = false;
         content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -871,7 +855,7 @@ impl SessionWindow {
 ///
 /// A toggle the host has not permitted is shown disabled rather than hidden, so
 /// the reason input is not working is visible instead of absent.
-fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession) {
+fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stats: &mut bool) {
     let grants = session.grants();
 
     // # Which art goes with which state
@@ -921,6 +905,30 @@ fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession) {
     );
     if resp.clicked() {
         session.want_keyboard = !session.want_keyboard;
+    }
+
+    ui.add_space(4.0);
+    // # Why the stats toggle sits here, between the inputs and the view
+    //
+    // It used to be last, past the sound slider, on the reasoning that it
+    // controls the toolbar rather than the session. But the bar reads left to
+    // right as *what I send* — pointer, keyboard — then *what I see* — the
+    // host's pointer, its sound. The numbers are the first of the second group:
+    // they are about this connection, not about anything being sent to it.
+    //
+    // It also stops the one toggle that changes the toolbar's own height from
+    // sitting next to a control that grows on hover.
+    let stats_on = *show_stats;
+    if theme::icon_toggle(
+        ui,
+        16.0,
+        if stats_on { theme::IconState::On } else { theme::IconState::Off },
+        egui::include_image!("../../assets/fps-metrics.svg"),
+        if stats_on { "Hide connection stats" } else { "Show connection stats" },
+    )
+    .clicked()
+    {
+        *show_stats = !stats_on;
     }
 
     ui.add_space(4.0);
