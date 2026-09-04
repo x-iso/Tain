@@ -77,6 +77,13 @@ unsafe extern "C" {
 /// better than never drawing again.
 const BLIT_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Decode failures with no picture between them before the decoder is reopened.
+///
+/// One is a dropped packet and costs nothing to ride out. A run of them is a
+/// decoder that will not recover on its own — see [`FfmpegDecoder::reset`].
+/// Three frames is a twentieth of a second at sixty a second.
+const FAILURES_BEFORE_REOPEN: u32 = 3;
+
 /// A decoded frame that never left the GPU.
 ///
 /// # This owns the surface it names
@@ -209,6 +216,8 @@ pub struct FfmpegDecoder {
     ///
     /// Read by [`Self::reset`], which is the only thing that can fix it.
     outgrown: bool,
+    /// Failures reported since the last picture came out. See [`Self::reset`].
+    failures: u32,
     /// Whether the caller will draw the converted texture itself.
     ///
     /// Set by the guest once its render thread has established that this driver
@@ -294,6 +303,7 @@ impl FfmpegDecoder {
             converter_generation: 0,
             retired: Retired::default(),
             outgrown: false,
+            failures: 0,
             present_on_gpu: false,
             rgba: Vec::new(),
             name,
@@ -354,6 +364,11 @@ impl FfmpegDecoder {
 
         self.frames += 1;
         self.report();
+        // A picture is the only evidence the decoder is working, and it is what
+        // makes the next failure a fresh one rather than the third of a run.
+        if picture.is_some() {
+            self.failures = 0;
+        }
         Ok(picture)
     }
 
@@ -489,21 +504,53 @@ impl FfmpegDecoder {
     /// D3D11VA surface pool it hands pictures into is part of the hardware
     /// frames context, which is built when the decoder opens and sized from the
     /// resolution it opened at. Flushing leaves it exactly as it was, which is
-    /// the thing that is wrong — see the check in `convert`.
+    /// the thing that is wrong.
     ///
-    /// Only when it has to be. A reset is also what a decode error asks for,
-    /// and those are ordinary — a dropped packet, a frame that arrived out of
-    /// order — where reopening would throw away a decoder that is working. So
-    /// the pool is only rebuilt when a frame has actually been seen to outgrow
-    /// it, and every other reset is the cheap kind.
+    /// Called on every decode failure, and most of those are ordinary — a
+    /// dropped packet, a frame arriving out of order — where reopening would
+    /// throw away a decoder that is working. So it only happens when the
+    /// decoder has actually stopped producing pictures.
     ///
     /// The next frames decode to nothing until a keyframe arrives, which the
     /// caller is already asking for by the time it gets here.
     pub fn reset(&mut self) {
-        if !self.outgrown {
+        self.failures = self.failures.saturating_add(1);
+        // # Two ways a decoder that cannot follow a size change reports it
+        //
+        // One is a picture bigger than the surface it was decoded into, which
+        // `convert` catches by name and is what an AMD D3D11VA path did.
+        //
+        // The other is `avcodec_send_packet` refusing the packet outright —
+        // "libavcodec rejected a packet: error -1", every frame, from the
+        // moment the host switched display, on a guest whose GPU was not the
+        // same make. Nothing is decoded, so nothing reaches `convert`, so the
+        // first check never fires and the decoder was never reopened: the
+        // session froze on its last good picture and asked for keyframes it
+        // could not use until it was closed.
+        //
+        // What both have in common is the only thing worth keying on: failures
+        // arriving with no picture between them. One is a dropped packet. A run
+        // of them is a decoder that is not going to recover on its own, and
+        // three frames is a twentieth of a second — long past the point where
+        // waiting longer would tell us anything new.
+        if !self.outgrown && self.failures < FAILURES_BEFORE_REOPEN {
             return;
         }
+        self.reopen();
+    }
+
+    /// Reopen now, whatever the decoder has been reporting.
+    ///
+    /// For when something else already knows the stream is about to change
+    /// shape — a display switch, say — and there is no reason to spend frames
+    /// discovering it.
+    pub fn expect_new_size(&mut self) {
+        self.reopen();
+    }
+
+    fn reopen(&mut self) {
         self.outgrown = false;
+        self.failures = 0;
 
         let mut err = [0u8; 256];
         // SAFETY: the device outlives the handle, and the error buffer is valid
@@ -1181,5 +1228,61 @@ mod tests {
             );
         }
         assert!(pass, "the stream stopped decoding when the frame size changed");
+    }
+
+    /// Reopening must leave a working decoder, however it was asked for.
+    ///
+    /// Both routes to it are new, and both run on a session that is already in
+    /// trouble — a decoder that came back worse than it went in would turn a
+    /// recoverable stall into a dead session.
+    #[test]
+    #[ignore = "diagnostic — run explicitly"]
+    fn a_reopened_decoder_still_decodes() {
+        use crate::codec_mf::HardwareH264Encoder;
+        use crate::encoder::{VideoCodec, VideoEncoder};
+        use crate::{EncodeConfig, PixelFormat};
+
+        let (w, h) = (1344u16, 848u16);
+        let config = EncodeConfig { codec: VideoCodec::Av1, ..EncodeConfig::default() };
+        let Ok(mut encoder) = HardwareH264Encoder::new(&config, false) else {
+            eprintln!("no hardware AV1 encoder — skipping");
+            return;
+        };
+        let Ok(mut decoder) = FfmpegDecoder::for_codec(VideoCodec::Av1) else {
+            eprintln!("no hardware AV1 decoder — skipping");
+            return;
+        };
+
+        let src = vec![90u8; w as usize * h as usize * 4];
+        let decode_a_few = |decoder: &mut FfmpegDecoder, encoder: &mut HardwareH264Encoder| {
+            let mut decoded = 0;
+            for _ in 0..20 {
+                let Ok(frame) = encoder.encode_frame(&src, w, h, PixelFormat::Bgra) else { continue };
+                if frame.data.is_empty() {
+                    continue;
+                }
+                if decoder.decode(&frame.data).expect("decode").is_some() {
+                    decoded += 1;
+                }
+            }
+            decoded
+        };
+
+        assert!(decode_a_few(&mut decoder, &mut encoder) > 0, "nothing decoded to begin with");
+
+        // Told in advance, which is the display-switch route.
+        decoder.expect_new_size();
+        encoder.request_keyframe();
+        assert!(decode_a_few(&mut decoder, &mut encoder) > 0, "dead after expect_new_size");
+
+        // And found out the hard way, which is the failure route. One reset is
+        // not enough to reopen and must leave the decoder exactly as it was.
+        decoder.reset();
+        assert!(decode_a_few(&mut decoder, &mut encoder) > 0, "a single reset broke it");
+        for _ in 0..FAILURES_BEFORE_REOPEN {
+            decoder.reset();
+        }
+        encoder.request_keyframe();
+        assert!(decode_a_few(&mut decoder, &mut encoder) > 0, "dead after a run of resets");
     }
 }

@@ -1266,18 +1266,28 @@ impl FrameDecoder {
     }
 
     /// Which decoder this is, for a log line that has to explain a freeze.
-    fn label(&self) -> &'static str {
+    ///
+    /// `Hevc` carries AV1 as well — the two share everything below the codec id
+    /// — so it asks libavcodec which decoder it actually opened rather than
+    /// naming the variant. It named the variant, and an AV1 session spent its
+    /// whole log insisting it was decoding H.265, which is exactly the wrong
+    /// thing for the one line whose job is explaining a freeze.
+    fn label(&self) -> String {
         match self {
-            Self::Pending => "no codec agreed yet",
-            Self::Raw => "raw",
-            Self::Delta(_) => "delta-zstd",
-            Self::H264(_) => "H.264 on the CPU",
+            Self::Pending => "no codec agreed yet".to_string(),
+            Self::Raw => "raw".to_string(),
+            Self::Delta(_) => "delta-zstd".to_string(),
+            Self::H264(_) => "H.264 on the CPU".to_string(),
             #[cfg(target_os = "windows")]
             #[cfg(all(target_os = "windows", db_ffmpeg))]
-            Self::H264Ffmpeg(_) => "H.264 on the GPU (D3D11VA)",
-            Self::H264Hardware(_) => "H.264 via Media Foundation (CPU)",
+            Self::H264Ffmpeg(decoder) => {
+                format!("libavcodec {} on the GPU (D3D11VA)", decoder.name)
+            }
+            Self::H264Hardware(_) => "H.264 via Media Foundation (CPU)".to_string(),
             #[cfg(all(target_os = "windows", db_ffmpeg))]
-            Self::Hevc(_) => "H.265 on the GPU (D3D11VA)",
+            Self::Hevc(decoder) => {
+                format!("libavcodec {} on the GPU (D3D11VA)", decoder.name)
+            }
         }
     }
 
@@ -1345,6 +1355,19 @@ impl FrameDecoder {
         #[cfg(all(target_os = "windows", db_ffmpeg))]
         if let Self::H264Ffmpeg(decoder) | Self::Hevc(decoder) = self {
             decoder.reset();
+        }
+    }
+
+    /// Told in advance that the stream is about to change shape.
+    ///
+    /// The failure path finds this out on its own after a few frames; this is
+    /// for when something already knows — a display switch — and there is no
+    /// reason to spend them. A no-op for the decoders with no hardware state to
+    /// rebuild, which is all of them but one.
+    fn expect_new_size(&mut self) {
+        #[cfg(all(target_os = "windows", db_ffmpeg))]
+        if let Self::H264Ffmpeg(decoder) | Self::Hevc(decoder) = self {
+            decoder.expect_new_size();
         }
     }
 }
@@ -1774,6 +1797,21 @@ where
                 *shared.watching.lock().unwrap() = Some(change.showing);
                 // A different display is a different picture of a different
                 // size, and the decoder holds reference frames for the old one.
+                //
+                // # Why the decoder is reopened rather than only reset
+                //
+                // A keyframe is enough for the inter-frame state and not for
+                // the hardware one. libavcodec sizes its D3D11VA surface pool
+                // when the decoder opens and does not grow it, so a stream that
+                // switches to a larger screen arrives somewhere it does not
+                // fit — reported by one vendor as a picture too big for its
+                // surface, and by another as `avcodec_send_packet` refusing
+                // every packet from that moment on.
+                //
+                // The failure path catches both after a few frames, but there
+                // is no reason to spend those frames here: this message says
+                // the shape is about to change, which is the whole condition.
+                decoder.expect_new_size();
                 let _ = keyframe_tx.send(Message::RequestKeyframe);
             }
             Message::GuestApprovalRequest(gar) => {
