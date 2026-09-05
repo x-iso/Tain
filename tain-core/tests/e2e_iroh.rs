@@ -499,9 +499,21 @@ async fn a_host_that_can_be_reached_directly_is_carried_directly() -> Result<()>
     assert!(!addrs.is_empty(), "the host bound no dialable socket");
     let key = iroh::PublicKey::from_bytes(&host_id).context("host id")?;
 
-    // Comfortably inside DIRECT_PATH_WAIT: a punch to ourselves is immediate,
-    // so anything approaching the real budget means the wait is not returning.
-    let guest = tokio::time::timeout(Duration::from_secs(10), GuestClient::connect_via(&key, None, &addrs))
+    // # Why this budget is not tight
+    //
+    // A loopback address is passed as `known_addrs`, and those are no longer
+    // raced against discovery — they are the last resort, tried only once
+    // everything that could say where the host is *now* has come back with
+    // nothing. So this test takes the slow path by construction: it waits for
+    // the lookups to give up before the address it was handed is used at all.
+    //
+    // That is the point rather than an accident. A remembered address is not
+    // evidence about the present, and preferring one was reported as breaking
+    // connections that worked the moment it was deleted.
+    //
+    // What is still being timed is the punch, which is immediate to ourselves.
+    // The budget covers discovery declining first.
+    let guest = tokio::time::timeout(Duration::from_secs(40), GuestClient::connect_via(&key, None, &addrs))
         .await
         .context("connecting to a host on this machine took longer than the punch should")??;
 

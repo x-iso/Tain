@@ -839,6 +839,12 @@ mod windows_impl {
         }
     }
 
+    /// The fewest monitors this driver will present.
+    ///
+    /// Not a choice — it reads a count of zero as invalid and substitutes one.
+    /// See [`remove_display`], which is where that matters.
+    const MIN_PRESENTED: usize = 1;
+
     /// How long a driver restart is given to produce its monitors.
     ///
     /// Generous: the driver tears itself down and comes back, Windows
@@ -875,11 +881,17 @@ mod windows_impl {
         sizes
     }
 
-    /// How many virtual monitors the driver is presenting right now.
+    
+    /// How many virtual displays are on the desktop right now.
+    ///
+    /// Attached ones, not presented ones. The driver keeps an idle monitor
+    /// after the last display is removed — it will not accept a count of zero
+    /// — and counting that would leave the interface insisting there is a
+    /// screen the user has just taken away and cannot see.
     pub fn monitor_count() -> usize {
         tain_core::virtual_display::available()
             .iter()
-            .filter(|screen| screen.ready)
+            .filter(|screen| screen.ready && screen.attached)
             .count()
     }
 
@@ -892,6 +904,23 @@ mod windows_impl {
     ///
     /// Needs no administrator rights. Installing the driver did; this does not.
     pub fn add_display(size: (u16, u16)) -> Result<String> {
+        // # A monitor the driver is already presenting is the one to use
+        //
+        // Removing a display takes it off the desktop and, when it is the last
+        // one, leaves the driver still presenting it — because a count of zero
+        // is not something this driver will accept. See [`remove_display`].
+        //
+        // So "add" usually has one sitting there already, and putting it back
+        // on the desktop is instant where raising the count is a driver
+        // restart and several seconds of waiting.
+        if let Some(spare) = tain_core::virtual_display::available()
+            .into_iter()
+            .find(|screen| screen.ready && !screen.attached)
+        {
+            place(&spare.name, size)?;
+            return Ok(spare.name);
+        }
+
         let before: std::collections::BTreeSet<String> = tain_core::virtual_display::available()
             .into_iter()
             .filter(|screen| screen.ready)
@@ -912,28 +941,34 @@ mod windows_impl {
             .find(|screen| screen.ready && !before.contains(&screen.name))
             .context("the driver presented a monitor that could not be identified")?;
 
-        // # Placed whether or not Windows already attached it
-        //
-        // This used to skip a display that was already attached, on the
-        // reasoning that there was nothing left to do. There was: Windows
-        // chooses a topology when a monitor arrives and very often chooses
-        // **clone**, which is attached, reports a size, and is a second copy of
-        // the primary at the same coordinates. Nothing to capture, nowhere for
-        // a pointer to go, and the only way out was a trip to Settings —
-        // reported for the virtual display and for a dummy HDMI plug alike.
-        //
-        // So the topology is set first, because a position cannot undo a clone
-        // — `ChangeDisplaySettingsExW` moves a display *within* a topology and
-        // is entitled to ignore the request otherwise — and then it is placed
-        // regardless of what it was already doing.
+        place(&fresh.name, size)?;
+        Ok(fresh.name)
+    }
+
+    /// Put a presented monitor on the desktop, at a size, in its own space.
+    ///
+    /// # Placed whether or not Windows already attached it
+    ///
+    /// This used to be skipped for a display that was already attached, on the
+    /// reasoning that there was nothing left to do. There was: Windows chooses
+    /// a topology when a monitor arrives and very often chooses **clone**,
+    /// which is attached, reports a size, and is a second copy of the primary
+    /// at the same coordinates. Nothing to capture, nowhere for a pointer to
+    /// go, and the only way out was a trip to Settings — reported for the
+    /// virtual display and for a dummy HDMI plug alike.
+    ///
+    /// The topology is set first, because a position cannot undo a clone:
+    /// `ChangeDisplaySettingsExW` moves a display *within* a topology and is
+    /// entitled to ignore the request otherwise.
+    fn place(name: &str, size: (u16, u16)) -> Result<()> {
         if let Err(e) = tain_core::virtual_display::extend_desktop() {
             // Not fatal. A machine with one display has nothing to extend, and
             // the placement below is the part that has to work.
             tracing::debug!("Could not set the desktop to extend: {e:#}");
         }
-        tain_core::virtual_display::attach(&fresh.name, size, 60)?;
-        tracing::info!("Virtual display {} is on the desktop at {}x{}", fresh.name, size.0, size.1);
-        Ok(fresh.name)
+        tain_core::virtual_display::attach(name, size, 60)?;
+        tracing::info!("Virtual display {name} is on the desktop at {}x{}", size.0, size.1);
+        Ok(())
     }
 
     /// Take the most recently added virtual display away again.
@@ -942,20 +977,48 @@ mod windows_impl {
     /// a monitor removed from under a window leaves the window somewhere
     /// nobody chose.
     pub fn remove_display() -> Result<()> {
-        let present: Vec<_> = tain_core::virtual_display::available()
-            .into_iter()
-            .filter(|screen| screen.ready)
-            .collect();
-        let Some(last) = present.last() else {
+        let screens = tain_core::virtual_display::available();
+        let Some(last) = screens.iter().rfind(|s| s.ready && s.attached) else {
             return Ok(());
         };
 
-        if last.attached && let Err(e) = tain_core::virtual_display::detach(&last.name) {
-            // Not fatal: the count is about to drop and take it with it.
-            tracing::warn!("Could not detach {} first: {e:#}", last.name);
+        // Off the desktop first, and this is the part that does the removing.
+        tain_core::virtual_display::detach(&last.name)
+            .with_context(|| format!("could not take {} off the desktop", last.name))?;
+
+        // # Why the count is not always lowered, and never to zero
+        //
+        // Asking this driver for zero monitors does not remove the last one. It
+        // writes the number, restarts, reads it back, and decides it is wrong:
+        //
+        //   if (monitorcount == 0) {
+        //       monitorcount = 1;
+        //       vddlog("i", "Loading singular monitor (Monitor Count is not valid)");
+        //   }
+        //
+        // So it presents one anyway — and a monitor arriving is a monitor
+        // Windows attaches. The removal recreated exactly the thing it had
+        // just taken away, which is what "there is some reaction from Windows,
+        // but the display is simply re-attached" looks like from outside.
+        //
+        // Detaching is what the user actually asked for: the screen is off
+        // their desktop, out of `displays()`, not offered to a guest and not
+        // capturable. That the driver still holds an idle monitor behind an
+        // adapter costs a little memory and nothing else — and `add_display`
+        // reuses it, which makes the next one instant instead of a restart.
+        //
+        // With more than one, lowering still works and is worth doing, because
+        // the floor it stops at is one rather than none.
+        let presented = screens.iter().filter(|s| s.ready).count();
+        if presented > MIN_PRESENTED {
+            pipe::set_display_count(presented as u32 - 1)?;
+            pipe::wait_until_live()?;
+        } else {
+            tracing::info!(
+                "{} is off the desktop. The driver keeps one idle monitor — it will not                  accept none — and adding a display will reuse it.",
+                last.name
+            );
         }
-        pipe::set_display_count(present.len().saturating_sub(1) as u32)?;
-        pipe::wait_until_live()?;
         Ok(())
     }
 
