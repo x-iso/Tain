@@ -40,6 +40,10 @@ fn test_config() -> SessionConfig {
         // These stream a synthetic frame with no display behind it; a test
         // that resized the developer's desktop would be memorable.
         virtual_display_follows_guest: false,
+        trusted_admins: Default::default(),
+        // Off: nobody is sitting at the machine running these, and a developer
+        // brushing the mouse would otherwise start dropping the input under test.
+        local_input_wins_for: Duration::ZERO,
     }
 }
 
@@ -60,7 +64,35 @@ fn decode_endpoint_id(hex_str: &str) -> Result<[u8; 32]> {
 
 /// Bring up a host, returning its handle, a master passcode, and its endpoint id.
 async fn start_host() -> Result<(Arc<HostServer>, String, [u8; 32])> {
-    let server = Arc::new(HostServer::bind().await?.with_config(test_config()));
+    // # Why the test host has somebody sitting at it
+    //
+    // These connect with the *admin* passcode, and an admin connection from an
+    // endpoint the host has not seen before now has to be approved — the code
+    // alone stopped being the whole of the authorisation, so that a copy of it
+    // that gets out cannot be used behind the owner's back.
+    //
+    // A host with no approval channel has nobody to ask and therefore refuses,
+    // which is correct and is what this harness used to be: it modelled a
+    // machine with no interface at all, and every test in this file would have
+    // been testing the refusal.
+    //
+    // So the harness answers yes. That is what a real host with a window open
+    // does, and it keeps these tests about what they are about — dialling,
+    // discovery, and the handshake.
+    let (approvals_tx, mut approvals) =
+        tokio::sync::mpsc::unbounded_channel::<tain_core::network::ApprovalRequest>();
+    tokio::spawn(async move {
+        while let Some(req) = approvals.recv().await {
+            let _ = req.approve_tx.send(tain_core::network::ApprovalDecision::Allow {
+                grants: tain_core::protocol::ControlGrants::ALL,
+                displays: tain_core::protocol::DisplayGrant::All,
+            });
+        }
+    });
+
+    let server = Arc::new(
+        HostServer::bind().await?.with_config(test_config()).with_approval_channel(approvals_tx),
+    );
     let passcode = server.generate_master_passcode().await?;
     let id = decode_endpoint_id(&server.endpoint_id())?;
 
@@ -134,16 +166,32 @@ async fn several_guests_arriving_together_are_all_answered() -> Result<()> {
         dials.push(tokio::spawn(async move {
             let mut guest = GuestClient::connect_via(&key, None, &addrs).await?;
             let (_send, mut recv) = guest.authenticate(&passcode, Some("Crowd")).await?;
-            // Reaching SessionStart is the proof: the handshake completed, the
-            // stream opened and the host answered on it.
-            let bytes = tokio::time::timeout(Duration::from_secs(20), read_stream_message(&mut recv))
-                .await
-                .context("timed out waiting for SessionStart")??
-                .context("stream closed before SessionStart")?;
-            anyhow::ensure!(
-                matches!(bincode::deserialize::<Message>(&bytes)?, Message::SessionStart(_)),
-                "first message was not SessionStart"
-            );
+            // # Reaching SessionStart is the proof
+            //
+            // The handshake completed, the stream opened and the host answered
+            // on it. What comes *before* it may be an approval request: an
+            // admin connection from an endpoint the host has not seen before
+            // is told it is waiting while somebody decides, and only then does
+            // the session start. Both orders are correct, so this reads past
+            // the waiting message rather than asserting on which one is first.
+            let mut started = false;
+            for _ in 0..2 {
+                let bytes =
+                    tokio::time::timeout(Duration::from_secs(20), read_stream_message(&mut recv))
+                        .await
+                        .context("timed out waiting for SessionStart")??
+                        .context("stream closed before SessionStart")?;
+                match bincode::deserialize::<Message>(&bytes)? {
+                    Message::SessionStart(_) => {
+                        started = true;
+                        break;
+                    }
+                    // Being asked about is expected, once.
+                    Message::GuestApprovalRequest(_) => continue,
+                    other => anyhow::bail!("unexpected first message: {other:?}"),
+                }
+            }
+            anyhow::ensure!(started, "the session never started");
             Ok::<_, anyhow::Error>(())
         }));
     }
@@ -512,8 +560,12 @@ async fn a_host_that_can_be_reached_directly_is_carried_directly() -> Result<()>
     // connections that worked the moment it was deleted.
     //
     // What is still being timed is the punch, which is immediate to ourselves.
-    // The budget covers discovery declining first.
-    let guest = tokio::time::timeout(Duration::from_secs(40), GuestClient::connect_via(&key, None, &addrs))
+    // The budget covers discovery declining first — and declining can mean
+    // hanging until the dial timeout rather than answering "nothing", which on
+    // a network where lookups are blocked is the usual shape. So the budget has
+    // to cover a full dial that found nothing *plus* the one that then uses the
+    // address, which is two dial timeouts and not one.
+    let guest = tokio::time::timeout(Duration::from_secs(60), GuestClient::connect_via(&key, None, &addrs))
         .await
         .context("connecting to a host on this machine took longer than the punch should")??;
 

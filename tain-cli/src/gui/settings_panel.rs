@@ -1069,6 +1069,27 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
         ui.checkbox(&mut settings.guest_autoreset, "Reset when the last guest leaves");
         ui.end_row();
 
+        // # Who wins when both people reach for the mouse
+        //
+        // A host being streamed is still a computer somebody may be sitting at,
+        // and two hands on one cursor is not a shared session — it is neither
+        // person being able to do anything, with the one actually in the room
+        // losing, because a guest's events arrive faster than a hand moves.
+        ui.label("Give way to me for");
+        ui.add(
+            egui::Slider::new(&mut settings.local_input_wins_ms, 0..=10_000)
+                .suffix(" ms")
+                .step_by(100.0),
+        )
+        .on_hover_text(
+            "After you use this machine's own mouse or keyboard, a guest's input is \
+             ignored for this long. It resumes on its own once you stop.\n\n\
+             Anything a guest is already holding is still released, so nothing can be \
+             left stuck down.\n\n\
+             Zero turns this off and lets a guest type over you.",
+        );
+        ui.end_row();
+
         ui.label("Offer by default");
         ui.vertical(|ui| {
             ui.checkbox(&mut settings.default_allow_mouse, "Mouse");
@@ -1080,6 +1101,43 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
              You still have to allow each connection. \
              Mouse also covers touch.",
         );
+        ui.end_row();
+
+        // # Who has already been let in with the admin code
+        //
+        // The first admin connection from each device has to be approved here,
+        // and the answer is remembered so the owner is not asked again from
+        // their own machines. A remembered decision nobody can see or undo is
+        // not something to ask people to trust, so this says how many there are
+        // and offers to forget them.
+        //
+        // A count rather than a list of endpoint ids: sixty-four hex characters
+        // identifies a device to the protocol and to nobody at all.
+        ui.label("Trusted devices");
+        ui.horizontal(|ui| {
+            let trusted = settings.trusted_admin_endpoints.len();
+            ui.label(
+                RichText::new(match trusted {
+                    0 => "None yet".to_string(),
+                    1 => "1 device".to_string(),
+                    n => format!("{n} devices"),
+                })
+                .size(11.0)
+                .color(if trusted > 0 { TEXT } else { TEXT_DIM }),
+            );
+            if ui
+                .add_enabled(trusted > 0, egui::Button::new("Forget all"))
+                .on_hover_text(
+                    "Devices that have connected with the admin passcode and been \
+                     allowed. Forgetting them means the next connection from each one \
+                     has to be approved again. Resetting the admin passcode does this \
+                     too, along with revoking the code itself.",
+                )
+                .clicked()
+            {
+                settings.trusted_admin_endpoints.clear();
+            }
+        });
         ui.end_row();
     });
 

@@ -900,6 +900,145 @@ impl InputInjector for StubInjector {
     }
 }
 
+/// An injector that gives way while somebody is using the machine.
+///
+/// # Why remote input yields at all
+///
+/// A host being streamed is still a computer somebody may be sitting at. When
+/// they reach for the mouse, two hands on one cursor is not a shared session —
+/// it is neither person being able to do anything, and the one actually in the
+/// room is the one who loses, because the guest's events arrive faster than a
+/// hand moves.
+///
+/// So local input wins for a couple of seconds. Short, because the point is to
+/// yield the machine rather than take it away: a guest driving a host nobody is
+/// touching notices nothing.
+///
+/// # Releases are never suppressed, and that is the whole subtlety
+///
+/// Dropping input mid-gesture is how a key gets stuck down. The guest presses
+/// Shift, somebody at the host jogs the mouse, the guest's Shift-up is dropped
+/// — and the host is now holding Shift with nothing left to release it, because
+/// the event that would have was thrown away.
+///
+/// So the rule is not "drop everything". It is: **presses, movement and scrolls
+/// give way; releases always go through.** A release can only ever undo
+/// something this same guest did, so letting one past cannot hand over control
+/// — it can only hand it back.
+///
+/// Touches are lifted rather than dropped for the same reason, once, as
+/// suppression begins.
+pub struct Deferring {
+    inner: Box<dyn InputInjector>,
+    /// Whether the last event was suppressed, so the transition can be logged
+    /// and the touches lifted exactly once.
+    yielding: std::sync::atomic::AtomicBool,
+}
+
+impl Deferring {
+    /// Wrap `inner`, giving way whenever somebody is using this machine.
+    ///
+    /// How long for is [`super::local_input::window`] — a property of the
+    /// machine rather than of this session, so that changing it takes effect at
+    /// once and everywhere.
+    ///
+    /// Does not start the watcher. That installs system-wide hooks, which is a
+    /// thing a host does once — see [`create_deferring_injector`] — and not
+    /// something wrapping an injector should do as a side effect.
+    pub fn new(inner: Box<dyn InputInjector>) -> Self {
+        Self { inner, yielding: std::sync::atomic::AtomicBool::new(false) }
+    }
+
+    /// Whether remote input should stand aside right now.
+    ///
+    /// Also does the once-per-transition work: lifting whatever the guest was
+    /// holding as it starts, and saying so in the log at both ends.
+    fn giving_way(&self) -> bool {
+        let window = super::local_input::window();
+        let now = super::local_input::active_within(window);
+        let before = self.yielding.swap(now, std::sync::atomic::Ordering::Relaxed);
+        if now && !before {
+            debug!("Somebody is using this machine — remote input gives way for {window:?}");
+            // Whatever the guest had down, put down. The events that would have
+            // lifted these are about to start being dropped.
+            let _ = self.inner.release_touches();
+        } else if !now && before {
+            debug!("The machine has been quiet for {window:?} — remote input resumes");
+        }
+        now
+    }
+}
+
+impl InputInjector for Deferring {
+    fn set_shown(&self, shown: Shown) {
+        // Not input. Which screen the guest is looking at has to stay correct
+        // whether or not their events are landing, or the first event after
+        // suppression lifts would be mapped against a stale picture.
+        self.inner.set_shown(shown);
+    }
+
+    fn move_mouse(&self, pos: MousePosition) -> Result<()> {
+        if self.giving_way() {
+            return Ok(());
+        }
+        self.inner.move_mouse(pos)
+    }
+
+    fn mouse_button(&self, input: MouseButtonInput) -> Result<()> {
+        if input.pressed && self.giving_way() {
+            return Ok(());
+        }
+        self.inner.mouse_button(input)
+    }
+
+    fn scroll(&self, input: ScrollInput) -> Result<()> {
+        if self.giving_way() {
+            return Ok(());
+        }
+        self.inner.scroll(input)
+    }
+
+    fn key(&self, input: KeyInput) -> Result<()> {
+        if input.pressed && self.giving_way() {
+            return Ok(());
+        }
+        self.inner.key(input)
+    }
+
+    fn touch(&self, input: TouchInput) -> Result<()> {
+        // A lift or a cancel ends something already on the screen; anything
+        // else starts or continues one.
+        let ending = matches!(
+            input.phase,
+            crate::protocol::TouchPhase::End | crate::protocol::TouchPhase::Cancel
+        );
+        if !ending && self.giving_way() {
+            return Ok(());
+        }
+        self.inner.touch(input)
+    }
+
+    fn release_touches(&self) -> Result<()> {
+        self.inner.release_touches()
+    }
+
+    fn is_real(&self) -> bool {
+        self.inner.is_real()
+    }
+}
+
+/// An injector that gives way to whoever is sitting at this machine.
+///
+/// What every session should use. [`create_injector`] is the bare platform
+/// backend underneath, and is what the tests and the stub path want.
+pub fn create_deferring_injector() -> Deferring {
+    // Where the system-wide hooks get installed, once per process: this is the
+    // call a host makes, and the only one that means somebody may need to be
+    // given way to.
+    super::local_input::watch();
+    Deferring::new(create_injector())
+}
+
 /// Create the appropriate input injector for the current platform.
 pub fn create_injector() -> Box<dyn InputInjector> {
     #[cfg(target_os = "windows")]
@@ -921,8 +1060,131 @@ pub fn create_injector() -> Box<dyn InputInjector> {
 }
 
 #[cfg(test)]
-mod tests {
+mod deferring_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Records what reached the platform, so a test can ask what got through.
+    ///
+    /// The log is shared rather than owned, because the recorder itself is
+    /// handed to `Deferring` and disappears behind a trait object.
+    #[derive(Default, Clone)]
+    struct Recorder {
+        events: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl InputInjector for Recorder {
+        fn move_mouse(&self, _pos: MousePosition) -> Result<()> {
+            self.note("move");
+            Ok(())
+        }
+        fn mouse_button(&self, input: MouseButtonInput) -> Result<()> {
+            self.note(if input.pressed { "button down" } else { "button up" });
+            Ok(())
+        }
+        fn scroll(&self, _input: ScrollInput) -> Result<()> {
+            self.note("scroll");
+            Ok(())
+        }
+        fn key(&self, input: KeyInput) -> Result<()> {
+            self.note(if input.pressed { "key down" } else { "key up" });
+            Ok(())
+        }
+        fn touch(&self, input: TouchInput) -> Result<()> {
+            self.note(match input.phase {
+                crate::protocol::TouchPhase::Start => "touch start",
+                crate::protocol::TouchPhase::Move => "touch move",
+                crate::protocol::TouchPhase::End => "touch end",
+                crate::protocol::TouchPhase::Cancel => "touch cancel",
+            });
+            Ok(())
+        }
+        fn release_touches(&self) -> Result<()> {
+            self.note("release touches");
+            Ok(())
+        }
+    }
+
+    impl Recorder {
+        fn note(&self, what: &str) {
+            self.events.lock().unwrap().push(what.to_string());
+        }
+    }
+
+    /// Send one of everything through `injector` and report what got through.
+    fn everything(injector: &Deferring) {
+        let _ = injector.move_mouse(MousePosition { x: 1, y: 1 });
+        let _ = injector.scroll(ScrollInput { dx: 0, dy: 120 });
+        let _ = injector.mouse_button(MouseButtonInput { button: 0, pressed: true });
+        let _ = injector.mouse_button(MouseButtonInput { button: 0, pressed: false });
+        let _ = injector.key(KeyInput { keycode: 65, pressed: true, scancode: 0, extended: false });
+        let _ =
+            injector.key(KeyInput { keycode: 65, pressed: false, scancode: 0, extended: false });
+        for phase in [
+            crate::protocol::TouchPhase::Start,
+            crate::protocol::TouchPhase::Move,
+            crate::protocol::TouchPhase::End,
+            crate::protocol::TouchPhase::Cancel,
+        ] {
+            let _ = injector.touch(TouchInput { id: 0, phase, x: 0, y: 0, pressure: 0 });
+        }
+    }
+
+    /// With nobody at the machine, nothing is held back.
+    #[test]
+    fn a_machine_nobody_is_using_passes_everything_through() {
+        // The last-input time and the window are process-wide; see
+        // `local_input::exclusive` for why that needs saying here.
+        let _held = crate::local_input::exclusive();
+        let recorder = Recorder::default();
+        let seen = recorder.events.clone();
+
+        let deferring = Deferring::new(Box::new(recorder));
+        everything(&deferring);
+
+        // Ten events in, ten events out.
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got.len(), 10, "something was dropped with the feature off: {got:?}");
+    }
+
+    /// The rule, stated as the bug it exists to prevent.
+    ///
+    /// A guest holding Shift when somebody at the host jogs the mouse must not
+    /// leave Shift down forever. Every *release* goes through however busy the
+    /// host is, because a release can only undo something this guest did — it
+    /// can never take control, only hand it back.
+    #[test]
+    fn nothing_a_guest_is_holding_can_be_left_stuck_down() {
+        let _held = crate::local_input::exclusive();
+        // A window wide enough that the input noted below is inside it.
+        crate::local_input::set_window(std::time::Duration::from_secs(3600));
+        crate::local_input::seen();
+
+        let recorder = Recorder::default();
+        let log = recorder.events.clone();
+        let deferring = Deferring::new(Box::new(recorder));
+        everything(&deferring);
+        let got = log.lock().unwrap().clone();
+
+        for release in ["button up", "key up", "touch end", "touch cancel"] {
+            assert!(
+                got.contains(&release.to_string()),
+                "{release} was suppressed — whatever the guest was holding is now stuck: {got:?}"
+            );
+        }
+        for grab in ["move", "scroll", "button down", "key down", "touch start", "touch move"] {
+            assert!(
+                !got.contains(&grab.to_string()),
+                "{grab} reached the machine while somebody was using it: {got:?}"
+            );
+        }
+        // And the contacts the guest had down were lifted as it began, once.
+        assert_eq!(
+            got.iter().filter(|e| *e == "release touches").count(),
+            1,
+            "touches should be lifted exactly once, as suppression starts: {got:?}"
+        );
+    }
 
     #[test]
     fn stub_reports_itself_as_not_real() {

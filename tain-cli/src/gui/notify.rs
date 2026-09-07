@@ -47,6 +47,38 @@ pub fn shut_down() {
     platform::remove();
 }
 
+/// Whether somebody clicked the notification since this was last asked.
+///
+/// # Why this is asked rather than acted on where the click arrives
+///
+/// Raising a window means Win32's foreground rules, which exist to stop
+/// background processes stealing focus and which a window procedure is a poor
+/// place to argue with. eframe already knows how to ask for focus in a way the
+/// window system accepts — see `ViewportCommand::Focus` — so the click is
+/// recorded here and the frame that notices it does the asking.
+pub fn was_clicked() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        platform::was_clicked()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Give this module a way to wake the interface when a notification is clicked.
+///
+/// Cheap to call every frame; only the first one is kept.
+pub fn watch(ctx: &egui::Context) {
+    #[cfg(target_os = "windows")]
+    platform::attach(ctx);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ctx;
+    }
+}
+
 /// What a notification should say.
 ///
 /// Split out so the wording can be tested without a desktop to draw on — the
@@ -75,13 +107,14 @@ mod platform {
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use windows::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-        NIM_MODIFY, NOTIFYICONDATAW,
+        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+        NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, LoadIconW, RegisterClassW, HWND_MESSAGE, IDI_APPLICATION,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_LBUTTONUP, WNDCLASSW,
     };
 
     /// The window the icon hangs off, once one has been made.
@@ -95,12 +128,54 @@ mod platform {
     /// the pair of window and id, and a second id would be a second icon.
     const ICON_ID: u32 = 1;
 
+    /// The message the shell sends this window when the icon or its balloon is
+    /// interacted with. Anything in the `WM_APP` range is the application's to
+    /// choose.
+    const CALLBACK: u32 = 0x0400 + 1;
+
+    /// `NIN_BALLOONUSERCLICK`, which the crate does not name. Sent when the
+    /// notification itself is clicked, as opposed to being dismissed with its
+    /// close button — which is `NIN_BALLOONUSERCLICK`'s neighbour and
+    /// deliberately not acted on.
+    const NIN_BALLOONUSERCLICK: u32 = 0x0405;
+
+    /// Set when somebody clicked the notification, cleared when it is read.
+    static CLICKED: AtomicBool = AtomicBool::new(false);
+
+    /// How to wake the interface, once it has said.
+    ///
+    /// # Why a click has to wake anything
+    ///
+    /// The flag above is read on a frame, and a frame only happens when
+    /// something asks for one. The case this whole module exists for is a
+    /// window nobody is looking at — behind something, or minimised — which is
+    /// exactly the case where nothing is asking. Without this, the click would
+    /// be recorded faithfully and acted on whenever the application next
+    /// happened to draw, which is not an answer.
+    static WAKE: Mutex<Option<egui::Context>> = Mutex::new(None);
+
+    /// Remember how to wake the interface. Cheap to call repeatedly.
+    pub fn attach(ctx: &egui::Context) {
+        let mut held = WAKE.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            *held = Some(ctx.clone());
+        }
+    }
+
+    /// Whether the notification has been clicked since this was last asked.
+    ///
+    /// Takes the answer rather than merely reading it: acting on a click twice
+    /// would fight the user for the foreground.
+    pub fn was_clicked() -> bool {
+        CLICKED.swap(false, Ordering::Relaxed)
+    }
+
     pub fn show(name: &str, needs_approval: bool) {
         let Some(window) = window() else { return };
         let (title, body) = super::wording(name, needs_approval);
 
         let mut data = base(window);
-        data.uFlags = NIF_ICON | NIF_TIP | NIF_INFO;
+        data.uFlags = NIF_ICON | NIF_TIP | NIF_INFO | NIF_MESSAGE;
         data.dwInfoFlags = NIIF_INFO;
         write_utf16(&mut data.szInfoTitle, &title);
         write_utf16(&mut data.szInfo, &body);
@@ -137,6 +212,9 @@ mod platform {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: window,
             uID: ICON_ID,
+            // Carried on every call, including the delete, so the shell always
+            // knows where to send what it has to say about this icon.
+            uCallbackMessage: CALLBACK,
             ..Default::default()
         };
         // SAFETY: a system icon, which needs no module and is never freed.
@@ -193,14 +271,38 @@ mod platform {
     }
 
     /// Nothing is handled: the icon sends its messages here and they are all
-    /// declined. Clicking it does nothing on purpose — a notification is not a
-    /// control surface, and the window it would raise is already in the taskbar.
+    /// declined except the one that means somebody wants the window.
+    ///
+    /// # What changed and why
+    ///
+    /// This used to decline everything, on the reasoning that a notification is
+    /// not a control surface and the window it would raise is already in the
+    /// taskbar. That reasoning ignores what a notification is *for*: it appears
+    /// because something needs attention, and the obvious gesture — clicking
+    /// the thing that just appeared — did nothing at all, which reads as the
+    /// application being broken rather than as a deliberate restraint.
+    ///
+    /// The click is only *recorded* here. Raising a window from a window
+    /// procedure means Win32 foreground rules, and eframe already knows how to
+    /// ask for focus properly; see [`super::was_clicked`].
     unsafe extern "system" fn procedure(
         window: HWND,
         message: u32,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if message == CALLBACK {
+            // The shell packs the event into the low word of `lparam`. A click
+            // on the balloon and a click on the tray icon are the same wish.
+            let event = (lparam.0 as u32) & 0xFFFF;
+            if event == NIN_BALLOONUSERCLICK || event == WM_LBUTTONUP {
+                CLICKED.store(true, Ordering::Relaxed);
+                if let Some(ctx) = WAKE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    ctx.request_repaint();
+                }
+            }
+            return LRESULT(0);
+        }
         // SAFETY: forwarding a message the system sent, unmodified.
         unsafe { DefWindowProcW(window, message, wparam, lparam) }
     }

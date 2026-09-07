@@ -30,6 +30,15 @@ pub const ADMIN_STROKE: Color32 = Color32::from_rgb(0xE0, 0x7B, 0x39);
 pub const GUEST_FILL: Color32 = Color32::from_rgb(0x2C, 0x2C, 0x2E);
 pub const GUEST_STROKE: Color32 = Color32::from_rgb(0xD1, 0xD1, 0xD6);
 
+/// A choice that is currently made — the screens being shared, and nothing
+/// else so far.
+///
+/// Blue rather than the green used for "this is working": one is a decision the
+/// user is making right now and can still change, the other is a report about
+/// the world. A tick that looks like a status light invites reading a proposal
+/// as a fact.
+pub const SELECT_BLUE: Color32 = Color32::from_rgb(0x0A, 0x84, 0xFF);
+
 pub const LIVE_GREEN: Color32 = Color32::from_rgb(0x34, 0xC7, 0x59);
 pub const OFFLINE_RED: Color32 = Color32::from_rgb(0xCB, 0x2F, 0x33);
 /// Something is wrong but recoverable — a relayed path, an expired code, a
@@ -111,7 +120,29 @@ pub const MIN_WINDOW_SIZE: [f32; 2] = [800.0, 600.0];
 /// cannot get that wrong, and does not need to be told.
 pub const PILL_HEIGHT: f32 = 44.0;
 
-pub const PILL_MIN_W: f32 = 150.0;
+/// How wide an incoming connection card is. All of them, always.
+///
+/// # Why one width rather than one per name
+///
+/// It used to be a minimum, with each card growing to fit its guest's name.
+/// Two things ended that.
+///
+/// The approval popup is drawn directly above its card and takes exactly that
+/// card's width — which is what keeps two popups from overlapping, since the
+/// cards themselves already lay out without colliding. So a card has to be wide
+/// enough for the question it may carry: two checkboxes, a row of screen icons,
+/// and two answers side by side.
+///
+/// And the marks on the card — mouse, keyboard, status — sit on its right edge.
+/// Right-aligning inside a card that is only as wide as its contents is the
+/// same as not aligning at all, and a strip of cards whose marks are at
+/// different distances from the left is a strip that has to be read one card at
+/// a time.
+///
+/// The cost is empty space beside a short name, which is what the design asks
+/// for: a row of identical cards, each with its name at one end and its state
+/// at the other.
+pub const PILL_W: f32 = 268.0;
 pub const CORNER: f32 = 5.0;
 
 /// Width to give each passcode button so the header fits `available`.
@@ -406,6 +437,186 @@ pub fn labelled_button(
     }
 
     resp
+}
+
+/// One screen, as a button that shows whether it is being shared.
+///
+/// # Why icons and not a column of checkboxes
+///
+/// The list they replace named every display in full — "2. DELL U2720Q —
+/// 3840×2160 (main)" — one per row, with a separate "All screens" tick above.
+/// That is a paragraph to read before a decision that is really about *shape*:
+/// how many screens there are, and which of them somebody is about to see. A
+/// row of monitors answers that at a glance and fits a dialog that appears
+/// while a person is waiting.
+///
+/// The detail is not lost, it is moved: the caller hangs it on the hover text,
+/// where it is available to anyone who wants it and in the way of nobody who
+/// does not.
+///
+/// `number` is `None` for the "all screens" button, which stands for whatever
+/// is plugged in rather than for any particular screen.
+pub fn display_button(
+    ui: &mut Ui,
+    size: f32,
+    src: egui::ImageSource<'_>,
+    number: Option<usize>,
+    caption: Option<&str>,
+    selected: bool,
+) -> Response {
+    // # Every cell is the same size, captioned or not
+    //
+    // The caption belongs to one of them — "All" — and giving that button a
+    // taller cell than the rest made the row lay out around it: a horizontal
+    // layout centres each item against the tallest, so the numbered screens
+    // hung below the one with a label under it.
+    //
+    // Reserving the caption's height on every cell costs a few points of empty
+    // space under the screens that have no caption, and means a row of them is
+    // a row, and several rows are a grid.
+    let button = Vec2::splat(size + 12.0);
+    let caption_height = ui.text_style_height(&egui::TextStyle::Small) + 2.0;
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(button.x, button.y + caption_height), Sense::click());
+    let face = Rect::from_min_size(rect.min, button);
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if selected {
+            painter.rect(face, CORNER, SELECT_BLUE, Stroke::NONE);
+        } else if resp.hovered() {
+            painter.rect(face, CORNER, CARD_BG_HOVER, Stroke::NONE);
+        }
+
+        let icon_rect = snap(ui, Rect::from_center_size(face.center(), Vec2::splat(size)));
+        sharp_image(src, icon_rect.size()).paint_at(ui, icon_rect);
+
+        // Inside the screen part of the glyph, which is its upper portion —
+        // centred on the whole icon would sit the digit over the stand.
+        if let Some(number) = number {
+            painter.text(
+                icon_rect.center() - Vec2::new(0.0, icon_rect.height() * 0.08),
+                egui::Align2::CENTER_CENTER,
+                number.to_string(),
+                egui::FontId::proportional(size * 0.42),
+                TEXT,
+            );
+        }
+
+        if let Some(caption) = caption {
+            painter.text(
+                egui::pos2(face.left(), face.bottom() + 1.0),
+                egui::Align2::LEFT_TOP,
+                caption,
+                egui::TextStyle::Small.resolve(ui.style()),
+                if selected { TEXT } else { TEXT_DIM },
+            );
+        }
+    }
+
+    resp
+}
+
+/// What a [`slide_to_reveal`] cover did this frame.
+pub struct SlideOutcome {
+    /// Where the knob is now, 0 at rest and 1 fully across. Feed it back next
+    /// frame — the widget itself keeps nothing.
+    pub progress: f32,
+    /// The knob reached the far end. What was covered should be uncovered.
+    pub completed: bool,
+    /// Somebody touched it. Not the same as [`Self::completed`]: this is the
+    /// first contact, and it is what a one-time explanation hangs on.
+    pub touched: bool,
+}
+
+/// A cover that has to be dragged aside, over a button that should not be
+/// pressed by accident.
+///
+/// # Why a slider and not a confirmation dialog
+///
+/// The thing being guarded is the admin passcode's *copy* button, and what it
+/// guards against is the copy happening at all — a code that reaches the
+/// clipboard can leave in the next paste, into whatever window happens to have
+/// focus, and nothing afterwards can call it back. A dialog does not help with
+/// that: it appears after the click, and the answer to a dialog you did not
+/// mean to summon is to dismiss it, which people do without reading.
+///
+/// A drag cannot happen by accident. It takes a deliberate gesture in a
+/// particular direction, it cannot be produced by a stray click or a keyboard
+/// repeat, and it leaves the button covered until somebody means it.
+///
+/// # Nothing is remembered here
+///
+/// `progress` comes in and goes out, so the caller owns the state. That is what
+/// lets the cover close on a timer, on a copy, and on a passcode reset without
+/// this widget knowing any of those things exist.
+pub fn slide_to_reveal(ui: &mut Ui, size: Vec2, label: &str, progress: f32) -> SlideOutcome {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::drag());
+
+    let knob_width = (size.y - 6.0).max(18.0);
+    // The knob's centre travels between these, so the distance it can cover is
+    // short of the full width by its own size.
+    let travel = (rect.width() - knob_width - 6.0).max(1.0);
+
+    let mut progress = progress.clamp(0.0, 1.0);
+    let touched = resp.drag_started() || resp.dragged();
+    if let Some(pointer) = resp.interact_pointer_pos() {
+        let from_left = pointer.x - rect.left() - 3.0 - knob_width / 2.0;
+        progress = (from_left / travel).clamp(0.0, 1.0);
+    }
+    // Released short of the end: back to the start rather than left part way,
+    // so the next attempt is the same gesture as the first and there is no
+    // half-open state to reason about.
+    let completed = progress >= 0.995;
+    if resp.drag_stopped() && !completed {
+        progress = 0.0;
+    }
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect(rect, CORNER, CARD_INNER_BG, Stroke::new(1.0, SEPARATOR));
+
+        // The label fades out as the knob crosses it: the instruction stops
+        // being useful exactly as it stops being needed.
+        let text_alpha = (1.0 - progress * 1.6).clamp(0.0, 1.0);
+        painter.text(
+            rect.center() + Vec2::new(knob_width / 2.0, 0.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            TEXT_DIM.gamma_multiply(text_alpha),
+        );
+
+        let knob_x = rect.left() + 3.0 + knob_width / 2.0 + travel * progress;
+        let knob = Rect::from_center_size(
+            egui::pos2(knob_x, rect.center().y),
+            Vec2::new(knob_width, size.y - 6.0),
+        );
+        let lit = resp.hovered() || resp.dragged();
+        painter.rect(
+            knob,
+            CORNER,
+            if lit { ADMIN_FILL.gamma_multiply(1.35) } else { ADMIN_FILL },
+            Stroke::new(1.0, ADMIN_STROKE),
+        );
+        // Two chevrons, pointing the way the knob has to go. Drawn rather than
+        // an asset: it is four lines of geometry and the alternative is a file.
+        for step in 0..2 {
+            let x = knob.center().x - 3.0 + step as f32 * 5.0;
+            let arm = 3.5;
+            let colour = TEXT.gamma_multiply(1.0 - progress);
+            painter.line_segment(
+                [egui::pos2(x, knob.center().y - arm), egui::pos2(x + arm, knob.center().y)],
+                Stroke::new(1.5, colour),
+            );
+            painter.line_segment(
+                [egui::pos2(x + arm, knob.center().y), egui::pos2(x, knob.center().y + arm)],
+                Stroke::new(1.5, colour),
+            );
+        }
+    }
+
+    SlideOutcome { progress, completed, touched }
 }
 
 /// How far the pan offset can travel on each axis before the far edge of the

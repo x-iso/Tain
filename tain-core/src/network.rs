@@ -142,8 +142,53 @@ pub struct ApprovalRequest {
     /// A remote-supplied name should not be presented as though the host
     /// vouched for it.
     pub label_is_self_reported: bool,
+    /// Whether this connection presented the **admin** passcode.
+    ///
+    /// A different question is being asked in each case, and the interface has
+    /// to ask the right one. A guest is asking to watch, and the host chooses
+    /// what to grant. An admin already has everything the moment it is let in —
+    /// every screen, mouse and keyboard, and the lock screen too where the
+    /// service is installed — so the only honest question is whether this is
+    /// the owner, and saying yes remembers the answer.
+    pub is_admin: bool,
+    /// The guest's endpoint id: the public key its connection is authenticated
+    /// with.
+    ///
+    /// What gets remembered when an admin connection is approved, and the
+    /// reason the memory is worth anything — see [`SessionConfig::trusted_admins`].
+    /// Nobody can present somebody else's, which is exactly what a name or an
+    /// address cannot promise.
+    pub endpoint_id: [u8; 32],
     /// Oneshot sender carrying the host's decision.
     pub approve_tx: tokio::sync::oneshot::Sender<ApprovalDecision>,
+}
+
+/// Whether somebody at the host has to say yes before this connection runs.
+///
+/// # The two rules, and why they are different
+///
+/// **Every guest, every time.** What a guest is allowed — which screens, mouse,
+/// keyboard — is decided per connection, so there is nothing to remember and
+/// nothing that could be skipped.
+///
+/// **An admin, the first time from each endpoint.** The admin passcode is
+/// unrestricted access, so the useful question is not "what may this connection
+/// do" but "is this the owner". Asked once per endpoint rather than once per
+/// connection: asking every time would train the answer out of anyone who uses
+/// their own machine, and an approval nobody reads protects nothing.
+///
+/// Pure, and separate from the connection it is asked about, because it is the
+/// whole of the authorisation decision and every case of it should be readable
+/// without a network.
+pub fn must_be_approved(
+    typ: PasscodeType,
+    endpoint_id: &[u8; 32],
+    trusted_admins: &std::collections::BTreeSet<[u8; 32]>,
+) -> bool {
+    match typ {
+        PasscodeType::Guest => true,
+        PasscodeType::Master => !trusted_admins.contains(endpoint_id),
+    }
 }
 
 /// Tunables for an individual guest session.
@@ -199,6 +244,48 @@ pub struct SessionConfig {
     /// for as long as both were connected. The first to watch it keeps it; a
     /// second guest wanting their own size wants a second virtual display.
     pub virtual_display_follows_guest: bool,
+    /// Endpoints the host has already let in with the admin passcode.
+    ///
+    /// # Why an admin code is not enough on its own
+    ///
+    /// The admin passcode is unrestricted access to the machine — every screen,
+    /// mouse and keyboard from the first frame, and with the service installed
+    /// that includes the lock screen and UAC prompts. Anything that ends up
+    /// holding it *is* the owner as far as this host is concerned.
+    ///
+    /// Which makes a copied code a very bad thing to lose, and codes do get
+    /// lost: pasted into the wrong window, read off a screen share, left in a
+    /// clipboard manager. Until now the code alone was the whole of the
+    /// authorisation, so a leak was silent and immediate.
+    ///
+    /// Requiring the host to approve the *first* connection from each endpoint
+    /// makes the leak visible — somebody has to be at the machine and say yes —
+    /// without making the code tedious for the person it belongs to, because
+    /// approval is asked once per endpoint and not once per connection.
+    ///
+    /// # What an endpoint is here
+    ///
+    /// The guest's iroh endpoint id: the public key its connection is
+    /// authenticated with, which cannot be claimed by anybody else. Not a name,
+    /// not an address — both of those are things a caller says about itself.
+    ///
+    /// # What clears it
+    ///
+    /// Resetting the admin passcode. That is the revocation the interface
+    /// already offers and the one people reach for when a code has got out, so
+    /// it takes the trust with it — a reset that left a leaked machine trusted
+    /// would be worse than useless, because it would look like it had worked.
+    pub trusted_admins: std::collections::BTreeSet<[u8; 32]>,
+    /// How long remote input gives way after somebody uses this machine.
+    ///
+    /// Zero turns it off. See [`super::input_inject::Deferring`] for what it
+    /// suppresses and what it deliberately does not, and
+    /// [`super::local_input`] for how a person is told apart from an injected
+    /// event.
+    ///
+    /// Carried here so it reaches the host from the settings panel, and applied
+    /// to the process rather than to the session — one keyboard, one answer.
+    pub local_input_wins_for: Duration,
 }
 
 impl Default for SessionConfig {
@@ -215,6 +302,12 @@ impl Default for SessionConfig {
             // Off: resizing somebody's desktop because a guest connected is a
             // surprising thing to do without being asked for it.
             virtual_display_follows_guest: false,
+            // Nobody, until somebody at this machine says so. A default that
+            // trusted anything would make the whole check decorative.
+            trusted_admins: std::collections::BTreeSet::new(),
+            local_input_wins_for: Duration::from_millis(
+                super::local_input::DEFAULT_WINDOW_MS,
+            ),
         }
     }
 }
@@ -353,6 +446,12 @@ impl HostServer {
     /// Applies to sessions started from now on; anything already connected keeps
     /// the configuration it was created with.
     pub fn set_session_config(&self, config: SessionConfig) {
+        // Pushed into the process rather than kept here, because that is where
+        // it is read from: the machine has one keyboard and one answer to how
+        // long its owner gets it to themselves, and applying it here means
+        // every session already running follows the new value rather than only
+        // the ones started afterwards.
+        super::local_input::set_window(config.local_input_wins_for);
         *self.config.lock().unwrap() = config;
     }
 
@@ -755,9 +854,27 @@ impl HostServer {
         // guest sees what the approval dialog chose, which replaces this.
         let mut allowed = super::protocol::DisplayGrant::All;
 
+        // # Who has to be asked about
+        //
+        // Every guest, every time — that has always been true, and what the
+        // host grants is theirs to decide per connection.
+        //
+        // And an admin arriving from an endpoint this machine has not seen
+        // before. Not every time: approval is remembered per endpoint, so the
+        // owner answers once from each of their own devices and never again.
+        // What it catches is a code that has got out — see
+        // [`SessionConfig::trusted_admins`], which is where the whole reasoning
+        // lives.
+        let endpoint_id = *conn.remote_id().as_bytes();
+        let is_admin = typ == PasscodeType::Master;
+        let must_ask = must_be_approved(typ, &endpoint_id, &config.trusted_admins);
+        if is_admin && !must_ask {
+            debug!("Session #{session_id} is an admin endpoint this host already trusts");
+        }
+
         // Guests wait here. Nothing has been captured, encoded, or sent — a
         // refused guest never sees a pixel of this machine.
-        let grants = if typ == PasscodeType::Guest {
+        let grants = if must_ask {
             write_stream_message(
                 &mut send,
                 &Message::GuestApprovalRequest(super::protocol::GuestApprovalRequest {
@@ -768,13 +885,32 @@ impl HostServer {
             .await?;
 
             let decision = self
-                .await_approval(session_id, label, client_name.is_some(), config.approval_timeout)
+                .await_approval(
+                    session_id,
+                    label,
+                    client_name.is_some(),
+                    is_admin,
+                    endpoint_id,
+                    config.approval_timeout,
+                )
                 .await;
 
             match decision {
                 ApprovalDecision::Allow { grants, displays } => {
+                    // # An approved admin keeps what an admin has
+                    //
+                    // The dialog's grants belong to the guest question — which
+                    // screens, whether the mouse is forwarded. There is no
+                    // version of that question for an admin: the code already
+                    // carries unrestricted access, and handing back less than
+                    // it authorises would be an interface pretending to a
+                    // limit the protocol does not have. The only thing being
+                    // decided here is whether this endpoint is the owner.
+                    let grants = if is_admin { initial_grants } else { grants };
+                    if !is_admin {
+                        allowed = displays;
+                    }
                     self.sessions.set_control(session_id, grants);
-                    allowed = displays;
                     grants
                 }
                 ApprovalDecision::Deny => {
@@ -946,23 +1082,45 @@ impl HostServer {
     /// Every path that is not an explicit "allow" denies. A host that cannot be
     /// asked — no UI attached, receiver gone, nobody at the keyboard — must not
     /// end up streaming its screen by default.
+    #[allow(clippy::too_many_arguments)]
     async fn await_approval(
         self: &Arc<Self>,
         session_id: u32,
         label: String,
         label_is_self_reported: bool,
+        is_admin: bool,
+        endpoint_id: [u8; 32],
         timeout: Duration,
     ) -> ApprovalDecision {
         let Some(ref tx) = self.approval_tx else {
-            warn!(
-                "Session #{}: no approval channel attached — refusing the guest",
-                session_id
-            );
+            // Nothing to ask, so nothing can be allowed. Said differently for
+            // an admin because the reason somebody would hit it is different:
+            // a guest being refused by a host with no interface is the expected
+            // shape of that host, while an admin being refused is a machine
+            // whose owner cannot get into it, and they need to know it is the
+            // missing interface and not their code.
+            if is_admin {
+                warn!(
+                    "Session #{session_id} used the admin passcode from an endpoint this \
+                     host has not approved before, and there is no interface here to ask. \
+                     Refusing. Connect once from a Tain window on this machine to approve \
+                     the device."
+                );
+            } else {
+                warn!("Session #{session_id}: no approval channel attached — refusing the guest");
+            }
             return ApprovalDecision::Deny;
         };
 
         let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
-        let req = ApprovalRequest { session_id, label, label_is_self_reported, approve_tx };
+        let req = ApprovalRequest {
+            session_id,
+            label,
+            label_is_self_reported,
+            is_admin,
+            endpoint_id,
+            approve_tx,
+        };
         if tx.send(req).is_err() {
             warn!("Session #{}: approval receiver dropped — refusing the guest", session_id);
             return ApprovalDecision::Deny;
@@ -1064,8 +1222,12 @@ where
     // One injector for the session, not one per thread: the capture thread has
     // to update what the pointer maps against when the desk is rearranged, and
     // `set_shown` takes `&self` precisely so that it can be shared.
+    //
+    // Wrapped so that remote input stands aside while somebody is using this
+    // machine — see [`super::input_inject::Deferring`], which explains why the
+    // rule is about presses rather than about all events.
     let injector: Arc<dyn super::input_inject::InputInjector> =
-        Arc::from(super::input_inject::create_injector());
+        Arc::new(super::input_inject::create_deferring_injector());
     let wanted_display: WantedDisplay =
         Arc::new(std::sync::Mutex::new(config.capture.display.clone()));
     // Which screens it is *allowed* to stream. A master code is the machine's
@@ -3231,31 +3393,55 @@ impl GuestClient {
         let mut using_fallback = false;
         let conn = loop {
             attempts += 1;
-            match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN)).await {
+            let outcome =
+                tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN)).await;
+
+            // # A dial that hangs found the host no better than one that
+            // came back empty
+            //
+            // This used to ask only about `NoAddress`, and treating a dial
+            // that spent its whole budget as fatal quietly made the fallback
+            // unreachable in the one situation it exists for. A lookup that is
+            // *blocked* does not answer "nothing" — it hangs, waiting on a
+            // relay or a resolver that will never reply — and a network where
+            // lookups hang is exactly the network where an address from last
+            // time is the only thing left to try.
+            //
+            // Caught by `a_host_that_can_be_reached_directly_is_carried_directly`,
+            // which handed a loopback address to a guest that could not
+            // discover anything and watched it give up without ever dialling
+            // the address it had been given.
+            let nothing_found = match &outcome {
+                Ok(Ok(_)) => false,
+                Ok(Err(e)) => not_found_yet(e),
+                Err(_elapsed) => true,
+            };
+
+            // Nothing said where this host is, and there is an address from
+            // last time. Now it is worth having — this is the "nothing else at
+            // all" it was kept for. Added once and then left in place, so the
+            // remaining retries include it.
+            if nothing_found && !using_fallback && !fallback.is_empty() {
+                using_fallback = true;
+                for known in &fallback {
+                    addr.addrs.insert(known.clone());
+                }
+                info!(
+                    "Nothing could say where this host is — trying {} address(es) it \
+                     answered on before",
+                    fallback.len()
+                );
+                on_step(DialStep::Direct);
+                continue;
+            }
+
+            match outcome {
                 Ok(Ok(conn)) => break conn,
                 Ok(Err(e)) => {
                     // The other case worth repeating: a first attempt made
                     // before this endpoint was online had no relay to fall back
                     // on, and the next one may.
                     let worth_waiting = not_found_yet(&e) || (!online && attempts == 1);
-
-                    // Nothing said where this host is, and there is an address
-                    // from last time. Now it is worth having — this is the
-                    // "nothing else at all" it was kept for. Added once and
-                    // then left in place, so the remaining retries include it.
-                    if !using_fallback && !fallback.is_empty() && not_found_yet(&e) {
-                        using_fallback = true;
-                        for known in &fallback {
-                            addr.addrs.insert(known.clone());
-                        }
-                        info!(
-                            "Nothing could say where this host is — trying {} address(es)                              it answered on before",
-                            fallback.len()
-                        );
-                        on_step(DialStep::Direct);
-                        continue;
-                    }
-
                     if !worth_waiting || std::time::Instant::now() >= deadline {
                         return Err(e).context("Failed to connect to host");
                     }
@@ -3950,6 +4136,96 @@ mod tests {
     use crate::protocol::{DisplayConfig, InputEvent, MouseEvent};
     use tokio::io::duplex;
 
+    fn endpoint(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    /// A guest is asked about every time, whatever else is remembered.
+    ///
+    /// The trusted set is about admin endpoints and must not leak into the
+    /// guest rule — an endpoint approved once as the owner turning up later
+    /// with a guest code is still a guest, and what a guest may do is decided
+    /// per connection.
+    #[test]
+    fn a_guest_is_always_asked_about() {
+        let mut trusted = std::collections::BTreeSet::new();
+        trusted.insert(endpoint(1));
+
+        assert!(must_be_approved(PasscodeType::Guest, &endpoint(1), &trusted));
+        assert!(must_be_approved(PasscodeType::Guest, &endpoint(2), &trusted));
+        assert!(must_be_approved(PasscodeType::Guest, &endpoint(1), &Default::default()));
+    }
+
+    /// An admin is asked about once per endpoint, and then not again.
+    #[test]
+    fn an_admin_is_asked_about_until_the_host_says_yes() {
+        let mut trusted = std::collections::BTreeSet::new();
+
+        // Nobody is trusted to begin with, so the first admin connection from
+        // anywhere has to be answered.
+        assert!(
+            must_be_approved(PasscodeType::Master, &endpoint(1), &trusted),
+            "an unknown endpoint holding the admin code must not walk in"
+        );
+
+        trusted.insert(endpoint(1));
+        assert!(
+            !must_be_approved(PasscodeType::Master, &endpoint(1), &trusted),
+            "the owner should not be asked again from a device they already approved"
+        );
+        // And approving one device says nothing about any other.
+        assert!(
+            must_be_approved(PasscodeType::Master, &endpoint(2), &trusted),
+            "trust is per endpoint — a second device is a second decision"
+        );
+    }
+
+    /// The whole point of the feature, stated as the thing it prevents.
+    ///
+    /// Somebody who has come by the admin passcode — pasted into the wrong
+    /// window, read off a screen share — still cannot use it without somebody
+    /// at the machine saying yes. The code alone stopped being sufficient, and
+    /// this is what says so.
+    #[test]
+    fn a_leaked_admin_code_alone_does_not_open_this_host() {
+        let owner = endpoint(7);
+        let thief = endpoint(200);
+        let trusted = std::collections::BTreeSet::from([owner]);
+
+        assert!(
+            must_be_approved(PasscodeType::Master, &thief, &trusted),
+            "holding the code must not be the whole of the authorisation"
+        );
+    }
+
+    /// Resetting the passcode is the revocation, so it must take trust with it.
+    ///
+    /// Modelled here as what the reset does — empty the set — because that is
+    /// the operation the interface offers, and a reset that left a leaked
+    /// machine trusted would look like it had worked and would not have.
+    #[test]
+    fn clearing_the_trusted_set_locks_everyone_out_again() {
+        let trusted = std::collections::BTreeSet::from([endpoint(1), endpoint(2)]);
+        assert!(!must_be_approved(PasscodeType::Master, &endpoint(1), &trusted));
+
+        let after_reset = std::collections::BTreeSet::new();
+        for known in [endpoint(1), endpoint(2)] {
+            assert!(
+                must_be_approved(PasscodeType::Master, &known, &after_reset),
+                "a passcode reset has to take its trusted endpoints with it"
+            );
+        }
+    }
+
+    /// A default host trusts nobody.
+    #[test]
+    fn nothing_is_trusted_until_it_is_said_so() {
+        assert!(
+            SessionConfig::default().trusted_admins.is_empty(),
+            "a default that trusted anything would make the check decorative"
+        );
+    }
+
     /// Every dial step must say something different, in both directions.
     ///
     /// The whole value of reporting steps is that the one left on screen
@@ -4050,6 +4326,13 @@ mod tests {
             // display behind it, and a test that resized the developer's
             // desktop would be a memorable way to find that out.
             virtual_display_follows_guest: false,
+            // Empty, so these exercise a host that has approved nobody — which
+            // is the state every host starts in.
+            trusted_admins: Default::default(),
+            // Off in tests: there is no person at this machine to give way to,
+            // and a developer's own mouse moving past would otherwise start
+            // dropping the input a test had just sent.
+            local_input_wins_for: Duration::ZERO,
         }
     }
 
@@ -4395,7 +4678,8 @@ mod tests {
 
         assert!(
             from_plan > from_achieved * 1.5,
-            "sized from the plan the window admits {from_plan:.0} fps, from the achieved              rate only {from_achieved:.0} — the second is the drag this avoids",
+            "sized from the plan the window admits {from_plan:.0} fps, from the achieved \
+             rate only {from_achieved:.0} — the second is the drag this avoids",
         );
     }
 

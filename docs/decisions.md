@@ -1003,3 +1003,237 @@ rather than offered in the interface.
 **Not changed by this**: the package is installed exactly as its authors signed
 it, and Windows names them rather than Tain in its publisher dialog. That is
 true whichever way the bytes arrive.
+
+## Tain Writes Its Own Graphics Preference Rather Than Explaining One
+
+**Problem**: on a laptop with two graphics chips, hosting failed outright and no
+amount of care inside the capture code could fix it. The report that finally
+explained it:
+
+```text
+no adapter could capture \.\DISPLAY1. Tried 6:
+  NVIDIA GeForce RTX 2060 with Max-Q Design: this GPU cannot duplicate that display (0x887A0004)
+  Intel(R) UHD Graphics: \.\DISPLAY1 is not attached to this adapter (it has none)
+  Intel(R) UHD Graphics: … (it has none)
+  Microsoft Basic Render Driver: … (it has none)
+  the default adapter: this GPU cannot duplicate that display (0x887A0004)
+  the software rasteriser: … (it has none)
+```
+
+The panel is driven by the Intel chip. Intel enumerates **no outputs at all**,
+and NVIDIA — this process's adapter zero — claims the display and then refuses
+to duplicate it. That is an Optimus laptop seen from a process the driver placed
+on the discrete GPU: it presents *through* the integrated chip, so it appears to
+own the desktop while owning nothing duplicable.
+
+**Why the two previous attempts could not have worked**: both added more
+adapters to try. There is exactly one adapter carrying the output, it is the
+wrong one, and DXGI will not pair an output with a device from another adapter.
+No search over adapters can succeed, however thorough — the search space does
+not contain the answer.
+
+**Decision**: when every adapter has failed and at least one failed with
+`DXGI_ERROR_UNSUPPORTED` on a machine with more than one real chip, Tain writes
+its own per-application preference to
+`HKCU\Software\Microsoft\DirectX\UserGpuPreferences` and asks to be restarted.
+
+**Rationale**: which chip a process runs on is fixed before `main`, so the run
+that failed cannot be repaired — only the next one. The previous message told
+the person at the keyboard to change it in *Settings > System > Display >
+Graphics*, and came back twice with the fault unfixed. That page is hard to find
+and these machines are usually being helped with from somewhere else. Writing
+the value is the same act, done by the program that knows it is needed.
+
+It is a modest thing to write: Tain's own executable, under `HKCU`, no
+administrator rights, reversible from that same Settings page and from
+`gpu_preference::clear`.
+
+**Why "power saving" and not the other option**: it is not a coin toss. The
+integrated chip is what the panel is wired to, and a process placed there sees
+an honest topology — Intel owns the internal display, the discrete chip owns the
+ports it drives — which the existing adapter search then resolves correctly. The
+preference is not "try the other GPU", it is "stop being lied to about which one
+owns the desktop".
+
+**What it will not do**: overwrite a preference somebody chose. Already on the
+integrated chip and still failing means this is not the wrong-chip problem;
+already on the discrete chip means somebody put it there. Both say so instead.
+
+**What it costs**: the whole application moves to the integrated chip, so its
+own rendering and any encoder chosen from that device are the integrated one's.
+On the machines this fires on, that is the difference between working and not.
+
+**The failure is carried as a type**, `DesktopOnAnotherGpu`, not recognised by
+its message — the Windows half of which arrives in the machine's own language,
+as the report above demonstrated in Russian.
+
+**Still unaddressed**: the *host* is who must restart, and the message reaches
+their log and their guest rather than their window. Windows.Graphics.Capture
+would avoid the whole question by not requiring the device and the desktop to
+share an adapter, and is the durable answer if this recurs.
+
+## There Are Two Ways to Capture a Screen, and the Second One Has No Adapter Rule
+
+**Problem**: Desktop Duplication requires the D3D device and the output to be on
+the same adapter — the one compositing the desktop. On a hybrid laptop the
+process is commonly placed on the *other* chip, which then claims the display
+and refuses to duplicate it. The full diagnosis is in the decision above.
+
+The remedy there works and was confirmed on a machine that could not host and
+then could. It is also a workaround wearing every bit of awkwardness that
+implies: the preference is filed under an exact executable path, so renaming or
+re-downloading Tain silently undoes it, and it cannot take effect until the
+process is restarted, because the decision it changes is made before `main`.
+
+**Decision**: add `capture_wgc`, a second backend built on
+Windows.Graphics.Capture, and fall back to it when duplication will not start.
+
+**Rationale**: WGC asks DWM for frames rather than duplicating an output. The
+compositor delivers onto whatever device the frame pool was given, so there is
+no ownership rule to break — nothing to restart, no path to match, no Windows
+setting to write. It is the mode OBS tells people with gaming laptops to use,
+for this exact fault.
+
+**Why duplication stays first**: it hands over a frame the moment the desktop
+changes, draws no capture border, and reports the pointer separately so the
+guest can draw it locally at its own frame rate. WGC gives up all three:
+
+- **The capture border.** A yellow rectangle around the captured screen.
+  `SetIsBorderRequired(false)` removes it, and only on Windows 11 21H2 and
+  later.
+- **The compositor's schedule**, not the desktop's — one more hop and one more
+  buffer.
+- **No pointer metadata.** WGC can bake the cursor in or leave it out and offers
+  no third answer, so it is baked in and `take_cursor` reports nothing.
+
+Every one of those is a real cost, and every one is paid only where the
+alternative is no picture at all.
+
+**Both failures are reported when both fail.** The duplication error names every
+adapter it tried, and that is the one that says what is wrong with the machine;
+losing it because a second attempt failed differently would throw away the
+diagnosis it exists to give.
+
+**Proved before it was wired in**, on real hardware rather than by reasoning: a
+2560x1600 frame of a live desktop through the frame pool, and the same again
+converted to NV12 by the video processor at exactly 12 bits per pixel — which is
+the path a session actually takes, and the one where a video processor that
+refused the size would only ever have shown up on somebody else's machine.
+
+**`TAIN_CAPTURE=wgc` forces it**, because a machine where duplication works never
+reaches the fallback and there would otherwise be no way to compare them — which
+is precisely what somebody wants when duplication works and looks wrong. An
+environment variable rather than a setting: one capture is shared between every
+session watching a display, so a per-session switch would mean the second
+session silently taking whatever the first one chose.
+
+**What this does not change**: the graphics preference stays. It is written, it
+works, and it costs nothing to leave in place as the line behind this one.
+
+## The Admin Passcode Stopped Being the Whole of the Authorisation
+
+**Problem**: the admin passcode is unrestricted access — every screen, mouse and
+keyboard from the first frame, and with the service installed the lock screen
+and UAC prompts too. Until now the code alone was the entire authorisation, so
+anything that came to hold it *was* the owner, silently and immediately. Codes
+do get out: pasted into the wrong window, read off a screen share, left in a
+clipboard manager.
+
+**Decision**, two halves that only work together:
+
+**A cover over the copy button.** The admin code cannot be copied by a click.
+The button is covered by a slider that has to be dragged aside, and on first
+contact a one-time dialog says what the code actually grants. The cover closes
+again on the copy it was opened for, on a passcode reset, and on its own after
+twenty seconds.
+
+*Why a drag and not a confirmation dialog*: what is being guarded against is the
+copy happening at all. Once the code is on the clipboard it can leave in the
+next paste, into whatever window has focus, and nothing afterwards calls it
+back. A dialog appears *after* the click, and the answer to a dialog you did not
+mean to summon is to dismiss it — which people do without reading. A drag cannot
+be produced by a stray click or a keyboard repeat.
+
+*Why the warning is shown once*: a dialog that appears every time is one nobody
+reads. The cover handles every later occasion, which is what it is for.
+
+**Approval on first use, per endpoint.** An admin connection from an endpoint
+the host has not seen before waits for somebody at the machine to say yes. The
+answer is remembered, so the owner is asked once from each of their own devices
+and never again.
+
+*Why per endpoint and not per connection*: asking every time would train the
+answer out of the person it protects, and an approval nobody reads protects
+nothing. Once per device is rare enough to be read and frequent enough to catch
+the case that matters — a code being used from somewhere it should not be.
+
+*What an endpoint is*: the guest's iroh endpoint id, the public key its
+connection is authenticated with. Not a name and not an address, both of which
+are things a caller says about itself.
+
+*What clears it*: resetting the admin passcode, which is the revocation the
+interface already offers and the one people reach for when a code has got out. A
+reset that left the machine that took the code still trusted would look like it
+had worked and would not have.
+
+**The dialog asks a different question for an admin.** A guest is asking to
+watch and the host chooses what to grant; an admin already has everything the
+moment it is let in. So the screen and input checkboxes are gone — offering them
+would imply a limit the protocol does not have — and the wording says what is
+being decided, which is whether this device is one of yours.
+
+**What this costs**: a host with no interface has nobody to ask, so it refuses.
+That was already true of guests; it is now true of admin connections from an
+unknown endpoint, which means a headless host cannot be reached from a device
+that has never been approved at the machine itself. The log says so in those
+words rather than reporting a bad passcode.
+
+**Caught by a test rather than by a user**: the e2e harness connects with the
+admin passcode and had no approval channel, so every one of its tests began
+failing — correctly. It now answers yes, which is what a real host with a window
+open does, and reads past the "waiting for approval" message that an admin
+connection is now sent before its session starts.
+
+## The Approval Popup Belongs to Its Card
+
+**Problem**: approving a guest was a modal dialog in the middle of the window,
+and it was a decision about *a* connection rather than about *that* one. With
+two guests waiting it was worse than untidy — the dialog named one of them, the
+strip showed both, and only the name tied the sentence to a card. The code
+enforced one at a time, on the reasoning that a second click was a mis-click.
+
+**Decision**: each waiting connection gets its own popup, drawn directly above
+its card and exactly as wide as it, and all of them are shown at once.
+
+**Why several is safe here when it would not be anywhere else**: the popups
+cannot overlap, because the cards cannot. Each takes its card's width, and the
+strip already lays cards out without collision — so the arrangement is inherited
+rather than invented. The card grows to `PILL_DECIDING_W` while a decision is
+attached and shrinks back once the guest is admitted, since a card carrying a
+question needs room for one.
+
+**Placed by its bottom edge.** The popup sits above the card, so what has to
+line up is its bottom — and its height is not known until its contents are laid
+out. `Area::pivot(LEFT_BOTTOM)` with `fixed_pos` says where the bottom-left
+corner goes and lets egui work out the rest, which is the difference between
+this and measuring on one frame to place on the next.
+
+**The Cancel button is gone.** It existed because a modal has to be got rid of
+before anything else can be done. A popup attached to its card is put away by
+clicking that card again, which leaves the guest exactly where it was — waiting,
+seeing nothing. That was the whole point of `Outcome::Dismiss` being distinct
+from `Deny`, and the distinction survives without the variant.
+
+**Screens became icons.** The list named every display in full, one per row —
+a paragraph to read before a decision that is really about shape: how many
+screens there are and which of them somebody is about to see. A row of monitors
+answers that at a glance, a virtual display is drawn as one, and the detail
+moves to the hover text where it is available to anyone who wants it and in the
+way of nobody who does not. It is shown even with a single screen, which the
+list was not: the single-monitor case previously said nothing at all about what
+was being shared.
+
+**The card reflects what the popup is offering.** Ticking Mouse lights the
+card's mouse mark immediately, with a tooltip saying it is offered rather than
+granted — the two used to disagree while a decision was open, the card showing
+the grants the session actually had and the popup showing what was proposed.

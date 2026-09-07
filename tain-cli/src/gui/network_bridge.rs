@@ -2136,6 +2136,8 @@ mod tests {
             host_name: Some("Test Host".into()),
             priority: Default::default(),
             virtual_display_follows_guest: false,
+            trusted_admins: Default::default(),
+            local_input_wins_for: std::time::Duration::ZERO,
         };
 
         let server = Arc::new(HostServer::bind().await.unwrap().with_config(config));

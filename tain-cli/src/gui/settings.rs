@@ -283,6 +283,32 @@ pub struct Settings {
     /// surprising thing to do without being asked.
     #[serde(default)]
     pub virtual_display_follows_guest: bool,
+    /// Endpoints this host has let in with the admin passcode.
+    ///
+    /// Hex endpoint ids — public keys, not secrets, so this file is the right
+    /// place for them. See [`tain_core::SessionConfig::trusted_admins`] for
+    /// what they authorise and why the list exists.
+    ///
+    /// Emptied whenever the admin passcode is reset. That is deliberate and it
+    /// is the whole revocation story: the reset is what somebody reaches for
+    /// when a code has got out, and a reset that left the machine that took it
+    /// still trusted would look like it had worked.
+    #[serde(default)]
+    pub trusted_admin_endpoints: Vec<String>,
+    /// Whether the warning about copying the admin passcode has been read.
+    ///
+    /// Shown once, on the first attempt to uncover that button, and then never
+    /// again — a dialog that appears every time is one nobody reads, and this
+    /// one has something to say.
+    #[serde(default)]
+    pub admin_copy_warning_read: bool,
+    /// How long remote input gives way after somebody uses this machine, in
+    /// milliseconds. Zero turns it off.
+    ///
+    /// See [`tain_core::input_inject::Deferring`] for what stands aside and
+    /// what deliberately does not.
+    #[serde(default = "default_local_input_wins_ms")]
+    pub local_input_wins_ms: u64,
     /// How large this application's own interface is, relative to the DPI
     /// scale the monitor asks for. `1.0` follows the monitor exactly.
     ///
@@ -399,6 +425,10 @@ impl Default for Settings {
             unattended_access: false,
             virtual_display_size: (0, 0),
             virtual_display_follows_guest: false,
+            // Nobody, until somebody at this machine says so.
+            trusted_admin_endpoints: Vec::new(),
+            admin_copy_warning_read: false,
+            local_input_wins_ms: default_local_input_wins_ms(),
             ui_scale: 1.0,
             rate_control: RateControlSetting::default(),
             latency_priority: LatencyPriority::default().value(),
@@ -585,8 +615,62 @@ impl Settings {
             host_name: self.device_name(),
             priority: self.priority(),
             virtual_display_follows_guest: self.virtual_display_follows_guest,
+            trusted_admins: self.trusted_admins(),
+            local_input_wins_for: std::time::Duration::from_millis(self.local_input_wins_ms),
         }
     }
+
+    /// The trusted endpoint ids, as the host server wants them.
+    ///
+    /// Anything unreadable is dropped rather than refused. This list is edited
+    /// by the application and could be edited by hand; a malformed entry means
+    /// one endpoint gets asked about again, which is the safe direction, while
+    /// refusing to start the host over it would not be.
+    pub fn trusted_admins(&self) -> std::collections::BTreeSet<[u8; 32]> {
+        self.trusted_admin_endpoints.iter().filter_map(|hex| parse_endpoint(hex)).collect()
+    }
+
+    /// Remember that this endpoint was let in with the admin passcode.
+    ///
+    /// Returns whether anything changed, so the caller can avoid writing the
+    /// file for a device that was already on the list.
+    pub fn trust_admin(&mut self, endpoint_id: [u8; 32]) -> bool {
+        let hex = format_endpoint(&endpoint_id);
+        if self.trusted_admin_endpoints.iter().any(|known| known.eq_ignore_ascii_case(&hex)) {
+            return false;
+        }
+        self.trusted_admin_endpoints.push(hex);
+        true
+    }
+}
+
+/// What a settings file written before this option existed should get.
+///
+/// The feature's own default rather than zero: somebody upgrading has never
+/// been asked, and the answer they would give is the one everybody gets.
+fn default_local_input_wins_ms() -> u64 {
+    tain_core::local_input::DEFAULT_WINDOW_MS
+}
+
+/// A hex endpoint id, as 32 bytes.
+fn parse_endpoint(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The same, the other way, lower case.
+fn format_endpoint(id: &[u8; 32]) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+impl Settings {
 
     /// Where settings live. `None` if no config directory can be determined.
     pub fn path() -> Option<PathBuf> {
@@ -639,6 +723,113 @@ impl Settings {
             }
             Err(e) => warn!("Could not serialize settings: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod trusted_admin_tests {
+    use super::*;
+
+    /// What is written down and what the host checks against must be the same
+    /// thing.
+    ///
+    /// This is the whole of the trust record, and both directions of it are
+    /// hand-rolled hex. Getting it wrong in one direction only would mean an
+    /// endpoint that is approved every single time — annoying, and the sort of
+    /// annoyance people work around by turning the feature off.
+    #[test]
+    fn a_trusted_endpoint_survives_being_written_down() {
+        let mut settings = Settings::default();
+        let device = [0xABu8; 32];
+
+        assert!(settings.trust_admin(device), "the first device is new");
+        assert!(
+            settings.trusted_admins().contains(&device),
+            "what was written down did not read back as the same endpoint"
+        );
+    }
+
+    /// Approving the same device twice must not grow the file forever.
+    #[test]
+    fn trusting_a_device_twice_records_it_once() {
+        let mut settings = Settings::default();
+        let device = [7u8; 32];
+
+        assert!(settings.trust_admin(device));
+        assert!(!settings.trust_admin(device), "nothing changed, so nothing to save");
+        assert_eq!(settings.trusted_admin_endpoints.len(), 1);
+    }
+
+    /// Every byte has to survive, including the ones a sloppy hex routine eats.
+    ///
+    /// A leading zero dropped, or a byte read as decimal, produces an id that
+    /// is *almost* right — which fails open in the worst way if it collides
+    /// with nothing and fails closed silently if it does not.
+    #[test]
+    fn every_byte_of_an_endpoint_id_round_trips() {
+        let mut id = [0u8; 32];
+        for (index, byte) in id.iter_mut().enumerate() {
+            // 0x00 and 0x0f included deliberately: both need a leading zero.
+            *byte = (index as u8).wrapping_mul(8);
+        }
+        let hex = format_endpoint(&id);
+        assert_eq!(hex.len(), 64, "32 bytes is 64 hex characters");
+        assert_eq!(parse_endpoint(&hex), Some(id));
+    }
+
+    /// A hand-edited or truncated entry must not become a *different* endpoint.
+    ///
+    /// Dropping it is right: the endpoint gets asked about again, which is the
+    /// safe direction. Accepting a short id and padding it would silently trust
+    /// something nobody approved.
+    #[test]
+    fn a_malformed_entry_is_dropped_rather_than_guessed_at() {
+        for bad in [
+            "",
+            "abc",
+            &"ab".repeat(31),          // one byte short
+            &"ab".repeat(33),          // one byte long
+            &format!("{}zz", "ab".repeat(31)), // right length, not hex
+        ] {
+            assert_eq!(parse_endpoint(bad), None, "{bad:?} was accepted as an endpoint");
+        }
+
+        let settings = Settings {
+            trusted_admin_endpoints: vec!["nonsense".into(), "ab".repeat(32)],
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.trusted_admins().len(),
+            1,
+            "the unreadable entry should be dropped and the good one kept"
+        );
+    }
+
+    /// Case is not identity — a device must not be trusted twice over it.
+    #[test]
+    fn an_endpoint_is_the_same_endpoint_in_either_case() {
+        let mut settings = Settings {
+            trusted_admin_endpoints: vec!["AB".repeat(32)],
+            ..Settings::default()
+        };
+        assert!(
+            !settings.trust_admin([0xABu8; 32]),
+            "the same device in another case is still the same device"
+        );
+        assert_eq!(settings.trusted_admin_endpoints.len(), 1);
+        assert!(settings.trusted_admins().contains(&[0xABu8; 32]));
+    }
+
+    /// A fresh install trusts nobody.
+    #[test]
+    fn nothing_is_trusted_out_of_the_box() {
+        let settings = Settings::default();
+        assert!(settings.trusted_admin_endpoints.is_empty());
+        assert!(settings.trusted_admins().is_empty());
+        assert!(
+            !settings.admin_copy_warning_read,
+            "the warning has not been read on a machine that has never shown it"
+        );
     }
 }
 

@@ -97,6 +97,114 @@ pub struct IncomingConnection {
     pub link: String,
 }
 
+/// The reset icon and autoreset checkbox that follow every copy button.
+///
+/// A free function because the admin row draws two different things to its left
+/// — the copy button, or the cover over it — and everything after that is the
+/// same either way. Duplicating it was the alternative, and the copy that got
+/// edited would have been whichever one was not being looked at.
+fn render_passcode_row_tail(
+    ui: &mut egui::Ui,
+    typ: PasscodeType,
+    settings: &Settings,
+    edits: &mut PendingEdits,
+) {
+    ui.add_space(8.0);
+
+    if theme::icon_button(
+        ui,
+        20.0,
+        egui::include_image!("../../assets/reset_passcode.svg"),
+        match typ {
+            PasscodeType::Master =>
+                "Generate a new admin code now. This invalidates the current one \
+                 and forgets every device it has let in.",
+            PasscodeType::Guest => "Generate a new code now (invalidates the current one)",
+        },
+    )
+    .clicked()
+    {
+        edits.regenerate.push(typ);
+    }
+
+    ui.add_space(4.0);
+    let mut on = autoreset_of(settings, typ);
+    if ui
+        .checkbox(&mut on, egui::RichText::new("autoreset").color(TEXT))
+        .on_hover_text(
+            "Regenerate automatically when the last guest disconnects.\n\
+             Turning this off keeps the code usable for reconnecting.",
+        )
+        .changed()
+    {
+        edits.set_autoreset.push((typ, on));
+    }
+}
+
+/// The cover over the admin passcode's copy button, and how far it is open.
+///
+/// # Why it closes again
+///
+/// The cover exists so the code cannot reach the clipboard by accident. Left
+/// open, it stops being a cover after the first use and the guard quietly
+/// becomes decoration — so it shuts on the copy it was opened for, on a passcode
+/// reset, and on its own after a short while if nothing happens.
+#[derive(Default)]
+struct AdminCover {
+    /// Where the knob is, 0 at rest and 1 fully across.
+    progress: f32,
+    /// When the cover closes again, once it has been opened.
+    closes_at: Option<std::time::Instant>,
+}
+
+impl AdminCover {
+    /// How long an uncovered button stays uncovered with nothing done to it.
+    ///
+    /// Long enough to read the button and press it without hurrying, short
+    /// enough that a window left open on a desk is not a copy button anybody
+    /// walking past can press.
+    const STAYS_OPEN: std::time::Duration = std::time::Duration::from_secs(20);
+
+    fn is_open(&self) -> bool {
+        self.closes_at.is_some_and(|at| at > std::time::Instant::now())
+    }
+
+    fn open(&mut self) {
+        self.progress = 1.0;
+        self.closes_at = Some(std::time::Instant::now() + Self::STAYS_OPEN);
+    }
+
+    fn close(&mut self) {
+        self.progress = 0.0;
+        self.closes_at = None;
+    }
+}
+
+/// A connection waiting for the host to decide, and what saying yes means.
+///
+/// The responder is the thing the server is blocked on — dropping it answers
+/// "no decision", which the server reads as a denial, so it is held until
+/// somebody has actually chosen.
+struct PendingApproval {
+    respond: oneshot::Sender<ApprovalDecision>,
+    /// The endpoint to remember, when this connection presented the **admin**
+    /// passcode.
+    ///
+    /// `None` for a guest, which is every connection that only ever gets asked
+    /// about and never remembered. One field rather than a bool beside an id,
+    /// because the two can never disagree that way: there is no admin without
+    /// an endpoint to trust, and no guest with one.
+    admin_endpoint: Option<[u8; 32]>,
+}
+
+#[cfg(test)]
+impl PendingApproval {
+    /// A guest waiting to be let in — nothing to remember either way.
+    fn guest(respond: oneshot::Sender<ApprovalDecision>) -> Self {
+        Self { respond, admin_endpoint: None }
+    }
+}
+
 /// Approval state for an incoming connection.
 ///
 /// There is no "denied" state: denial disconnects the guest, so a refused
@@ -977,6 +1085,12 @@ struct PendingEdits {
     open_settings: bool,
     /// Actions raised by a pill, pending confirmation.
     confirm: Vec<(u32, ConfirmAction)>,
+    /// Where the admin cover's knob was dragged to this frame.
+    admin_slider: Option<f32>,
+    /// The knob reached the end — uncover the copy button.
+    admin_uncovered: bool,
+    /// The cover was touched by somebody who has not read the warning yet.
+    admin_warning: bool,
 }
 
 /// A decision held until the user confirms it.
@@ -990,6 +1104,11 @@ struct Confirm {
     /// Whether `guest` is a name the other machine chose for itself.
     guest_named_itself: bool,
     action: ConfirmAction,
+    /// Whether the connection presented the admin passcode.
+    ///
+    /// Changes what is being asked rather than merely how it is worded — see
+    /// [`Self::body`].
+    is_admin: bool,
     /// Which devices the checkboxes currently offer. Deliberately starts empty:
     /// the safe answer must be the one you get by not thinking about it.
     grants: ControlGrants,
@@ -1011,16 +1130,18 @@ enum ConfirmAction {
     Kick,
 }
 
-/// What the user chose in the confirmation dialog.
+/// What the user chose, when they chose something.
 ///
-/// `Dismiss` is deliberately distinct from `Deny`: closing the dialog leaves the
-/// guest waiting, while denying disconnects it. Collapsing the two would make
-/// an accidental Escape into a disconnection.
+/// There is no `Dismiss` here, and there used to be: closing the dialog was a
+/// third answer because the dialog was modal and had to be got rid of. A popup
+/// attached to its card is put away by clicking that card, which never reaches
+/// this — leaving the guest waiting, which is the whole distinction the old
+/// variant existed to preserve. See
+/// [`GuestApp::closing_a_decision_does_not_answer_it`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Allow(ControlGrants),
     Deny,
-    Dismiss,
 }
 
 impl Confirm {
@@ -1060,13 +1181,32 @@ impl Confirm {
             .map(|d| d.id)
             .into_iter()
             .collect();
-        Self { session_id, guest, guest_named_itself, action, grants, screens, share }
+        Self {
+            session_id,
+            guest,
+            guest_named_itself,
+            action,
+            grants,
+            screens,
+            share,
+            is_admin: false,
+        }
+    }
+
+    /// Say that this connection presented the admin passcode.
+    ///
+    /// A different question entirely — see [`Self::body`] — so it changes the
+    /// wording and takes away the checkboxes, which have nothing to decide.
+    fn for_admin(mut self, yes: bool) -> Self {
+        self.is_admin = yes;
+        self
     }
 
     fn title(&self) -> &'static str {
-        match self.action {
-            ConfirmAction::Approve => "Allow this connection?",
-            ConfirmAction::Kick => "Disconnect this guest?",
+        match (self.action, self.is_admin) {
+            (ConfirmAction::Approve, true) => "Allow full control of this machine?",
+            (ConfirmAction::Approve, false) => "Allow this connection?",
+            (ConfirmAction::Kick, _) => "Disconnect this guest?",
         }
     }
 
@@ -1075,15 +1215,28 @@ impl Confirm {
     /// The screen is the part people underestimate, so it leads: input can be
     /// revoked later, but anything visible during the session has been seen.
     fn body(&self) -> String {
-        match self.action {
-            ConfirmAction::Approve => format!(
-                "{} will see everything on this machine's screen for as long as \
-                 the connection lasts.\n\nNothing is being streamed yet.",
-                self.guest
-            ),
-            ConfirmAction::Kick => {
-                format!("{} will be disconnected immediately.", self.guest)
+        match (self.action, self.is_admin) {
+            // # The admin question is not the guest question
+            //
+            // A guest is asking to watch, and the host chooses what to grant.
+            // Somebody holding the admin passcode already has everything the
+            // moment they are let in, so there is nothing to choose and
+            // offering checkboxes would imply a limit that does not exist.
+            //
+            // What is actually being decided is whether this device is one of
+            // yours — which is why the answer is remembered, and why it says so.
+            // The admin case says what the code carries, because the dialog
+            // has no permissions to show — there is nothing to choose, and a
+            // dialog with nothing in it would look like a smaller decision
+            // than a guest's rather than a larger one.
+            (ConfirmAction::Approve, true) => {
+                "wants to connect with this PC's admin passcode — every screen, \
+                 the mouse and the keyboard, and the lock screen too where \
+                 unattended access is installed."
+                    .to_string()
             }
+            (ConfirmAction::Approve, false) => "wants to connect to this PC".to_string(),
+            (ConfirmAction::Kick, _) => "will be disconnected immediately.".to_string(),
         }
     }
 
@@ -1109,9 +1262,13 @@ pub struct GuestApp {
     command_tx: Option<mpsc::UnboundedSender<HostCommand>>,
     /// Approval decisions the server is still waiting on, keyed by session.
     /// Nothing is streamed to these guests until one of these is answered.
-    pending_approvals: HashMap<u32, oneshot::Sender<ApprovalDecision>>,
+    pending_approvals: HashMap<u32, PendingApproval>,
     /// Which passcode was most recently copied, for transient UI feedback.
     copied_at: Option<(PasscodeType, std::time::Instant)>,
+    /// The guard over the admin passcode's copy button.
+    admin_cover: AdminCover,
+    /// Whether the one-time explanation of what that code is, is on screen.
+    admin_warning_open: bool,
     /// Live guest sessions, one per tab in the session window.
     sessions: Vec<GuestSession>,
     /// The session window's own state (active tab, fullscreen, toolbar).
@@ -1163,8 +1320,12 @@ pub struct GuestApp {
     /// would be announced sixty times a second.
     announced: std::collections::HashSet<u32>,
     checked_rx: Option<mpsc::UnboundedReceiver<(ConnectionCode, ProbeOutcome)>>,
-    /// A destructive action awaiting confirmation.
-    confirm: Option<Confirm>,
+    /// Decisions awaiting an answer, one per connection.
+    ///
+    /// Several at once on purpose: each is drawn above the card it is about and
+    /// is exactly as wide as it, so two guests arriving together are two
+    /// questions side by side rather than a queue. See [`Self::render_confirms`].
+    confirms: Vec<Confirm>,
     /// Whether the settings window is open.
     show_settings: bool,
     /// Transient state for the settings window (which shortcut is rebinding).
@@ -1192,6 +1353,8 @@ impl GuestApp {
             command_tx: None,
             pending_approvals: HashMap::new(),
             copied_at: None,
+            admin_cover: AdminCover::default(),
+            admin_warning_open: false,
             sessions: Vec::new(),
             session_window: SessionWindow::default(),
             immersive: Immersive::default(),
@@ -1210,7 +1373,7 @@ impl GuestApp {
             resweep_tx: None,
             announced: std::collections::HashSet::new(),
             checked_rx: None,
-            confirm: None,
+            confirms: Vec::new(),
             show_settings: false,
             settings_panel: PanelState::default(),
             settings_settling: None,
@@ -1235,12 +1398,12 @@ impl GuestApp {
                 .iter()
                 .find(|c| c.status == ApprovalStatus::Pending)
         {
-            self.confirm = Some(Confirm::new(
+            self.confirms = vec![Confirm::new(
                 card.session_id,
                 card.display_name.clone(),
                 card.name_is_self_reported,
                 ConfirmAction::Approve,
-            ));
+            )];
         }
     }
 
@@ -1302,8 +1465,37 @@ impl GuestApp {
     /// Drain server notifications into UI state.
     fn poll_channels(&mut self) {
         if let Some(ref mut rx) = self.approval_rx {
+            // Read before the loop: `settings()` takes a lock that must not be
+            // held while `incoming` is locked below.
+            let defaults = self.state.settings().default_grants();
             while let Ok(req) = rx.try_recv() {
                 info!("Approval requested for session #{}: {}", req.session_id, req.label);
+
+                // # The question asks itself
+                //
+                // It used to wait for the card to be clicked, which made the
+                // card a notification *about* a decision rather than the
+                // decision — one click before anything could be answered, and
+                // one more thing to notice on a strip somebody is not looking
+                // at. There is nothing being decided here that the person has
+                // to ask for: a guest is already waiting, and the popup is what
+                // says so.
+                //
+                // Only on arrival. Putting it away is a click on the card, and
+                // it stays away — deriving this from "pending and no popup"
+                // would reopen it on the next frame and make dismissing
+                // impossible.
+                self.confirms.push(
+                    Confirm::with_grants(
+                        req.session_id,
+                        req.label.clone(),
+                        req.label_is_self_reported,
+                        ConfirmAction::Approve,
+                        defaults,
+                    )
+                    .for_admin(req.is_admin),
+                );
+
                 self.state.incoming.lock().unwrap().push(IncomingConnection {
                     session_id: req.session_id,
                     display_name: req.label,
@@ -1311,15 +1503,20 @@ impl GuestApp {
                     mouse_allowed: false,
                     keyboard_allowed: false,
                     status: ApprovalStatus::Pending,
-                    // Only guest connections are ever asked about.
-                    is_admin: false,
+                    is_admin: req.is_admin,
                     // Nothing is streaming yet, so there is nothing to say
                     // about the link; `reconcile_incoming` fills this in.
                     link: String::new(),
                 });
                 // Hold the responder until the user decides. Dropping it here
                 // would answer "no decision", which the server reads as a denial.
-                self.pending_approvals.insert(req.session_id, req.approve_tx);
+                self.pending_approvals.insert(
+                    req.session_id,
+                    PendingApproval {
+                        respond: req.approve_tx,
+                        admin_endpoint: req.is_admin.then_some(req.endpoint_id),
+                    },
+                );
             }
         }
 
@@ -1380,16 +1577,77 @@ impl GuestApp {
         self.paste_state = PasteState::Checking;
     }
 
+    /// Remember an endpoint the host has let in with the admin passcode.
+    ///
+    /// Written to disk and pushed to the running server, in that order: the
+    /// file is what survives a restart, and the server's copy is what the
+    /// *next* connection from this endpoint is checked against. Skipping either
+    /// would mean the owner being asked again — once more this run, or once
+    /// more every run.
+    fn trust_admin_endpoint(&mut self, endpoint_id: [u8; 32]) {
+        let changed = {
+            let mut settings = self.state.settings.lock().unwrap();
+            settings.trust_admin(endpoint_id)
+        };
+        if !changed {
+            return;
+        }
+        self.state.save_settings();
+        let config = self.state.settings().to_session_config();
+        self.send(HostCommand::ApplySettings(config));
+        info!(
+            "This device is now a trusted admin endpoint. \
+             Resetting the admin passcode forgets it again."
+        );
+    }
+
+    /// Forget every endpoint trusted with the admin passcode.
+    ///
+    /// What a passcode reset does, and what the button in Settings does. After
+    /// this the next admin connection from anywhere — including from this
+    /// machine's owner — has to be approved again.
+    fn forget_trusted_admins(&mut self) {
+        let had = {
+            let mut settings = self.state.settings.lock().unwrap();
+            let had = settings.trusted_admin_endpoints.len();
+            settings.trusted_admin_endpoints.clear();
+            had
+        };
+        if had == 0 {
+            return;
+        }
+        self.state.save_settings();
+        let config = self.state.settings().to_session_config();
+        self.send(HostCommand::ApplySettings(config));
+        info!("Forgot {had} trusted admin endpoint(s) — the next one will be asked about");
+    }
+
     /// Answer a guest that is waiting to be let in.
     fn resolve_approval(&mut self, session_id: u32, decision: ApprovalDecision) {
         // Cloned rather than moved: the decision is both *sent* to the waiting
         // session and used below to update this side's own view of it, and it
         // stopped being `Copy` when it grew a list of screens.
         match self.pending_approvals.remove(&session_id) {
-            Some(tx) => {
+            Some(pending) => {
+                // # Saying yes to an admin is what creates the trust
+                //
+                // Recorded here rather than by the server, because this is the
+                // moment somebody at the machine actually decided, and because
+                // the answer has to outlive the process — a trust list that
+                // forgot on every restart would ask the owner again every day
+                // and train them to click through it.
+                //
+                // Only on `Allow`, and only for a connection that presented the
+                // admin passcode. A denial leaves the endpoint exactly as
+                // unknown as it was.
+                if let (Some(endpoint), ApprovalDecision::Allow { .. }) =
+                    (pending.admin_endpoint, &decision)
+                {
+                    self.trust_admin_endpoint(endpoint);
+                }
                 // The server is blocked on this: it has captured nothing and
                 // sent nothing, and will only start once we answer.
-                let _ = tx.send(decision.clone());
+                let _ = pending.respond.send(decision.clone());
             }
             None => {
                 // Already streaming — the prompt closed, or this is a live
@@ -1443,6 +1701,16 @@ impl GuestApp {
 
         for typ in edits.regenerate {
             self.send(HostCommand::RegeneratePasscode(typ));
+            // # A reset takes the trusted devices with it
+            //
+            // Resetting the admin passcode is what somebody reaches for when a
+            // code has got out, and the trust list is the other half of the
+            // authorisation. Leaving it behind would revoke the code from
+            // everybody except the machines that had already used it — which is
+            // exactly backwards, and would look like it had worked.
+            if typ == PasscodeType::Master {
+                self.forget_trusted_admins();
+            }
         }
 
         if !edits.set_autoreset.is_empty() {
@@ -1464,23 +1732,40 @@ impl GuestApp {
             *self.state.settings.lock().unwrap() = settings;
         }
 
-        // Only one confirmation at a time; a second click while one is open is
-        // almost certainly a mis-click rather than a second decision.
-        if self.confirm.is_none()
-            && let Some((session_id, action)) = edits.confirm.into_iter().next()
-        {
+        // One per connection, not one at a time. A second guest arriving while
+        // the first is still being decided about is a second question, and it
+        // now has somewhere of its own to be asked — above its own card.
+        //
+        // Still only one *per* connection: clicking a card that already has a
+        // popup open is a mis-click, not a second decision about the same
+        // guest.
+        if !edits.confirm.is_empty() {
             // Snapshot before locking `incoming` — `settings()` takes its own
             // lock and these must not nest.
             let defaults = self.state.settings().default_grants();
             let incoming = self.state.incoming.lock().unwrap();
-            if let Some(card) = incoming.iter().find(|c| c.session_id == session_id) {
-                self.confirm = Some(Confirm::with_grants(
-                    session_id,
-                    card.display_name.clone(),
-                    card.name_is_self_reported,
-                    action,
-                    defaults,
-                ));
+            for (session_id, action) in edits.confirm.iter().copied() {
+                // Clicking a card whose question is already up puts it away —
+                // which is the way out now that there is no Cancel button, and
+                // leaves the guest exactly where it was: waiting, seeing
+                // nothing.
+                if let Some(open) = self.confirms.iter().position(|c| c.session_id == session_id)
+                {
+                    self.confirms.remove(open);
+                    continue;
+                }
+                if let Some(card) = incoming.iter().find(|c| c.session_id == session_id) {
+                    self.confirms.push(
+                        Confirm::with_grants(
+                            session_id,
+                            card.display_name.clone(),
+                            card.name_is_self_reported,
+                            action,
+                            defaults,
+                        )
+                        .for_admin(card.is_admin),
+                    );
+                }
             }
         }
 
@@ -1786,9 +2071,7 @@ impl GuestApp {
 
         // Drop responders and dialogs for sessions that vanished.
         self.pending_approvals.retain(|id, _| live.contains(id));
-        if self.confirm.as_ref().is_some_and(|c| !live.contains(&c.session_id)) {
-            self.confirm = None;
-        }
+        self.confirms.retain(|c| live.contains(&c.session_id));
     }
 
     /// Mirror live session state into the saved-connection list.
@@ -1849,8 +2132,8 @@ impl GuestApp {
         });
         // Answer any outstanding approval so the server is not left waiting out
         // its whole timeout on a session that is going away.
-        if let Some(tx) = self.pending_approvals.remove(&session_id) {
-            let _ = tx.send(ApprovalDecision::Deny);
+        if let Some(pending) = self.pending_approvals.remove(&session_id) {
+            let _ = pending.respond.send(ApprovalDecision::Deny);
         }
         self.state.incoming.lock().unwrap().retain(|c| c.session_id != session_id);
     }
@@ -1880,12 +2163,153 @@ impl GuestApp {
         self.send(HostCommand::ApplySettings(settings.to_session_config()));
     }
 
-    fn render_confirm(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = self.confirm.as_mut() else { return };
+    /// What the admin passcode is, said once, before it can be copied.
+    ///
+    /// # Why this exists and why it is only shown once
+    ///
+    /// The button beside it copies a secret that *is* the machine — every
+    /// screen, mouse and keyboard from the first frame, and with the service
+    /// installed the lock screen and UAC prompts too. That is not obvious from
+    /// a button labelled "Copy admin passcode", and the moment to say so is
+    /// before the first copy rather than in documentation nobody opened.
+    ///
+    /// Once, because a dialog that appears every time is one people learn to
+    /// dismiss without reading, and the cover behind it already handles the
+    /// accidental case on every later occasion.
+    fn render_admin_warning(&mut self, ctx: &egui::Context) {
+        if !self.admin_warning_open {
+            return;
+        }
+        let mut understood = false;
+
+        egui::Window::new("This code is the whole machine")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(400.0);
+                ui.label(
+                    egui::RichText::new(
+                        "The admin passcode gives whoever holds it unrestricted access to \
+                         this computer: every screen, the mouse and the keyboard, with no \
+                         approval asked for anything.",
+                    )
+                    .size(12.0)
+                    .color(TEXT),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "With unattended access installed that includes the lock screen \
+                         and administrator prompts — the things a password would normally \
+                         stop.",
+                    )
+                    .size(12.0)
+                    .color(AMBER),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Keep it for your own devices, and send it somewhere private if \
+                         you must send it at all — not a group chat, not a screen share. \
+                         Anything that ends up holding it is you, as far as this machine \
+                         is concerned.",
+                    )
+                    .size(12.0)
+                    .color(TEXT),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Two things soften a mistake. The first connection from each new \
+                         device has to be approved here, so a code that gets out cannot be \
+                         used behind your back. And the reset button beside the code \
+                         revokes it — along with every device it has already let in.",
+                    )
+                    .size(12.0)
+                    .color(TEXT_DIM),
+                );
+
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let button = egui::Button::new(
+                        egui::RichText::new("I understand").color(egui::Color32::WHITE),
+                    )
+                    .fill(ADMIN_FILL);
+                    if ui.add(button).clicked() {
+                        understood = true;
+                    }
+                });
+            });
+
+        if understood {
+            self.admin_warning_open = false;
+            // Written down rather than remembered in memory: shown once means
+            // once, not once per launch.
+            self.state.settings.lock().unwrap().admin_copy_warning_read = true;
+            self.state.save_settings();
+        }
+    }
+
+    /// Every decision waiting to be made, each above the card it is about.
+    ///
+    /// # Why they are attached and why there can be several
+    ///
+    /// This was one dialog in the middle of the window, and a decision about
+    /// *a* connection rather than about *that* one. With two guests waiting it
+    /// was worse than untidy: the dialog named one of them, the strip showed
+    /// both, and nothing tied the sentence to the card.
+    ///
+    /// Anchored to its card, the popup is an extension of it — which is what
+    /// makes several at once safe rather than chaotic. Each is exactly as wide
+    /// as the card beneath it, so two of them can no more overlap than the two
+    /// cards can, and the cards already lay themselves out without colliding.
+    ///
+    /// A card that is not on screen this frame gets no popup and keeps its
+    /// state: the decision is still pending, there is simply nowhere to put the
+    /// question. [`Self::retain_live`] is what removes one for good.
+    fn render_confirms(&mut self, ctx: &egui::Context, cards: &[(u32, egui::Rect)]) {
+        if self.confirms.is_empty() {
+            return;
+        }
+        // Taken out so each popup can be given `&mut Confirm` while the answers
+        // below need `&mut self`. Put back before anything is applied.
+        let mut confirms = std::mem::take(&mut self.confirms);
+        let mut answered: Vec<(u32, Outcome)> = Vec::new();
+
+        for confirm in &mut confirms {
+            let Some(card) = cards
+                .iter()
+                .find(|(session_id, _)| *session_id == confirm.session_id)
+                .map(|(_, rect)| *rect)
+            else {
+                continue;
+            };
+            if let Some(outcome) = Self::show_confirm(ctx, confirm, card) {
+                answered.push((confirm.session_id, outcome));
+            }
+        }
+        self.confirms = confirms;
+
+        for (session_id, outcome) in answered {
+            self.answer_confirm(session_id, outcome);
+        }
+    }
+
+    /// One popup, above one card. Returns the answer if it was given.
+    fn show_confirm(
+        ctx: &egui::Context,
+        confirm: &mut Confirm,
+        card: egui::Rect,
+    ) -> Option<Outcome> {
         let (title, body, label) = (confirm.title(), confirm.body(), confirm.confirm_label());
         let caveat = confirm.name_caveat();
+        let confirm_guest = confirm.guest.clone();
         let approving = confirm.action == ConfirmAction::Approve;
-        let session_id = confirm.session_id;
+        // An admin connection has nothing to tick: the code already carries
+        // every screen and both input devices, and the server ignores anything
+        // this dialog might say to the contrary.
+        let choosable = approving && !confirm.is_admin;
         let mut grants = confirm.grants;
         let screens = confirm.screens.clone();
         let mut share = confirm.share.clone();
@@ -1910,115 +2334,205 @@ impl GuestApp {
             label
         }
 
+        // # Placed by its bottom edge, not its top
+        //
+        // The popup sits *above* the card, so what has to line up is its
+        // bottom — and its height is not known until its contents are laid
+        // out. A pivot of LEFT_BOTTOM says where the bottom-left corner goes
+        // and lets egui work out the rest, which is the difference between
+        // this and measuring the popup on one frame to place it on the next.
+        //
+        // Identified by session rather than by title: two popups with the same
+        // words in them are still two popups, and sharing an id would make
+        // egui treat them as one.
+        // # The margin is chosen here so the width can be worked back from it
+        //
+        // Setting the *content* width to the card's width made the popup wider
+        // than the card by twice the window's padding, because a frame is its
+        // contents plus its margins. Which margin the default window frame uses
+        // is a style question this has no business guessing at, so it names one
+        // and subtracts it.
+        const PAD: f32 = 12.0;
+        let inner_width = (card.width() - PAD * 2.0).max(1.0);
+
         egui::Window::new(title)
+            .id(egui::Id::new(("connection-decision", confirm.session_id)))
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::window(&ctx.style()).inner_margin(egui::Margin::same(PAD)),
+            )
+            .fixed_pos(egui::pos2(card.left(), card.top() - 8.0))
+            .pivot(egui::Align2::LEFT_BOTTOM)
             .show(ctx, |ui| {
-                ui.set_max_width(380.0);
-                ui.label(egui::RichText::new(body).size(12.0).color(TEXT));
+                // Exactly the card's width, edge to edge. This is what keeps two
+                // of them from colliding without anybody having to arrange them:
+                // the cards already do not overlap, so neither can their
+                // extensions.
+                ui.set_min_width(inner_width);
+                ui.set_max_width(inner_width);
+
+                // # Who, then what
+                //
+                // The name is the heading rather than a sentence inside one,
+                // because it is the only part of this dialog that changes
+                // between one connection and the next — and the only part
+                // somebody has to actually look at before deciding.
+                ui.label(egui::RichText::new(&confirm_guest).size(15.0).strong().color(TEXT));
+                ui.label(egui::RichText::new(body).size(12.5).color(TEXT));
                 if let Some(caveat) = caveat {
-                    ui.add_space(4.0);
+                    ui.add_space(3.0);
                     ui.label(egui::RichText::new(caveat).size(11.0).color(TEXT_DIM));
                 }
 
-                // Screens first: what is shared at all comes before what may be
-                // driven, which is the order the decision is actually made in.
-                // Only when there is a choice — a machine with one screen has
-                // nothing to tick and a section saying so is noise.
-                if approving && screens.len() > 1 {
+                if choosable {
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("Share these screens:").size(12.0).color(TEXT));
+                    ui.label(
+                        egui::RichText::new("Permissions for connection:")
+                            .size(12.5)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Remote inputs:").size(12.0).color(TEXT));
+                    ui.checkbox(
+                        &mut grants.mouse,
+                        egui::RichText::new("Mouse + Touch").color(TEXT),
+                    )
+                    .on_hover_text(
+                        "Pointing at your screen, however they do it — a mouse, a \
+                         trackpad or a touchscreen are the same act.",
+                    );
+                    ui.checkbox(
+                        &mut grants.keyboard,
+                        egui::RichText::new("Keyboard").color(TEXT),
+                    )
+                    .on_hover_text(
+                        "Typing into whatever has focus on this machine. \
+                         Revocable later from the connection strip.",
+                    );
+
+                    // # Screens as a row of monitors
+                    //
+                    // Shown even with one screen, unlike the list this replaces.
+                    // A row of one costs a line and says what is about to be
+                    // seen; the list it replaces cost a paragraph, which is why
+                    // it was hidden and why the single-screen case then said
+                    // nothing at all.
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Displays:").size(12.0).color(TEXT));
                     ui.add_space(2.0);
+                    // # Wrapped, because a host can have a great many screens
+                    //
+                    // A machine that has spawned virtual displays can offer
+                    // more of them than a card is wide, and a single row would
+                    // either overflow the popup or squeeze the icons down to
+                    // nothing. Wrapping grows the popup downward instead, which
+                    // it has room to do — it is anchored by its bottom edge and
+                    // opens upward.
+                    //
+                    // Every cell is the same size, caption or not, so the rows
+                    // line up; see `theme::display_button`.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        let everything = screens.is_empty() || share.len() == screens.len();
 
-                    let mut every = share.len() == screens.len();
-                    if ui
-                        .checkbox(&mut every, egui::RichText::new("All screens").color(TEXT))
-                        .on_hover_text(
-                            "Including any monitor plugged in later. Leave this off to                              share only the screens ticked below.",
-                        )
-                        .changed()
-                    {
-                        share = if every {
-                            screens.iter().map(|d| d.id).collect()
-                        } else {
-                            Default::default()
-                        };
-                    }
-
-                    for screen in &screens {
-                        let mut on = share.contains(&screen.id);
-                        if ui
-                            .checkbox(&mut on, egui::RichText::new(describe(screen)).color(TEXT))
-                            .changed()
+                        let resp = theme::display_button(
+                            ui,
+                            26.0,
+                            egui::include_image!("../../assets/multimonitor.svg"),
+                            None,
+                            Some("All"),
+                            everything,
+                        );
+                        if resp
+                            .on_hover_text("Every screen, including any monitor plugged in later.")
+                            .clicked()
                         {
-                            if on {
-                                share.insert(screen.id);
+                            share = screens.iter().map(|d| d.id).collect();
+                        }
+
+                        for (index, screen) in screens.iter().enumerate() {
+                            let on = !everything && share.contains(&screen.id);
+                            // A virtual display is drawn as one: it is not a
+                            // panel on somebody's desk, and which of these is
+                            // which decides what a guest is actually looking at.
+                            let icon = if screen.virtual_display {
+                                egui::include_image!("../../assets/virtualdisplay.svg")
                             } else {
-                                share.remove(&screen.id);
+                                egui::include_image!("../../assets/monitor.svg")
+                            };
+                            let resp =
+                                theme::display_button(ui, 26.0, icon, Some(index + 1), None, on);
+                            // The detail the old list spelled out on every row,
+                            // available to whoever wants it.
+                            if resp.on_hover_text(describe(screen)).clicked() {
+                                if everything {
+                                    // Coming from "all", the obvious meaning of
+                                    // clicking one screen is "only that one" —
+                                    // not "all of them except this".
+                                    share = std::iter::once(screen.id).collect();
+                                } else if on {
+                                    share.remove(&screen.id);
+                                } else {
+                                    share.insert(screen.id);
+                                }
                             }
                         }
-                    }
+                    });
 
                     if share.is_empty() {
                         ui.add_space(2.0);
                         ui.label(
                             egui::RichText::new(
-                                "With none ticked they connect and see nothing.",
+                                "With none chosen they connect and see nothing.",
                             )
                             .size(11.0)
                             .color(AMBER),
                         );
                     }
-                }
-
-                if approving {
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new("Also let them control:").size(12.0).color(TEXT),
-                    );
-                    ui.add_space(2.0);
-                    ui.checkbox(
-                        &mut grants.mouse,
-                        egui::RichText::new("Mouse").color(TEXT),
-                    )
-                    .on_hover_text(
-                        "Also covers touch, if they are using a touchscreen — it is \
-                         the same act of pointing at your screen.",
-                    );
-                    ui.checkbox(
-                        &mut grants.keyboard,
-                        egui::RichText::new("Keyboard").color(TEXT),
-                    );
-                    ui.add_space(2.0);
+                } else if approving {
+                    // The admin case. No permissions to choose — the code
+                    // already carries all of them — so what is worth saying is
+                    // the part that outlives this connection.
+                    ui.add_space(10.0);
                     ui.label(
                         egui::RichText::new(
-                            "Leave both off to share the screen only. \
-                             You can change this later from the connection strip.",
+                            "Allowing this makes the device trusted: it will connect \
+                             with the admin passcode from now on without asking, until \
+                             that passcode is reset.",
                         )
-                        .size(11.0)
-                        .color(TEXT_DIM),
+                        .size(12.0)
+                        .color(AMBER),
                     );
                 }
 
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    // Cancel walks away without answering: the guest stays in
-                    // the list, still waiting, still seeing nothing.
-                    if ui
-                        .button("Cancel")
-                        .on_hover_text("Decide later — nothing is shared in the meantime")
-                        .clicked()
-                    {
-                        outcome = Some(Outcome::Dismiss);
-                    }
-
+                    // # Two answers, and no third button
+                    //
+                    // There used to be a Cancel, from when this was a modal in
+                    // the middle of the window that had to be got rid of before
+                    // anything else could be done. Attached to its card and no
+                    // longer blocking anything, it does not need one: leaving
+                    // the question unanswered is simply not answering it, and
+                    // clicking the card again puts the popup away.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let confirm_button = egui::Button::new(
-                            egui::RichText::new(label).color(egui::Color32::WHITE),
+                        // # The two answers are told apart by colour and mark
+                        //
+                        // They sit next to each other and mean opposite things,
+                        // and one of them is irreversible in the way that
+                        // matters — anything seen during a session has been
+                        // seen. So they do not merely differ in wording.
+                        let go = egui::Button::new(
+                            egui::RichText::new(format!("✔ {label}"))
+                                .color(egui::Color32::WHITE)
+                                .strong(),
                         )
-                        .fill(if approving { ADMIN_FILL } else { OFFLINE_RED });
-                        if ui.add(confirm_button).clicked() {
+                        .fill(if approving { LIVE_GREEN } else { OFFLINE_RED })
+                        .min_size(egui::vec2(84.0, 26.0));
+                        if ui.add(go).clicked() {
                             outcome = Some(if approving {
                                 Outcome::Allow(grants)
                             } else {
@@ -2027,16 +2541,16 @@ impl GuestApp {
                         }
 
                         if approving {
-                            // Wider than the usual gap: Allow and Deny sit next
-                            // to each other and mean opposite things.
-                            ui.add_space(14.0);
+                            ui.add_space(10.0);
+                            let no = egui::Button::new(
+                                egui::RichText::new("✖ deny")
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(OFFLINE_RED)
+                            .min_size(egui::vec2(84.0, 26.0));
                             if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("Deny").color(egui::Color32::WHITE),
-                                    )
-                                    .fill(OFFLINE_RED),
-                                )
+                                .add(no)
                                 .on_hover_text("Refuse and disconnect this guest")
                                 .clicked()
                             {
@@ -2047,31 +2561,36 @@ impl GuestApp {
                 });
             });
 
-        // Keep the checkbox state across frames while the dialog is open.
-        if let Some(confirm) = self.confirm.as_mut() {
-            confirm.grants = grants;
-            confirm.share = share.clone();
-        }
+        // Keep the checkbox state across frames while the popup is open.
+        confirm.grants = grants;
+        confirm.share = share;
+        outcome
+    }
+
+    /// Act on an answer, and take the popup away.
+    fn answer_confirm(&mut self, session_id: u32, outcome: Outcome) {
+        let Some(index) = self.confirms.iter().position(|c| c.session_id == session_id) else {
+            return;
+        };
+        let confirm = self.confirms.remove(index);
 
         match outcome {
-            Some(Outcome::Allow(grants)) => {
-                self.confirm = None;
-                // Every screen ticked means *all*, not "these ones that happen
+            Outcome::Allow(grants) => {
+                // Every screen chosen means *all*, not "these ones that happen
                 // to be all of them": a monitor plugged in later should follow
                 // what was meant rather than be silently excluded.
-                let displays = if screens.is_empty() || share.len() == screens.len() {
+                let displays = if confirm.screens.is_empty()
+                    || confirm.share.len() == confirm.screens.len()
+                {
                     tain_core::protocol::DisplayGrant::All
                 } else {
-                    tain_core::protocol::DisplayGrant::Only(share.iter().copied().collect())
+                    tain_core::protocol::DisplayGrant::Only(
+                        confirm.share.iter().copied().collect(),
+                    )
                 };
                 self.resolve_approval(session_id, ApprovalDecision::Allow { grants, displays });
             }
-            Some(Outcome::Deny) => {
-                self.confirm = None;
-                self.resolve_approval(session_id, ApprovalDecision::Deny);
-            }
-            Some(Outcome::Dismiss) => self.confirm = None,
-            None => {}
+            Outcome::Deny => self.resolve_approval(session_id, ApprovalDecision::Deny),
         }
     }
 
@@ -2268,6 +2787,37 @@ impl GuestApp {
         let stroke = if recently_copied { LIVE_GREEN } else { stroke };
 
         ui.horizontal(|ui| {
+            // # The admin code is kept behind a cover
+            //
+            // Copying it is a one-way act: once it is on the clipboard it can
+            // leave in the next paste, into whatever window has focus, and
+            // nothing afterwards calls it back. And what it hands over is the
+            // machine — every screen, mouse and keyboard, and with the service
+            // installed the lock screen too.
+            //
+            // So it is not a button that can be hit by accident. See
+            // [`theme::slide_to_reveal`] for why a drag and not a dialog.
+            if typ == PasscodeType::Master && !self.admin_cover.is_open() {
+                let outcome = theme::slide_to_reveal(
+                    ui,
+                    egui::vec2(width, BUTTON_HEIGHT),
+                    if roomy { "Slide to reveal admin passcode" } else { "Slide to reveal" },
+                    self.admin_cover.progress,
+                );
+                edits.admin_slider = Some(outcome.progress);
+                // The explanation comes on first contact, before the gesture
+                // has finished — somebody who reads it and changes their mind
+                // should not have had to complete the drag to be told.
+                if outcome.touched && !self.state.settings().admin_copy_warning_read {
+                    edits.admin_warning = true;
+                }
+                if outcome.completed {
+                    edits.admin_uncovered = true;
+                }
+                render_passcode_row_tail(ui, typ, &self.state.settings(), edits);
+                return;
+            }
+
             let resp = theme::labelled_button(
                 ui,
                 egui::vec2(width, BUTTON_HEIGHT),
@@ -2295,31 +2845,7 @@ impl GuestApp {
                 edits.copied = Some(typ);
             }
 
-            ui.add_space(8.0);
-
-            if theme::icon_button(
-                ui,
-                20.0,
-                egui::include_image!("../../assets/reset_passcode.svg"),
-                "Generate a new code now (invalidates the current one)",
-            )
-            .clicked()
-            {
-                edits.regenerate.push(typ);
-            }
-
-            ui.add_space(4.0);
-            let mut on = autoreset_of(&self.state.settings(), typ);
-            if ui
-                .checkbox(&mut on, egui::RichText::new("autoreset").color(TEXT))
-                .on_hover_text(
-                    "Regenerate automatically when the last guest disconnects.\n\
-                     Turning this off keeps the code usable for reconnecting.",
-                )
-                .changed()
-            {
-                edits.set_autoreset.push((typ, on));
-            }
+            render_passcode_row_tail(ui, typ, &self.state.settings(), edits);
         });
     }
 
@@ -2545,7 +3071,12 @@ impl GuestApp {
 
     // ── Footer: incoming connections ─────────────────────────
 
-    fn render_incoming_connections(&self, ui: &mut egui::Ui, edits: &mut PendingEdits) {
+    /// Returns where each card ended up, so the decision popups can sit on them.
+    fn render_incoming_connections(
+        &self,
+        ui: &mut egui::Ui,
+        edits: &mut PendingEdits,
+    ) -> Vec<(u32, egui::Rect)> {
         // Snapshot, then release — the toggles below used to re-lock this mutex
         // mid-iteration and freeze the app on the first click.
         let incoming = self.state.incoming.lock().unwrap().clone();
@@ -2556,15 +3087,36 @@ impl GuestApp {
                     .size(12.0)
                     .color(TEXT_DIM),
             );
-            return;
+            return Vec::new();
         }
 
+        // # What the open dialog is proposing, shown on the card it is about
+        //
+        // The checkboxes and the card's own mouse and keyboard marks say the
+        // same thing about the same connection, and while the dialog is open
+        // they used to disagree: the card kept showing the grants the session
+        // actually has — none, for a guest that has not been let in — while the
+        // dialog above it showed what was being offered.
+        //
+        // Reflecting the pending answer downward makes ticking a box visibly
+        // *do* something, and means the strip somebody will be reading during
+        // the session already reads correctly before it starts.
+        let mut rects = Vec::new();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 8.0);
             for conn in &incoming {
-                Self::render_incoming_pill(ui, conn, edits);
+                let pending_grants = self
+                    .confirms
+                    .iter()
+                    .find(|c| {
+                        c.session_id == conn.session_id && c.action == ConfirmAction::Approve
+                    })
+                    .map(|c| c.grants);
+                let rect = Self::render_incoming_pill(ui, conn, pending_grants, edits);
+                rects.push((conn.session_id, rect));
             }
         });
+        rects
     }
 
     /// One incoming connection, as a card that fits the name on it.
@@ -2584,11 +3136,18 @@ impl GuestApp {
     fn render_incoming_pill(
         ui: &mut egui::Ui,
         conn: &IncomingConnection,
+        proposed: Option<ControlGrants>,
         edits: &mut PendingEdits,
-    ) {
+    ) -> egui::Rect {
         const MARGIN: egui::Vec2 = egui::vec2(8.0, 10.0);
 
         let pending = conn.status == ApprovalStatus::Pending;
+        // What the open dialog is offering, where there is one, and otherwise
+        // what this session actually has.
+        let (mouse_on, keyboard_on) = match proposed {
+            Some(grants) => (grants.mouse, grants.keyboard),
+            None => (conn.mouse_allowed, conn.keyboard_allowed),
+        };
         let shown = elide(&conn.display_name, PILL_NAME_MAX_CHARS);
 
         let mut card = egui::Frame::none()
@@ -2598,11 +3157,16 @@ impl GuestApp {
 
         {
             let ui = &mut card.content_ui;
-            // A card is still a card with one letter on it.
-            ui.set_min_size(egui::vec2(
-                PILL_MIN_W - MARGIN.x * 2.0,
-                PILL_HEIGHT - MARGIN.y * 2.0,
-            ));
+            // # Fixed, not merely a minimum
+            //
+            // The marks below are laid out from the right edge, and a
+            // right-to-left layout claims whatever width it is *offered* — so a
+            // card that could grow would grow to the whole strip, taking its
+            // marks with it. Capping the width is what makes "on the right
+            // edge" mean the card's edge. See [`theme::PILL_W`].
+            let width = theme::PILL_W - MARGIN.x * 2.0;
+            ui.set_min_size(egui::vec2(width, PILL_HEIGHT - MARGIN.y * 2.0));
+            ui.set_max_width(width);
 
             ui.horizontal(|ui| {
                 // The person icon *is* the accept/remove control. Pending
@@ -2659,40 +3223,43 @@ impl GuestApp {
                         hover.push_str("\nThis name was chosen by the connecting machine.");
                     }
                 }
-                ui.label(egui::RichText::new(&shown).size(13.0).color(TEXT))
-                    .on_hover_text(hover);
-
-                // On an established connection these toggle directly — revoking
-                // should be instant. On a pending one there is nothing to
-                // toggle yet, so they open the same dialog the person icon does.
-                let mouse = if conn.mouse_allowed {
-                    egui::include_image!("../../assets/mouse_allowed.svg")
-                } else {
-                    egui::include_image!("../../assets/mouse_disabled.svg")
-                };
-                if theme::icon_button(
-                    ui,
-                    22.0,
-                    mouse,
-                    match (pending, conn.mouse_allowed) {
-                        (true, _) => "Decide whether to allow this connection",
-                        (false, true) => "Mouse allowed — click to revoke",
-                        (false, false) => "Mouse blocked — click to allow",
-                    },
+                // Truncated rather than wrapped. `elide` already caps this at a
+                // character count, but a count is not a width: twelve Cyrillic
+                // or CJK characters are far wider than twelve Latin ones, and a
+                // name that wraps makes the card taller than every other card
+                // in the strip. The full name is in the tooltip either way.
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&shown).size(13.0).color(TEXT))
+                        .truncate(),
                 )
-                .clicked()
-                {
-                    if pending {
-                        edits.confirm.push((conn.session_id, ConfirmAction::Approve));
-                    } else {
-                        edits.set_grants.push((
-                            conn.session_id,
-                            ControlGrants::new(!conn.mouse_allowed, conn.keyboard_allowed),
-                        ));
+                .on_hover_text(hover);
+
+                // # The marks sit on the right edge, not beside the name
+                //
+                // A card is as wide as its name until a decision is attached to
+                // it, and then it is as wide as the question above it — which
+                // left the icons floating in the middle of a card with empty
+                // space after them, in a strip whose whole job is to be read at
+                // a glance.
+                //
+                // Laid out right-to-left, so they are added in the order they
+                // are read *backwards*: status, keyboard, mouse.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match conn.status {
+                    ApprovalStatus::Pending => {
+                        ui.add(egui::Spinner::new().size(14.0).color(TEXT_DIM))
+                            .on_hover_text("Nothing is being shared until you decide");
+                    }
+                    ApprovalStatus::Allowed => {
+                        theme::icon(
+                            ui,
+                            13.0,
+                            egui::include_image!("../../assets/in_connect_live.svg"),
+                        );
                     }
                 }
 
-                let kbd = if conn.keyboard_allowed {
+                let kbd = if keyboard_on {
                     egui::include_image!("../../assets/keyboard_allowed.svg")
                 } else {
                     egui::include_image!("../../assets/keyboard_disabled.svg")
@@ -2701,8 +3268,9 @@ impl GuestApp {
                     ui,
                     22.0,
                     kbd,
-                    match (pending, conn.keyboard_allowed) {
-                        (true, _) => "Decide whether to allow this connection",
+                    match (pending, keyboard_on) {
+                        (true, true) => "Offered in the dialog above — not granted until you allow",
+                        (true, false) => "Decide whether to allow this connection",
                         (false, true) => "Keyboard allowed — click to revoke",
                         (false, false) => "Keyboard blocked — click to allow",
                     },
@@ -2719,19 +3287,37 @@ impl GuestApp {
                     }
                 }
 
-                match conn.status {
-                    ApprovalStatus::Pending => {
-                        ui.add(egui::Spinner::new().size(14.0).color(TEXT_DIM))
-                            .on_hover_text("Nothing is being shared until you decide");
-                    }
-                    ApprovalStatus::Allowed => {
-                        theme::icon(
-                            ui,
-                            13.0,
-                            egui::include_image!("../../assets/in_connect_live.svg"),
-                        );
+                // On an established connection these toggle directly — revoking
+                // should be instant. On a pending one there is nothing to
+                // toggle yet, so they open the same dialog the person icon does.
+                let mouse = if mouse_on {
+                    egui::include_image!("../../assets/mouse_allowed.svg")
+                } else {
+                    egui::include_image!("../../assets/mouse_disabled.svg")
+                };
+                if theme::icon_button(
+                    ui,
+                    22.0,
+                    mouse,
+                    match (pending, mouse_on) {
+                        (true, true) => "Offered in the dialog above — not granted until you allow",
+                        (true, false) => "Decide whether to allow this connection",
+                        (false, true) => "Mouse allowed — click to revoke",
+                        (false, false) => "Mouse blocked — click to allow",
+                    },
+                )
+                .clicked()
+                {
+                    if pending {
+                        edits.confirm.push((conn.session_id, ConfirmAction::Approve));
+                    } else {
+                        edits.set_grants.push((
+                            conn.session_id,
+                            ControlGrants::new(!conn.mouse_allowed, conn.keyboard_allowed),
+                        ));
                     }
                 }
+                });
             });
         }
 
@@ -2780,6 +3366,8 @@ impl GuestApp {
             // while the screen is idle.
             ui.ctx().request_repaint();
         }
+
+        rect
     }
 }
 
@@ -3139,6 +3727,18 @@ impl eframe::App for GuestApp {
     /// one it was.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.say_goodbye_to_guests();
+        // A virtual display belongs to the application that put it on the
+        // desktop, and this is that application closing. Leaving it behind
+        // gives somebody a screen they cannot see, cannot use and have nothing
+        // left running to remove.
+        //
+        // Only the ordinary way out comes through here. A process that is
+        // killed runs none of this, which is why the agent asks the same
+        // question on a timer — see `display_driver::reap_orphans`.
+        match crate::display_driver::release() {
+            0 => {}
+            n => info!("Put away {n} virtual display(s) on the way out"),
+        }
         // Otherwise the icon is left in the tray until something makes the
         // shell notice the process has gone, which is usually a mouse passing
         // over it.
@@ -3183,7 +3783,7 @@ impl eframe::App for GuestApp {
         t = self.frametime.phase("header", t);
 
         // Footer sizes to its pills, then the middle gets everything else.
-        egui::TopBottomPanel::bottom("incoming")
+        let incoming_panel = egui::TopBottomPanel::bottom("incoming")
             .frame(
                 egui::Frame::none()
                     .fill(WINDOW_BG)
@@ -3197,6 +3797,9 @@ impl eframe::App for GuestApp {
                 );
                 self.render_incoming_connections(ui, &mut edits)
             });
+        // Where each card ended up, so a decision can be drawn on top of the
+        // one it is about. Same frame: the cards were just laid out.
+        let cards = incoming_panel.inner;
         t = self.frametime.phase("incoming", t);
 
         egui::CentralPanel::default()
@@ -3269,13 +3872,54 @@ impl eframe::App for GuestApp {
 
         t = self.frametime.phase("settings", t);
 
-        self.render_confirm(ctx);
+        self.render_confirms(ctx, &cards);
+        self.render_admin_warning(ctx);
+
+        // # Somebody clicked the notification and wants this window
+        //
+        // Asked through the viewport rather than done with `SetForegroundWindow`
+        // here: taking the foreground is a thing Windows is entitled to refuse,
+        // and winit already handles the difference between a request that is
+        // granted and one that turns into a flashing taskbar button.
+        //
+        // Un-minimised first, because a window that has focus and is minimised
+        // is still a window nobody can see.
+        super::notify::watch(ctx);
+        if super::notify::was_clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
 
         if let Some(typ) = edits.copied {
             self.copied_at = Some((typ, std::time::Instant::now()));
+            // The cover is for the *next* accident, not this deliberate copy.
+            if typ == PasscodeType::Master {
+                self.admin_cover.close();
+            }
         }
         if !edits.regenerate.is_empty() {
             self.copied_at = None;
+            // A new code is a new secret, and it starts covered like the last.
+            self.admin_cover.close();
+        }
+
+        // # The cover, in the order the frame decided things
+        //
+        // The warning first: it is raised on first contact with the cover, and
+        // whoever reads it has not yet finished the drag. Then the drag itself,
+        // which is only allowed to open anything once the warning has been
+        // read — otherwise a single long drag would both raise the explanation
+        // and slide past it.
+        if edits.admin_warning && !self.state.settings().admin_copy_warning_read {
+            self.admin_warning_open = true;
+            self.admin_cover.close();
+        } else {
+            if let Some(progress) = edits.admin_slider {
+                self.admin_cover.progress = progress;
+            }
+            if edits.admin_uncovered {
+                self.admin_cover.open();
+            }
         }
         // Starting a session needs `ctx`, which `apply` does not have.
         let connect = edits.connect;
@@ -3448,7 +4092,7 @@ mod tests {
                         let mut edits = PendingEdits::default();
                         card = ui
                             .horizontal(|ui| {
-                                GuestApp::render_incoming_pill(ui, &conn, &mut edits);
+                                GuestApp::render_incoming_pill(ui, &conn, None, &mut edits);
                             })
                             .response
                             .rect;
@@ -3476,15 +4120,26 @@ mod tests {
         );
     }
 
-    /// A long name must widen the card rather than run under the icons.
+    /// Every card is the same size, whatever name is on it.
     ///
-    /// The card was twice sized from a figure worked out in advance, and both
-    /// times the figure left something out — most recently the spacing egui
-    /// puts between widgets, which put the name underneath the permission
-    /// toggles. This measures the card that is actually produced.
+    /// # What this replaced, and why
+    ///
+    /// It used to assert that a longer name produced a *wider* card, because
+    /// the card grew to fit and the bug being guarded against was a name
+    /// running underneath the permission marks.
+    ///
+    /// Cards are now a fixed width — the approval popup is drawn above one and
+    /// takes its width, and the marks are laid out from its right edge, neither
+    /// of which works against a card that resizes itself. So the old assertion
+    /// is false by design and the bug it guarded against has moved: a name that
+    /// no longer fits does not overflow sideways, it *wraps*, making one card
+    /// taller than the rest of the strip.
+    ///
+    /// Measuring both dimensions catches that, and is a closer statement of
+    /// what is actually wanted than the width ever was.
     #[test]
-    fn a_card_grows_to_fit_the_name_it_shows() {
-        let card_width = |name: &str| {
+    fn a_card_is_the_same_size_whatever_name_is_on_it() {
+        let card_size = |name: &str| {
             let ctx = egui::Context::default();
             let conn = IncomingConnection {
                 session_id: 1,
@@ -3497,7 +4152,7 @@ mod tests {
                 link: String::new(),
             };
 
-            let mut width = 0.0f32;
+            let mut size = egui::Vec2::ZERO;
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -3511,25 +4166,37 @@ mod tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let mut edits = PendingEdits::default();
                         // The card's own rectangle, not the panel it sits in.
-                        width = ui
+                        size = ui
                             .horizontal(|ui| {
-                                GuestApp::render_incoming_pill(ui, &conn, &mut edits);
+                                GuestApp::render_incoming_pill(ui, &conn, None, &mut edits)
                             })
-                            .response
-                            .rect
-                            .width();
+                            .inner
+                            .size();
                     });
                 });
             }
-            width
+            size
         };
 
-        let short = card_width("Q");
-        let long = card_width("LAPTOP-7K2Q9F");
-        assert!(
-            long > short,
-            "a longer name produced the same {short} point card, so it has              nowhere to go but under the icons"
-        );
+        let short = card_size("Q");
+        let long = card_size("LAPTOP-7K2Q9F");
+        // A name from a machine that chose its own, in a script where twelve
+        // characters is nothing like twelve Latin ones.
+        let wide = card_size("Мой-компьютер");
+
+        assert_eq!(short.x, theme::PILL_W, "a card is one width and this is it");
+        for (name, measured) in [("long", long), ("wide", wide)] {
+            assert_eq!(
+                measured.x, short.x,
+                "the {name} name changed the card's width — the popup above it \
+                 takes this width and would no longer match"
+            );
+            assert_eq!(
+                measured.y, short.y,
+                "the {name} name changed the card's height — it is wrapping \
+                 instead of being truncated"
+            );
+        }
     }
 
     /// A name from another machine must never be able to panic this one.
@@ -3904,23 +4571,23 @@ mod tests {
         let (mut app, sessions) = app_with_sessions();
         let id = sessions.add_session([0u8; 32], ControlGrants::NONE, CorePasscodeType::Guest);
         let (tx, _rx) = oneshot::channel();
-        app.pending_approvals.insert(id, tx);
+        app.pending_approvals.insert(id, PendingApproval::guest(tx));
         app.state.incoming.lock().unwrap().push(incoming(id, ApprovalStatus::Pending));
-        app.confirm =
-            Some(Confirm::new(id, "Guest #1".into(), false, ConfirmAction::Approve));
+        app.confirms =
+            vec![Confirm::new(id, "Guest #1".into(), false, ConfirmAction::Approve)];
 
         sessions.remove_session(id);
         app.reconcile_incoming();
 
         assert!(app.pending_approvals.is_empty(), "responder should not outlive the session");
-        assert!(app.confirm.is_none(), "a dialog for a dead session is unanswerable");
+        assert!(app.confirms.is_empty(), "a dialog for a dead session is unanswerable");
     }
 
     #[tokio::test]
     async fn allowing_answers_the_pending_oneshot() {
         let mut app = GuestApp::new(AppState::new());
         let (tx, rx) = oneshot::channel();
-        app.pending_approvals.insert(7, tx);
+        app.pending_approvals.insert(7, PendingApproval::guest(tx));
         app.state.incoming.lock().unwrap().push(incoming(7, ApprovalStatus::Pending));
 
         app.resolve_approval(7, ApprovalDecision::Allow { grants: ControlGrants::ALL, displays: tain_core::protocol::DisplayGrant::All });
@@ -3940,7 +4607,7 @@ mod tests {
         // to reach the server as an Allow rather than looking like a denial.
         let mut app = GuestApp::new(AppState::new());
         let (tx, rx) = oneshot::channel();
-        app.pending_approvals.insert(3, tx);
+        app.pending_approvals.insert(3, PendingApproval::guest(tx));
         app.state.incoming.lock().unwrap().push(incoming(3, ApprovalStatus::Pending));
 
         app.resolve_approval(3, ApprovalDecision::Allow { grants: ControlGrants::NONE, displays: tain_core::protocol::DisplayGrant::All });
@@ -3953,7 +4620,7 @@ mod tests {
     async fn denying_disconnects_rather_than_leaving_a_greyed_out_card() {
         let mut app = GuestApp::new(AppState::new());
         let (tx, rx) = oneshot::channel();
-        app.pending_approvals.insert(5, tx);
+        app.pending_approvals.insert(5, PendingApproval::guest(tx));
         app.state.incoming.lock().unwrap().push(incoming(5, ApprovalStatus::Pending));
 
         app.resolve_approval(5, ApprovalDecision::Deny);
@@ -3967,7 +4634,7 @@ mod tests {
     async fn granting_the_mouse_alone_leaves_the_keyboard_denied() {
         let mut app = GuestApp::new(AppState::new());
         let (tx, rx) = oneshot::channel();
-        app.pending_approvals.insert(9, tx);
+        app.pending_approvals.insert(9, PendingApproval::guest(tx));
         app.state.incoming.lock().unwrap().push(incoming(9, ApprovalStatus::Pending));
 
         app.set_grants(9, ControlGrants::new(true, false));
@@ -3986,7 +4653,7 @@ mod tests {
     async fn kicking_answers_the_responder_so_the_server_is_not_left_waiting() {
         let mut app = GuestApp::new(AppState::new());
         let (tx, rx) = oneshot::channel();
-        app.pending_approvals.insert(4, tx);
+        app.pending_approvals.insert(4, PendingApproval::guest(tx));
         app.state.incoming.lock().unwrap().push(incoming(4, ApprovalStatus::Pending));
 
         app.kick(4);
@@ -3997,19 +4664,41 @@ mod tests {
     }
 
     #[test]
-    fn the_approval_dialog_leads_with_what_is_actually_being_shared() {
-        // The screen is the part people underestimate; input can be revoked,
-        // but anything seen has been seen.
+    fn the_approval_dialog_says_what_each_answer_means() {
+        // The name is the dialog's heading now, so the body must not repeat it
+        // — "Guest #1 Guest #1 wants to connect" is what this catches.
         let approve = Confirm::new(1, "Guest #1".into(), false, ConfirmAction::Approve);
-        assert!(approve.body().contains("Guest #1"));
-        assert!(approve.body().contains("screen"));
-        assert!(approve.body().contains("Nothing is being streamed yet"));
+        assert!(!approve.body().contains("Guest #1"), "the heading already says who");
+        assert!(approve.body().contains("connect"));
         assert_eq!(approve.confirm_label(), "Allow");
 
         let kick = Confirm::new(1, "Guest #1".into(), false, ConfirmAction::Kick);
         assert!(kick.body().contains("disconnected"));
         assert_eq!(kick.confirm_label(), "Disconnect");
         assert_ne!(approve.title(), kick.title());
+    }
+
+    /// An admin connection is a different decision and has to read as one.
+    ///
+    /// The guest wording is about watching a screen. If the admin case ever
+    /// fell back to it, the most consequential dialog in the application would
+    /// be the one that undersold itself.
+    #[test]
+    fn the_admin_dialog_does_not_read_like_the_guest_one() {
+        let guest = Confirm::new(1, "Friend PC2".into(), false, ConfirmAction::Approve);
+        let admin = Confirm::new(1, "Friend PC2".into(), false, ConfirmAction::Approve)
+            .for_admin(true);
+
+        assert_ne!(admin.body(), guest.body());
+        assert_ne!(admin.title(), guest.title());
+        // The two things somebody has to know before saying yes: what it grants
+        // now, and that the answer is remembered.
+        let says = admin.body().to_lowercase();
+        assert!(says.contains("admin passcode"), "it must say which code this is");
+        assert!(
+            says.contains("keyboard") && says.contains("screen"),
+            "it must say what the code already carries: {says}"
+        );
     }
 
     #[test]
@@ -4060,9 +4749,87 @@ mod tests {
         assert!(kick.name_caveat().is_none());
     }
 
+    /// A guest that is waiting asks its own question.
+    ///
+    /// # Why this is not left to a click
+    ///
+    /// It was, and the card was then a notification *about* a decision rather
+    /// than the decision: one click before anything could be answered, on a
+    /// strip somebody is by definition not looking at — the host window is
+    /// behind something, which is why there is a desktop notification at all.
+    /// Nothing here has to be asked for. A guest is already waiting.
+    #[tokio::test]
+    async fn a_waiting_guest_asks_its_own_question() {
+        let mut app = GuestApp::new(AppState::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.approval_rx = Some(rx);
+
+        let (approve_tx, _held) = oneshot::channel();
+        tx.send(tain_core::ApprovalRequest {
+            session_id: 1,
+            label: "Friend PC2".into(),
+            label_is_self_reported: true,
+            is_admin: false,
+            endpoint_id: [9u8; 32],
+            approve_tx,
+        })
+        .expect("the receiver is attached");
+
+        app.poll_channels();
+
+        assert_eq!(app.confirms.len(), 1, "the question should not wait to be asked for");
+        assert_eq!(app.confirms[0].session_id, 1);
+        assert_eq!(app.state.incoming.lock().unwrap().len(), 1, "and the card is there too");
+    }
+
+    /// Once put away, it stays away.
+    ///
+    /// The popup is created when the request arrives and never re-derived from
+    /// "pending and nothing open" — which would reopen it on the very next
+    /// frame and make dismissing impossible.
+    #[tokio::test]
+    async fn a_dismissed_question_is_not_asked_again_by_itself() {
+        let mut app = GuestApp::new(AppState::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.approval_rx = Some(rx);
+
+        let (approve_tx, _held) = oneshot::channel();
+        tx.send(tain_core::ApprovalRequest {
+            session_id: 1,
+            label: "Friend PC2".into(),
+            label_is_self_reported: false,
+            is_admin: true,
+            endpoint_id: [9u8; 32],
+            approve_tx,
+        })
+        .expect("the receiver is attached");
+
+        app.poll_channels();
+        assert!(app.confirms[0].is_admin, "an admin request opens the admin question");
+
+        // Clicking the card puts it away.
+        app.apply(PendingEdits {
+            confirm: vec![(1, ConfirmAction::Approve)],
+            ..Default::default()
+        });
+        assert!(app.confirms.is_empty());
+
+        // Frames keep happening; the guest is still waiting.
+        app.poll_channels();
+        app.poll_channels();
+        assert!(app.confirms.is_empty(), "it reopened on its own — dismissing is impossible");
+        assert_eq!(app.state.incoming.lock().unwrap().len(), 1, "the guest is still there");
+    }
+
+    /// Two guests waiting are two questions, not a queue.
+    ///
+    /// This used to assert the opposite — one dialog at a time — because there
+    /// was one dialog, in the middle of the window, that could only be about
+    /// one connection. Now each is drawn above its own card and takes that
+    /// card's width, so they cannot overlap and there is no reason to make
+    /// somebody answer them in turn.
     #[test]
-    fn only_one_confirmation_is_shown_at_a_time() {
-        // A second click while a dialog is open is a mis-click, not a decision.
+    fn every_waiting_connection_gets_its_own_decision() {
         let mut app = GuestApp::new(AppState::new());
         app.state.incoming.lock().unwrap().push(incoming(1, ApprovalStatus::Pending));
         app.state.incoming.lock().unwrap().push(incoming(2, ApprovalStatus::Allowed));
@@ -4072,7 +4839,62 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(app.confirm.as_ref().map(|c| c.session_id), Some(1));
+        let open: Vec<u32> = app.confirms.iter().map(|c| c.session_id).collect();
+        assert_eq!(open, vec![1, 2], "both connections should be answerable at once");
+    }
+
+    /// Clicking the same card twice is still a mis-click.
+    ///
+    /// One *per* connection is the rule that replaced one at a time, and a
+    /// second popup for the same guest would stack on the first with no way to
+    /// tell them apart.
+    #[test]
+    fn clicking_the_same_card_again_puts_its_decision_away() {
+        let mut app = GuestApp::new(AppState::new());
+        app.state.incoming.lock().unwrap().push(incoming(1, ApprovalStatus::Pending));
+
+        let click = |app: &mut GuestApp| {
+            app.apply(PendingEdits {
+                confirm: vec![(1, ConfirmAction::Approve)],
+                ..Default::default()
+            })
+        };
+
+        click(&mut app);
+        assert_eq!(app.confirms.len(), 1, "the first click asks the question");
+        click(&mut app);
+        assert!(app.confirms.is_empty(), "the second puts it away — there is no Cancel button");
+        click(&mut app);
+        assert_eq!(app.confirms.len(), 1, "and it can be asked again");
+
+        // Never two for one guest: a second popup would stack on the first with
+        // no way to tell them apart.
+        assert_eq!(app.confirms.iter().filter(|c| c.session_id == 1).count(), 1);
+    }
+
+    /// Putting the question away is not answering it.
+    ///
+    /// The guest stays in the list, still waiting, still seeing nothing — where
+    /// denying disconnects it. Collapsing the two would make a stray click on a
+    /// card into a refusal.
+    #[test]
+    fn closing_a_decision_does_not_answer_it() {
+        let mut app = GuestApp::new(AppState::new());
+        app.state.incoming.lock().unwrap().push(incoming(1, ApprovalStatus::Pending));
+        let (tx, mut rx) = oneshot::channel();
+        app.pending_approvals.insert(1, PendingApproval::guest(tx));
+
+        for _ in 0..2 {
+            app.apply(PendingEdits {
+                confirm: vec![(1, ConfirmAction::Approve)],
+                ..Default::default()
+            });
+        }
+
+        assert!(app.confirms.is_empty());
+        assert!(app.pending_approvals.contains_key(&1), "the guest is still waiting");
+        assert!(rx.try_recv().is_err(), "nothing was decided");
+        assert_eq!(app.state.incoming.lock().unwrap().len(), 1, "the card is still there");
     }
 
     #[test]
@@ -4082,13 +4904,13 @@ mod tests {
             confirm: vec![(99, ConfirmAction::Approve)],
             ..Default::default()
         });
-        assert!(app.confirm.is_none());
+        assert!(app.confirms.is_empty());
     }
 
     #[test]
-    fn dismissing_is_not_the_same_decision_as_denying() {
-        // Closing the dialog leaves the guest waiting; denying disconnects it.
-        assert_ne!(Outcome::Dismiss, Outcome::Deny);
+    fn allowing_nothing_is_not_the_same_decision_as_denying() {
+        // A guest allowed with neither device still gets a session and sees the
+        // screen; a denied one is disconnected. The two must never collapse.
         assert_ne!(Outcome::Allow(ControlGrants::NONE), Outcome::Deny);
     }
 
