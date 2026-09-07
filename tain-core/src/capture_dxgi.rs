@@ -136,14 +136,42 @@ impl Duplication {
         // about the GPU the display is actually plugged into, and from here
         // there is no way to know which that is.
         let mut failures: Vec<String> = Vec::new();
+        let mut wrong_gpu = false;
+        let mut chips = 0;
         for candidate in candidates {
+            chips += usize::from(candidate.hardware);
             match Self::create_on(&candidate, want, colour_log) {
                 Ok(built) => return Ok(built),
-                Err(e) => failures.push(format!("{}: {e:#}", candidate.label)),
+                Err(e) => {
+                    // Asked of the error's own chain rather than of its text.
+                    wrong_gpu |= e.chain().any(|link| link.is::<DesktopOnAnotherGpu>());
+                    failures.push(format!("{}: {e:#}", candidate.label));
+                }
             }
         }
         if failures.is_empty() {
             anyhow::bail!("this machine reports no display adapters at all");
+        }
+        // # The one failure with something to be done about it
+        //
+        // Two graphics chips, and the one holding the display refuses to
+        // duplicate it. Trying more adapters cannot help — that was the last
+        // two attempts at this fault, and the log they produced is quoted in
+        // `gpu_preference`, which is where the actual remedy lives.
+        if wrong_gpu && chips > 1 {
+            // Layered rather than concatenated. The guest is sent `{e}` and the
+            // log gets `{e:#}`, so the remedy is what reaches the person and the
+            // list of adapters is what reaches whoever reads the log — which is
+            // the split that made the last two rounds of this so slow, when the
+            // only thing anybody could see was a sentence about DXGI.
+            let remedy = move_to_the_desktops_gpu(want);
+            warn!("{remedy}");
+            return Err(anyhow::anyhow!(
+                "tried {} adapter(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ))
+            .context(remedy);
         }
         anyhow::bail!(
             "no adapter could capture {}. Tried {}: {}",
@@ -557,6 +585,16 @@ pub(crate) struct Candidate {
     /// Only meaningful when there is no adapter: passing one requires
     /// `D3D_DRIVER_TYPE_UNKNOWN` and the pair is rejected otherwise.
     pub driver: windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE,
+    /// Whether this is a real graphics chip.
+    ///
+    /// Every machine enumerates at least one adapter that is not — the
+    /// Microsoft Basic Render Driver is always there, and WARP is added below —
+    /// so "how many adapters are there" is not the same question as "does this
+    /// machine have two graphics chips". Only the second one decides whether
+    /// moving the process to the other chip could possibly help, and answering
+    /// it wrong would write a Windows setting on a single-GPU machine that has
+    /// nowhere else to run.
+    pub hardware: bool,
 }
 
 /// Every adapter worth asking to duplicate this display, best first.
@@ -577,6 +615,12 @@ pub(crate) struct Candidate {
 fn adapters_for(want: Option<&str>) -> Vec<Candidate> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 
+    use windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE;
+
+    // Name, and whether it is a real chip. An adapter that will not describe
+    // itself is taken for hardware: the count it feeds decides whether to
+    // suggest moving to another chip, and under-counting there turns a fixable
+    // machine into one that is told nothing can be done.
     let describe = |adapter: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1| {
         // SAFETY: reads a descriptor from a live adapter.
         match unsafe { adapter.GetDesc1() } {
@@ -586,9 +630,10 @@ fn adapters_for(want: Option<&str>) -> Vec<Candidate> {
                     .iter()
                     .position(|&c| c == 0)
                     .unwrap_or(desc.Description.len());
-                String::from_utf16_lossy(&desc.Description[..end])
+                let hardware = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0;
+                (String::from_utf16_lossy(&desc.Description[..end]), hardware)
             }
-            Err(_) => "an unnamed adapter".to_string(),
+            Err(_) => ("an unnamed adapter".to_string(), true),
         }
     };
 
@@ -601,7 +646,7 @@ fn adapters_for(want: Option<&str>) -> Vec<Candidate> {
         if let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() {
             for adapter_index in 0.. {
                 let Ok(adapter) = factory.EnumAdapters1(adapter_index) else { break };
-                let name = describe(&adapter);
+                let (name, hardware) = describe(&adapter);
 
                 let mut owns = false;
                 for output_index in 0.. {
@@ -640,6 +685,7 @@ fn adapters_for(want: Option<&str>) -> Vec<Candidate> {
                     adapter: Some(generic),
                     label: name,
                     driver: windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
+                    hardware,
                 };
                 if owns {
                     owning.push(candidate);
@@ -656,6 +702,8 @@ fn adapters_for(want: Option<&str>) -> Vec<Candidate> {
         adapter: None,
         label: "the default adapter".into(),
         driver: D3D_DRIVER_TYPE_HARDWARE,
+        // Whichever chip this turns out to be, it is one already counted above.
+        hardware: false,
     });
     // Software rasterisation, which duplicates nothing a GPU would but keeps a
     // virtual machine — and a host whose driver refuses hardware duplication —
@@ -665,6 +713,7 @@ fn adapters_for(want: Option<&str>) -> Vec<Candidate> {
         adapter: None,
         label: "the software rasteriser".into(),
         driver: D3D_DRIVER_TYPE_WARP,
+        hardware: false,
     });
     all
 }
@@ -760,6 +809,87 @@ fn choose_output(
     Ok((output, where_))
 }
 
+/// Put this executable on the chip that draws the desktop, and say so.
+///
+/// # This writes a Windows setting, and does it on purpose
+///
+/// Which chip a process runs on is fixed before `main`, so nothing can repair
+/// the run that failed — only the next one. The previous version of this told
+/// the person at the keyboard to go and change it themselves, in
+/// *Settings > System > Display > Graphics*, and that is a fair description of
+/// a page almost nobody will find, on a machine that is usually being helped
+/// with from somewhere else. Twice now, that message has come back with the
+/// fault unfixed.
+///
+/// So Tain writes its own per-application preference — its own executable, its
+/// own key under `HKCU`, reversible from the same Settings page — and asks for
+/// a restart. See [`crate::gpu_preference`] for the shape of the failure and
+/// why the integrated chip is the answer rather than a coin toss.
+///
+/// Never against a preference somebody chose. Already on the integrated chip
+/// and still failing means this is not the wrong-chip problem, and an
+/// executable somebody deliberately put on the discrete chip is not this
+/// function's to move back.
+fn move_to_the_desktops_gpu(want: Option<&str>) -> String {
+    use crate::gpu_preference::{self, Preference};
+
+    let screen = want.unwrap_or("the primary display");
+    let preamble = format!(
+        "{screen} is drawn by a graphics chip this process cannot capture from — \
+         Desktop Duplication needs them to be the same one, and which chip a \
+         process gets is decided before it starts"
+    );
+
+    // Asked before the preference is read, because writing it does not move
+    // *this* process: every later failure in this run has to keep saying
+    // "restart", not "already set and still failing".
+    if gpu_preference::switched_this_run() {
+        return format!("{preamble}. Tain has asked Windows for the other chip — restart Tain");
+    }
+
+    let current = gpu_preference::current();
+    if !gpu_preference::worth_switching(current) {
+        return format!(
+            "{preamble}. Tain is already set to {}, so this is not simply the wrong chip; \
+             Settings > System > Display > Graphics is where that is changed",
+            current.name()
+        );
+    }
+
+    match gpu_preference::set(Preference::PowerSaving) {
+        Ok(()) => format!(
+            "{preamble}. Tain has asked Windows to run it on the chip that draws the \
+             desktop — restart Tain and this display will capture"
+        ),
+        Err(e) => format!(
+            "{preamble}, and Tain could not set that itself ({e:#}). In Settings > System > \
+             Display > Graphics, add Tain and set it to Power saving"
+        ),
+    }
+}
+
+/// This adapter enumerates the display and cannot duplicate it.
+///
+/// # Why this is a type and not a sentence
+///
+/// It is the one capture failure with a remedy, and the remedy is not something
+/// to read out to somebody: it is a per-application Windows setting Tain can
+/// write for itself. See [`crate::gpu_preference`], which explains both the
+/// failure and the setting at length.
+///
+/// Recognising it by its message would not survive contact with the machines it
+/// happens on, where the text is in whatever language Windows was installed in.
+#[derive(Debug)]
+pub struct DesktopOnAnotherGpu;
+
+impl std::fmt::Display for DesktopOnAnotherGpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the desktop is drawn by a graphics chip this process does not run on")
+    }
+}
+
+impl std::error::Error for DesktopOnAnotherGpu {}
+
 fn duplicate(
     device: &ID3D11Device,
     output1: &IDXGIOutput1,
@@ -773,6 +903,12 @@ fn duplicate(
                  a UAC prompt is up — both run on a desktop we cannot see."
             )
         } else if e.code() == DXGI_ERROR_UNSUPPORTED {
+            // Carried as a type rather than recognised later by its words. The
+            // Windows half of this message arrives in the machine's own
+            // language — the report that finally explained this fault said
+            // "Указанный интерфейс устройства или уровень компонента не
+            // поддерживается" — so matching on English would have worked
+            // exactly until it met the machine it was written for.
             // # What this actually means, and why the message says so
             //
             // `DXGI_ERROR_UNSUPPORTED` reads as "this feature is not supported
@@ -787,12 +923,8 @@ fn duplicate(
             // executable and from a Windows setting. Saying which setting turns
             // a dead end into something the person in front of the machine can
             // act on, which is worth more than another sentence about DXGI.
-            anyhow::anyhow!(
-                "this GPU cannot duplicate that display ({e}). On a machine with two \
-                 graphics chips that usually means Tain is running on the wrong one — \
-                 in Settings > System > Display > Graphics, add Tain and set it to \
-                 Power saving, which is the GPU the desktop is drawn by."
-            )
+            anyhow::Error::new(DesktopOnAnotherGpu)
+                .context(format!("this GPU cannot duplicate that display ({e})"))
         } else {
             anyhow::anyhow!("DuplicateOutput failed: {e}")
         }
@@ -957,15 +1089,6 @@ impl DxgiCapturer {
         })
     }
 
-    /// What the frames coming out of here are laid out as.
-    ///
-    /// Asked by [`super::capture_shared`], where a second session needs to know
-    /// whether the format it wants is already the one being produced — the
-    /// answer decides whether it can join or has to take what is on offer.
-    pub fn current_format(&self) -> PixelFormat {
-        self.format
-    }
-
     /// Rebuild after `DXGI_ERROR_ACCESS_LOST`.
     ///
     /// Failure here is expected and temporary — the lock screen and UAC prompts
@@ -1092,6 +1215,15 @@ impl DxgiCapturer {
 }
 
 impl ScreenCaptureBackend for DxgiCapturer {
+    /// What the frames coming out of here are laid out as.
+    ///
+    /// Negotiated once and then fixed — see the field's own note. On the trait
+    /// rather than inherent so that [`super::capture_shared`] can ask it of
+    /// whichever backend it ended up with.
+    fn current_format(&self) -> PixelFormat {
+        self.format
+    }
+
     /// Pointer state, when the duplication is live.
     ///
     /// Nothing during a recovery — a UAC prompt tears the duplication down and

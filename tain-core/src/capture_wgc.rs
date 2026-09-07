@@ -1,0 +1,833 @@
+//! Capturing a display through the compositor instead of duplicating it.
+//!
+//! # Why there are two ways to capture a screen
+//!
+//! Desktop Duplication makes the application duplicate an output, and requires
+//! the D3D device and that output to be on the same adapter — the one drawing
+//! the desktop. On a laptop with two graphics chips that is broken by default
+//! and cannot be repaired from inside the process: which chip a process runs on
+//! is decided before `main`, and the adapter holding the output is the one that
+//! refuses to duplicate it. See [`super::gpu_preference`], which is the
+//! workaround and carries the whole diagnosis.
+//!
+//! Windows.Graphics.Capture asks DWM for frames instead. DWM already composites
+//! the desktop on whichever chip it likes and delivers textures onto *the device
+//! given to the frame pool* — so there is no ownership rule to break:
+//!
+//! - nothing has to be restarted, because no launch-time decision is involved
+//! - nothing is filed under an executable path, so renaming or copying Tain
+//!   changes nothing
+//! - no Windows setting is written at all
+//!
+//! It is the mode OBS tells people with gaming laptops to use, for this exact
+//! fault.
+//!
+//! # Why it is not simply the only way
+//!
+//! Two costs, both real:
+//!
+//! - **The capture border.** WGC draws a yellow rectangle around what it
+//!   captures. [`GraphicsCaptureSession::SetIsBorderRequired`] removes it, and
+//!   only on Windows 11 21H2 and later — on Windows 10 the person being
+//!   streamed watches a yellow box around their screen for as long as the
+//!   session lasts.
+//! - **It is DWM's schedule, not ours.** Duplication hands over a frame the
+//!   moment the desktop changes; a frame pool delivers what the compositor
+//!   produced, which is one more hop and one more buffer.
+//!
+//! So duplication stays first where it works, and this is what a machine falls
+//! back to rather than what every machine uses. On the machines that fall back,
+//! the alternative is not a border or an extra hop — it is no picture at all.
+//!
+//! # Polled, not evented
+//!
+//! The frame pool is created with `CreateFreeThreaded`, and frames are taken
+//! with `TryGetNextFrame` rather than through the `FrameArrived` event. The
+//! event needs a `DispatcherQueue` on the capturing thread, which means a
+//! message pump on a thread whose whole job is to block on capture — and
+//! [`super::capture_shared`] already gives this a thread of its own and a loop
+//! that asks for frames. Polling fits that; an event loop would have to be
+//! bolted beside it.
+//!
+//! A frame must be closed before the next one is asked for, or the pool runs
+//! out of buffers and stops delivering. That is what [`Frame`] is for.
+
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use tracing::{debug, info, warn};
+use windows::core::Interface;
+
+use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, ScreenFrame};
+
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+};
+use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::SizeInt32;
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::System::WinRT::Direct3D11::{
+    CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+};
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+
+/// How many buffers the compositor may queue for us.
+///
+/// Two. One being filled while one is read is the whole requirement, and every
+/// extra buffer is a frame of latency the session pays for nothing — a remote
+/// desktop would rather drop a frame than show an old one.
+const BUFFERS: i32 = 2;
+
+/// How long an unchanged screen goes before it is sent again.
+///
+/// Matches the duplication path's reasoning: a guest that joins a still desktop
+/// has nothing to draw until something moves, so the picture is re-sent
+/// occasionally to cover a lost frame or a late arrival.
+const REFRESH_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether this machine can capture this way at all.
+///
+/// False on Windows before 1903. Asked rather than assumed, because the answer
+/// decides whether a fallback exists and saying "no adapter could capture"
+/// while silently having skipped the thing that would have worked is the worst
+/// of both.
+pub fn is_available() -> bool {
+    match GraphicsCaptureSession::IsSupported() {
+        Ok(yes) => yes,
+        Err(e) => {
+            debug!("Windows.Graphics.Capture is not available here: {e}");
+            false
+        }
+    }
+}
+
+/// A frame borrowed from the pool, returned when this is dropped.
+///
+/// The pool holds a fixed number of buffers and hands out one at a time; a
+/// frame that is not closed is a buffer that never comes back, and after
+/// [`BUFFERS`] of those the compositor has nowhere to put the next one and
+/// delivery stops — with no error, because nothing failed. Tying the close to a
+/// scope is the only way to be sure it happens on every path out, including the
+/// ones that return an error partway through reading the texture.
+struct Frame(windows::Graphics::Capture::Direct3D11CaptureFrame);
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        let _ = self.0.Close();
+    }
+}
+
+/// Capture of one display, through the compositor.
+pub struct WgcCapturer {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    /// The WinRT device wrapping [`Self::device`], kept because recreating the
+    /// pool after a resolution change needs it again.
+    winrt_device: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice,
+    item: GraphicsCaptureItem,
+    pool: Direct3D11CaptureFramePool,
+    /// Dropped last, and never before the pool: closing the session is what
+    /// stops the compositor writing into buffers this still owns.
+    session: GraphicsCaptureSession,
+
+    /// BGRA readback target, rebuilt whenever the source size changes.
+    staging: Option<ID3D11Texture2D>,
+    /// The GPU colour conversion, when the encoder asked for NV12. The same
+    /// video processor the duplication path uses — it rescales in the same pass
+    /// it converts, which is why the emitted size is its business and not a
+    /// separate resample here.
+    converter: Option<super::capture_nv12::Nv12Converter>,
+
+    /// What the compositor is producing.
+    width: u16,
+    height: u16,
+    /// What is emitted, once the scale and the guest's viewport are applied.
+    out_width: u16,
+    out_height: u16,
+    scale: QualityScale,
+    ceiling: Option<(u16, u16)>,
+    granularity: (u16, u16),
+    format: PixelFormat,
+
+    last_frame: Option<Bytes>,
+    last_emitted: Option<std::time::Instant>,
+    /// The display this is for, for the log line and for rebuilding.
+    label: String,
+}
+
+// SAFETY: every WinRT and D3D object here is agile or free-threaded — the pool
+// is created with `CreateFreeThreaded` precisely so it has no thread affinity,
+// and the device is marked multithread-protected below. `capture_shared` builds
+// this on its capture thread and uses it there; the bound exists because the
+// trait requires it of every backend.
+unsafe impl Send for WgcCapturer {}
+unsafe impl Sync for WgcCapturer {}
+
+impl WgcCapturer {
+    /// `want` is a device name as [`super::screen_capture::displays`] reports
+    /// it; `None` means the primary display.
+    pub fn new(want: Option<String>) -> Result<Self> {
+        anyhow::ensure!(
+            is_available(),
+            "this version of Windows has no compositor capture (it needs 1903 or later)"
+        );
+
+        // WinRT class activation needs the calling thread to be in an
+        // apartment, and the capture thread is a bare `std::thread`. This is
+        // the call meant for exactly that: it joins the process-wide MTA
+        // without the thread having to own an apartment or pump messages. The
+        // cookie is deliberately leaked — the MTA should outlive this capturer,
+        // since another one may be built on another thread a moment later.
+        // SAFETY: documented; the returned cookie is only for decrementing.
+        let _ = unsafe { windows::Win32::System::Com::CoIncrementMTAUsage() };
+
+        let (monitor, label) = monitor_for(want.as_deref())?;
+        let (device, context) = create_device()?;
+
+        // SAFETY: the device is live and implements IDXGIDevice.
+        let winrt_device = unsafe {
+            let dxgi: IDXGIDevice = device.cast().context("device is not an IDXGIDevice")?;
+            CreateDirect3D11DeviceFromDXGIDevice(&dxgi)
+                .context("could not hand the D3D device to WinRT")?
+        }
+        .cast::<windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>()
+        .context("the WinRT device is not an IDirect3DDevice")?;
+
+        // The interop factory is how a Win32 HMONITOR becomes something the
+        // WinRT API will capture. There is no other way in from desktop code.
+        let interop: IGraphicsCaptureItemInterop =
+            windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                .context("no capture item factory — this Windows cannot capture a monitor")?;
+        // SAFETY: a live monitor handle from the enumeration above.
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor) }
+            .with_context(|| format!("{label} cannot be captured by the compositor"))?;
+
+        let size = item.Size().context("the capture item has no size")?;
+        let (width, height) = clamp_size(size);
+
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            BUFFERS,
+            size,
+        )
+        .context("could not create the capture frame pool")?;
+
+        let session = pool.CreateCaptureSession(&item).context("could not start a capture")?;
+
+        // # The pointer is drawn into the frame here, unlike the other path
+        //
+        // Desktop Duplication reports the pointer separately — shape, position,
+        // visibility — and the guest draws it locally, which is what makes it
+        // move at the guest's frame rate rather than the stream's. WGC has no
+        // equivalent: it can bake the pointer in or leave it out, and there is
+        // no third answer. Left out, the guest would see no pointer at all, so
+        // it goes in.
+        let _ = session.SetIsCursorCaptureEnabled(true);
+
+        // Windows 11 21H2 and later. On anything older this fails and the
+        // yellow rectangle stays, which is a cost worth paying on a machine
+        // whose alternative is not capturing at all — see the module note.
+        if session.SetIsBorderRequired(false).is_err() {
+            info!(
+                "This Windows draws a capture border around {label}. \
+                 It cannot be turned off before Windows 11 21H2."
+            );
+        }
+
+        session.StartCapture().context("the compositor refused to start capturing")?;
+        info!("Capturing {label} through the compositor at {width}x{height}");
+
+        let mut capturer = Self {
+            device,
+            context,
+            winrt_device,
+            item,
+            pool,
+            session,
+            staging: None,
+            converter: None,
+            width,
+            height,
+            out_width: width,
+            out_height: height,
+            scale: QualityScale::Native,
+            ceiling: None,
+            granularity: (2, 2),
+            format: PixelFormat::Bgra,
+            last_frame: None,
+            last_emitted: None,
+            label,
+        };
+        capturer.recompute_output();
+        Ok(capturer)
+    }
+
+    /// Work out what size to emit, from the scale, the ceiling and the encoder.
+    ///
+    /// Identical in intent to the duplication path's version: the controller
+    /// sheds pixels under load, the guest caps what is worth sending, and the
+    /// encoder says what multiples it will accept.
+    fn recompute_output(&mut self) {
+        let (mut w, mut h) = self.scale.apply((self.width, self.height));
+        if let Some((cw, ch)) = self.ceiling {
+            let (cw, ch) = (cw.max(1), ch.max(1));
+            if w > cw || h > ch {
+                let by = f64::from(cw) / f64::from(w);
+                let by = by.min(f64::from(ch) / f64::from(h));
+                w = ((f64::from(w) * by).round() as u16).max(1);
+                h = ((f64::from(h) * by).round() as u16).max(1);
+            }
+        }
+        let (w, h) = super::screen_capture::snap_to((w, h), self.granularity);
+        if (w, h) == (self.out_width, self.out_height) {
+            return;
+        }
+        self.out_width = w;
+        self.out_height = h;
+        // The converter is built for one output size. Dropping it here is what
+        // makes the next frame rebuild it at the new one.
+        self.converter = None;
+    }
+
+    /// Follow a resolution change on the captured display.
+    ///
+    /// The compositor keeps delivering the old size until the pool is told, and
+    /// a frame that no longer matches is not an error anywhere — it is simply
+    /// the wrong picture, cropped or stretched, for as long as nobody notices.
+    fn resize_to(&mut self, size: SizeInt32) -> Result<()> {
+        let (width, height) = clamp_size(size);
+        if (width, height) == (self.width, self.height) {
+            return Ok(());
+        }
+        self.pool
+            .Recreate(&self.winrt_device, DirectXPixelFormat::B8G8R8A8UIntNormalized, BUFFERS, size)
+            .context("could not resize the capture frame pool")?;
+        info!("{} changed to {width}x{height}", self.label);
+        self.width = width;
+        self.height = height;
+        self.staging = None;
+        self.converter = None;
+        self.recompute_output();
+        Ok(())
+    }
+
+    /// Turn one captured texture into the bytes a frame carries.
+    fn read(&mut self, texture: &ID3D11Texture2D) -> Result<Vec<u8>> {
+        if self.format == PixelFormat::Nv12 {
+            if self.converter.is_none() {
+                self.converter = Some(super::capture_nv12::Nv12Converter::scaling(
+                    &self.device,
+                    &self.context,
+                    self.width,
+                    self.height,
+                    self.out_width,
+                    self.out_height,
+                )?);
+            }
+            if let Some(converter) = self.converter.as_mut() {
+                return converter.convert(texture);
+            }
+        }
+        self.read_bgra(texture)
+    }
+
+    /// The plain path: copy to a staging texture and read it on the CPU.
+    fn read_bgra(&mut self, texture: &ID3D11Texture2D) -> Result<Vec<u8>> {
+        if self.staging.is_none() {
+            self.staging = Some(staging_texture(&self.device, self.width, self.height)?);
+        }
+        let staging = self.staging.as_ref().expect("just built");
+
+        // SAFETY: staging matches the source in format and size; it is unmapped
+        // before this returns on every path.
+        unsafe {
+            self.context.CopyResource(staging, texture);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("could not map the staging texture")?;
+            let pixels = read_mapped(&mapped, self.width, self.height);
+            self.context.Unmap(staging, 0);
+            Ok(pixels)
+        }
+    }
+
+    /// Re-send the last picture when nothing has changed for a while.
+    fn idle_refresh(&mut self) -> Option<ScreenFrame> {
+        let last = self.last_frame.clone()?;
+        let due = self.last_emitted.is_none_or(|at| at.elapsed() >= REFRESH_IDLE);
+        if !due {
+            return None;
+        }
+        self.last_emitted = Some(std::time::Instant::now());
+        Some(ScreenFrame::with_format(
+            self.out_width,
+            self.out_height,
+            last,
+            self.format,
+            std::time::Duration::ZERO,
+        ))
+    }
+}
+
+impl ScreenCaptureBackend for WgcCapturer {
+    fn capture_next(&mut self) -> Result<Option<ScreenFrame>> {
+        // Null rather than an error is how the pool says "nothing yet", and it
+        // is the ordinary answer on a still desktop.
+        let Ok(raw) = self.pool.TryGetNextFrame() else {
+            return Ok(self.idle_refresh());
+        };
+        let frame = Frame(raw);
+
+        // # A resolution change is acted on with no frame outstanding
+        //
+        // `Recreate` reallocates the pool's buffers, and this frame is one of
+        // them. Doing it here — with the frame still open, before reading the
+        // texture — would leave the read working through a surface belonging to
+        // a pool that had just been thrown away, which is not something that
+        // fails cleanly.
+        //
+        // So the frame is handed back first and this one is skipped. Microsoft's
+        // own sample does the same thing for the same reason. Losing a single
+        // frame at the instant somebody changes their resolution costs nothing;
+        // the next one arrives at the new size.
+        let resized = frame
+            .0
+            .ContentSize()
+            .ok()
+            .filter(|size| clamp_size(*size) != (self.width, self.height));
+        if let Some(size) = resized {
+            drop(frame);
+            if let Err(e) = self.resize_to(size) {
+                warn!("Could not follow a resolution change on {}: {e:#}", self.label);
+            }
+            return Ok(None);
+        }
+
+        let started = std::time::Instant::now();
+        let surface = frame.0.Surface().context("a captured frame carried no surface")?;
+        let access: IDirect3DDxgiInterfaceAccess =
+            surface.cast().context("the frame surface is not a DXGI surface")?;
+        // SAFETY: the surface is live for as long as `frame` is, which outlives
+        // the read below.
+        let texture: ID3D11Texture2D =
+            unsafe { access.GetInterface() }.context("the frame surface is not a texture")?;
+
+        let pixels = self.read(&texture)?;
+        let cost = started.elapsed();
+
+        // On the NV12 path the video processor already produced the emitted
+        // size; on the BGRA path the frame is still full size and has to be
+        // brought down here.
+        let (pixels, cost) = if self.format == PixelFormat::Bgra
+            && (self.out_width, self.out_height) != (self.width, self.height)
+        {
+            let scaling = std::time::Instant::now();
+            let full = ScreenFrame::new(self.width, self.height, Bytes::from(pixels), cost);
+            let scaled =
+                super::screen_capture::box_downscale(&full, self.out_width, self.out_height);
+            (scaled, cost + scaling.elapsed())
+        } else {
+            (pixels, cost)
+        };
+
+        let data = Bytes::from(pixels);
+        self.last_frame = Some(data.clone());
+        self.last_emitted = Some(std::time::Instant::now());
+        Ok(Some(ScreenFrame::with_format(
+            self.out_width,
+            self.out_height,
+            data,
+            self.format,
+            cost,
+        )))
+    }
+
+    /// Nothing. The pointer is drawn into the frame instead — see the note in
+    /// [`WgcCapturer::new`], where that is decided and why there is no choice.
+    fn take_cursor(&mut self) -> Option<super::cursor::CursorUpdate> {
+        None
+    }
+
+    fn frame_size(&self) -> (u16, u16) {
+        (self.out_width, self.out_height)
+    }
+
+    fn set_scale(&mut self, scale: QualityScale) -> bool {
+        self.scale = scale;
+        self.recompute_output();
+        true
+    }
+
+    fn set_size_ceiling(&mut self, ceiling: Option<(u16, u16)>) -> bool {
+        self.ceiling = ceiling;
+        self.recompute_output();
+        true
+    }
+
+    fn set_size_granularity(&mut self, granularity: (u16, u16)) -> bool {
+        self.granularity = (granularity.0.max(1), granularity.1.max(1));
+        self.recompute_output();
+        true
+    }
+
+    fn request_format(&mut self, format: PixelFormat) -> bool {
+        if format != PixelFormat::Nv12 {
+            return false;
+        }
+        // Built lazily on the next frame, where the source texture is in hand.
+        // Answering yes before it exists is safe because the only thing that
+        // can refuse is the video processor, and a machine whose driver has one
+        // for the duplication path has the same one here.
+        self.format = PixelFormat::Nv12;
+        self.converter = None;
+        self.recompute_output();
+        true
+    }
+
+    fn current_format(&self) -> PixelFormat {
+        self.format
+    }
+}
+
+impl Drop for WgcCapturer {
+    fn drop(&mut self) {
+        // Order matters: the session is what has the compositor writing into
+        // the pool's buffers, so it stops first.
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+        let _ = &self.item;
+    }
+}
+
+/// A size the rest of the pipeline can carry, and never zero.
+fn clamp_size(size: SizeInt32) -> (u16, u16) {
+    (
+        size.Width.clamp(1, u16::MAX as i32) as u16,
+        size.Height.clamp(1, u16::MAX as i32) as u16,
+    )
+}
+
+/// The monitor handle for a display name, and something to call it.
+///
+/// Matched on `szDevice` — `\\.\DISPLAY1` — which is the same string
+/// [`super::screen_capture::displays`] reports and the same one the duplication
+/// path matches on, so a display asked for by name reaches the same screen
+/// whichever backend answers.
+fn monitor_for(
+    want: Option<&str>,
+) -> Result<(windows::Win32::Graphics::Gdi::HMONITOR, String)> {
+    use windows::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    };
+
+    /// `MONITORINFOF_PRIMARY`, which the crate does not name.
+    const PRIMARY: u32 = 0x0000_0001;
+
+    struct Search {
+        want: Option<String>,
+        found: Option<(HMONITOR, String)>,
+        seen: Vec<String>,
+    }
+
+    unsafe extern "system" fn visit(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _rect: *mut RECT,
+        state: LPARAM,
+    ) -> BOOL {
+        // SAFETY: the pointer is the `Search` handed to EnumDisplayMonitors
+        // below, which outlives the enumeration.
+        let search = unsafe { &mut *(state.0 as *mut Search) };
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // SAFETY: `info` is sized as the API requires and outlives the call.
+        if !unsafe {
+            GetMonitorInfoW(monitor, std::ptr::addr_of_mut!(info) as *mut MONITORINFO)
+        }
+        .as_bool()
+        {
+            return TRUE;
+        }
+
+        let end = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+        let name = String::from_utf16_lossy(&info.szDevice[..end]);
+        search.seen.push(name.clone());
+
+        let matches = match search.want.as_deref() {
+            Some(wanted) => name == wanted,
+            // The primary, which is the one Windows flags as such rather than
+            // the one at the origin — those agree, and the flag says so
+            // directly.
+            None => info.monitorInfo.dwFlags & PRIMARY != 0,
+        };
+        if matches && search.found.is_none() {
+            search.found = Some((monitor, name));
+        }
+        TRUE
+    }
+
+    let mut search =
+        Search { want: want.map(str::to_string), found: None, seen: Vec::new() };
+    // SAFETY: the callback only touches `search`, which outlives this call.
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(visit),
+            LPARAM(std::ptr::addr_of_mut!(search) as isize),
+        );
+    }
+
+    search.found.with_context(|| {
+        format!(
+            "{} is not one of this machine's monitors (it has {})",
+            want.unwrap_or("the primary display"),
+            if search.seen.is_empty() {
+                "none".to_string()
+            } else {
+                search.seen.join(", ")
+            }
+        )
+    })
+}
+
+/// A D3D11 device for the frame pool to deliver onto.
+///
+/// The default adapter, deliberately: unlike duplication, this does not have to
+/// be the chip drawing the desktop — that freedom is the entire reason this
+/// module exists. Whichever one this process was given is one the compositor
+/// can deliver to.
+fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+    let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+    let mut last = None;
+
+    // VIDEO_SUPPORT is what makes the NV12 conversion available. Asked for and
+    // given up rather than insisted on, as on the duplication path: a driver
+    // that refuses it still captures, and losing the conversion costs a CPU
+    // pass per frame where losing the device costs the session.
+    for flags in [
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    ] {
+        // SAFETY: all out-params are valid; a failed call leaves them None.
+        let result = unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                None,
+                flags,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        };
+        match result {
+            Ok(()) => break,
+            Err(e) => last = Some(e),
+        }
+    }
+
+    let device = device
+        .ok_or_else(|| anyhow::anyhow!("could not create a D3D11 device: {last:?}"))?;
+    let context = context.context("D3D11 device came back without a context")?;
+
+    // The pool is free-threaded and the compositor writes into it from its own
+    // thread. Without this the driver may assume single-threaded access, and
+    // what that produces is a corrupt frame or a device removal rather than an
+    // error anyone can trace back here.
+    if let Ok(mt) = device.cast::<ID3D11Multithread>() {
+        // SAFETY: the device is live; this only sets a flag on it.
+        unsafe {
+            let _ = mt.SetMultithreadProtected(true);
+        }
+    }
+    Ok((device, context))
+}
+
+/// A CPU-readable copy target matching the captured surface.
+fn staging_texture(device: &ID3D11Device, width: u16, height: u16) -> Result<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: u32::from(width),
+        Height: u32::from(height),
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    // SAFETY: the description is fully initialised and the out-param is valid.
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+        .context("could not create the staging texture")?;
+    texture.context("CreateTexture2D returned nothing")
+}
+
+/// Copy a mapped BGRA surface into a tightly packed buffer.
+///
+/// `RowPitch` is almost never `width * 4` — the driver pads rows for alignment,
+/// so copying the whole mapping in one go produces a skewed image.
+///
+/// # Safety
+/// `mapped.pData` must point to at least `height * mapped.RowPitch` readable bytes.
+unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16) -> Vec<u8> {
+    let row_bytes = width as usize * 4;
+    let pitch = mapped.RowPitch as usize;
+    let mut out = vec![0u8; row_bytes * height as usize];
+
+    for y in 0..height as usize {
+        let src = unsafe { (mapped.pData as *const u8).add(y * pitch) };
+        let dst = &mut out[y * row_bytes..(y + 1) * row_bytes];
+        // SAFETY: the row lies inside the mapped region and dst is exactly row_bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), row_bytes) };
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A size from the compositor must never reach the pipeline as zero.
+    #[test]
+    fn a_size_is_clamped_into_something_capturable() {
+        assert_eq!(clamp_size(SizeInt32 { Width: 1920, Height: 1080 }), (1920, 1080));
+        // A monitor being reconfigured reports these, and a zero-sized frame is
+        // a division by zero several layers up.
+        assert_eq!(clamp_size(SizeInt32 { Width: 0, Height: 0 }), (1, 1));
+        assert_eq!(clamp_size(SizeInt32 { Width: -1, Height: 1080 }), (1, 1080));
+        // And nothing here can carry a size the protocol cannot.
+        assert_eq!(clamp_size(SizeInt32 { Width: 100_000, Height: 1080 }), (u16::MAX, 1080));
+    }
+
+    /// Whether this machine can capture through the compositor at all.
+    ///
+    /// A diagnostic rather than an assertion: the answer is a property of the
+    /// Windows version, and both answers are correct on some machine.
+    #[test]
+    fn what_this_machine_says_about_compositor_capture() {
+        println!("Windows.Graphics.Capture supported: {}", is_available());
+    }
+
+    /// Capture one real frame from this machine's primary display.
+    ///
+    /// # Why this is worth running on a real machine
+    ///
+    /// Every interesting thing here is the compositor's answer rather than this
+    /// code's: whether a monitor can be turned into a capture item, whether the
+    /// pool delivers without a dispatcher queue, whether the surface hands back
+    /// a texture, and whether the frame has anything in it. None of that can be
+    /// asserted without a desktop, and all of it decides whether this is a
+    /// fallback worth having.
+    ///
+    /// Run with
+    /// `cargo test -p tain-core --lib -- --ignored --nocapture compositor_capture_produces`.
+    #[test]
+    #[ignore = "captures this machine's screen — run explicitly"]
+    fn compositor_capture_produces_a_frame_of_this_desktop() {
+        if !is_available() {
+            println!("No compositor capture on this Windows — nothing to test.");
+            return;
+        }
+        let mut capturer = WgcCapturer::new(None).expect("could not start compositor capture");
+        let (width, height) = capturer.frame_size();
+        println!("Capturing {width}x{height}");
+
+        // The first frame is not always ready the instant capture starts, so
+        // this asks for a moment rather than once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let frame = loop {
+            match capturer.capture_next().expect("capture failed") {
+                Some(frame) => break frame,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                None => panic!("no frame arrived within 5s"),
+            }
+        };
+
+        assert_eq!((frame.width, frame.height), (width, height));
+        assert_eq!(
+            frame.data.len(),
+            frame.width as usize * frame.height as usize * 4,
+            "a BGRA frame is four bytes a pixel"
+        );
+        // A desktop that is entirely one colour is what a frame of nothing
+        // looks like, and it is the failure this test exists to catch.
+        let distinct: std::collections::BTreeSet<&[u8]> =
+            frame.data.chunks_exact(4).step_by(997).take(500).collect();
+        println!("  {} bytes, {} distinct sampled pixels", frame.data.len(), distinct.len());
+        assert!(distinct.len() > 1, "every sampled pixel was identical — the frame is blank");
+    }
+
+    /// The path a real session actually takes: NV12, converted on the GPU.
+    ///
+    /// # Why this is separate from the frame above
+    ///
+    /// The encoder asks for NV12, and getting it is what keeps a full-resolution
+    /// colour conversion off the CPU — at 2560x1600 that is fourteen megabytes a
+    /// frame. So BGRA capturing correctly proves the plumbing and *not* the
+    /// thing that runs: a video processor that refuses this size, or produces
+    /// the wrong number of bytes, is a fault that only appears here.
+    ///
+    /// Run with
+    /// `cargo test -p tain-core --lib -- --ignored --nocapture compositor_capture_converts`.
+    #[test]
+    #[ignore = "captures this machine's screen — run explicitly"]
+    fn compositor_capture_converts_to_nv12_on_the_gpu() {
+        if !is_available() {
+            println!("No compositor capture on this Windows — nothing to test.");
+            return;
+        }
+        let mut capturer = WgcCapturer::new(None).expect("could not start compositor capture");
+        assert!(
+            capturer.request_format(PixelFormat::Nv12),
+            "the compositor backend refused the format the encoder asks for"
+        );
+        assert_eq!(capturer.current_format(), PixelFormat::Nv12);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let frame = loop {
+            match capturer.capture_next().expect("capture failed") {
+                Some(frame) => break frame,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                None => panic!("no frame arrived within 5s"),
+            }
+        };
+
+        assert_eq!(frame.format, PixelFormat::Nv12, "the frame is not what was asked for");
+        // NV12 is one byte of luma per pixel plus a half-resolution chroma
+        // plane: twelve bits a pixel, which is the whole reason for asking.
+        let expected = frame.width as usize * frame.height as usize * 3 / 2;
+        assert_eq!(
+            frame.data.len(),
+            expected,
+            "{}x{} of NV12 should be {expected} bytes",
+            frame.width,
+            frame.height
+        );
+        println!("  NV12 {}x{}, {} bytes", frame.width, frame.height, frame.data.len());
+    }
+}

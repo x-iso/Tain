@@ -155,7 +155,10 @@ struct Desktop {
     /// by control calls ([`Subscriber::set_scale`] and friends) for as long as
     /// it takes to reconfigure — which is why those answer honestly instead of
     /// posting a request and hoping.
-    capturer: Mutex<DxgiCapturer>,
+    /// Boxed rather than a concrete `DxgiCapturer`, because there are two ways
+    /// to capture a screen and which one a machine gets is decided at
+    /// [`Desktop::start`] — see [`start_capturing`].
+    capturer: Mutex<Box<dyn ScreenCaptureBackend>>,
     published: Mutex<Published>,
     /// Signalled by the pump on every wake-up, frame or not: a pointer move on a
     /// still desktop is also something a subscriber is waiting for.
@@ -173,6 +176,68 @@ struct Desktop {
     pump: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// Start capturing one display, whichever way this machine can.
+///
+/// # Duplication first, the compositor second
+///
+/// Desktop Duplication is the leaner path — it hands over a frame the moment
+/// the desktop changes, draws no capture border, and reports the pointer
+/// separately so the guest can draw it locally at its own frame rate. Where it
+/// works it is the one to use, and on a machine with one graphics chip it
+/// always works.
+///
+/// It cannot work on some machines with two. The rule is that the D3D device
+/// and the output must be on the same adapter — the one compositing the desktop
+/// — and on a hybrid laptop the process is commonly placed on the *other* chip,
+/// which then claims the display and refuses to duplicate it. Nothing inside
+/// the process can move it; see [`super::gpu_preference`], which writes a
+/// Windows setting and asks for a restart, and is a workaround wearing all the
+/// awkwardness that implies.
+///
+/// [`super::capture_wgc`] has no such rule, because the compositor delivers
+/// onto whatever device it is given. So it is what a machine falls back to,
+/// and the fallback is worth its costs precisely where it is reached: the
+/// alternative there is not a border and an extra buffer, it is no picture.
+///
+/// Both failures are reported when both fail. The duplication error names every
+/// adapter it tried, and that is the one that says what is actually wrong with
+/// the machine — losing it because a second attempt failed differently would
+/// undo the diagnosis it exists to give.
+fn start_capturing(want: Option<String>) -> Result<Box<dyn ScreenCaptureBackend>> {
+    // # Forcing the compositor, for comparing the two
+    //
+    // A machine where duplication works never reaches the fallback, so there
+    // would otherwise be no way to see what the other path does on it — which
+    // is exactly what somebody wants when duplication *works* and looks wrong.
+    //
+    // An environment variable rather than a setting, because this is a property
+    // of the host rather than of a session, and [`attach`] shares one capture
+    // between every session watching a display: a per-session switch would mean
+    // the second session silently taking whatever the first one chose. If it
+    // earns a place in the interface it belongs there as a host setting.
+    if std::env::var("TAIN_CAPTURE").is_ok_and(|v| v.eq_ignore_ascii_case("wgc")) {
+        tracing::info!("TAIN_CAPTURE=wgc — capturing through the compositor by request");
+        return Ok(Box::new(super::capture_wgc::WgcCapturer::new(want)?));
+    }
+
+    let duplication = match DxgiCapturer::new(want.clone()) {
+        Ok(capturer) => return Ok(Box::new(capturer)),
+        Err(e) => e,
+    };
+
+    if !super::capture_wgc::is_available() {
+        return Err(duplication);
+    }
+
+    tracing::info!("Duplication would not start — trying the compositor instead");
+    match super::capture_wgc::WgcCapturer::new(want) {
+        Ok(capturer) => Ok(Box::new(capturer)),
+        Err(compositor) => Err(duplication.context(format!(
+            "and the compositor would not capture it either ({compositor:#})"
+        ))),
+    }
+}
+
 impl Desktop {
     fn start(want: Option<String>) -> Result<Arc<Self>> {
         let key = want.clone().unwrap_or_default();
@@ -180,13 +245,14 @@ impl Desktop {
         // duplication are created and used on the same thread for their whole
         // life. Handing a live one across threads works, but only by accident of
         // how it is used, and this removes the question.
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<DxgiCapturer>>();
+        let (ready_tx, ready_rx) =
+            std::sync::mpsc::channel::<Result<Box<dyn ScreenCaptureBackend>>>();
         let (start_tx, start_rx) = std::sync::mpsc::channel::<Arc<Desktop>>();
 
         let handle = std::thread::Builder::new()
             .name("desktop-capture".into())
             .spawn(move || {
-                let capturer = DxgiCapturer::new(want);
+                let capturer = start_capturing(want);
                 let failed = capturer.is_err();
                 if ready_tx.send(capturer).is_err() || failed {
                     return;

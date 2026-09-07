@@ -33,6 +33,8 @@ pub mod network;
 pub mod passcode;
 pub mod screen_capture;
 pub mod virtual_display;
+pub mod gpu_preference;
+pub mod local_input;
 pub mod cursor;
 pub mod preview;
 pub mod wallpaper;
@@ -45,6 +47,8 @@ pub mod capture_hdr;
 pub mod capture_nv12;
 #[cfg(target_os = "windows")]
 pub mod capture_shared;
+#[cfg(target_os = "windows")]
+pub mod capture_wgc;
 #[cfg(target_os = "windows")]
 pub mod capture_wall;
 pub mod encoder;

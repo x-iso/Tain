@@ -627,6 +627,19 @@ pub trait ScreenCaptureBackend: Send + Sync {
         false
     }
 
+    /// What the frames coming out of here are laid out as, right now.
+    ///
+    /// Asked by [`super::capture_shared`], where a second session joining a
+    /// capture that already exists needs to know whether the format it wants is
+    /// the one being produced — the answer decides whether it can join or has
+    /// to take what is on offer.
+    ///
+    /// Defaults to BGRA, because that is what a backend which refuses
+    /// [`Self::request_format`] necessarily produces.
+    fn current_format(&self) -> PixelFormat {
+        PixelFormat::Bgra
+    }
+
     /// Whether this backend captures a real screen.
     fn is_real(&self) -> bool {
         true

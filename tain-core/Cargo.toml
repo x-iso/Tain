@@ -92,6 +92,15 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_System_Variant",
+    # The per-application graphics preference, which is the only way to put this
+    # process on the chip that draws the desktop. See `gpu_preference`.
+    "Win32_System_Registry",
+    # Windows.Graphics.Capture: frames from the compositor rather than by
+    # duplicating an output this process has to own. See `capture_wgc`.
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_WinRT_Direct3D11",
 ] }
 
 # The libavcodec shim is compiled by build.rs with the same MSVC toolchain Rust
