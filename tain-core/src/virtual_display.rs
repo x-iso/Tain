@@ -510,13 +510,186 @@ mod windows_impl {
 
     /// Take a virtual display off the desktop.
     ///
-    /// A zeroed mode is how detaching is spelled: there is no separate call,
-    /// and a display with no width is not on the desktop.
+    /// # Two ways, because the obvious one is refused
+    ///
+    /// Detaching used to be spelled the way it has been spelled since Windows
+    /// 95: hand `ChangeDisplaySettingsExW` a zeroed mode, on the reasoning that
+    /// a display with no width is not on the desktop. On a real monitor that
+    /// works. On this driver's monitor it comes back `DISP_CHANGE_BADMODE`:
+    ///
+    /// ```text
+    /// could not take \\.\DISPLAY41 off the desktop: the display change was refused (-2)
+    /// ```
+    ///
+    /// Which is Windows saying it will not set a mode of 0x0 — a reasonable
+    /// reading of the request, and one that leaves the legacy call with no way
+    /// to express what was meant. The remove button did nothing at all, and the
+    /// reason never reached the window.
+    ///
+    /// `SetDisplayConfig` says it directly. A desktop is a set of *paths* from
+    /// a source to a target, and one that is part of the desktop carries
+    /// `DISPLAYCONFIG_PATH_ACTIVE`; clearing that flag and handing the layout
+    /// back is the whole operation. No mode is involved, so there is no mode to
+    /// refuse. It is also what the Settings app does, and `SDC_SAVE_TO_DATABASE`
+    /// makes the decision stick — so the display stays off across a driver
+    /// restart and a reboot rather than coming back the next time Windows
+    /// remembers what it used to do with that monitor.
+    ///
+    /// The old call is still tried second. It is twenty lines, it works on
+    /// hardware this one has not been proved against, and a display that will
+    /// not leave the desktop is precisely the failure being fixed here.
+    ///
+    /// # Success is read from the desktop, not from the return value
+    ///
+    /// Both calls are capable of reporting success and changing nothing — that
+    /// is how the previous attempt at this went wrong in the other direction,
+    /// where the driver was asked for zero monitors, said yes, and presented
+    /// one anyway. So each attempt is checked against what the desktop actually
+    /// says afterwards, and a call that lied is treated as a failure and
+    /// followed by the next one.
     pub fn detach(name: &str) -> Result<()> {
         let screen = must_be_virtual(name)?;
         if !screen.attached {
             return Ok(());
         }
+
+        /// One way of asking Windows to take a display off the desktop.
+        type Attempt = (&'static str, fn(&str) -> Result<()>);
+        let attempts: [Attempt; 2] =
+            [("SetDisplayConfig", deactivate_path), ("ChangeDisplaySettingsEx", blank_the_mode)];
+
+        let mut refused = Vec::new();
+        for (how, attempt) in attempts {
+            match attempt(name) {
+                Ok(()) if still_attached(name) => refused.push(format!(
+                    "{how} reported success and left it on the desktop"
+                )),
+                Ok(()) => {
+                    info!("Detached {} ({}) with {how}", screen.name, screen.adapter);
+                    return Ok(());
+                }
+                Err(e) => refused.push(format!("{how}: {e:#}")),
+            }
+        }
+        bail!("nothing could take {name} off the desktop. {}", refused.join("; "))
+    }
+
+    /// Whether the desktop still lists this display, asked fresh.
+    fn still_attached(name: &str) -> bool {
+        available().iter().any(|screen| screen.name == name && screen.attached)
+    }
+
+    /// Turn off the path that puts this display on the desktop.
+    ///
+    /// Reads the whole layout, clears one path's active flag, and hands it all
+    /// back. `SDC_ALLOW_CHANGES` lets Windows adjust the rest to stay valid,
+    /// which it has to be allowed to do: taking a display away can move the
+    /// desktop origin, and refusing that would refuse the removal.
+    fn deactivate_path(name: &str) -> Result<()> {
+        use windows::Win32::Devices::Display::{
+            DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+            SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO,
+            DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+            SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+        };
+        use windows::Win32::Foundation::ERROR_SUCCESS;
+
+        /// `DISPLAYCONFIG_PATH_ACTIVE`, which the crate does not name.
+        const PATH_ACTIVE: u32 = 0x0000_0001;
+        /// `DISPLAYCONFIG_PATH_MODE_IDX_INVALID`. Written as one word into a
+        /// union that is either a single index or two sixteen-bit ones — and
+        /// all-ones is the "none" value in both readings, which is why this
+        /// does not have to know which layout is in force.
+        const NO_MODE: u32 = 0xFFFF_FFFF;
+
+        let (mut path_count, mut mode_count) = (0u32, 0u32);
+        // SAFETY: both counts are locals that outlive the call.
+        let sized = unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        };
+        if sized != ERROR_SUCCESS {
+            bail!("could not measure the desktop layout ({})", sized.0);
+        }
+
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        // SAFETY: both buffers are exactly the length just asked for, and the
+        // counts are updated in place with how much was actually written.
+        let read = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        if read != ERROR_SUCCESS {
+            bail!("could not read the desktop layout ({})", read.0);
+        }
+        paths.truncate(path_count as usize);
+        modes.truncate(mode_count as usize);
+
+        let mut turned_off = 0;
+        for path in &mut paths {
+            if path.flags & PATH_ACTIVE == 0 {
+                continue;
+            }
+            let mut ask = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                    adapterId: path.sourceInfo.adapterId,
+                    id: path.sourceInfo.id,
+                },
+                ..Default::default()
+            };
+            // SAFETY: the packet is the struct its header's type and size
+            // declare, and it outlives the call.
+            if unsafe { DisplayConfigGetDeviceInfo(&mut ask.header) } != 0 {
+                continue;
+            }
+            if text(&ask.viewGdiDeviceName) != name {
+                continue;
+            }
+            path.flags &= !PATH_ACTIVE;
+            // A path that is not on the desktop has no modes. Writing a union
+            // field needs no `unsafe` — only reading one can observe a variant
+            // that was never written.
+            path.sourceInfo.Anonymous.modeInfoIdx = NO_MODE;
+            path.targetInfo.Anonymous.modeInfoIdx = NO_MODE;
+            turned_off += 1;
+        }
+        if turned_off == 0 {
+            bail!("{name} is not one of the {} paths making up the desktop", paths.len());
+        }
+
+        // SAFETY: both slices describe the arrays filled in above.
+        let applied = unsafe {
+            SetDisplayConfig(
+                Some(&paths),
+                Some(&modes),
+                SDC_APPLY
+                    | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+                    | SDC_ALLOW_CHANGES
+                    | SDC_SAVE_TO_DATABASE,
+            )
+        };
+        if applied != 0 {
+            bail!("Windows refused the desktop without {name} ({applied})");
+        }
+        Ok(())
+    }
+
+    /// The old spelling: a mode of nothing, which is no longer accepted here.
+    ///
+    /// Kept as the second attempt rather than deleted. It is the call every
+    /// other program has used for thirty years, it works on displays this has
+    /// not been tried against, and the cost of keeping it is that a failure
+    /// reports two reasons instead of one.
+    fn blank_the_mode(name: &str) -> Result<()> {
         let mut mode = DEVMODEW {
             dmSize: std::mem::size_of::<DEVMODEW>() as u16,
             dmFields: DM_POSITION
@@ -526,9 +699,7 @@ mod windows_impl {
                 | DM_DISPLAYFREQUENCY,
             ..Default::default()
         };
-        apply(name, Some(&mut mode))?;
-        info!("Detached {} ({})", screen.name, screen.adapter);
-        Ok(())
+        apply(name, Some(&mut mode))
     }
 }
 
@@ -710,6 +881,60 @@ mod tests {
             before,
             "detaching left the desktop with a display it did not start with"
         );
+    }
+
+    /// Whether this machine's virtual displays can actually be taken away.
+    ///
+    /// # Why this is a test and not something to be reasoned about
+    ///
+    /// Detaching is one call, it is documented, and it did not work: handed a
+    /// zeroed mode, this driver's monitor came back `DISP_CHANGE_BADMODE` and
+    /// the remove button did nothing at all, twice, across two attempts to fix
+    /// it by thinking harder. What settles the question is a real display on a
+    /// real machine answering, which is what this is.
+    ///
+    /// Leaves the display *off*. Unlike
+    /// [`a_virtual_display_can_be_attached_and_put_away`], which borrows a
+    /// spare and puts it back, this one is aimed at a display that is on the
+    /// desktop and should not be — so restoring it afterwards would undo the
+    /// only thing it is for. Attaching one again is a button in Settings.
+    ///
+    /// Run with
+    /// `cargo test -p tain-core --lib -- --ignored --nocapture get_a_virtual_display_off`.
+    #[test]
+    #[ignore = "changes this machine's desktop layout — run explicitly"]
+    fn what_it_takes_to_get_a_virtual_display_off_this_desktop() {
+        let attached: Vec<VirtualDisplay> =
+            available().into_iter().filter(|d| d.attached && d.ready).collect();
+        if attached.is_empty() {
+            println!("No virtual display is on this desktop — nothing to take off.");
+            return;
+        }
+
+        for screen in &attached {
+            println!("Taking {} ({}) off the desktop", screen.name, screen.adapter);
+            match detach(&screen.name) {
+                Ok(()) => {
+                    let still = available()
+                        .into_iter()
+                        .any(|d| d.name == screen.name && d.attached);
+                    println!(
+                        "  {}",
+                        if still {
+                            "reported success and it is STILL on the desktop"
+                        } else {
+                            "gone. The driver still presents it, so adding one reuses it."
+                        }
+                    );
+                    assert!(!still, "{} would not leave the desktop", screen.name);
+                }
+                // Printed as well as failed: the message names every mechanism
+                // that was tried and what each one said, which is the whole
+                // value of running this on a machine that refuses.
+                Err(e) => panic!("  refused: {e:#}"),
+            }
+        }
+        println!("Attached displays now: {:?}", occupied());
     }
 
     /// What this machine actually has, for someone wiring up a driver.

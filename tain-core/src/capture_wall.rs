@@ -291,7 +291,8 @@ impl Wall {
     fn warn_once_about_resize(&mut self, name: &str, got: (u16, u16), slot: (u16, u16)) {
         if self.resized.insert(name.to_string()) {
             warn!(
-                "{name} is producing {}x{} for a {}x{} slot — scaling it to fit. Its                  capture is probably owned by another session.",
+                "{name} is producing {}x{} for a {}x{} slot — scaling it to fit. Its \
+                 capture is probably owned by another session.",
                 got.0, got.1, slot.0, slot.1
             );
         }

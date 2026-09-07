@@ -37,10 +37,17 @@
 //! `CreateNamedPipeW` — and answers a small set of verbs:
 //!
 //! - `SETDISPLAYCOUNT` is the one that matters. Its log line is *"Display Count
-//!   Changed, Restarting Driver"*, so asking for a count is the whole of
-//!   creating and destroying monitors: the driver writes the number into its
-//!   settings file and restarts itself. No device disable/enable of ours, and
-//!   nothing needing administrator rights after the install.
+//!   Changed, Restarting Driver"*, so asking for a count is how a monitor comes
+//!   to exist: the driver writes the number into its settings file and restarts
+//!   itself. No device disable/enable of ours, and nothing needing
+//!   administrator rights after the install.
+//!
+//!   It is not how one stops existing. The driver refuses a count of zero and
+//!   substitutes one, and any change to the count restarts it — so every
+//!   monitor it presents goes away and comes back, and Windows may attach what
+//!   comes back. Removal is therefore taking the display off the desktop, which
+//!   is [`tain_core::virtual_display::detach`] and no business of the driver's.
+//!   See [`remove_display`].
 //! - `PING`, `GETSETTINGS`, `RELOAD_DRIVER` for state and lifecycle.
 //! - `GETALLGPUS`, `GETASSIGNEDGPU`, `VDDPATH` for which adapter it renders on
 //!   and where its settings live.
@@ -395,29 +402,69 @@ mod windows_impl {
     /// what appears in the display list is *their* name — "Virtual Display
     /// Driver", by Mike The Tech, for the package this ships today. Looking for
     /// "Tain" would have found nothing, ever.
-    fn device_present(package: Option<&Package>) -> bool {
+    /// The virtual displays belonging to *this* driver, and no other.
+    ///
+    /// # Why everything here is scoped and not just the risky parts
+    ///
+    /// [`tain_core::virtual_display::available`] answers a broader question —
+    /// every adapter on the machine that looks like a virtual display, whoever
+    /// installed it. That is the right question for the module that drives one,
+    /// and the wrong one for every caller in here: a machine with Parsec
+    /// installed has sixteen of its adapters enumerating alongside this
+    /// driver's, and "remove the last one" reaching Parsec's display would take
+    /// away a screen Tain has no business touching.
+    ///
+    /// Matched on the adapter name the package declares, because that is what
+    /// Windows shows: the driver is installed exactly as its authors signed it,
+    /// so the name in the display list is theirs. Looking for "Tain" would find
+    /// nothing, ever — which is the same mistake the hardware id made once
+    /// already.
+    fn ours(package: Option<&Package>) -> Vec<tain_core::virtual_display::VirtualDisplay> {
         let wanted = package
             .and_then(|p| p.device_name.as_deref())
             .unwrap_or("virtual display driver")
             .to_ascii_lowercase();
         tain_core::virtual_display::available()
-            .iter()
-            .any(|screen| screen.adapter.to_ascii_lowercase().contains(&wanted))
+            .into_iter()
+            .filter(|screen| screen.adapter.to_ascii_lowercase().contains(&wanted))
+            .collect()
     }
 
     /// What the settings panel shows.
     pub fn state() -> DriverState {
         let package = package();
-        if device_present(package.as_ref()) {
-            let ready = tain_core::virtual_display::available()
-                .iter()
-                .any(|screen| screen.ready);
+        let screens = ours(package.as_ref());
+        if !screens.is_empty() {
+            let ready = screens.iter().any(|screen| screen.ready);
             return if ready { DriverState::Ready } else { DriverState::Idle };
         }
         if package.is_none() {
             return DriverState::NotBundled;
         }
         DriverState::NotInstalled
+    }
+
+    /// Whether the driver on this machine is the one Tain put here.
+    ///
+    /// # Why this question is asked before anything is taken away
+    ///
+    /// The clean-up below removes virtual displays nobody is using any more,
+    /// and it has to be sure they are Tain's to remove. This driver can also
+    /// arrive by its own installer, from its own authors, on a machine where
+    /// somebody uses it as a permanent second screen — and reaping *that* every
+    /// time Tain is not running would be taking away a monitor on the strength
+    /// of having recognised the name of its driver.
+    ///
+    /// The settings pointer answers it exactly. [`decide_settings_path`] claims
+    /// `HKLM\…\VDDPATH` only when nothing else has set it, and leaves an
+    /// existing one alone — so the value reading back as Tain's folder means
+    /// Tain installed this driver, and anything else means somebody got there
+    /// first.
+    pub fn installed_by_tain() -> bool {
+        let (Some(configured), Some(ours)) = (settings::configured(), settings::ours()) else {
+            return false;
+        };
+        configured == ours
     }
 
     /// Ask for elevation and install the driver.
@@ -815,18 +862,184 @@ mod windows_impl {
         }
     }
 
+    /// Whether a Tain window is open, which is what a display's lifetime hangs
+    /// on.
+    ///
+    /// # The problem
+    ///
+    /// A virtual display outlives the process that made it. Nothing about a
+    /// monitor on the desktop says who put it there, so closing Tain — or
+    /// killing it, or watching it crash — leaves a screen behind that shoves
+    /// windows onto itself and that nobody can see anything on. Asked for
+    /// directly: *"virtual display should disappear upon closing Tain.exe
+    /// (gracefully or not)"*.
+    ///
+    /// # A handle, rather than a note on disk
+    ///
+    /// Tain holds a named mutex for as long as it is running, and that is the
+    /// entire mechanism. It is the kernel's bookkeeping and not this code's: a
+    /// handle is closed when the process holding it ends, whether it ended by
+    /// being asked to, by crashing, or by being killed from Task Manager. There
+    /// is no sequence of events in which the record outlives the thing it
+    /// records, which is exactly the property a file full of process ids does
+    /// not have.
+    ///
+    /// # `Local\`, not `Global\`
+    ///
+    /// The agent that reaps orphaned displays runs in the console session,
+    /// which is the session whose desktop the display is on — so a
+    /// session-local name is the right scope rather than a compromise. It also
+    /// needs no privilege to create, where a global name needs
+    /// `SeCreateGlobalPrivilege`. That matters more than it looks: if
+    /// announcing could fail, there would be a case where a running Tain went
+    /// unnoticed and had its display taken away underneath it, and the whole
+    /// point of this module is that that case does not exist.
+    pub mod presence {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::Threading::{
+            CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+        };
+
+        /// Session-local, so the console session's agent sees the console
+        /// session's application and nothing else.
+        const NAME: &str = r"Local\Tain.Application";
+
+        /// Held for as long as this process counts as a running Tain.
+        ///
+        /// Never locked. A mutex is used for its *existence*, which is what
+        /// [`is_running`] asks about — taking ownership would say something
+        /// about one process among several, and several are allowed.
+        pub struct Presence(HANDLE);
+
+        impl Drop for Presence {
+            fn drop(&mut self) {
+                // SAFETY: opened in `announce` and closed once, here.
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+
+        // SAFETY: a kernel handle is a process-wide value with no thread
+        // affinity, and the only thing done with this one is closing it.
+        unsafe impl Send for Presence {}
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        /// Say that a Tain application is running here, until the value drops.
+        ///
+        /// An existing mutex is opened rather than fought over: two copies of
+        /// Tain are allowed, and the name outlives both only if both are gone.
+        pub fn announce() -> Option<Presence> {
+            let name = wide(NAME);
+            // SAFETY: the name outlives the call. `false` asks not to take
+            // ownership, which this never wants — see the note on `Presence`.
+            let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) };
+            match handle {
+                Ok(handle) => Some(Presence(handle)),
+                Err(e) => {
+                    // Nothing stops working. What is lost is the agent's
+                    // ability to tell that this process is alive, so it says so
+                    // plainly rather than leaving a display to vanish for no
+                    // visible reason.
+                    tracing::warn!(
+                        "Could not announce this Tain to the rest of the machine ({e}). \
+                         A virtual display may be put away while it is still in use."
+                    );
+                    None
+                }
+            }
+        }
+
+        /// Whether any Tain application is running in this session.
+        pub fn is_running() -> bool {
+            let name = wide(NAME);
+            // SAFETY: the name outlives the call; the handle is closed below.
+            let opened =
+                unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) };
+            match opened {
+                Ok(handle) => {
+                    // SAFETY: just opened, closed once, here.
+                    unsafe {
+                        let _ = CloseHandle(handle);
+                    }
+                    true
+                }
+                // Every failure reads as absent. The one that matters is
+                // "no such object", and the others — a name that cannot be
+                // opened for permissions, say — are not states this creates.
+                Err(_) => false,
+            }
+        }
+    }
+
+    /// Take away displays whose application has gone.
+    ///
+    /// # Why this is not simply done when Tain closes
+    ///
+    /// It is, and that covers the ordinary case. It does not cover the case
+    /// that was asked about: a process that is killed, or crashes, runs no exit
+    /// path at all, and the display it attached stays on the desktop with
+    /// nothing left to take it off.
+    ///
+    /// So something that outlives the application has to do it. That is the
+    /// agent — the service cannot, because a service is in session zero and
+    /// display configuration belongs to the session whose desktop it is, while
+    /// the agent runs in the console session and can.
+    ///
+    /// # What it refuses to touch
+    ///
+    /// Only this driver's displays ([`ours`]), and only when Tain installed the
+    /// driver ([`installed_by_tain`]). Somebody who installed the same driver
+    /// themselves and keeps a virtual screen up permanently would otherwise
+    /// lose it every time Tain was not running, on the strength of Tain having
+    /// recognised the name of a driver it did not put there.
+    ///
+    /// Returns how many it removed, so a caller can log the interesting case
+    /// and stay quiet the rest of the time — which is nearly always, since this
+    /// runs on a timer.
+    pub fn reap_orphans() -> usize {
+        if presence::is_running() {
+            return 0;
+        }
+        // Cheapest question first: this runs on a timer and the answer is
+        // almost always that there is nothing on the desktop to think about.
+        if !ours(package().as_ref()).iter().any(|screen| screen.attached) {
+            return 0;
+        }
+        release()
+    }
+
+    /// Put away every virtual display Tain is responsible for.
+    ///
+    /// What [`reap_orphans`] does once it has established that nobody is using
+    /// them, and what the application does as it closes — where the question
+    /// does not arise, because the application closing is the thing that would
+    /// have been waited for.
+    ///
+    /// Gated on [`installed_by_tain`] for the reason given there: a driver
+    /// somebody else installed is not Tain's to take displays away from.
+    pub fn release() -> usize {
+        if !installed_by_tain() {
+            return 0;
+        }
+        stand_down()
+    }
+
     /// Wait until the driver has presented at least this many monitors.
     ///
     /// Adapters exist from the moment the driver is installed and mean nothing;
     /// what is being waited for is a monitor *behind* one — see
     /// [`tain_core::virtual_display`], whose `ready` is that question.
     fn wait_for_monitors(at_least: usize, within: std::time::Duration) -> Result<()> {
+        let package = package();
         let until = std::time::Instant::now() + within;
         loop {
-            let ready = tain_core::virtual_display::available()
-                .iter()
-                .filter(|screen| screen.ready)
-                .count();
+            let ready =
+                ours(package.as_ref()).iter().filter(|screen| screen.ready).count();
             if ready >= at_least {
                 return Ok(());
             }
@@ -842,7 +1055,9 @@ mod windows_impl {
     /// The fewest monitors this driver will present.
     ///
     /// Not a choice — it reads a count of zero as invalid and substitutes one.
-    /// See [`remove_display`], which is where that matters.
+    /// Which is why nothing here tries to reach none by asking: taking a
+    /// display off the desktop is what removal means, and [`remove_display`]
+    /// says why at length.
     const MIN_PRESENTED: usize = 1;
 
     /// How long a driver restart is given to produce its monitors.
@@ -852,6 +1067,13 @@ mod windows_impl {
     /// time is slower still. Waiting a few seconds too long costs a progress
     /// spinner; giving up too early reports a failure that did not happen.
     const MONITOR_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// How long Windows is given to put a new monitor on the desktop.
+    ///
+    /// Short, because unlike the wait above this one has no answer it is hoping
+    /// for: Windows may attach the monitor or leave it alone, and both are
+    /// ordinary. Waiting is only worth the time it takes to stop racing it.
+    const ATTACH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
     /// The sizes a virtual display can actually be set to, largest first.
     ///
@@ -865,7 +1087,7 @@ mod windows_impl {
     /// one is created.
     pub fn offered_sizes() -> Vec<(u16, u16)> {
         let Some(screen) =
-            tain_core::virtual_display::available().into_iter().find(|screen| screen.ready)
+            ours(package().as_ref()).into_iter().find(|screen| screen.ready)
         else {
             return Vec::new();
         };
@@ -889,7 +1111,7 @@ mod windows_impl {
     /// — and counting that would leave the interface insisting there is a
     /// screen the user has just taken away and cannot see.
     pub fn monitor_count() -> usize {
-        tain_core::virtual_display::available()
+        ours(package().as_ref())
             .iter()
             .filter(|screen| screen.ready && screen.attached)
             .count()
@@ -913,15 +1135,15 @@ mod windows_impl {
         // So "add" usually has one sitting there already, and putting it back
         // on the desktop is instant where raising the count is a driver
         // restart and several seconds of waiting.
-        if let Some(spare) = tain_core::virtual_display::available()
-            .into_iter()
-            .find(|screen| screen.ready && !screen.attached)
+        let package = package();
+        if let Some(spare) =
+            ours(package.as_ref()).into_iter().find(|screen| screen.ready && !screen.attached)
         {
             place(&spare.name, size)?;
             return Ok(spare.name);
         }
 
-        let before: std::collections::BTreeSet<String> = tain_core::virtual_display::available()
+        let before: std::collections::BTreeSet<String> = ours(package.as_ref())
             .into_iter()
             .filter(|screen| screen.ready)
             .map(|screen| screen.name)
@@ -936,7 +1158,7 @@ mod windows_impl {
 
         // The new one, by elimination. Named by device rather than by index
         // because the numbers move when a monitor is plugged in.
-        let fresh = tain_core::virtual_display::available()
+        let fresh = ours(package.as_ref())
             .into_iter()
             .find(|screen| screen.ready && !before.contains(&screen.name))
             .context("the driver presented a monitor that could not be identified")?;
@@ -977,49 +1199,152 @@ mod windows_impl {
     /// a monitor removed from under a window leaves the window somewhere
     /// nobody chose.
     pub fn remove_display() -> Result<()> {
-        let screens = tain_core::virtual_display::available();
+        let screens = ours(package().as_ref());
         let Some(last) = screens.iter().rfind(|s| s.ready && s.attached) else {
             return Ok(());
         };
 
-        // Off the desktop first, and this is the part that does the removing.
-        tain_core::virtual_display::detach(&last.name)
-            .with_context(|| format!("could not take {} off the desktop", last.name))?;
-
-        // # Why the count is not always lowered, and never to zero
+        // # Taking it off the desktop *is* the removal
         //
-        // Asking this driver for zero monitors does not remove the last one. It
-        // writes the number, restarts, reads it back, and decides it is wrong:
+        // Asking the driver for one monitor fewer looks like the tidier answer
+        // and is not, in two separate ways.
+        //
+        // Zero does not work at all. The driver writes the number, restarts,
+        // reads it back, and decides it is wrong:
         //
         //   if (monitorcount == 0) {
         //       monitorcount = 1;
         //       vddlog("i", "Loading singular monitor (Monitor Count is not valid)");
         //   }
         //
-        // So it presents one anyway — and a monitor arriving is a monitor
-        // Windows attaches. The removal recreated exactly the thing it had
-        // just taken away, which is what "there is some reaction from Windows,
-        // but the display is simply re-attached" looks like from outside.
+        // So it presents one anyway, and a monitor arriving is a monitor
+        // Windows attaches — the removal recreating precisely the thing it had
+        // just taken away.
         //
-        // Detaching is what the user actually asked for: the screen is off
-        // their desktop, out of `displays()`, not offered to a guest and not
-        // capturable. That the driver still holds an idle monitor behind an
-        // adapter costs a little memory and nothing else — and `add_display`
-        // reuses it, which makes the next one instant instead of a restart.
+        // And lowering a count above one has the same shape for a subtler
+        // reason: *any* change to the count restarts the driver, so every
+        // monitor it presents goes away and comes back, and one that comes back
+        // is one Windows may put on the desktop. Undoing the detach that just
+        // succeeded, in the name of tidying up after it.
         //
-        // With more than one, lowering still works and is worth doing, because
-        // the floor it stops at is one rather than none.
-        let presented = screens.iter().filter(|s| s.ready).count();
-        if presented > MIN_PRESENTED {
-            pipe::set_display_count(presented as u32 - 1)?;
-            pipe::wait_until_live()?;
-        } else {
-            tracing::info!(
-                "{} is off the desktop. The driver keeps one idle monitor — it will not                  accept none — and adding a display will reuse it.",
-                last.name
-            );
-        }
+        // Detaching is what was actually asked for. The screen is off the
+        // desktop, out of `displays()`, not offered to a guest and not
+        // capturable. What remains is a monitor the driver presents and nothing
+        // shows — which costs a little memory, and which `add_display` reuses,
+        // making the next display instant rather than a restart and a wait. The
+        // count therefore only ever rises to the most displays that were wanted
+        // at once, and `install` puts it back to one.
+        tain_core::virtual_display::detach(&last.name)
+            .with_context(|| format!("could not take {} off the desktop", last.name))?;
         Ok(())
+    }
+
+    /// Take every one of this driver's displays off the desktop.
+    ///
+    /// Returns how many were removed, and reports the ones that would not go
+    /// rather than failing on the first: this runs where nobody is watching —
+    /// as an application closes, after an install, from the agent — and a
+    /// display left behind because an earlier one refused would be the worst of
+    /// both.
+    ///
+    /// Does not lower the driver's count. What is left is a monitor the driver
+    /// presents and nothing displays, which costs a little memory and makes the
+    /// next [`add_display`] instant; asking for fewer would mean a driver
+    /// restart, and asking for none does not work at all — see
+    /// [`remove_display`].
+    pub fn stand_down() -> usize {
+        let package = package();
+        let mut removed = 0;
+        for screen in ours(package.as_ref()).into_iter().filter(|s| s.attached) {
+            match tain_core::virtual_display::detach(&screen.name) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::warn!("Could not put {} away: {e:#}", screen.name),
+            }
+        }
+        removed
+    }
+
+    /// Put away the display that installing the driver brings with it.
+    ///
+    /// # Why installing produces a display nobody asked for
+    ///
+    /// The driver presents a monitor the moment it starts, because it will not
+    /// accept a count of none — a zero in its settings is read back as invalid
+    /// and replaced with one. Windows attaches whatever monitor arrives. So the
+    /// end of a successful install is a desktop with an extra screen on it,
+    /// which is not what "install the driver" means: installing is being able
+    /// to make a display, and making one is a separate button.
+    ///
+    /// Reported and reinstalled straight after the first time, as *"if I
+    /// uninstall, then install again, it automatically comes back without me
+    /// pressing add monitor"*.
+    ///
+    /// # Why the count is lowered first
+    ///
+    /// Uninstalling leaves the settings file behind on purpose — it may hold
+    /// things somebody edited — and the count is in it. So a machine that had
+    /// three displays gets three back on the next install. One is the fewest
+    /// the driver accepts, and lowering it first means the wait below is for
+    /// one monitor rather than for three that are all about to be put away.
+    ///
+    /// Nothing here can fail the install. The driver is installed by the time
+    /// this runs; a tidy-up that did not work is worth a log line and not an
+    /// error message about an install that succeeded.
+    fn settle_after_install() {
+        if let Err(e) = pipe::wait_until_live() {
+            tracing::info!("The driver is installed but not answering yet: {e:#}");
+            return;
+        }
+
+        let presented =
+            ours(package().as_ref()).iter().filter(|screen| screen.ready).count();
+        if presented > MIN_PRESENTED {
+            tracing::info!(
+                "An earlier install left {presented} monitors configured — asking for {MIN_PRESENTED}"
+            );
+            if let Err(e) = pipe::set_display_count(MIN_PRESENTED as u32)
+                .and_then(|()| pipe::wait_until_live())
+            {
+                tracing::warn!("Could not lower the monitor count: {e:#}");
+            }
+        }
+
+        if let Err(e) = wait_for_monitors(MIN_PRESENTED, MONITOR_WAIT) {
+            tracing::info!("Nothing to put away after installing: {e:#}");
+            return;
+        }
+        // Presenting a monitor and Windows putting it on the desktop are two
+        // events, and the second trails the first by a moment. Detaching before
+        // it happens removes nothing and leaves the display to arrive
+        // afterwards, which is the bug this exists to prevent.
+        wait_for_attachment(ATTACH_WAIT);
+
+        match stand_down() {
+            0 => tracing::info!("The driver is installed and presenting nothing on the desktop"),
+            n => tracing::info!(
+                "Put away {n} display(s) the install brought with it — \
+                 use Add a display to create one"
+            ),
+        }
+    }
+
+    /// Wait for Windows to put one of this driver's monitors on the desktop.
+    ///
+    /// Returns whether it did. Not an error either way: Windows is entitled to
+    /// leave a monitor unattached, and a caller that wanted one gone has
+    /// nothing to do in that case.
+    fn wait_for_attachment(within: std::time::Duration) -> bool {
+        let package = package();
+        let until = std::time::Instant::now() + within;
+        loop {
+            if ours(package.as_ref()).iter().any(|screen| screen.attached) {
+                return true;
+            }
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
 
     /// Create the device node and bind the driver to it.
@@ -1053,6 +1378,10 @@ mod windows_impl {
             package.hardware_id,
             inf.display()
         );
+        // The driver starts presenting a monitor as soon as it is bound, and
+        // Windows attaches whatever arrives — so an install ends with a screen
+        // on the desktop unless something puts it away.
+        settle_after_install();
         Ok(())
     }
 
@@ -1347,8 +1676,8 @@ mod windows_impl {
 
 #[cfg(target_os = "windows")]
 pub use windows_impl::{
-    add_display, install, monitor_count, offered_sizes, remove_display, request_install,
-    request_uninstall, state, uninstall,
+    add_display, install, monitor_count, offered_sizes, presence, reap_orphans, release,
+    remove_display, request_install, request_uninstall, state, uninstall,
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -1392,12 +1721,32 @@ mod stub {
         Vec::new()
     }
 
+    pub fn release() -> usize {
+        0
+    }
+
+    pub fn reap_orphans() -> usize {
+        0
+    }
+
+    pub mod presence {
+        /// Nothing to announce where there are no virtual displays to own.
+        pub struct Presence;
+
+        pub fn announce() -> Option<Presence> {
+            None
+        }
+
+        pub fn is_running() -> bool {
+            false
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
 pub use stub::{
-    add_display, install, monitor_count, offered_sizes, remove_display, request_install,
-    request_uninstall, state, uninstall,
+    add_display, install, monitor_count, offered_sizes, presence, reap_orphans, release,
+    remove_display, request_install, request_uninstall, state, uninstall,
 };
 
 #[cfg(test)]

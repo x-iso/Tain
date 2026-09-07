@@ -204,6 +204,12 @@ async fn main() -> Result<()> {
     // though the same hook works in a standalone program on the same machine.
     gui::immersive::start_hook_early();
 
+    // Held until this process ends, however it ends. It is what lets the agent
+    // tell a Tain that is running from one that was killed, and so what stops a
+    // virtual display outliving the application that put it on the desktop —
+    // see `display_driver::presence`.
+    let _running = display_driver::presence::announce();
+
     let state = gui::AppState::persistent();
     #[cfg(debug_assertions)]
     gui::app::seed_demo_data(&state);

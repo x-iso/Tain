@@ -128,6 +128,12 @@ mod platform {
         // agent's log and one in the other's — and a line every 300ms would
         // bury it.
         let mut had_input: Option<bool> = None;
+        // Only the ordinary desktop's agent. Display configuration belongs to
+        // the session rather than to the desktop, so both agents would be
+        // asking the same question and answering it in the same way — and two
+        // processes racing to take the same display off the desktop is a way to
+        // turn a tidy-up into an error message.
+        let mut orphans = started_on.eq_ignore_ascii_case("Default").then(OrphanWatch::new);
         // The pipe waits on its own thread, because accepting a connection
         // blocks and this loop has a desktop to watch.
         let serving = {
@@ -159,10 +165,65 @@ mod platform {
                 had_input = Some(mine);
             }
 
+            if let Some(watch) = orphans.as_mut() {
+                watch.poll();
+            }
+
             std::thread::sleep(WATCH);
         }
         let _ = serving.join();
         Ok(())
+    }
+
+    /// Takes away a virtual display whose application is gone.
+    ///
+    /// # Why the agent, of all things
+    ///
+    /// Closing Tain puts its virtual displays away on the way out, and that is
+    /// the whole answer for the ordinary case. It is no answer at all for the
+    /// case that was actually asked about — a process that is killed, or
+    /// crashes, runs no exit path, and what it leaves behind is a monitor on
+    /// somebody's desktop with nothing running that could remove it.
+    ///
+    /// So it has to be something that outlives the application. Not the
+    /// service: a service is in session zero, and changing the display
+    /// configuration of the desktop somebody is looking at can only be done
+    /// from that person's session. The agent is already there, already on a
+    /// timer, and already the thing the service keeps alive for exactly this
+    /// kind of reason.
+    ///
+    /// # On its own timer, not the desktop watch's
+    ///
+    /// The watch above runs eight times a second because a handover to the
+    /// secure desktop has to be instant. Nothing about an abandoned monitor is
+    /// urgent, and the check reads the registry and enumerates display
+    /// adapters, so it gets an interval that suits it.
+    struct OrphanWatch {
+        next: std::time::Instant,
+    }
+
+    impl OrphanWatch {
+        /// How often to look. Seconds after a crash is soon enough, and rare
+        /// enough that the cost of asking does not matter.
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+        fn new() -> Self {
+            Self { next: std::time::Instant::now() }
+        }
+
+        fn poll(&mut self) {
+            let now = std::time::Instant::now();
+            if now < self.next {
+                return;
+            }
+            self.next = now + Self::EVERY;
+            match crate::display_driver::reap_orphans() {
+                0 => {}
+                n => tracing::info!(
+                    "Put away {n} virtual display(s) left behind by a Tain that is no longer running"
+                ),
+            }
+        }
     }
 
     /// Serve this desktop's frames for as long as a host wants them.
