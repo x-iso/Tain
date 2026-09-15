@@ -14,6 +14,8 @@
 
 use egui::{Context, RichText, ViewportId};
 
+use tain_core::i18n;
+use tain_core::t;
 use tain_core::protocol::{
     InputEvent, KeyEvent, MouseButtonEvent, MouseEvent, ScrollEvent, TouchEvent, TouchPhase,
     WHEEL_DELTA,
@@ -212,10 +214,8 @@ impl SessionWindow {
         // off with the last session, in `after_sessions_changed`.
         immersive.set_forwarding(true);
 
-        let title = match sessions.len() {
-            1 => "Tain — Session".to_string(),
-            n => format!("Tain — {n} Sessions"),
-        };
+        let title =
+            tain_core::i18n::plural("session.window_title", sessions.len() as u64, &[]);
 
         parent.show_viewport_immediate(
             ViewportId::from_hash_of("tain-sessions"),
@@ -414,6 +414,13 @@ impl SessionWindow {
                     None => render_waiting(ui, session),
                 }
 
+                // Over the picture, whether or not there is one. A window that
+                // was minimised mid-session leaves its last frame on screen,
+                // and a frozen picture with nothing over it is indistinguishable
+                // from a dead link — which is the whole reason the host bothers
+                // to say what happened.
+                render_shared_window_notice(ui, session, viewport);
+
                 self.render_toolbar(ui, viewport, sessions, immersive, actions);
             });
     }
@@ -456,7 +463,7 @@ impl SessionWindow {
 
                 if ui
                     .small_button("×")
-                    .on_hover_text("Close this session")
+                    .on_hover_text(t!("session.close_tab"))
                     .clicked()
                 {
                     actions.close.push(session.tab_id);
@@ -564,7 +571,7 @@ impl SessionWindow {
                 16.0,
                 theme::IconState::Off,
                 egui::include_image!("../../assets/cancel.svg"),
-                "Disconnect from this host",
+                t!("session.disconnect"),
             )
             .clicked()
             {
@@ -585,7 +592,7 @@ impl SessionWindow {
                 } else {
                     egui::include_image!("../../assets/fullscreen.svg")
                 },
-                if full { "Leave fullscreen" } else { "Go fullscreen" },
+                if full { t!("session.leave_fullscreen") } else { t!("session.go_fullscreen") },
             )
             .clicked()
             {
@@ -600,9 +607,9 @@ impl SessionWindow {
                 if on { theme::IconState::On } else { theme::IconState::Off },
                 egui::include_image!("../../assets/immersive_mode.svg"),
                 if on {
-                    "Immersive — every key goes to the host and the pointer stays here"
+                    t!("session.immersive_on")
                 } else {
-                    "Immersive mode: send every key, Win and Alt included, and keep the pointer in this window"
+                    t!("session.immersive_off")
                 },
             )
             .clicked()
@@ -639,11 +646,10 @@ impl SessionWindow {
 
             if session.loopback {
                 ui.add_space(10.0);
-                ui.label(RichText::new("⚠ loopback — input disabled").size(12.0).color(AMBER))
-                    .on_hover_text(
-                        "This session points at our own host endpoint. Forwarding input \
-                         would drive this machine's own pointer in a feedback loop.",
-                    );
+                ui.label(
+                    RichText::new(i18n::text("session.loopback")).size(12.0).color(AMBER),
+                )
+                .on_hover_text(i18n::text("session.loopback_hint"));
             }
         });
 
@@ -796,7 +802,7 @@ impl SessionWindow {
         if resp.clicked() {
             self.show_toolbar = false;
         }
-        resp.on_hover_text("Hide the toolbar — move the pointer to the top edge to bring it back");
+        resp.on_hover_text(t!("session.hide_toolbar"));
     }
 }
 
@@ -839,7 +845,7 @@ impl SessionWindow {
         if resp.clicked() {
             self.show_toolbar = true;
         }
-        resp.on_hover_text("Show the toolbar");
+        resp.on_hover_text(t!("session.show_toolbar"));
     }
 }
 
@@ -875,15 +881,30 @@ fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stat
             egui::include_image!("../../assets/mouse_allowed.svg")
         },
         match mouse_state {
-            _ if session.loopback => "Pointer disabled — this session is a loopback",
-            theme::IconState::Unavailable => "The host has not allowed pointer control",
-            theme::IconState::On => "Pointer goes to the host — click to keep it local",
-            theme::IconState::Off => "Pointer stays on this machine — click to send it",
+            _ if session.loopback => t!("session.pointer_loopback"),
+            theme::IconState::Unavailable => t!("session.pointer_unavailable"),
+            theme::IconState::On => t!("session.pointer_on"),
+            theme::IconState::Off => t!("session.pointer_off"),
         },
     );
     if resp.clicked() {
         session.want_mouse = !session.want_mouse;
     }
+    // # The sensitivity lives behind the control it belongs to
+    //
+    // It applies to one thing — movement sent while the host has captured its
+    // pointer — and that thing is what this button governs. A slider on the
+    // toolbar beside it would be a permanent control for a mode most sessions
+    // never enter; in the settings only, it could not be adjusted against the
+    // game it is being adjusted *for*.
+    //
+    // So: right-click the pointer button. See `Settings::pointer_sensitivity`
+    // for why this needs to be adjustable at all.
+    let sensitivity_id = ui.make_persistent_id(("pointer-sensitivity", session.tab_id));
+    if resp.secondary_clicked() {
+        ui.memory_mut(|m| m.toggle_popup(sensitivity_id));
+    }
+    render_sensitivity_popup(ui, session, &resp, sensitivity_id);
 
     ui.add_space(4.0);
     let key_state = input_state(session.loopback, grants.keyboard, session.want_keyboard);
@@ -897,10 +918,10 @@ fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stat
             egui::include_image!("../../assets/keyboard_allowed.svg")
         },
         match key_state {
-            _ if session.loopback => "Keyboard disabled — this session is a loopback",
-            theme::IconState::Unavailable => "The host has not allowed keyboard control",
-            theme::IconState::On => "Typing goes to the host — click to keep it local",
-            theme::IconState::Off => "Typing stays on this machine — click to send it",
+            _ if session.loopback => t!("session.keyboard_loopback"),
+            theme::IconState::Unavailable => t!("session.keyboard_unavailable"),
+            theme::IconState::On => t!("session.keyboard_on"),
+            theme::IconState::Off => t!("session.keyboard_off"),
         },
     );
     if resp.clicked() {
@@ -924,7 +945,7 @@ fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stat
         16.0,
         if stats_on { theme::IconState::On } else { theme::IconState::Off },
         egui::include_image!("../../assets/fps-metrics.svg"),
-        if stats_on { "Hide connection stats" } else { "Show connection stats" },
+        if stats_on { t!("session.hide_stats") } else { t!("session.show_stats") },
     )
     .clicked()
     {
@@ -942,9 +963,9 @@ fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stat
         if on { theme::IconState::On } else { theme::IconState::Off },
         egui::include_image!("../../assets/cursor_show.svg"),
         if on {
-            "Showing the host's pointer — click to hide it"
+            t!("session.cursor_shown")
         } else {
-            "Host's pointer hidden — click to show it"
+            t!("session.cursor_hidden")
         },
     )
     .clicked()
@@ -992,9 +1013,9 @@ fn volume_control(ui: &mut egui::Ui, session: &mut GuestSession) {
             egui::include_image!("../../assets/sound_off.svg")
         },
         if on {
-            "Playing the host's sound — click to mute"
+            t!("session.sound_on")
         } else {
-            "Host sound muted — click to play it"
+            t!("session.sound_off")
         },
     );
     if icon.clicked() {
@@ -1021,7 +1042,10 @@ fn volume_control(ui: &mut egui::Ui, session: &mut GuestSession) {
             session.apply_sound_preference();
         }
         hot = hot.union(slider.rect);
-        slider.on_hover_text(format!("Host volume {}%", (session.volume * 100.0).round()));
+        slider.on_hover_text(t!(
+            "session.volume",
+            percent = (session.volume * 100.0).round()
+        ));
     }
     // A little larger than the controls, so crossing the gap between them does
     // not count as leaving.
@@ -1053,6 +1077,51 @@ fn input_state(loopback: bool, granted: bool, wanted: bool) -> theme::IconState 
 /// than its device name: `\\.\DISPLAY2` says nothing about *which* monitor that
 /// is, while "left" and "right" match what the person at the other end sees.
 fn render_display_picker(ui: &mut egui::Ui, session: &GuestSession) {
+    // # A window session is one the host granted windows to, not one that
+    // happens to be showing a window
+    //
+    // Keyed off the list rather than off `shared_window`, which names the single
+    // window being watched and is `None` while the composite is on screen. Read
+    // the other way round, switching to "all windows" would make the switcher
+    // vanish and the *screen* picker appear in its place — offering monitors
+    // this session cannot see.
+    let offered = session.shared_windows();
+    if offered.len() > 1 {
+        render_window_picker(ui, session, session.shared_window().as_ref(), &offered);
+        return;
+    }
+
+    // Every shared window has been closed. Nothing to switch between and no
+    // composite to switch to — the buttons go with the windows they stood for,
+    // rather than lingering as controls that do nothing. What happened is said
+    // over the picture instead; see `render_shared_window_notice`.
+    if session.windows_all_closed() {
+        return;
+    }
+
+    if let Some(window) = session.shared_window() {
+        // One window, so there is nothing to offer. Saying which window is
+        // worth the space the picker would have taken; offering a choice that
+        // does not exist is not.
+        let named = if window.app.is_empty() {
+            i18n::text("session.window_unnamed").to_string()
+        } else {
+            window.app.clone()
+        };
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(i18n::format("session.watching_window", &[("app", &named)]))
+                .size(12.0)
+                .color(TEXT_DIM),
+        )
+        .on_hover_text(format!(
+            "{}\n\n{}",
+            window.title,
+            i18n::text("session.watching_window_hint")
+        ));
+        return;
+    }
+
     let displays = session.displays();
     if displays.len() < 2 {
         return;
@@ -1071,8 +1140,7 @@ fn render_display_picker(ui: &mut egui::Ui, session: &GuestSession) {
         16.0,
         if all { theme::IconState::On } else { theme::IconState::Off },
         egui::include_image!("../../assets/overview.svg"),
-        "Every screen at once, laid out the way the host has them. Use 1:1 rather than Fit \
-         to see it at full resolution.",
+        i18n::text("session.all_screens_hint"),
     )
     .clicked()
         && !all
@@ -1113,6 +1181,94 @@ fn render_display_picker(ui: &mut egui::Ui, session: &GuestSession) {
     }
 }
 
+/// The windows a host granted, as buttons to switch between.
+///
+/// # Why there is no "all of them" here
+///
+/// The screen picker opens with one, because a wall of monitors is a real
+/// picture of a real desk: they sit beside each other, the host knows where, and
+/// composing them reproduces that arrangement. Windows have no such
+/// arrangement — they overlap, in a stack whose order changes as somebody works
+/// — so a composition of them would be a layout this end invented. One at a
+/// time is the only honest answer.
+fn render_window_picker(
+    ui: &mut egui::Ui,
+    session: &GuestSession,
+    showing: Option<&tain_core::protocol::SharedWindow>,
+    offered: &[tain_core::protocol::SharedWindow],
+) {
+    use tain_core::protocol::DisplayChoice;
+
+    ui.add_space(12.0);
+
+    // Every shared window at once, first — the same place the screen picker
+    // puts the whole desk, and for the same reason: it is the answer to "what
+    // did they share with me", and the individual windows are the refinement.
+    let all = session.watching() == Some(DisplayChoice::All);
+    if theme::icon_toggle(
+        ui,
+        16.0,
+        if all { theme::IconState::On } else { theme::IconState::Off },
+        egui::include_image!("../../assets/multi-window.svg"),
+        &i18n::format("session.all_windows_hint", &[("n", &offered.len().to_string())]),
+    )
+    .clicked()
+        && !all
+    {
+        session.watch_display(DisplayChoice::All);
+    }
+    ui.add_space(2.0);
+
+    for window in offered {
+        // Measured against the window actually on screen rather than against
+        // the last request: a host that refused a switch, or moved on its own
+        // because a window closed, says so through this — and the button that
+        // lights up has to be the one being watched. Nothing lights up while
+        // the composite is showing, which is correct: none of them is *the*
+        // window then.
+        let selected = !all && showing.is_some_and(|shown| shown.id == window.id);
+
+        // Named the way the host's own picker named it: the program, then the
+        // caption that separates that program's windows from each other. The
+        // caption is live for the window being watched, where the host keeps
+        // re-reading it, and as it was granted for the rest.
+        let caption = match showing {
+            Some(shown) if selected && !shown.title.is_empty() => shown.title.clone(),
+            _ => window.title.clone(),
+        };
+        let hover = if caption.is_empty() {
+            window.app.clone()
+        } else {
+            format!("{}\n{caption}", window.app)
+        };
+
+        let clicked = theme::lettered_icon_toggle(
+            ui,
+            16.0,
+            if selected { theme::IconState::On } else { theme::IconState::Off },
+            // # The plain frame, not the window art
+            //
+            // The letter goes in the middle of the icon, and `app_window.svg`
+            // has a title bar drawn across exactly that part — so the two
+            // collided. Shrinking the letter to fit between them makes it
+            // unreadable at 16 points, which is the size this row is.
+            //
+            // `empty_button.svg` is the same rounded frame with nothing inside
+            // it, which is what a mark drawn *by* the caller wants: the art
+            // says "a window" and leaves the middle alone.
+            egui::include_image!("../../assets/empty_button.svg"),
+            &window.app,
+            &hover,
+        )
+        .clicked();
+
+        if clicked && !selected {
+            session.watch_display(DisplayChoice::Window(window.id));
+        }
+        ui.add_space(2.0);
+    }
+}
+
 /// A display named the way the person at the host would recognise it.
 ///
 /// Position first, because that is what identifies a monitor to a human — the
@@ -1126,24 +1282,41 @@ fn describe_display(
     // A virtual screen is named for what it is, not where it is. Nobody at the
     // host is looking at it and it has no place on a desk, so "Right" would
     // describe a position that means nothing to either end.
+    let size = [
+        ("w", display.width.to_string()),
+        ("h", display.height.to_string()),
+    ];
+    let with_size = |key: &str| {
+        tain_core::i18n::format(key, &[("w", &size[0].1), ("h", &size[1].1)])
+    };
+
     if display.virtual_display {
-        return format!("Virtual {}×{}", display.width, display.height);
+        return with_size("session.screen_virtual");
     }
     if display.primary {
-        return format!("Main {}×{}", display.width, display.height);
+        return with_size("session.screen_main");
     }
 
     // Relative to the primary, which is the one at the origin.
     let where_ = match all.iter().find(|d| d.primary) {
-        Some(main) if display.x + i32::from(display.width) <= main.x => "Left",
-        Some(main) if display.x >= main.x + i32::from(main.width) => "Right",
-        Some(main) if display.y + i32::from(display.height) <= main.y => "Above",
-        Some(main) if display.y >= main.y + i32::from(main.height) => "Below",
+        Some(main) if display.x + i32::from(display.width) <= main.x => "session.screen_left",
+        Some(main) if display.x >= main.x + i32::from(main.width) => "session.screen_right",
+        Some(main) if display.y + i32::from(display.height) <= main.y => "session.screen_above",
+        Some(main) if display.y >= main.y + i32::from(main.height) => "session.screen_below",
         // Overlapping or stacked oddly: fall back to something that at least
         // distinguishes them.
-        _ => return format!("Screen {} {}×{}", display.id + 1, display.width, display.height),
+        _ => {
+            return tain_core::i18n::format(
+                "session.screen_numbered",
+                &[
+                    ("n", &(display.id + 1).to_string()),
+                    ("w", &size[0].1),
+                    ("h", &size[1].1),
+                ],
+            )
+        }
     };
-    format!("{where_} {}×{}", display.width, display.height)
+    with_size(where_)
 }
 
 /// The numbers, on their own row when asked for.
@@ -1161,13 +1334,9 @@ fn render_stats_row(ui: &mut egui::Ui, session: &GuestSession) {
     ui.add_space(10.0);
     ui.label(RichText::new(session.live_stats()).size(12.0).color(TEXT_DIM))
         .on_hover_text(format!(
-            "{}\n\n\
-             lat — capture on the host through to display here, the whole \
-             pipeline.\n\
-             net — round trip on the link alone.\n\n\
-             A large gap between them means the delay is in encoding or \
-             decoding rather than the network.",
-            session.health_detail()
+            "{}\n\n{}",
+            session.health_detail(),
+            i18n::text("session.stats_hint")
         ));
 
     if let Some(ms) = session.audio_buffered_ms() {
@@ -1176,13 +1345,14 @@ fn render_stats_row(ui: &mut egui::Ui, session: &GuestSession) {
         // keeps breaking it, so a session with unexpected audio delay should be
         // able to say whether that is a stall or a cushion it had to build.
         let text = match session.audio_target_ms() {
-            Some(target) => format!("audio {ms}/{target} ms"),
-            None => format!("audio {ms} ms"),
+            Some(target) => i18n::format(
+                "session.audio_buffer",
+                &[("ms", &ms.to_string()), ("target", &target.to_string())],
+            ),
+            None => i18n::format("session.audio_buffer_plain", &[("ms", &ms.to_string())]),
         };
-        ui.label(RichText::new(text).size(12.0).color(TEXT_DIM)).on_hover_text(
-            "Audio buffered ahead of the speakers, and the cushion it is aiming for. \
-             The target grows when the link drops audio and shrinks again when it stops.",
-        );
+        ui.label(RichText::new(text).size(12.0).color(TEXT_DIM))
+            .on_hover_text(i18n::text("session.audio_buffer_hint"));
     }
 
     render_bottlenecks(ui, session.bottlenecks());
@@ -1211,7 +1381,161 @@ fn render_bottlenecks(ui: &mut egui::Ui, active: tain_core::BottleneckSet) {
     }
 }
 
+/// Say why the picture has stopped, when the reason is not a fault.
+///
+/// # Why this is drawn over the frame rather than instead of it
+///
+/// A window that is minimised mid-session leaves its last frame on screen, and
+/// that frame is worth keeping: it is what was there a moment ago, it says
+/// which window this is, and it comes straight back when the window does.
+/// Replacing it with a blank panel would throw away context to make room for a
+/// sentence. So the frame stays, dimmed, and the sentence sits on top of it.
+///
+/// Nothing is drawn at all for an ordinary screen session — a screen cannot be
+/// minimised, and this is the only thing that separates "no picture because
+/// somebody put the window away" from "no picture because something is wrong".
+fn render_shared_window_notice(
+    ui: &mut egui::Ui,
+    session: &GuestSession,
+    viewport: egui::Rect,
+) {
+    use tain_core::protocol::SharedWindowState;
+
+    // # A view that has been asked for and has not arrived
+    //
+    // Checked before everything below, because it is the more recent fact: a
+    // guest switching away from a minimised window should be told its new view
+    // is coming, not told again about the one it just left.
+    if session.switching() {
+        render_switching_notice(ui, viewport);
+        return;
+    }
+
+    // # Nothing left at all, which is not any one window's story
+    //
+    // Checked first and without a `shared_window`, because there is no longer a
+    // window to be in a state: a composite watches none of them individually,
+    // and every one of them has gone. Without this the guest sits looking at
+    // the last frame it received with nothing saying why it stopped — which is
+    // the same failure the per-window notice exists to prevent, one level up.
+    let (key, detail, named) = if let Some(away) = session.windows_unavailable() {
+        match away {
+            super::session::WindowsAway::Closed => (
+                "session.windows_all_closed",
+                "session.windows_all_closed_wait",
+                String::new(),
+            ),
+            // Still granted, still listed, none of them on screen. Not the same
+            // sentence as closed: these are one gesture away from coming back,
+            // and the host is the one who can make it.
+            super::session::WindowsAway::Minimised => (
+                "session.windows_all_away",
+                "session.windows_all_away_wait",
+                String::new(),
+            ),
+        }
+    } else {
+        let Some(window) = session.shared_window() else { return };
+        // Whether there is anywhere else to go. A window that has closed is the
+        // end of a one-window session and nothing can be done about it from
+        // this side — but a session granted several has the others, and the
+        // sentence should say so rather than leave somebody staring at a dead
+        // panel.
+        let elsewhere = session.shared_windows().len() > 1;
+        let (key, detail) = match window.state {
+            SharedWindowState::Showing => return,
+            SharedWindowState::Minimised if elsewhere => {
+                ("session.window_minimised", "session.window_waiting_others")
+            }
+            SharedWindowState::Minimised => {
+                ("session.window_minimised", "session.window_waiting")
+            }
+            SharedWindowState::Closed if elsewhere => {
+                ("session.window_closed", "session.window_gone_others")
+            }
+            SharedWindowState::Closed => ("session.window_closed", "session.window_gone"),
+        };
+
+        // Named by the program where it has one. A window that has closed may
+        // have answered neither, and "the shared window" is still a true
+        // sentence.
+        let named = if window.app.is_empty() {
+            i18n::text("session.window_unnamed").to_string()
+        } else {
+            window.app.clone()
+        };
+        (key, detail, named)
+    };
+
+    let painter = ui.painter_at(viewport);
+    // Dimmed rather than hidden: enough to say the picture is not live, not so
+    // much that what it was showing is lost.
+    painter.rect_filled(viewport, 0.0, egui::Color32::from_black_alpha(150));
+
+    let heading = i18n::format(key, &[("app", &named)]);
+    let waiting = i18n::text(detail);
+
+    // Painted rather than laid out with widgets: it is two centred lines over a
+    // picture, and a widget layout here would claim input the video area needs.
+    let centre = viewport.center();
+    let heading_id = painter.text(
+        centre - egui::vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        &heading,
+        egui::FontId::proportional(17.0),
+        TEXT,
+    );
+    painter.text(
+        egui::pos2(centre.x, heading_id.max.y + 10.0),
+        egui::Align2::CENTER_TOP,
+        waiting,
+        egui::FontId::proportional(13.0),
+        TEXT_DIM,
+    );
+}
+
+/// "The picture you asked for is on its way", over the one you have.
+///
+/// # Why the old picture stays underneath
+///
+/// It is dimmed rather than replaced, for the same reason a minimised window's
+/// notice leaves its last frame up: what was there a moment ago is context, and
+/// a black panel with a sentence on it throws that away to say something the
+/// sentence already says. Dimming is what separates "this is live" from "this
+/// is what was live".
+///
+/// The ring is what separates *this* from the notices around it. Those describe
+/// a state that will last until somebody at the host does something; this one
+/// is work in progress, and a moving thing is the only honest way to say so.
+fn render_switching_notice(ui: &mut egui::Ui, viewport: egui::Rect) {
+    let painter = ui.painter_at(viewport);
+    painter.rect_filled(viewport, 0.0, egui::Color32::from_black_alpha(150));
+
+    let centre = viewport.center();
+    // The ring draws around the rectangle it is given rather than inside it, so
+    // this is the space at its middle, not its extent.
+    let ring = egui::Rect::from_center_size(
+        centre - egui::vec2(0.0, 22.0),
+        egui::Vec2::splat(18.0),
+    );
+    theme::spinner_ring(ui, ring, TEXT);
+
+    painter.text(
+        centre + egui::vec2(0.0, 14.0),
+        egui::Align2::CENTER_CENTER,
+        i18n::text("session.switching"),
+        egui::FontId::proportional(15.0),
+        TEXT,
+    );
+}
+
 fn render_waiting(ui: &mut egui::Ui, session: &GuestSession) {
+    // A session waiting on a minimised window is not waiting on the connection,
+    // and a spinner over "waiting for the first frame" would say it was. The
+    // notice drawn on top of this says the true thing.
+    if !session.source_is_live() {
+        return;
+    }
     ui.vertical_centered(|ui| {
         ui.add_space(80.0);
         if session.is_active() {
@@ -1408,7 +1732,21 @@ fn forward_pointer(
     }
     release_touches(session);
 
-    if resp.hovered() {
+    // # A captured pointer is driven by movement, not by position
+    //
+    // Instead of the block below and not as well as it: the two are
+    // alternatives, and sending both would have the host's own re-centring
+    // fight the positions. See `GuestSession::wants_relative_pointer`.
+    //
+    // The buttons and the wheel after it are *not* an alternative — a game
+    // being looked around in is still being shot in — so this replaces the
+    // movement and falls through to the rest.
+    let relative = session.wants_relative_pointer();
+    if relative {
+        forward_relative_pointer(session, ui, rect);
+    }
+
+    if !relative && resp.hovered() {
         // Collected before sending: `ui.input` holds a lock, and sending takes
         // the session mutably.
         let moved: Vec<egui::Pos2> = ui.input(|i| {
@@ -1491,6 +1829,148 @@ fn forward_pointer(
 /// that, one finger per message is the smaller protocol, it fits the fixed
 /// record the agent pipe carries to the secure desktop, and it passes the same
 /// per-event permission check as a click. See `protocol::TouchEvent`.
+/// The pointer sensitivity, when somebody has asked to see it.
+///
+/// Shown as a popup under the pointer button rather than as a permanent
+/// control: it governs one mode, most sessions never enter that mode, and a
+/// toolbar is a scarce thing. Live, and per session — a value that suited the
+/// last game is not evidence about this one.
+fn render_sensitivity_popup(
+    ui: &mut egui::Ui,
+    session: &mut GuestSession,
+    anchor: &egui::Response,
+    id: egui::Id,
+) {
+    egui::popup_below_widget(
+        ui,
+        id,
+        anchor,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(190.0);
+            ui.label(
+                RichText::new(i18n::text("session.pointer_sensitivity")).size(12.0).color(TEXT),
+            );
+            let range = super::settings::POINTER_SENSITIVITY_RANGE;
+            ui.add(
+                egui::Slider::new(&mut session.pointer_sensitivity, range)
+                    .logarithmic(true)
+                    .fixed_decimals(2),
+            );
+            ui.label(
+                RichText::new(i18n::text("session.pointer_sensitivity_hint"))
+                    .size(11.0)
+                    .color(TEXT_DIM),
+            );
+            // A way back that does not need the number remembering. The value
+            // this restores is the one in Settings, not a constant, so somebody
+            // who set a default gets their default.
+            if ui.button(i18n::text("session.pointer_sensitivity_reset")).clicked() {
+                session.pointer_sensitivity = session.default_pointer_sensitivity();
+            }
+        },
+    );
+}
+
+/// Send the pointer as movement, for a host that has captured its own.
+///
+/// # Why the cursor is put back in the middle every frame
+///
+/// Movement is only movement while there is somewhere to move *from*. A pointer
+/// left where the user pushed it stops producing anything the moment it reaches
+/// the edge of the window — which, in a game, is the moment you try to keep
+/// turning. Warping it back to the middle after reading each delta is what
+/// makes the space endless, and it is what every application that captures a
+/// pointer does.
+///
+/// # Why the position is read from the system and not from egui
+///
+/// The warp is itself a movement, and egui would report it as one — so the
+/// delta it hands over would include the correction, doubling every input and
+/// cancelling it on alternate frames. Reading the position, subtracting the
+/// centre and putting it back is one exchange with no bookkeeping to get wrong.
+fn forward_relative_pointer(session: &mut GuestSession, ui: &egui::Ui, rect: egui::Rect) {
+    // Only while this window is the one being typed into. A session left open
+    // behind something else must not be dragging the pointer of the machine it
+    // is running on.
+    if !ui.ctx().input(|i| i.focused) {
+        return;
+    }
+
+    // Hidden, because there are two pointers and only one of them is real: the
+    // host is drawing whatever the game draws, and a local arrow sitting in the
+    // middle of it is the ghost `draw_remote_cursor` already refuses to be.
+    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+
+    // The middle of the picture, in the screen's own coordinates — which is
+    // where the pointer is held.
+    let centre = rect.center();
+    let scale = ui.ctx().pixels_per_point();
+    let outer = ui.ctx().input(|i| i.viewport().inner_rect);
+    let Some(outer) = outer else { return };
+    let hold = (
+        ((outer.min.x + centre.x) * scale).round() as i32,
+        ((outer.min.y + centre.y) * scale).round() as i32,
+    );
+
+    // # Movement is sent as it was made, times what the user asked for
+    //
+    // It was scaled by the ratio between the picture and the host's screen, on
+    // the reasoning that a delta should feel the same as moving across that
+    // screen. That is right for a *position* and wrong here: a program that
+    // captured the pointer is reading movement, not a place on a screen, and
+    // what it does with the number is its own sensitivity setting. Multiplying
+    // by a window-size ratio put a second, invisible sensitivity in front of
+    // it — which is how a small window turned ordinary movements into extreme
+    // rotations.
+    //
+    // So one is one, and anything else is a slider the user can see. See
+    // `Settings::pointer_sensitivity`.
+    let sensitivity = session.pointer_sensitivity();
+
+    if let Some((dx, dy)) = pointer_delta_from(hold) {
+        let dx = (dx as f32 * sensitivity).round() as i32;
+        let dy = (dy as f32 * sensitivity).round() as i32;
+        if (dx, dy) != (0, 0) {
+            session.send_input(InputEvent::MouseMotion(tain_core::protocol::MouseMotion {
+                dx: dx.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                dy: dy.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            }));
+        }
+    }
+
+    // Nothing else wakes the interface while the pointer is the only thing
+    // moving, and a frame not drawn is a delta not read.
+    ui.ctx().request_repaint();
+}
+
+/// How far the pointer has moved from `hold`, putting it back there.
+///
+/// `None` where this cannot be done — every platform but Windows, and a failed
+/// call — which leaves the pointer alone rather than half-driving it.
+#[cfg(target_os = "windows")]
+fn pointer_delta_from(hold: (i32, i32)) -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+    let mut at = POINT::default();
+    // SAFETY: both take a pointer to a `POINT` this frame owns, and neither
+    // allocates or retains anything.
+    unsafe {
+        GetCursorPos(&mut at).ok()?;
+        let delta = (at.x - hold.0, at.y - hold.1);
+        if delta != (0, 0) {
+            SetCursorPos(hold.0, hold.1).ok()?;
+        }
+        Some(delta)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pointer_delta_from(_hold: (i32, i32)) -> Option<(i32, i32)> {
+    None
+}
+
 fn forward_touch(session: &mut GuestSession, ui: &egui::Ui, rect: egui::Rect) {
     // Collected before sending: `ui.input` holds a lock and sending takes the
     // session mutably.

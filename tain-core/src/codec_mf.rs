@@ -979,15 +979,43 @@ impl MediaFoundationEncoder {
 }
 
 impl Drop for MediaFoundationEncoder {
+    /// Hand the encode session back, in the order the driver expects.
+    ///
+    /// # Why the order is the whole of this
+    ///
+    /// `ShutdownObject` — which runs when `activated` drops — blocked forever,
+    /// roughly once in every ten runs of the test suite, and this is why. Two
+    /// things were wrong, and both are about what the transform is still
+    /// holding when it is asked to shut down.
+    ///
+    /// **Nothing flushed.** `encode_frame` deliberately takes only the output
+    /// already queued and leaves the rest for the next frame, so an encoder
+    /// dropped mid-stream leaves the transform holding samples it has finished
+    /// with and signalled, and nobody ever collects. `MFT_MESSAGE_COMMAND_FLUSH`
+    /// is what says "abandon that", and it is the counterpart to the flush this
+    /// encoder already sends when it starts streaming.
+    ///
+    /// **The event generator outlived the transform.** Rust drops fields in
+    /// declaration order, and `activated` is declared before `events` — so
+    /// `ShutdownObject` ran while this struct still held a live reference into
+    /// the object being shut down. That is the deadlock: a reference count the
+    /// driver waits on, held by the thread doing the waiting.
+    ///
+    /// So: flush, say the stream is over, let go of the event generator, and
+    /// only then let `activated` release the session. See
+    /// [`crate::watchdog`] for how this was found, and the entry in
+    /// `docs/decisions.md`.
     fn drop(&mut self) {
-        // SAFETY: telling the transform to stop before releasing it. The
-        // release itself happens when `activated` drops immediately after this,
-        // which is what actually hands the GPU encode session back — see
-        // `ActivatedTransform`.
+        // SAFETY: messages to a transform we own, on the thread that owns it.
         unsafe {
+            let _ = self.activated.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             let _ = self.activated.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
             let _ = self.activated.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
         }
+        // Explicit, and not a tidy-up: this reference has to be gone before
+        // `activated` drops, and relying on field order to arrange that is what
+        // went wrong in the first place.
+        self.events = None;
     }
 }
 
@@ -1633,6 +1661,29 @@ mod tests {
     use super::*;
     use crate::encoder::VideoCodec;
 
+    /// The probe every hardware test starts with, and a time limit to go with it.
+    ///
+    /// # Why the limit is here and not left to whoever is watching
+    ///
+    /// Roughly one full-suite run in ten stops dead in one of the tests below,
+    /// at no CPU, and never comes back — see [`crate::watchdog`], which records
+    /// what was measured and why the cause is not something this repository can
+    /// reach. Every test that reaches a graphics driver takes the guard, and
+    /// holds it for as long as it holds an encoder, so a stall ends the run in
+    /// a minute with a name on it instead of waiting forever in silence.
+    ///
+    /// Returning both together is what makes that hard to forget: there is no
+    /// way to get at the encoder without also getting the limit that bounds it.
+    #[must_use]
+    fn hardware(test: &'static str) -> Option<(EncoderInfo, crate::watchdog::Guard)> {
+        // The limit starts *before* the probe, not after it. The first `probe()`
+        // in a process is the call that enumerates transforms and activates one
+        // — a driver call like any other here, and one that would otherwise sit
+        // outside the bound that exists for it.
+        let limit = crate::watchdog::limit(test);
+        Some((probe()?, limit))
+    }
+
     fn pattern(width: u16, height: u16) -> Vec<u8> {
         let mut data = vec![0u8; width as usize * height as usize * 4];
         for y in 0..height as usize {
@@ -1791,6 +1842,7 @@ mod tests {
     /// asserted — CI and VMs legitimately have none.
     #[test]
     fn report_available_hardware_encoder() {
+        let _limit = crate::watchdog::limit("report_available_hardware_encoder");
         match probe() {
             Some(info) => println!("hardware encoder: {}", info.name),
             None => println!("no hardware H.264 encoder on this machine"),
@@ -1806,6 +1858,7 @@ mod tests {
     /// call fails here rather than in someone's dropdown.
     #[test]
     fn the_encoder_probe_is_cheap_once_the_answer_is_known() {
+        let _limit = crate::watchdog::limit("the_encoder_probe_is_cheap_once_the_answer_is_known");
         // Pay for the first one; it is allowed to be slow.
         let first = probe();
 
@@ -2356,23 +2409,34 @@ mod tests {
         // keep streaming — the same path covers a GPU that has run out of
         // concurrent encode sessions, which is what a fourth guest hits.
         use crate::encoder::VideoEncoder;
-        let Some(_) = probe() else { return };
+        let Some((_, limit)) = hardware("a_size_the_gpu_cannot_take_degrades_to_the_cpu")
+        else {
+            return;
+        };
 
         let config = EncodeConfig::default();
+        limit.at("building the wrapper — enumerate + ActivateObject");
         let mut enc = HardwareH264Encoder::new(&config, true).expect("wrapper");
+
+        limit.at("encoding 16x16, which the GPU refuses and the CPU takes over");
         let frame = enc.encode_frame(&pattern(16, 16), 16, 16, PixelFormat::Bgra);
         assert!(frame.is_ok(), "Auto must not drop a session over frame size: {frame:?}");
         assert!(!enc.is_using_hardware(), "16x16 cannot have been encoded on the GPU");
 
         // And the same encoder goes back to hardware at a size it can take.
+        limit.at("encoding 640x480, which rebuilds the hardware encoder");
         enc.encode_frame(&pattern(640, 480), 640, 480, PixelFormat::Bgra).expect("encode");
         assert!(enc.is_using_hardware());
+
+        limit.at("dropping the encoder — ShutdownObject");
     }
 
     #[test]
     fn asking_for_hardware_explicitly_refuses_rather_than_downgrading() {
         use crate::encoder::VideoEncoder;
-        let Some(_) = probe() else { return };
+        let Some((_, _limit)) = hardware("asking_for_hardware_explicitly_refuses") else {
+            return;
+        };
 
         let config = EncodeConfig::default();
         let mut enc = HardwareH264Encoder::new(&config, false).expect("wrapper");
@@ -2406,7 +2470,9 @@ mod tests {
     #[test]
     fn a_frame_may_change_format_mid_stream() {
         use crate::encoder::VideoEncoder;
-        let Some(_) = probe() else { return };
+        let Some((_, limit)) = hardware("a_frame_may_change_format_mid_stream") else {
+            return;
+        };
 
         let (w, h) = (640u16, 480u16);
         let bgra = pattern(w, h);
@@ -2415,7 +2481,9 @@ mod tests {
         let config = EncodeConfig::default();
 
         // ── a stream that changes format is not an error ──
+        limit.at("building the first encoder");
         let mut enc = HardwareH264Encoder::new(&config, true).expect("wrapper");
+        limit.at("encoding the mixed-format stream");
         // NV12 first, so anything cached from the opening frame is the format
         // that later has to give way.
         enc.encode_frame(&nv12, w, h, PixelFormat::Nv12).expect("NV12 opening frame");
@@ -2425,9 +2493,11 @@ mod tests {
             .expect("and NV12 again once the prompt has gone");
 
         // ── and the format is read, not assumed ──
+        limit.at("dropping the first encoder and building three more");
         let mut honest_nv12 = HardwareH264Encoder::new(&config, true).expect("wrapper");
         let mut honest_bgra = HardwareH264Encoder::new(&config, true).expect("wrapper");
         let mut misread = HardwareH264Encoder::new(&config, true).expect("wrapper");
+        limit.at("encoding twelve frames through each of the three");
         let (mut nv12_bytes, mut bgra_bytes, mut misread_bytes) = (0usize, 0usize, 0usize);
         // Enough frames to drain the transform: a hardware encoder holds the
         // first several and returns nothing for them, so one frame measures

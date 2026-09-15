@@ -32,8 +32,10 @@ pub mod connection_code;
 pub mod network;
 pub mod passcode;
 pub mod screen_capture;
+pub mod window_capture;
 pub mod virtual_display;
 pub mod gpu_preference;
+pub mod i18n;
 pub mod local_input;
 pub mod cursor;
 pub mod preview;
@@ -56,6 +58,11 @@ pub mod adaptive;
 pub mod codec_delta;
 pub mod codec_h264;
 pub mod h264_bitstream;
+/// A time limit for tests that call into a graphics driver. Tests only — it
+/// bounds a stall in somebody else's code, which is not a thing to do to a
+/// running application.
+#[cfg(test)]
+pub mod watchdog;
 #[cfg(target_os = "windows")]
 pub mod codec_mf;
 #[cfg(target_os = "windows")]

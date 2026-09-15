@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::*;
 
+use tain_core::i18n;
 use tain_core::protocol::{InputEvent, KeyEvent, MouseButtonEvent};
 use tain_core::{ConnectionCode, ControlGrants};
 
@@ -29,6 +30,19 @@ pub const PAN_MARGIN: f32 = 0.2;
 /// Scales linearly from zero at the inner boundary of the margin, so a slow
 /// approach nudges and a hard shove into the corner travels quickly.
 const PAN_SPEED: f32 = 1400.0;
+
+/// Why a window session has nothing to show.
+///
+/// Two states rather than one because they want different sentences and offer
+/// different hope: a closed window is not coming back and the host has to share
+/// something else, while a minimised one is one gesture away from returning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsAway {
+    /// Every shared window has been closed.
+    Closed,
+    /// They are all still there and none of them is on screen.
+    Minimised,
+}
 
 /// A live (or failed) connection to one host.
 pub struct GuestSession {
@@ -69,6 +83,16 @@ pub struct GuestSession {
     /// machine can be quieter than whatever this one is already playing, and
     /// two open sessions are two different remote machines.
     pub volume: f32,
+    /// How far the pointer moves on the host per unit of movement here, while
+    /// the host has captured its own.
+    ///
+    /// Per session and seeded from the setting, like the volume beside it: the
+    /// right value depends on the game at the other end, so it wants changing
+    /// while a session is running and without becoming the default for the
+    /// next one. See [`Settings::pointer_sensitivity`].
+    pub pointer_sensitivity: f32,
+    /// What it opened at, so the control can offer to put it back.
+    opened_with_sensitivity: f32,
     /// Whether this session ever reached the streaming state.
     ///
     /// The difference between "the host hung up on us" and "we never got in".
@@ -164,7 +188,6 @@ impl GuestSession {
     /// Dial the host a code addresses and start streaming.
     pub fn start(
         code: ConnectionCode,
-        known_addrs: Vec<std::net::SocketAddr>,
         settings: &Settings,
         loopback: bool,
         repaint: impl Fn() + Send + Sync + 'static,
@@ -191,7 +214,6 @@ impl GuestSession {
             .store(settings.priority().value(), Ordering::Relaxed);
         let task = tokio::spawn(run_guest_session(
             code,
-            known_addrs,
             client_name,
             shared.clone(),
             input_rx,
@@ -213,6 +235,8 @@ impl GuestSession {
             want_keyboard: false,
             want_sound: true,
             volume: 1.0,
+            pointer_sensitivity: settings.pointer_sensitivity,
+            opened_with_sensitivity: settings.pointer_sensitivity,
             was_streaming: false,
             show_remote_cursor: true,
             mouse_seeded: false,
@@ -246,6 +270,51 @@ impl GuestSession {
             self.scaling = mode;
             self.pan = egui::Vec2::ZERO;
         }
+    }
+
+    /// Whether the pointer should be sent as movement rather than as a place.
+    ///
+    /// # Why this is decided by what the host is doing
+    ///
+    /// A guest cannot tell from its own side whether the program on the far end
+    /// wants a position or a movement — they look identical from here. The host
+    /// can: a program that captured the pointer hides it, which is a thing the
+    /// session already reports so the remote cursor is not drawn as a ghost.
+    ///
+    /// So the same fact decides both, and nothing new has to be asked of the
+    /// person using it. Games that hide the cursor to look around get movement;
+    /// their own menus, which put the cursor back, go straight back to
+    /// positions — mid-session, without anybody switching a mode.
+    ///
+    /// Gated on input being wanted at all, so a view-only session never grabs
+    /// the pointer of the machine it is being watched from.
+    pub fn wants_relative_pointer(&self) -> bool {
+        self.sends_mouse() && self.host_cursor_hidden()
+    }
+
+    /// What this session opened at, for the control that offers to go back.
+    ///
+    /// Read from the settings rather than remembered, so somebody who changed
+    /// their default gets their default rather than whatever the session
+    /// happened to start with.
+    pub fn default_pointer_sensitivity(&self) -> f32 {
+        self.opened_with_sensitivity
+    }
+
+    /// The multiplier applied to captured-pointer movement, always usable.
+    ///
+    /// Clamped on the way out as well as on the way in: this multiplies every
+    /// delta, and a value that arrived from somewhere unclamped would be a
+    /// pointer nobody can control in the one mode with no cursor to see it
+    /// with.
+    pub fn pointer_sensitivity(&self) -> f32 {
+        if !self.pointer_sensitivity.is_finite() {
+            return 1.0;
+        }
+        self.pointer_sensitivity.clamp(
+            *super::settings::POINTER_SENSITIVITY_RANGE.start(),
+            *super::settings::POINTER_SENSITIVITY_RANGE.end(),
+        )
     }
 
     /// Slide the 1:1 view when the pointer nears an edge.
@@ -304,6 +373,8 @@ impl GuestSession {
             want_keyboard: false,
             want_sound: true,
             volume: 1.0,
+            pointer_sensitivity: 1.0,
+            opened_with_sensitivity: 1.0,
             was_streaming: false,
             show_remote_cursor: true,
             mouse_seeded: false,
@@ -378,6 +449,27 @@ impl GuestSession {
     /// The texture is rebuilt only when the shape id changes — Windows reports
     /// the same handful of pointers constantly as the mouse crosses windows,
     /// and re-uploading one per frame would cost more than the video.
+    /// Whether the host has hidden its own pointer.
+    ///
+    /// # What this is used for besides not drawing one
+    ///
+    /// It is the only signal either end has that a program over there has
+    /// *captured* the pointer — hiding it and reading movement rather than
+    /// following a position. That is what a game does to look around, and it is
+    /// the one case where sending a position is worse than useless. See
+    /// [`Self::wants_relative_pointer`].
+    ///
+    /// `false` before the host has said anything, which is the safe direction:
+    /// an ordinary desktop keeps its cursor.
+    pub fn host_cursor_hidden(&self) -> bool {
+        self.shared
+            .cursor
+            .lock()
+            .unwrap()
+            .position
+            .is_some_and(|position| !position.visible)
+    }
+
     pub fn cursor_texture(
         &mut self,
         ctx: &egui::Context,
@@ -854,6 +946,72 @@ impl GuestSession {
         *self.shared.watching.lock().unwrap()
     }
 
+    /// The window this session is watching, when it is watching one.
+    ///
+    /// `None` for an ordinary screen session — which is what tells the two
+    /// apart everywhere on this side, since a window session has no display
+    /// menu and can lose its picture for a reason that is not a fault.
+    pub fn shared_window(&self) -> Option<tain_core::protocol::SharedWindow> {
+        self.shared.shared_window.lock().unwrap().clone()
+    }
+
+    /// Every window this session may watch, in the order the host chose them.
+    ///
+    /// Empty for a screen session. One entry means there is nothing to switch
+    /// between — the toolbar names the window and offers no choice; several
+    /// means the host granted several, and the guest picks among them.
+    pub fn shared_windows(&self) -> Vec<tain_core::protocol::SharedWindow> {
+        self.shared.shared_windows.lock().unwrap().clone()
+    }
+
+    /// Whether the session shares windows and none of them can be shown.
+    ///
+    /// `None` when there is something to show, or when this is not a window
+    /// session at all. `Some` carries which kind of nothing it is, because the
+    /// two want different sentences: a closed window is not coming back, and a
+    /// minimised one is one gesture away.
+    pub fn windows_unavailable(&self) -> Option<WindowsAway> {
+        use tain_core::protocol::SharedWindowState;
+        if !self.shared.sharing_windows.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let offered = self.shared.shared_windows.lock().unwrap();
+        if offered.is_empty() {
+            return Some(WindowsAway::Closed);
+        }
+        offered
+            .iter()
+            .all(|window| window.state != SharedWindowState::Showing)
+            .then_some(WindowsAway::Minimised)
+    }
+
+    /// Whether every window this session was sharing has been closed.
+    ///
+    /// The one state an empty [`Self::shared_windows`] cannot express on its
+    /// own: a screen session has no windows either, and so does a host that
+    /// cannot enumerate its displays. There is nothing to show and nothing the
+    /// guest can do about it — which is worth saying, because the alternative
+    /// is a frozen picture with no explanation.
+    pub fn windows_all_closed(&self) -> bool {
+        self.windows_unavailable() == Some(WindowsAway::Closed)
+    }
+
+    /// Whether the host has something to send right now.
+    ///
+    /// False only while a shared window is minimised or gone. A screen session
+    /// is always live in this sense: a screen cannot be put away.
+    pub fn source_is_live(&self) -> bool {
+        use tain_core::protocol::SharedWindowState;
+        if self.windows_unavailable().is_some() {
+            // Nothing is being captured at all. Not covered by the check below:
+            // a composite watches no single window, so there is no
+            // `shared_window` to be in a state.
+            return false;
+        }
+        self.shared_window()
+            .is_none_or(|window| window.state == SharedWindowState::Showing)
+    }
+
     /// Ask the host to show a different display.
     ///
     /// Fire and forget: the host answers with the display it is *actually*
@@ -865,8 +1023,36 @@ impl GuestSession {
         match control.as_ref() {
             Some(tx) => {
                 let _ = tx.send(tain_core::protocol::Message::WatchDisplay(choice));
+                // Recorded before the answer, because the wait starts here: the
+                // host rebuilds its capture to honour this and produces nothing
+                // while it does. See `network_bridge::Switching`.
+                *self.shared.switching.lock().unwrap() =
+                    Some(super::network_bridge::Switching {
+                        since: std::time::Instant::now(),
+                        answered: false,
+                    });
             }
             None => debug!("No session to ask for {choice:?}"),
+        }
+    }
+
+    /// Whether a view has been asked for and not yet arrived.
+    ///
+    /// Gives up after [`super::network_bridge::SWITCH_PATIENCE`]: a request the
+    /// host never answers should leave the picture it has rather than a
+    /// spinner that never stops. Clearing it here rather than only reporting
+    /// keeps that decision in one place.
+    pub fn switching(&self) -> bool {
+        let mut switching = self.shared.switching.lock().unwrap();
+        match *switching {
+            Some(pending) if pending.since.elapsed() < super::network_bridge::SWITCH_PATIENCE => {
+                true
+            }
+            Some(_) => {
+                *switching = None;
+                false
+            }
+            None => false,
         }
     }
 
@@ -881,22 +1067,31 @@ impl GuestSession {
         let health = self.shared.health.lock().unwrap();
         let live = health.live;
         let mut lines = vec![
-            format!("Decoding {:.1} ms per frame", live.decode_ms),
-            format!("Drawing {:.1} ms per frame", live.render_ms),
+            i18n::format("session.decode_ms", &[("ms", &format!("{:.1}", live.decode_ms))]),
+            i18n::format("session.draw_ms", &[("ms", &format!("{:.1}", live.render_ms))]),
         ];
         match health.status {
-            Some(status) => lines.push(format!(
-                "Host is sending {} fps at up to {} kbit/s{}",
-                status.fps,
-                status.bitrate_kbps,
-                if health.is_degraded() { ", reduced from what it was asked for" } else { "" }
+            Some(status) => lines.push(i18n::format(
+                "session.host_sending",
+                &[
+                    ("fps", &status.fps.to_string()),
+                    ("kbps", &status.bitrate_kbps.to_string()),
+                    (
+                        "reduced",
+                        if health.is_degraded() {
+                            i18n::text("session.host_reduced")
+                        } else {
+                            ""
+                        },
+                    ),
+                ],
             )),
-            None => lines.push("The host has not reported its settings yet.".into()),
+            None => lines.push(i18n::text("session.no_status").into()),
         }
         if live.skipped_fps >= 1.0 {
-            lines.push(format!(
-                "{:.0} frames a second arrived and were replaced before this window drew them",
-                live.skipped_fps
+            lines.push(i18n::format(
+                "session.displaced",
+                &[("n", &format!("{:.0}", live.skipped_fps))],
             ));
         }
 
@@ -909,20 +1104,16 @@ impl GuestSession {
         // between two neighbouring cities reads as 110 ms with nothing on
         // screen to account for it.
         if let Some(ref path) = health.path {
-            lines.push(format!(
-                "{} path to {}, {:.0} ms round trip",
-                path.label(),
-                path.remote(),
-                path.rtt_ms()
+            lines.push(i18n::format(
+                "session.path_line",
+                &[
+                    ("kind", path.label()),
+                    ("peer", path.remote()),
+                    ("ms", &format!("{:.0}", path.rtt_ms())),
+                ],
             ));
             if path.is_direct() && path.looks_tunnelled() {
-                lines.push(
-                    "That is a private address, so this is going through a VPN or \
-                     similar tunnel unless the other machine is on your own network. \
-                     The round trip above is the tunnel's, not the internet's — worth \
-                     comparing with the VPN off."
-                        .into(),
-                );
+                lines.push(i18n::text("session.tunnelled").into());
             }
         }
 
@@ -958,17 +1149,6 @@ impl GuestSession {
             return Some(from_host);
         }
         self.preview.clone()
-    }
-
-    /// Where this host answered, once a direct path has been established.
-    ///
-    /// `None` while the session is relayed, which is the case worth *not*
-    /// remembering: a relay's address is the relay's, and dialling it next time
-    /// would reach a server that has never heard of this host.
-    pub fn direct_addr(&self) -> Option<String> {
-        let health = self.shared.health.lock().unwrap();
-        let path = health.path.as_ref()?;
-        path.is_direct().then(|| path.remote().to_string())
     }
 
     pub fn last_pointer(&self) -> Option<(u16, u16)> {
@@ -1166,6 +1346,192 @@ fn pan_velocity(offset: f32, extent: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use super::WindowsAway;
+
+    fn offered(
+        state: tain_core::protocol::SharedWindowState,
+        id: u64,
+    ) -> tain_core::protocol::SharedWindow {
+        tain_core::protocol::SharedWindow {
+            id,
+            title: "Budget 2026.xlsx".into(),
+            app: "Excel".into(),
+            state,
+        }
+    }
+
+    /// Nothing to show is said out loud, and the two reasons are told apart.
+    ///
+    /// # The report this is for
+    ///
+    /// Minimising the last shared window left the composite showing its last
+    /// frame, frozen, with nothing saying why — the same failure as closing
+    /// them all, which had already been fixed. It was not covered by that fix
+    /// because a minimised window does not leave the offer: it is still
+    /// granted, still listed, and can come back. Only its *state* moved, and
+    /// the offer did not carry one.
+    #[test]
+    fn a_window_session_with_nothing_showing_says_which_kind_of_nothing() {
+        use std::sync::atomic::Ordering;
+        use tain_core::protocol::SharedWindowState::{Closed, Minimised, Showing};
+
+        let session = super::GuestSession::test_stub();
+        let set = |windows: Vec<tain_core::protocol::SharedWindow>| {
+            *session.shared.shared_windows.lock().unwrap() = windows;
+        };
+
+        // A screen session is never any of this, whatever its window list says.
+        session.shared.sharing_windows.store(false, Ordering::Relaxed);
+        set(Vec::new());
+        assert_eq!(
+            session.windows_unavailable(),
+            None,
+            "a host that cannot enumerate its displays is still showing a screen"
+        );
+
+        session.shared.sharing_windows.store(true, Ordering::Relaxed);
+
+        // One of them on screen is something to show, however many are not.
+        set(vec![offered(Minimised, 1), offered(Showing, 2)]);
+        assert_eq!(session.windows_unavailable(), None);
+        assert!(session.source_is_live());
+
+        // None of them on screen, and all still there to come back.
+        set(vec![offered(Minimised, 1), offered(Minimised, 2)]);
+        assert_eq!(session.windows_unavailable(), Some(WindowsAway::Minimised));
+        assert!(!session.source_is_live(), "a session with nothing to send is not live");
+
+        // A window that has *closed* leaves the offer entirely, so an empty
+        // list is the other kind of nothing — and it is a different sentence,
+        // because nothing at the host will bring it back.
+        set(Vec::new());
+        assert_eq!(session.windows_unavailable(), Some(WindowsAway::Closed));
+        assert!(session.windows_all_closed());
+
+        // Closed windows never reach the offer, but a mixed list must still
+        // read as "nothing showing" rather than as one of them being fine.
+        set(vec![offered(Closed, 1), offered(Minimised, 2)]);
+        assert_eq!(session.windows_unavailable(), Some(WindowsAway::Minimised));
+    }
+
+    /// The pointer becomes movement exactly when the host hides its own.
+    ///
+    /// # The report this is for
+    ///
+    /// A 3D game's camera was uncontrollable from the guest while the same
+    /// game's menus worked perfectly. That is the difference between a program
+    /// that follows a cursor and one that captures it: the second warps the
+    /// pointer back to the middle after every frame and reads what moved, so
+    /// an absolute position arrives as the distance between where it put the
+    /// cursor and where the guest's is — an enormous flick, sixty times a
+    /// second.
+    ///
+    /// The switch has to be automatic, because nobody should have to know that
+    /// is what their game is doing. Hiding the cursor is the same fact that
+    /// already stops the remote pointer being drawn, so it costs nothing new.
+    #[test]
+    fn the_pointer_is_sent_as_movement_when_the_host_has_captured_its_own() {
+        let mut session = super::GuestSession::test_stub();
+        let at = |visible: bool| tain_core::cursor::CursorPosition {
+            x: 10,
+            y: 10,
+            desktop_width: 1920,
+            desktop_height: 1080,
+            visible,
+        };
+
+        // Nothing said yet. An ordinary desktop keeps its cursor, and that is
+        // the safe answer before the host has reported one.
+        session.want_mouse = true;
+        *session.shared.grants.lock().unwrap() = tain_core::ControlGrants::ALL;
+        assert!(!session.host_cursor_hidden());
+        assert!(!session.wants_relative_pointer());
+
+        session.shared.cursor.lock().unwrap().position = Some(at(true));
+        assert!(!session.wants_relative_pointer(), "a visible cursor is followed, not tracked");
+
+        session.shared.cursor.lock().unwrap().position = Some(at(false));
+        assert!(session.host_cursor_hidden());
+        assert!(
+            session.wants_relative_pointer(),
+            "a host that hid its pointer has captured it, and wants movement"
+        );
+
+        // # And it is never taken without the pointer having been granted
+        //
+        // Engaging pins this machine's cursor to the middle of the video. Doing
+        // that for a session that cannot send a pointer at all would take the
+        // mouse away from somebody who is only watching.
+        session.want_mouse = false;
+        assert!(!session.sends_mouse());
+        assert!(
+            !session.wants_relative_pointer(),
+            "a session that sends no pointer must not capture one"
+        );
+    }
+
+    /// The multiplier is always a number a pointer can be driven by.
+    ///
+    /// # Why it is clamped on the way out as well as in
+    ///
+    /// It multiplies every delta in the one mode where there is no cursor on
+    /// screen to show what went wrong. A NaN — from a hand-edited file, or from
+    /// arithmetic somewhere upstream — rounds to zero, which is a pointer that
+    /// has simply stopped, in a game, with nothing saying why. `sanitize` is
+    /// the other half of this and runs on load; this is the half that holds
+    /// whatever the running session ended up with.
+    #[test]
+    fn the_aim_sensitivity_is_always_a_usable_number() {
+        let range = super::super::settings::POINTER_SENSITIVITY_RANGE;
+        let mut session = super::GuestSession::test_stub();
+
+        assert_eq!(session.pointer_sensitivity(), 1.0, "one is the honest default");
+
+        session.pointer_sensitivity = 2.5;
+        assert_eq!(session.pointer_sensitivity(), 2.5, "a value in range is used as given");
+
+        session.pointer_sensitivity = f32::NAN;
+        assert_eq!(session.pointer_sensitivity(), 1.0, "a NaN would stop the pointer dead");
+
+        session.pointer_sensitivity = 1e9;
+        assert_eq!(session.pointer_sensitivity(), *range.end());
+        session.pointer_sensitivity = -4.0;
+        assert_eq!(session.pointer_sensitivity(), *range.start());
+
+        // And going back means going back to what the session opened at, which
+        // is the user's own default rather than a constant.
+        assert_eq!(session.default_pointer_sensitivity(), 1.0);
+    }
+
+    /// A view asked for is waited on, and not for ever.
+    #[test]
+    fn a_switch_that_is_never_answered_stops_claiming_to_be_coming() {
+        let session = super::GuestSession::test_stub();
+        assert!(!session.switching(), "nothing has been asked for");
+
+        *session.shared.switching.lock().unwrap() =
+            Some(super::super::network_bridge::Switching {
+                since: std::time::Instant::now(),
+                answered: false,
+            });
+        assert!(session.switching(), "a picture was asked for and has not arrived");
+
+        // Long past the point where a host was going to answer. The guest keeps
+        // the picture it has rather than a spinner that never stops.
+        *session.shared.switching.lock().unwrap() =
+            Some(super::super::network_bridge::Switching {
+                since: std::time::Instant::now()
+                    - super::super::network_bridge::SWITCH_PATIENCE
+                    - std::time::Duration::from_secs(1),
+                answered: false,
+            });
+        assert!(!session.switching(), "a switch that never landed span for ever");
+        assert!(
+            session.shared.switching.lock().unwrap().is_none(),
+            "giving up should also forget, or every frame re-decides it"
+        );
+    }
+
     /// A decoder that never hands over a texture must not freeze the picture.
     ///
     /// The reported fault: skip-the-readback on at one end, a frozen first
@@ -1497,15 +1863,15 @@ mod tests {
     #[tokio::test]
     async fn tab_ids_are_unique_across_sessions() {
         let settings = Settings::default();
-        let a = GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {});
-        let b = GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {});
+        let a = GuestSession::start(code([1; 32]), &settings, true, || {});
+        let b = GuestSession::start(code([1; 32]), &settings, true, || {});
         assert_ne!(a.tab_id, b.tab_id, "two tabs to the same host must be distinguishable");
     }
 
     #[tokio::test]
     async fn loopback_sessions_never_forward_input() {
         let settings = Settings::default();
-        let mut session = GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {});
+        let mut session = GuestSession::start(code([1; 32]), &settings, true, || {});
         let (tx, mut rx) = mpsc::unbounded_channel();
         session.input_tx = Some(tx);
 
@@ -1532,7 +1898,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_releases_every_held_input() {
         let settings = Settings::default();
-        let mut session = GuestSession::start(code([1; 32]), Vec::new(), &settings, false, || {});
+        let mut session = GuestSession::start(code([1; 32]), &settings, false, || {});
         let (tx, mut rx) = mpsc::unbounded_channel();
         session.input_tx = Some(tx);
 
@@ -1575,7 +1941,7 @@ mod tests {
     /// A 1:1 session on a remote screen larger than the window.
     async fn panning_session() -> GuestSession {
         let settings = Settings { scaling_mode: ScalingMode::Actual, ..Settings::default() };
-        GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {})
+        GuestSession::start(code([1; 32]), &settings, true, || {})
     }
 
     #[test]
@@ -1628,7 +1994,7 @@ mod tests {
     #[tokio::test]
     async fn fit_mode_never_pans() {
         let settings = Settings { scaling_mode: ScalingMode::Fit, ..Settings::default() };
-        let mut session = GuestSession::start(code([1; 32]), Vec::new(), &settings, true, || {});
+        let mut session = GuestSession::start(code([1; 32]), &settings, true, || {});
 
         session.auto_pan(viewport(), egui::vec2(1920.0, 1080.0), Some(egui::pos2(799.0, 599.0)), 1.0);
         assert_eq!(session.pan, egui::Vec2::ZERO);
@@ -1668,14 +2034,14 @@ mod tests {
     #[tokio::test]
     async fn a_session_knows_which_saved_connection_it_belongs_to() {
         let settings = Settings::default();
-        let session = GuestSession::start(code([0xAB; 32]), Vec::new(), &settings, false, || {});
+        let session = GuestSession::start(code([0xAB; 32]), &settings, false, || {});
         assert_eq!(session.endpoint_hex, "ab".repeat(32));
     }
 
     #[tokio::test]
     async fn win_key_tracking_does_not_duplicate() {
         let settings = Settings::default();
-        let mut session = GuestSession::start(code([1; 32]), Vec::new(), &settings, false, || {});
+        let mut session = GuestSession::start(code([1; 32]), &settings, false, || {});
         session.note_held_key(0x5B, true);
         session.note_held_key(0x5B, true);
         assert_eq!(session.keys_down.len(), 1);

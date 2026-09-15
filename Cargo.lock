@@ -5661,6 +5661,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "blake3",
  "bs58",
  "bytes",
  "cc",

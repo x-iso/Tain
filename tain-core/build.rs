@@ -18,6 +18,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NASM");
     println!("cargo:rerun-if-changed=build.rs");
 
+    embed_languages();
+
     println!("cargo:rerun-if-changed=ffmpeg/db_decode.c");
     println!("cargo:rerun-if-changed=ffmpeg/db_audio.c");
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
@@ -93,7 +95,8 @@ fn main() {
         None => {
             println!("cargo:rustc-link-search=native={}", lib.display());
             println!(
-                "cargo:warning=using ffmpeg's shipped import libraries — a missing DLL will                  fail before main() instead of falling back to the software decoder"
+                "cargo:warning=using ffmpeg's shipped import libraries — a missing DLL will \
+                 fail before main() instead of falling back to the software decoder"
             );
         }
     }
@@ -284,4 +287,72 @@ fn embed_runtime(dir: &Path) {
         }
     }
     println!("cargo:rustc-env=DB_RUNTIME_ID={fingerprint:016x}");
+}
+
+/// Compile every translation in `i18n/` into the binary.
+///
+/// # Why a directory rather than a list
+///
+/// Adding a language should be dropping a file in. A list in a Rust file would
+/// mean every translator's first contribution touches code, needs a reviewer
+/// who reads Rust, and can be rejected for a trailing comma — which is a
+/// remarkable amount of friction to place in front of somebody volunteering to
+/// translate an application.
+///
+/// So this globs the directory. The catalogue says its own tag, name and plural
+/// rule; see `i18n/README.md`, which is written for the person adding one.
+///
+/// Nothing here can fail the build. A malformed catalogue is one language that
+/// does not appear, reported as a warning — the alternative is a contributor's
+/// typo breaking everybody else's build.
+fn embed_languages() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../i18n");
+    println!("cargo:rerun-if-changed={}", dir.display());
+
+    let mut entries = Vec::new();
+    match std::fs::read_dir(&dir) {
+        Ok(found) => {
+            let mut files: Vec<PathBuf> = found
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lang"))
+                })
+                .collect();
+            // Sorted, so the compiled order does not depend on the order a
+            // directory happened to be read in.
+            files.sort();
+            for path in files {
+                println!("cargo:rerun-if-changed={}", path.display());
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                entries.push((name, path));
+            }
+        }
+        Err(e) => println!("cargo:warning=no i18n directory at {}: {e}", dir.display()),
+    }
+
+    if entries.is_empty() {
+        println!("cargo:warning=no .lang catalogues found — the interface will be English only");
+    }
+
+    let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let mut source = String::from(
+        "/// Every translation compiled into this build, as (file name, contents).\n\
+         pub static FILES: &[(&str, &str)] = &[\n",
+    );
+    for (name, path) in &entries {
+        // `include_str!` rather than the text itself: the file stays a file,
+        // errors point at it, and nothing has to be escaped into a Rust string.
+        source.push_str(&format!(
+            "    ({:?}, include_str!({:?})),\n",
+            name,
+            path.canonicalize().unwrap_or_else(|_| path.clone()),
+        ));
+    }
+    source.push_str("];\n");
+
+    let target = out.join("language_catalogues.rs");
+    if let Err(e) = std::fs::write(&target, source) {
+        println!("cargo:warning=could not write {}: {e}", target.display());
+    }
 }

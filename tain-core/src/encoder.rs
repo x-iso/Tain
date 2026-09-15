@@ -54,28 +54,26 @@ impl VideoCodec {
         [Self::DeltaZstd, Self::Raw, Self::H264, Self::H265, Self::Av1, Self::Vp9];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::DeltaZstd => "Lossless (delta + zstd)",
-            Self::Raw => "Raw BGRA",
-            Self::H264 => "H.264 / AVC",
-            Self::H265 => "H.265 / HEVC",
-            Self::Av1 => "AV1",
-            Self::Vp9 => "VP9",
-        }
+        crate::i18n::text(match self {
+            Self::DeltaZstd => "codec.delta_zstd",
+            Self::Raw => "codec.raw",
+            Self::H264 => "codec.h264",
+            Self::H265 => "codec.h265",
+            Self::Av1 => "codec.av1",
+            Self::Vp9 => "codec.vp9",
+        })
     }
 
     /// Short note on what this codec is for, shown next to the choice.
     pub fn description(self) -> &'static str {
-        match self {
-            Self::DeltaZstd => {
-                "Pixel-exact and CPU-only. Cheap on a still screen, very expensive once it moves."
-            }
-            Self::Raw => "No compression. Lowest latency, needs a fast local network.",
-            Self::H264 => "Best all-round choice. Software encoder, works on any machine.",
-            Self::H265 => "Smaller than H.264 at the same quality, costs more to encode.",
-            Self::Av1 => "Smallest streams. Needs recent hardware to stay low-latency.",
-            Self::Vp9 => "Royalty-free. Software encoding is slower than H.264.",
-        }
+        crate::i18n::text(match self {
+            Self::DeltaZstd => "codec.delta_zstd_detail",
+            Self::Raw => "codec.raw_detail",
+            Self::H264 => "codec.h264_detail",
+            Self::H265 => "codec.h265_detail",
+            Self::Av1 => "codec.av1_detail",
+            Self::Vp9 => "codec.vp9_detail",
+        })
     }
 
     pub fn availability(self) -> Availability {
@@ -200,19 +198,19 @@ impl EncoderBackend {
     pub const ALL: [Self; 3] = [Self::Auto, Self::Hardware, Self::Software];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Automatic",
-            Self::Hardware => "Hardware (GPU)",
-            Self::Software => "Software (CPU)",
-        }
+        crate::i18n::text(match self {
+            Self::Auto => "backend.auto",
+            Self::Hardware => "backend.hardware",
+            Self::Software => "backend.software",
+        })
     }
 
     pub fn description(self) -> &'static str {
-        match self {
-            Self::Auto => "Use the GPU when available, otherwise the CPU",
-            Self::Hardware => "GPU only — lowest latency, fails if unsupported",
-            Self::Software => "CPU only — works anywhere, competes with the host's own work",
-        }
+        crate::i18n::text(match self {
+            Self::Auto => "backend.auto_detail",
+            Self::Hardware => "backend.hardware_detail",
+            Self::Software => "backend.software_detail",
+        })
     }
 }
 
@@ -424,25 +422,12 @@ impl LatencyPriority {
 
     /// Short description of what this position actually does.
     pub fn summary(self) -> &'static str {
-        match self.0 {
-            0..=33 => {
-                "Holds the picture. If the link or the hardware falls behind, the \
-                 frame rate drops before the resolution does, and sound is \
-                 buffered generously so it stays continuous."
-            }
-            34..=66 => {
-                "Balanced. Trouble is answered with bitrate first, then whichever \
-                 of detail and smoothness is cheaper to give up."
-            }
-            67..=85 => {
-                "Favours responsiveness. Resolution softens before the frame rate \
-                 is allowed to fall."
-            }
-            _ => {
-                "Holds the frame rate. Detail is spent freely, and sound is \
-                 buffered as little as possible, to keep everything immediate."
-            }
-        }
+        crate::i18n::text(match self.0 {
+            0..=33 => "priority.quality",
+            34..=66 => "priority.balanced",
+            67..=85 => "priority.responsive",
+            _ => "priority.latency",
+        })
     }
 }
 
@@ -468,19 +453,19 @@ impl RateControl {
     pub const ALL: [Self; 3] = [Self::Constant, Self::Variable, Self::ConstantQuality];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Constant => "Constant bitrate",
-            Self::Variable => "Variable bitrate",
-            Self::ConstantQuality => "Constant quality",
-        }
+        crate::i18n::text(match self {
+            Self::Constant => "rate.constant",
+            Self::Variable => "rate.variable",
+            Self::ConstantQuality => "rate.quality",
+        })
     }
 
     pub fn description(self) -> &'static str {
-        match self {
-            Self::Constant => "Steady bandwidth; quality dips when the screen moves a lot",
-            Self::Variable => "Better quality per byte, bandwidth varies",
-            Self::ConstantQuality => "Pick a quality and let bandwidth follow — can spike",
-        }
+        crate::i18n::text(match self {
+            Self::Constant => "rate.constant_detail",
+            Self::Variable => "rate.variable_detail",
+            Self::ConstantQuality => "rate.quality_detail",
+        })
     }
 
     /// Whether this mode is driven by a bitrate target rather than a quality target.
@@ -544,27 +529,19 @@ impl H264Profile {
     }
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Baseline => "Baseline",
-            Self::Main => "Main",
-            Self::High => "High",
-        }
+        crate::i18n::text(match self {
+            Self::Baseline => "profile.baseline",
+            Self::Main => "profile.main",
+            Self::High => "profile.high",
+        })
     }
 
     pub fn description(self) -> &'static str {
-        match self {
-            Self::Baseline => {
-                "Works with every guest, including one decoding on its CPU. \
-                 Largest bitstream, and some Intel encoders stall on it."
-            }
-            Self::Main => {
-                "Smaller at the same quality, and the fix if an Intel encoder \
-                 stalls. The guest must be decoding on its GPU."
-            }
-            Self::High => {
-                "A few percent smaller again. The guest must be decoding on its GPU."
-            }
-        }
+        crate::i18n::text(match self {
+            Self::Baseline => "profile.baseline_detail",
+            Self::Main => "profile.main_detail",
+            Self::High => "profile.high_detail",
+        })
     }
 }
 

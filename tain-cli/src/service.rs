@@ -71,11 +71,18 @@ pub enum ServiceState {
     Running,
     /// Registered but not running, so nothing it provides is available.
     Stopped,
-    /// Registered, but pointing at a different executable than this one.
+    /// Registered, but not against the build running now.
     ///
-    /// Happens after the portable exe is moved or replaced, which for an app
-    /// people copy around is normal rather than exotic. Reinstalling fixes it,
-    /// and saying so beats a feature that quietly does not work.
+    /// Either the registered path is not the one this build installs to, or the
+    /// copy sitting at that path was made from a different build. The second is
+    /// the common one and was invisible until it was looked for: an install
+    /// whose copy fails leaves the old service running, reports its error to an
+    /// elevated window nobody sees, and every state below this one goes on
+    /// saying the service is healthy.
+    ///
+    /// Happens after the portable exe is moved, replaced, or rebuilt — which
+    /// for an app people copy around is normal rather than exotic. Reinstalling
+    /// fixes it, and saying so beats a feature that quietly does not work.
     Mismatched,
     /// The service database could not be read at all.
     Unknown,
@@ -89,13 +96,13 @@ impl ServiceState {
 
     /// One line for the settings panel.
     pub fn summary(self) -> &'static str {
-        match self {
-            Self::NotInstalled => "Not installed. Admin access needs it.",
-            Self::Running => "Installed and running.",
-            Self::Stopped => "Installed but not running — unattended access is unavailable.",
-            Self::Mismatched => "Installed, but registered against a different copy of Tain.",
-            Self::Unknown => "The service database could not be read.",
-        }
+        tain_core::i18n::text(match self {
+            Self::NotInstalled => "service.not_installed",
+            Self::Running => "service.running",
+            Self::Stopped => "service.stopped",
+            Self::Mismatched => "service.mismatched",
+            Self::Unknown => "service.unknown",
+        })
     }
 }
 
@@ -207,6 +214,156 @@ mod windows_impl {
         Ok(base.join("Tain").join("tain-service.exe"))
     }
 
+    /// Beside the copy, naming which build it was made from.
+    ///
+    /// See [`build_stamp`] for why the copy alone cannot answer that.
+    fn installed_stamp_path() -> Result<std::path::PathBuf> {
+        Ok(installed_exe_path()?.with_extension("build"))
+    }
+
+    /// The application's settings, as the service last received them.
+    ///
+    /// # Why a file and not the credential store
+    ///
+    /// Size, mostly: a credential blob is capped at a couple of kilobytes and
+    /// these are shortcuts, exclusion lists and device names. But also because
+    /// none of it is secret — it is the same content as the settings file in
+    /// the user's own profile, which is not protected either.
+    ///
+    /// The one part that *is* security-relevant, the approved admin devices,
+    /// does not come from here. It is mirrored into the credential store and
+    /// read back from there, so editing this file cannot grant anybody access.
+    /// See `apply_settings` and [`HostSecrets::trusted_admins`].
+    ///
+    /// [`HostSecrets::trusted_admins`]: crate::gui::secrets::HostSecrets::trusted_admins
+    fn settings_path() -> Result<std::path::PathBuf> {
+        Ok(installed_exe_path()?.with_file_name("settings.json"))
+    }
+
+    /// What the firewall rule is called, and how it is found again to remove.
+    const FIREWALL_RULE_NAME: &str = "Tain Host Service";
+
+    /// Shown beside the rule in Windows Defender Firewall.
+    const FIREWALL_RULE_DESCRIPTION: &str =
+        "Lets the Tain service answer connections while nobody is signed in. \
+         Removed when the Tain service is removed.";
+
+    /// Let the installed copy receive the packets a connection is made of.
+    ///
+    /// # Why this has to be done at all
+    ///
+    /// Windows Firewall identifies a program by its path, and the service runs
+    /// from a copy in ProgramData rather than from the application. So the rule
+    /// Windows created when somebody first ran Tain — by putting a prompt on
+    /// screen and having them click Allow — does not cover the service. It is a
+    /// different program as far as the firewall is concerned.
+    ///
+    /// And it can never get its own prompt. That dialogue is raised on the
+    /// interactive desktop by a process that has one; a service in session zero
+    /// has no desktop and nobody to click it. There is no path by which this
+    /// rule appears on its own, so the install has to create it, from the
+    /// elevated half where the rights to do so already exist.
+    ///
+    /// # Inbound UDP, and nothing else
+    ///
+    /// The connection is QUIC, which is UDP, and local discovery is mDNS, which
+    /// is UDP on a port the same program binds — one application rule covers
+    /// both. Nothing here listens on TCP: the relay is an outbound connection,
+    /// and outbound is allowed by default. A rule any wider would be granting
+    /// what is not used.
+    ///
+    /// # Every profile, deliberately
+    ///
+    /// Windows' own prompt defaults to Private and Domain, leaving Public off.
+    /// That default is right for a program somebody is sitting in front of and
+    /// wrong for this one: unattended access exists to reach a machine on
+    /// whatever network it happens to be on, and Windows classifies anything it
+    /// does not recognise as Public. A rule that skipped Public would work at
+    /// home and fail exactly where the feature earns its keep — silently, which
+    /// is the failure mode this whole area has had too much of already.
+    fn allow_through_firewall(exe: &std::path::Path) -> Result<()> {
+        use windows::core::BSTR;
+        use windows::Win32::NetworkManagement::WindowsFirewall::{
+            INetFwPolicy2, INetFwRule, NetFwPolicy2, NetFwRule, NET_FW_ACTION_ALLOW,
+            NET_FW_IP_PROTOCOL_UDP, NET_FW_PROFILE2_ALL, NET_FW_RULE_DIR_IN,
+        };
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+        };
+
+        // SAFETY: initialising COM on this thread. A thread that already has it
+        // returns a code saying so, which is not a failure to act on — hence
+        // the result is dropped rather than checked.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+
+        // SAFETY: creating documented in-process COM objects, and calling them
+        // through the interfaces they were created as.
+        unsafe {
+            let policy: INetFwPolicy2 =
+                CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)
+                    .context("could not reach the Windows Firewall configuration")?;
+            let rules = policy.Rules().context("could not read the firewall rules")?;
+
+            let name = BSTR::from(FIREWALL_RULE_NAME);
+            // Removed first, so installing twice leaves one rule rather than
+            // two. Removing one that is not there fails, and that is the
+            // ordinary case on a first install.
+            let _ = rules.Remove(&name);
+
+            let rule: INetFwRule = CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER)
+                .context("could not create a firewall rule")?;
+            rule.SetName(&name)?;
+            rule.SetDescription(&BSTR::from(FIREWALL_RULE_DESCRIPTION))?;
+            rule.SetApplicationName(&BSTR::from(exe.display().to_string()))?;
+            rule.SetProtocol(NET_FW_IP_PROTOCOL_UDP.0)?;
+            rule.SetDirection(NET_FW_RULE_DIR_IN)?;
+            rule.SetAction(NET_FW_ACTION_ALLOW)?;
+            rule.SetProfiles(NET_FW_PROFILE2_ALL.0)?;
+            rule.SetEnabled(windows::Win32::Foundation::VARIANT_TRUE)?;
+
+            rules.Add(&rule).context("could not add the firewall rule")?;
+        }
+        Ok(())
+    }
+
+    /// Take the rule away again, so an uninstall leaves nothing behind.
+    fn remove_from_firewall() -> Result<()> {
+        use windows::core::BSTR;
+        use windows::Win32::NetworkManagement::WindowsFirewall::{INetFwPolicy2, NetFwPolicy2};
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+        };
+
+        // SAFETY: as in `allow_through_firewall`.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let policy: INetFwPolicy2 =
+                CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)
+                    .context("could not reach the Windows Firewall configuration")?;
+            let rules = policy.Rules().context("could not read the firewall rules")?;
+            rules
+                .Remove(&BSTR::from(FIREWALL_RULE_NAME))
+                .context("could not remove the firewall rule")?;
+        }
+        Ok(())
+    }
+
+    /// Identifies the build an executable is, cheaply enough to ask every frame.
+    ///
+    /// Length and modified time, not a hash. The settings panel asks for the
+    /// service's state while it is on screen, which is sixty times a second,
+    /// and hashing sixty megabytes at that rate to answer "is the installed
+    /// copy current" would cost far more than the question is worth. Two pieces
+    /// of metadata separate any two builds anyone will actually have: a rebuild
+    /// moves the time, and a different build moves the length as well.
+    fn build_stamp(path: &std::path::Path) -> Option<String> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(format!("{}:{}", meta.len(), modified.as_secs()))
+    }
+
     /// Put a copy of this executable where the service will run it from.
     fn install_binary() -> Result<std::path::PathBuf> {
         let target = installed_exe_path()?;
@@ -228,6 +385,20 @@ mod windows_impl {
                 target.display()
             )
         })?;
+
+        // Written after the copy, so a stamp only ever describes a copy that
+        // was actually made. A failed copy leaves the previous stamp naming the
+        // previous build, which is exactly the state `Mismatched` is for.
+        //
+        // A stamp that cannot be written is not worth failing an install over —
+        // the service is installed and works. It costs the ability to notice a
+        // stale copy later, which `state` treats as "cannot tell" rather than
+        // as either answer.
+        if let (Ok(stamp_path), Some(stamp)) = (installed_stamp_path(), build_stamp(&source))
+            && let Err(e) = std::fs::write(&stamp_path, &stamp)
+        {
+            tracing::warn!("Could not record which build was installed: {e}");
+        }
         Ok(target)
     }
 
@@ -281,7 +452,7 @@ mod windows_impl {
             Err(_) => return ServiceState::Unknown,
         };
 
-        if !registered_against_this_exe(&handle) {
+        if !registered_against_this_exe(&handle) || !installed_copy_is_this_build() {
             return ServiceState::Mismatched;
         }
 
@@ -295,6 +466,44 @@ mod windows_impl {
         } else {
             ServiceState::Stopped
         }
+    }
+
+    /// Whether the installed copy was made from the executable running now.
+    ///
+    /// # Why the path check is not enough
+    ///
+    /// [`registered_against_this_exe`] compares the path the service manager
+    /// was given against [`installed_exe_path`], and those are both always
+    /// `%ProgramData%\Tain\tain-service.exe`. So it matches from the first
+    /// install onwards and can never notice that the file at that path is an
+    /// old build — the very case [`ServiceState::Mismatched`] describes itself
+    /// as being for.
+    ///
+    /// That gap is not theoretical. An install whose copy fails — the usual
+    /// cause being the previous service still holding the file — leaves the old
+    /// copy running, and nothing anywhere said so: the elevated half of the
+    /// install reports its error to a hidden window that exits immediately, and
+    /// the state this function feeds went on saying the service was healthy. A
+    /// service running code from days ago while the application runs today is
+    /// the hardest kind of thing to debug, because every fix appears to have
+    /// been applied and none of them are.
+    ///
+    /// # What it does when it cannot tell
+    ///
+    /// Says yes. A missing stamp means an install from before stamps existed,
+    /// which is not evidence of staleness, and reporting `Mismatched` for every
+    /// such machine would turn a real signal into one people learn to dismiss.
+    fn installed_copy_is_this_build() -> bool {
+        let (Ok(stamp_path), Ok(source)) = (installed_stamp_path(), std::env::current_exe()) else {
+            return true;
+        };
+        let Ok(recorded) = std::fs::read_to_string(&stamp_path) else {
+            return true;
+        };
+        let Some(current) = build_stamp(&source) else {
+            return true;
+        };
+        recorded.trim() == current
     }
 
     /// Whether the registered binary path is the executable running now.
@@ -477,6 +686,31 @@ mod windows_impl {
             );
         }
 
+        // After the service exists, so a registration that failed does not
+        // leave a hole in the firewall for a service nobody installed.
+        //
+        // # Why this does not fail the install
+        //
+        // The service is registered and runs without it, and on a machine whose
+        // firewall is off or managed by policy there may be no rule to make.
+        // Refusing to install over that would be refusing to install on a
+        // machine that works.
+        //
+        // It is a warning rather than a debug line because the failure it
+        // describes is invisible in every other way: the service starts, the
+        // settings panel says it is running, and connections simply never
+        // arrive. Anybody reading the log after that symptom needs to find this.
+        match allow_through_firewall(&installed) {
+            Ok(()) => {
+                tracing::info!("Allowed the service through the firewall for inbound UDP")
+            }
+            Err(e) => tracing::warn!(
+                "Could not let the service through the firewall ({e:#}) — it will run, but \
+                 may not be reachable until inbound UDP to {} is allowed",
+                installed.display()
+            ),
+        }
+
         // Started now rather than at the next boot, so the feature the user
         // just switched on works immediately.
         // SAFETY: a service handle with start access.
@@ -513,6 +747,30 @@ mod windows_impl {
 
         // SAFETY: a handle with delete access.
         unsafe { DeleteService(service.0) }.context("could not remove the Tain service")?;
+
+        // The stamp goes with the registration it describes. Left behind, it
+        // would answer for a service that no longer exists — and a reinstall
+        // whose copy failed would find a stamp that happened to match and call
+        // the stale copy current, which is the one wrong answer this must not
+        // give. The copy itself stays: it is what the service was running, and
+        // removing a file another process may still hold is how an uninstall
+        // fails for no useful reason.
+        if let Ok(stamp) = installed_stamp_path()
+            && let Err(e) = std::fs::remove_file(&stamp)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("Could not remove {}: {e}", stamp.display());
+        }
+
+        // Somebody who removes unattended access should not be left with a hole
+        // punched in their firewall for a program that is no longer there.
+        // Failing is the ordinary case on a machine that never had the rule, so
+        // it is noted and not raised.
+        if let Err(e) = remove_from_firewall() {
+            tracing::debug!("No firewall rule to remove ({e:#})");
+        } else {
+            tracing::info!("Removed the {FIREWALL_RULE_NAME} firewall rule");
+        }
         Ok(())
     }
 
@@ -686,38 +944,6 @@ mod windows_impl {
         start_with_token(&token, desktop)
     }
 
-    /// A primary token for the user signed in at the console.
-    fn console_user_token(session: u32) -> Result<OwnedHandle> {
-        use windows::Win32::Security::{
-            DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
-        };
-        use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
-
-        // SAFETY: called as SYSTEM, which is what this privilege requires; the
-        // handle is owned from here on.
-        let mut user = HANDLE::default();
-        unsafe { WTSQueryUserToken(session, &mut user) }
-            .context("no user is signed in at the console yet")?;
-        let user = OwnedHandle(user);
-
-        // `CreateProcessAsUser` will not take the impersonation token
-        // `WTSQueryUserToken` hands out.
-        let mut primary = HANDLE::default();
-        // SAFETY: duplicating a token this function owns.
-        unsafe {
-            DuplicateTokenEx(
-                user.0,
-                TOKEN_ALL_ACCESS,
-                None,
-                SecurityImpersonation,
-                TokenPrimary,
-                &mut primary,
-            )
-        }
-        .context("could not duplicate the console user's token")?;
-        Ok(OwnedHandle(primary))
-    }
-
     /// A copy of this service's own SYSTEM token, moved into `session`.
     ///
     /// # Why the session has to be set explicitly
@@ -847,12 +1073,67 @@ mod windows_impl {
         }
     }
 
-    /// Whether the application has said it is hosting.
+    /// What the application has last said about hosting.
     ///
     /// Two hosts on one identity is worse than none: a guest reaches whichever
-    /// answers first, and which that is changes between attempts. So this
-    /// yields to the application whenever it is up.
-    static APPLICATION_HOSTING: AtomicBool = AtomicBool::new(false);
+    /// answers first, and which that is changes between attempts. So the
+    /// service yields to the application whenever it is up.
+    ///
+    /// # Why a time and not a flag
+    ///
+    /// It was a flag, and the flag only ever went up. The application said it
+    /// was hosting when it started and said nothing when it closed, so the
+    /// service spent the rest of its life yielding to a host that had exited —
+    /// which meant closing the application made the machine unreachable until
+    /// the service was restarted. Exactly the case unattended access is for.
+    ///
+    /// A time expires on its own. Nothing has to be delivered for the service
+    /// to recover, which is the property a flag could not have: the application
+    /// that is killed, panics, or has its power cut is not a rare case here, it
+    /// is the normal way an unattended machine ends up unattended. See
+    /// [`tain_core::service_control::ControlMessage::ApplicationHosting`].
+    #[derive(Clone, Copy)]
+    enum HostingClaim {
+        /// Nothing heard since this service started.
+        ///
+        /// Distinct from an expired claim, and the distinction matters at
+        /// startup: a service that begins life during a signed-in session has
+        /// an application that may well be hosting and has simply not had a
+        /// chance to say so yet. Treating silence at that moment as "nobody is
+        /// hosting" would have both bind — the failure this whole mechanism is
+        /// here to avoid — so the first
+        /// [`HOSTING_LEASE`](tain_core::service_control::HOSTING_LEASE) gives
+        /// it time to speak.
+        Unheard,
+        /// The application said it was hosting, at this moment.
+        Held(std::time::Instant),
+        /// The application said it has stopped, and hosting is free.
+        Released,
+    }
+
+    /// The application's last word on hosting.
+    static HOSTING: std::sync::Mutex<HostingClaim> = std::sync::Mutex::new(HostingClaim::Unheard);
+
+    /// When this service began, so [`HostingClaim::Unheard`] can expire too.
+    static STARTED: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+
+    /// Whether the application's claim to be hosting is still good.
+    ///
+    /// A poisoned lock answers "yes", which is the cautious direction here: two
+    /// hosts on one identity is a failure a person cannot diagnose, and a
+    /// machine that stays unreachable is one they can — and will, because they
+    /// are the one trying to reach it.
+    fn application_is_hosting() -> bool {
+        use tain_core::service_control::HOSTING_LEASE;
+
+        let Ok(claim) = HOSTING.lock() else { return true };
+        match *claim {
+            HostingClaim::Unheard => STARTED.elapsed() < HOSTING_LEASE,
+            HostingClaim::Held(at) => at.elapsed() < HOSTING_LEASE,
+            HostingClaim::Released => false,
+        }
+    }
 
     /// Take the control channel and keep the service's copy of the identity.
     ///
@@ -863,7 +1144,7 @@ mod windows_impl {
 
         let secrets = crate::gui::secrets::HostSecrets::os();
         let served = serve(&RUNNING, |message| match message {
-            ControlMessage::AdoptIdentity { secret_key, codes } => {
+            ControlMessage::AdoptIdentity { secret_key, codes, settings } => {
                 if !secrets.set_identity(&secret_key) {
                     tracing::warn!("Could not store the host identity — unattended access \
                                     will not survive a restart");
@@ -882,19 +1163,92 @@ mod windows_impl {
                         Err(e) => tracing::warn!("The application sent an unreadable code: {e}"),
                     }
                 }
+                // Parsed here rather than at host start, so a settings file
+                // this build cannot read is complained about while somebody is
+                // signed in to read the complaint — not hours later with
+                // nobody at the machine.
+                let approved = match serde_json::from_str::<crate::gui::settings::Settings>(
+                    &settings,
+                ) {
+                    Ok(parsed) => {
+                        if let Ok(path) = settings_path()
+                            && let Err(e) = std::fs::write(&path, &settings)
+                        {
+                            tracing::warn!(
+                                "Could not save the settings to {} ({e}) — an unattended \
+                                 session will use defaults",
+                                path.display()
+                            );
+                        }
+                        parsed.trusted_admins()
+                    }
+                    Err(e) => {
+                        // The identity and the codes still got across, so this
+                        // costs the tunables and the approvals rather than the
+                        // whole feature.
+                        tracing::warn!("The application sent settings this build cannot read: {e}");
+                        std::collections::BTreeSet::new()
+                    }
+                };
+
+                // Mirrored into the credential store, which is what the admin
+                // gate actually reads. Replacing rather than merging, so a
+                // reset that emptied the list empties this one — that reset is
+                // the whole revocation story.
+                if !secrets.set_trusted_admins(&approved) {
+                    tracing::warn!(
+                        "Could not store the approved devices — an unattended host will \
+                         refuse the admin passcode from every one of them"
+                    );
+                }
+
+                IDENTITY_CHANGED.store(true, Ordering::Relaxed);
                 tracing::info!(
-                    "Adopted the host identity and {kept} of {} codes — this machine can \
-                     answer with nobody signed in",
-                    codes.len()
+                    "Adopted the host identity, {kept} of {} codes, this machine's settings \
+                     and {} approved device(s) — it can answer whenever the application is not",
+                    codes.len(),
+                    approved.len(),
                 );
             }
             ControlMessage::ForgetIdentity => {
                 secrets.forget_code(tain_core::PasscodeType::Master);
                 secrets.forget_code(tain_core::PasscodeType::Guest);
+                // The key too, which this did not do and its own name says it
+                // should. Leaving it meant a service that went on binding this
+                // machine's endpoint after the feature was switched off —
+                // answering nothing, because the codes were gone, but holding
+                // the identity and a connection to say so with.
+                secrets.forget_identity();
+                // And who was allowed to use it. A list of approved devices
+                // outliving the feature it belongs to would quietly come back
+                // into force the next time unattended access was switched on.
+                secrets.forget_trusted_admins();
+                // And the settings copy. Nothing here is secret, but it names
+                // this machine and what it shares, and leaving it behind after
+                // somebody switched the feature off is keeping a record they
+                // did not ask to keep.
+                if let Ok(path) = settings_path()
+                    && let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!("Could not remove {}: {e}", path.display());
+                }
+                IDENTITY_CHANGED.store(true, Ordering::Relaxed);
                 tracing::info!("Forgot the host identity — unattended access is off");
             }
             ControlMessage::ApplicationHosting(hosting) => {
-                let was = APPLICATION_HOSTING.swap(hosting, Ordering::Relaxed);
+                let was = application_is_hosting();
+                if let Ok(mut claim) = HOSTING.lock() {
+                    // `false` releases rather than back-dating a beat: the
+                    // application is saying it has stopped, which frees hosting
+                    // now instead of a lease from now.
+                    *claim = match hosting {
+                        true => HostingClaim::Held(std::time::Instant::now()),
+                        false => HostingClaim::Released,
+                    };
+                }
+                // Only the edges. The claim is renewed every few seconds and a
+                // line each time would bury everything else in the log.
                 if was != hosting {
                     tracing::info!(
                         "The application is {} hosting",
@@ -912,28 +1266,74 @@ mod windows_impl {
     struct UnattendedHost {
         /// The running host, and the flag that stops it.
         running: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
+        /// When starting was last attempted and found nothing to start with.
+        ///
+        /// The supervisor loop runs twice a second, and looking for an identity
+        /// means reading the credential store. On a machine with unattended
+        /// access switched off that answer is "no" every time and will not
+        /// change without somebody visiting Settings, so asking twice a second
+        /// for as long as the machine is on is a lot of credential reads to
+        /// learn nothing. This used to be hidden by the sign-in check, which
+        /// made it rare; wanting to host whenever the application is not makes
+        /// it the ordinary state.
+        idle_since: Option<std::time::Instant>,
     }
+
+    /// How long to leave the credential store alone after finding no identity.
+    ///
+    /// Turning unattended access on writes one and says so on the same control
+    /// channel, which clears the wait outright — see [`IDENTITY_CHANGED`]. So
+    /// this is the floor on asking pointlessly, not the latency of an answer
+    /// anybody is waiting for.
+    const RETRY_LOOKING_FOR_AN_IDENTITY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Set when the control channel adopts or forgets an identity.
+    ///
+    /// The supervisor loop and the control channel are different threads, and
+    /// this is the whole of what one needs to tell the other: look again, the
+    /// answer you cached is out of date.
+    static IDENTITY_CHANGED: AtomicBool = AtomicBool::new(false);
 
     impl UnattendedHost {
         fn new() -> Self {
-            Self { running: None }
+            Self { running: None, idle_since: None }
         }
 
         /// Start or stop hosting to match what the machine currently needs.
         ///
         /// # When the service should be the host
         ///
-        /// Only when there is nobody to be one instead. A signed-in user has
-        /// the application, which owns the same identity and the same codes —
-        /// and answering alongside it would mean a guest reaching whichever
-        /// bound first.
+        /// Whenever nothing else is. That is the whole test, and it is one
+        /// question rather than two on purpose.
         ///
-        /// `WTSQueryUserToken` failing *is* the test for "nobody is signed in".
-        /// The console session exists at the sign-in screen; what it lacks is a
-        /// user, and asking for that user's token is how Windows says so.
+        /// It used to also require that nobody was signed in, on the reasoning
+        /// that a signed-in user has the application. They do not: they may
+        /// have closed it, it may have crashed, it may never have been launched
+        /// at login. In every one of those the machine had a service running,
+        /// an adopted identity, working codes — and answered nothing, because
+        /// somebody was signed in. "Signed in" was never the question worth
+        /// asking; "is anyone already answering" is, and the hosting lease
+        /// answers it directly.
+        ///
+        /// What that costs is worth stating plainly: this machine now answers
+        /// master codes while an unlocked desktop sits unattended with the
+        /// application closed, and nothing on screen says so. That is the
+        /// feature working as asked rather than a gap — unattended access that
+        /// stopped at the moment you closed a window would not be unattended
+        /// access — but it is a real change in what a closed application means.
+        ///
+        /// # The two edges this has
+        ///
+        /// Starting up, the service has heard nothing yet and an application
+        /// that is already hosting has not had a chance to say so. Binding then
+        /// would give the machine two hosts. So silence counts as "somebody is
+        /// hosting" for the first lease — see [`HostingClaim::Unheard`].
+        ///
+        /// Shutting down, the application says so on its way out and hosting
+        /// moves within half a second. When it does not get to say so, the
+        /// claim expires a lease later instead. Both paths end here.
         fn poll(&mut self) {
-            let wanted = !APPLICATION_HOSTING.load(Ordering::Relaxed)
-                && console_user_token(console_session().unwrap_or(u32::MAX)).is_err();
+            let wanted = !application_is_hosting();
 
             // A host that stopped on its own — a bind that failed, a network
             // that went away — is restarted by the next pass.
@@ -946,7 +1346,7 @@ mod windows_impl {
             match (wanted, self.running.is_some()) {
                 (true, false) => self.start(),
                 (false, true) => {
-                    tracing::info!("Somebody is signed in — handing hosting back");
+                    tracing::info!("The application is hosting — handing hosting back");
                     self.stop();
                 }
                 _ => {}
@@ -954,14 +1354,42 @@ mod windows_impl {
         }
 
         fn start(&mut self) {
+            // Asked at most every `RETRY_LOOKING_FOR_AN_IDENTITY` once the
+            // answer has been "nothing adopted" once, and immediately whenever
+            // the control channel says the answer has changed. See
+            // `idle_since` and `IDENTITY_CHANGED`.
+            if IDENTITY_CHANGED.swap(false, Ordering::Relaxed) {
+                self.idle_since = None;
+            }
+            if self
+                .idle_since
+                .is_some_and(|since| since.elapsed() < RETRY_LOOKING_FOR_AN_IDENTITY)
+            {
+                return;
+            }
+
             let secrets = crate::gui::secrets::HostSecrets::os();
-            let Some(identity) = secrets.identity() else {
+
+            // Both, not either. A key with no codes binds an endpoint that can
+            // authenticate nobody — `validate` fails closed on an empty store —
+            // so it would listen forever and answer nothing. That is the state
+            // an older `ForgetIdentity` left behind, and asking for a code as
+            // well means a store in that state is inert rather than merely
+            // harmless.
+            let identity = secrets.identity();
+            let has_a_code = [tain_core::PasscodeType::Master, tain_core::PasscodeType::Guest]
+                .into_iter()
+                .any(|typ| secrets.code(typ).is_some());
+
+            let (Some(identity), true) = (identity, has_a_code) else {
                 // Nothing adopted, so unattended access is off or was never
                 // configured. Not a failure and not worth a line every pass.
+                self.idle_since = Some(std::time::Instant::now());
                 return;
             };
+            self.idle_since = None;
 
-            tracing::info!("Nobody is signed in — hosting on this machine's behalf");
+            tracing::info!("Nothing else is hosting — hosting on this machine's behalf");
             let stop = Arc::new(AtomicBool::new(false));
             let flag = stop.clone();
             let spawned = std::thread::Builder::new()
@@ -990,6 +1418,54 @@ mod windows_impl {
         }
     }
 
+    /// The session configuration an unattended host should run with.
+    ///
+    /// The application's own settings, translated the same way the application
+    /// translates them — one call to `to_session_config`, so the frame rate,
+    /// bitrate, codec, resolution ceiling, audio exclusions, host name and
+    /// local-input window are the ones the owner chose rather than the library
+    /// defaults an unattended session used to get.
+    ///
+    /// # Two things are not taken from the file
+    ///
+    /// `trusted_admins` comes from the credential store instead, because it is
+    /// the one field here that decides who gets in. Reading it from a file that
+    /// sits beside the service would mean anybody who could write that file
+    /// could approve themselves; reading it from the store means they would
+    /// need the rights to write the store, which is a level of access that
+    /// already implies everything else.
+    ///
+    /// `auto_regen_guest_passcode` is forced off. Issuing a fresh guest code
+    /// when the last guest leaves is right for a host with somebody at it — the
+    /// new code is on screen the moment it exists. Here there is no screen, and
+    /// a code regenerated by the service is one the application's stored copy
+    /// no longer matches, leaving a machine that answers to neither.
+    fn session_config(
+        approved: std::collections::BTreeSet<[u8; 32]>,
+    ) -> tain_core::SessionConfig {
+        let saved = settings_path()
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<crate::gui::settings::Settings>(&text).ok());
+
+        let mut config = match saved {
+            Some(settings) => settings.to_session_config(),
+            None => {
+                // No file yet, or one this build cannot read. Defaults are a
+                // working session rather than no session, and the line says why
+                // the picture may not look like the settings panel promises.
+                tracing::warn!(
+                    "No usable settings for the unattended host — falling back to defaults, \
+                     so the frame rate, bitrate and codec are not this machine's chosen ones"
+                );
+                tain_core::SessionConfig::default()
+            }
+        };
+        config.trusted_admins = approved;
+        config.auto_regen_guest_passcode = false;
+        config
+    }
+
     /// Run a host with the adopted identity until told to stop.
     ///
     /// On its own runtime rather than the application's: the service main runs
@@ -997,9 +1473,11 @@ mod windows_impl {
     /// borrowing one across that boundary is more machinery than a runtime
     /// costs.
     fn host_until_stopped(identity: [u8; 32], stop: &AtomicBool) {
-        // Session zero has no desktop, so every frame has to come from the
-        // agent on the secure desktop — which, with nobody signed in, is the
-        // sign-in screen and the only thing there is to show.
+        // Session zero has no desktop, so every frame has to come from an
+        // agent. Which agent is not fixed: with nobody signed in it is the
+        // sign-in screen on the secure desktop, and with somebody signed in but
+        // no application running it is their ordinary desktop. The capturer
+        // follows whichever currently has the input — see `DesktopFollowing`.
         tain_core::capture_follow::use_agent_only();
 
         let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -1041,11 +1519,33 @@ mod windows_impl {
                 }
             }
 
+            // Who the owner has already approved for the admin passcode.
+            //
+            // Without this the host runs on `SessionConfig::default()`, whose
+            // trusted set is empty — and an empty set means every admin
+            // connection needs approving, from a host that has nobody to ask.
+            // So a correct master code from the owner's own approved laptop
+            // authenticated and was then refused, which read from the far end
+            // as the code being wrong. See `must_be_approved`.
+            let approved = secrets.trusted_admins();
+            let approved_count = approved.len();
+            server.set_session_config(session_config(approved));
+
             // No approval channel, deliberately. Nobody is signed in to answer
             // one, and `await_approval` refuses a guest that has no channel —
-            // so a MASTER code connects and a GUEST code is declined rather
-            // than hanging until it times out or, worse, being let through.
-            tracing::info!("Unattended host listening — master codes only");
+            // so a MASTER code from an approved device connects, and a GUEST
+            // code is declined rather than hanging until it times out or,
+            // worse, being let through.
+            match approved_count {
+                0 => tracing::warn!(
+                    "Unattended host listening, but no device is approved for the admin \
+                     passcode — every connection will be refused. Connect once from a Tain \
+                     window on this machine to approve the device."
+                ),
+                n => tracing::info!(
+                    "Unattended host listening — master codes from {n} approved device(s)"
+                ),
+            }
 
             let serving = server.clone().run();
             tokio::pin!(serving);
@@ -1112,6 +1612,11 @@ mod windows_impl {
             .spawn(serve_control)
             .ok();
 
+        // Started here rather than whenever it is first read, so the grace an
+        // already-running application gets to announce itself is measured from
+        // the service starting and not from some later first question.
+        std::sync::LazyLock::force(&STARTED);
+
         // One agent per desktop of the console session. See `AgentSupervisor`
         // for why it is not one that follows the input around.
         let mut agents = AgentSupervisor::new();
@@ -1153,4 +1658,49 @@ mod windows_impl {
     /// Silences an unused-import warning on the handle type in stub builds.
     #[allow(dead_code)]
     fn _unused(_: HANDLE) {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The whole point of the stamp: a new build is not the old one.
+        ///
+        /// Written against real files rather than a fake clock because the
+        /// property being checked is about what the filesystem reports, and a
+        /// stamp that agreed with a mock while disagreeing with Windows would
+        /// pass this and still let a stale service run.
+        #[test]
+        fn a_rebuilt_binary_does_not_match_the_stamp_taken_before_it() {
+            let dir = std::env::temp_dir().join(format!("tain-stamp-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("a temp directory");
+            let exe = dir.join("pretend.exe");
+
+            std::fs::write(&exe, b"first build").expect("write");
+            let before = build_stamp(&exe).expect("a stamp for a file that exists");
+
+            // Same length, different content and a later write. A rebuild that
+            // happened to produce the same size must still be noticed, which is
+            // what makes the modified time worth carrying.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            std::fs::write(&exe, b"secnd build").expect("rewrite");
+            let after = build_stamp(&exe).expect("a stamp for the rebuilt file");
+
+            assert_ne!(before, after, "a rebuild must not look like the build before it");
+            assert_eq!(after, build_stamp(&exe).expect("stamp"), "and must be stable");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A file that is not there cannot be stamped, and must not pretend.
+        ///
+        /// `installed_copy_is_this_build` reads `None` as "cannot tell" and
+        /// answers yes, so a `Some` here for a missing file would turn "no
+        /// service installed" into a confident claim about a build.
+        #[test]
+        fn a_missing_binary_has_no_stamp() {
+            let missing = std::env::temp_dir().join("tain-no-such-file-here.exe");
+            let _ = std::fs::remove_file(&missing);
+            assert_eq!(build_stamp(&missing), None);
+        }
+    }
 }

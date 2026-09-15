@@ -60,38 +60,32 @@ pub enum ConnectionStatus {
 impl ConnectionStatus {
     /// Label shown in the card's bottom bar. Carries the *state*.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Online => "connected",
-            Self::Connecting => "connecting...",
-            Self::Waiting => "waiting for approval...",
-            Self::Failed => "last attempt failed",
-            Self::Unknown => "checking...",
-            Self::Ready => "online",
-            Self::Stale => "code expired",
-            Self::Unreachable => "offline",
-            Self::NoCode => "no saved code",
-        }
+        tain_core::i18n::text(match self {
+            Self::Online => "status.connected",
+            Self::Connecting => "status.connecting",
+            Self::Waiting => "status.waiting",
+            Self::Failed => "status.failed",
+            Self::Unknown => "status.checking",
+            Self::Ready => "status.online",
+            Self::Stale => "status.expired",
+            Self::Unreachable => "status.offline",
+            Self::NoCode => "status.no_code",
+        })
     }
 
     /// Longer explanation, for the card's tooltip.
     pub fn detail(self) -> &'static str {
-        match self {
-            Self::Online => "A session to this host is open.",
-            Self::Connecting => "Dialling this host now.",
-            Self::Waiting => "Connected — waiting for the host to allow it.",
-            Self::Failed => "The last attempt to connect did not succeed.",
-            Self::Unknown => "Checking whether this host is reachable and the code still works.",
-            Self::Ready => "This host answered just now and still accepts this code.",
-            Self::Stale => {
-                "This host is reachable, but the code has expired — it generates a new one \
-                 after the last guest disconnects. Ask for the current code."
-            }
-            Self::Unreachable => {
-                "This host did not answer. It may be switched off, asleep, or not \
-                 reachable from this network."
-            }
-            Self::NoCode => "No code is saved for this host, so there is nothing to dial.",
-        }
+        tain_core::i18n::text(match self {
+            Self::Online => "status.connected_detail",
+            Self::Connecting => "status.connecting_detail",
+            Self::Waiting => "status.waiting_detail",
+            Self::Failed => "status.failed_detail",
+            Self::Unknown => "status.checking_detail",
+            Self::Ready => "status.online_detail",
+            Self::Stale => "status.expired_detail",
+            Self::Unreachable => "status.offline_detail",
+            Self::NoCode => "status.no_code_detail",
+        })
     }
 
     /// Colour of the card's action triangle. Carries *actionability*, not state —
@@ -144,25 +138,6 @@ pub struct SavedConnection {
     /// did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
-    /// Where this host answered last time, if a direct path was established.
-    ///
-    /// # Why remembering an address is worth the line
-    ///
-    /// Finding a host normally needs a relay: an endpoint id is a public key,
-    /// not a route, and something has to translate one into the other. On a
-    /// connection where the relays are unreachable — which is the whole reason
-    /// anyone is running a tunnel — that step is where connecting fails.
-    ///
-    /// An address that worked once removes the step. It costs nothing to offer:
-    /// iroh races every candidate and keeps whichever answers first, so a stale
-    /// one simply loses. It cannot reach the wrong machine either, because the
-    /// endpoint id is checked cryptographically during the handshake — the
-    /// worst a wrong address does is fail.
-    ///
-    /// Stored as text rather than parsed, because this file is written by hand
-    /// often enough and a malformed entry should be ignored rather than fatal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_direct_addr: Option<String>,
     /// Plaintext code written by an older build. Only ever read, to migrate it
     /// into the credential store; never written back.
     #[serde(default, skip_serializing)]
@@ -198,7 +173,6 @@ impl SavedConnection {
             display_name,
             last_connected: now_secs(),
             preview: None,
-            last_direct_addr: None,
             legacy_code: None,
             has_code: false,
             status: ConnectionStatus::default(),
@@ -418,36 +392,6 @@ impl ConnectionStore {
     /// session is running and the file would otherwise be rewritten on a timer
     /// for no reason. Silently does nothing for a host with no row — a preview
     /// is not a reason to remember a machine.
-    /// Remember where this host answered, for the next connection.
-    ///
-    /// Returns whether anything changed, so a caller can avoid writing the file
-    /// when a session reports the same address every few seconds.
-    pub fn set_direct_addr(&mut self, endpoint_id: &str, addr: &str) -> bool {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.endpoint_id == endpoint_id) else {
-            return false;
-        };
-        if entry.last_direct_addr.as_deref() == Some(addr) {
-            return false;
-        }
-        entry.last_direct_addr = Some(addr.to_string());
-        true
-    }
-
-    /// Where this host answered last time, if it parses as an address.
-    ///
-    /// A malformed entry is dropped rather than reported: it came from a file
-    /// somebody may have edited, and the cost of ignoring it is one relay
-    /// lookup.
-    pub fn direct_addr(&self, endpoint_id: &str) -> Option<std::net::SocketAddr> {
-        self.entries
-            .iter()
-            .find(|e| e.endpoint_id == endpoint_id)?
-            .last_direct_addr
-            .as_deref()?
-            .parse()
-            .ok()
-    }
-
     pub fn set_preview(&mut self, endpoint_id: &str, pixels: &[u8]) -> bool {
         let encoded = super::preview::encode(pixels);
         let Some(entry) = self.entries.iter_mut().find(|c| c.endpoint_id == endpoint_id) else {
@@ -500,23 +444,23 @@ impl ConnectionStore {
         }
     }
 
-    /// Every row we hold a code for, as `(endpoint_hex, code, known addresses)`.
-    ///
-    /// The addresses matter: probing with the relay alone reported a host on
-    /// this very network as offline every sweep, while Connect reached it
-    /// directly and at once. A sweep that does less than the button it is
-    /// describing will disagree with it.
+    /// Every row we hold a code for, as `(endpoint_hex, code)`.
     ///
     /// Pulled out in one pass so the prober can work without holding the store
     /// locked across the network.
-    pub fn probe_targets(&self) -> Vec<(String, String, Vec<std::net::SocketAddr>)> {
+    ///
+    /// A remembered address used to come with each one, so that a sweep did
+    /// what the Connect button did. Both stopped doing it: an address from a
+    /// previous session is not evidence about the present, and a sweep that
+    /// clung to a stale one reported a reachable host as offline — the one
+    /// thing a card exists to answer. See `GuestClient::connect_reporting`.
+    pub fn probe_targets(&self) -> Vec<(String, String)> {
         self.entries
             .iter()
             .filter(|e| e.has_code)
             .filter_map(|e| {
                 let code = self.secrets.load(&e.endpoint_id)?;
-                let addrs = self.direct_addr(&e.endpoint_id).into_iter().collect();
-                Some((e.endpoint_id.clone(), code, addrs))
+                Some((e.endpoint_id.clone(), code))
             })
             .collect()
     }
@@ -585,40 +529,35 @@ pub fn placeholder_name(endpoint_hex: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// The address is remembered per host and read back as an address.
+    /// Nothing here remembers where a host was.
+    ///
+    /// # Why this is a test and not simply an absence
+    ///
+    /// Caching the address a host answered on has been added three times, in
+    /// three shapes — raced alongside the relay, then gated on "no lookup
+    /// answered", then gated on a discovery grace — and each one was reported
+    /// as still breaking connections that worked the moment the cache was
+    /// deleted. The reasoning is in `docs/decisions.md` and in
+    /// `GuestClient::connect_reporting`.
+    ///
+    /// The signature change is what actually enforces it; this is here so that
+    /// somebody adding the field back reads why before they do. A saved row is
+    /// a name, a code and a picture — where the machine *was* is not a property
+    /// worth keeping.
     #[test]
-    fn a_direct_address_is_remembered_and_parsed_back() {
+    fn a_saved_connection_remembers_no_address() {
         let mut store = ConnectionStore::new();
         store.record("aa".into(), "MASTER-x".into(), "Host");
 
-        assert_eq!(store.direct_addr("aa"), None, "nothing known yet");
-        assert!(store.set_direct_addr("aa", "203.0.113.9:41641"));
-        assert_eq!(
-            store.direct_addr("aa"),
-            Some("203.0.113.9:41641".parse().unwrap()),
+        let written = serde_json::to_string(&store.entries).expect("a saved list serialises");
+        assert!(
+            !written.contains("addr"),
+            "a saved connection is carrying an address again: {written}"
         );
 
-        // Writing the same one again is not a change, so a session reporting it
-        // every few seconds does not rewrite the file.
-        assert!(!store.set_direct_addr("aa", "203.0.113.9:41641"));
-        assert!(store.set_direct_addr("aa", "203.0.113.9:5000"));
-    }
-
-    /// A hand-edited file must not take the connection down with it.
-    #[test]
-    fn an_unparseable_address_is_ignored_rather_than_fatal() {
-        let mut store = ConnectionStore::new();
-        store.record("bb".into(), "MASTER-y".into(), "Host");
-        store.set_direct_addr("bb", "not an address");
-        assert_eq!(store.direct_addr("bb"), None);
-    }
-
-    /// An address for a host that is not saved goes nowhere.
-    #[test]
-    fn remembering_an_address_for_an_unknown_host_does_nothing() {
-        let mut store = ConnectionStore::new();
-        assert!(!store.set_direct_addr("missing", "203.0.113.9:41641"));
-        assert_eq!(store.direct_addr("missing"), None);
+        // And what it does keep is still kept.
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.entries[0].endpoint_id, "aa");
     }
 
     use super::*;
@@ -634,8 +573,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (id, name))| SavedConnection {
-                last_direct_addr: None,
-                preview: None,
+                    preview: None,
                 endpoint_id: (*id).to_string(),
                 display_name: (*name).to_string(),
                 legacy_code: None,
@@ -846,7 +784,6 @@ mod tests {
     fn a_row_without_a_code_says_so_rather_than_looking_connectable() {
         let mut store = ConnectionStore::new();
         store.entries.push(SavedConnection {
-            last_direct_addr: None,
             preview: None,
             endpoint_id: "abc".into(),
             display_name: "Old PC".into(),

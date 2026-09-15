@@ -54,6 +54,13 @@ use super::screen_capture::{
 /// this tick. Comfortably longer than one panel's own wait.
 const WAIT: std::time::Duration = std::time::Duration::from_millis(40);
 
+/// How long a pump waits before asking a source that had nothing again.
+///
+/// Short enough to be invisible against a sixteen-millisecond frame budget, and
+/// long enough that asking is not a spin — see the pump's own note. A source
+/// that blocks on its own pays this only on top of a wait it already did.
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// The widest or tallest a composed wall may be.
 ///
 /// # Why the capture layer knows about encoders
@@ -88,16 +95,57 @@ struct Panel {
     /// Contended for the length of one capture, which is the same arrangement
     /// [`super::capture_shared`] uses for the same reason.
     capturer: Mutex<Box<dyn ScreenCaptureBackend>>,
-    /// Offset within the wall, in wall pixels. Never negative: the layout is
-    /// shifted so the top-left of the bounding box is the origin.
-    x: u32,
-    y: u32,
-    /// The display's own size, for working out its share of the wall.
-    source: (u16, u16),
+    /// Where this panel sits and how big its source is, in wall pixels.
+    ///
+    /// # Why this can change without the wall being rebuilt
+    ///
+    /// A display's size is a fact for the life of the wall — a mode change
+    /// rearranges the desk and rebuilds it. A *window's* is not: somebody drags
+    /// its edge and it is a different shape, while the capture behind it
+    /// carries on perfectly well, because the compositor follows the window and
+    /// does not care what size it is.
+    ///
+    /// Left fixed, the panel keeps the slot it was given at construction and
+    /// the frame arriving for it is squashed into the old shape. Switching away
+    /// and back corrected it, which is what a stale layout looks like from the
+    /// outside. See [`Wall::relayout`].
+    ///
+    /// Never negative: the layout is shifted so the top-left of the bounding
+    /// box is the origin.
+    at: Mutex<Placement>,
     /// What the display is called, for a log line that has to name which one.
     name: String,
     /// The latest frame this display produced, if it has produced one.
     frame: Mutex<Option<ScreenFrame>>,
+    /// That frame, resampled to the slot it has to fill, and which slot that
+    /// was.
+    ///
+    /// Only ever populated for a panel that is not producing its slot's size —
+    /// see [`Wall::compose`], which explains why that happens and why doing the
+    /// resample once instead of once a frame is the difference between a
+    /// composite that runs and one that does not.
+    ///
+    /// Cleared by the pump when a newer frame arrives, which is what keeps it
+    /// honest: it is a property of the frame beside it, not of the panel.
+    fitted: Mutex<Option<Fitted>>,
+}
+
+/// A panel's frame resampled to a slot, and which slot that was.
+type Fitted = ((u16, u16), Vec<u8>);
+
+/// Where a panel sits on the wall and how big the thing behind it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement {
+    x: u32,
+    y: u32,
+    /// The source's own size, for working out its share of the wall.
+    source: (u16, u16),
+}
+
+impl Panel {
+    fn placement(&self) -> Placement {
+        *self.at.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Displays composed into one picture, laid out as the host has them.
@@ -122,7 +170,19 @@ pub struct Wall {
     /// Once each: it happens on every frame for as long as the other session
     /// lasts, and a log line per frame is how a diagnosis gets buried.
     resized: std::collections::BTreeSet<String>,
-    /// The arrangement this wall was built from.
+    /// What this wall is made of, and what would make it out of date.
+    composed: Composed,
+}
+
+/// What a wall is composed from, and what "out of date" means for it.
+///
+/// The composition itself does not care — it copies rectangles into a buffer —
+/// but the two sources go stale for entirely different reasons, and neither can
+/// fix itself in place: the panels are attached to particular displays or
+/// particular windows. So each says when it should be rebuilt, and the session
+/// rebuilds it. See [`Wall::stale`].
+enum Composed {
+    /// Displays, laid out where the host has them.
     ///
     /// A wall is a picture of where the screens *are*, and that is a fact about
     /// the machine at the moment it was composed. Someone dragging a monitor to
@@ -134,10 +194,23 @@ pub struct Wall {
     /// Worse than looking wrong: the pointer maps guest coordinates through the
     /// desk's bounding box, so a stale layout puts the pointer somewhere the
     /// user did not click.
+    Desk {
+        /// Name, position and size of every display, as it was.
+        layout: Vec<(String, i32, i32, u16, u16)>,
+    },
+    /// Windows, tiled.
     ///
-    /// It cannot fix itself — the panels are attached to particular displays —
-    /// so it reports instead, and the session rebuilds it. See [`Self::stale`].
-    layout: Vec<(String, i32, i32, u16, u16)>,
+    /// Moving a window changes nothing here — the grid is not where they are —
+    /// which is the point: a guest watching a composite should not have the
+    /// picture rearrange itself every time somebody drags something. What does
+    /// change it is a window going away or coming back.
+    Windows {
+        /// Every window the session asked for, including any that could not be
+        /// captured at the moment this was built.
+        wanted: Vec<u64>,
+        /// The ones that actually got a panel, in grid order.
+        present: Vec<u64>,
+    },
 }
 
 /// The arrangement, as a value that can be compared.
@@ -191,10 +264,13 @@ impl Wall {
             let panel = Arc::new(Panel {
                 name: screen.name.clone(),
                 capturer: Mutex::new(capturer),
-                x: (screen.x - left).max(0) as u32,
-                y: (screen.y - top).max(0) as u32,
-                source: (screen.width, screen.height),
+                at: Mutex::new(Placement {
+                    x: (screen.x - left).max(0) as u32,
+                    y: (screen.y - top).max(0) as u32,
+                    source: (screen.width, screen.height),
+                }),
                 frame: Mutex::new(None),
+                fitted: Mutex::new(None),
             });
             panels.push(Arc::clone(&panel));
             pumps.push(spawn_pump(
@@ -230,13 +306,233 @@ impl Wall {
             granularity: (2, 2),
             buffer: Vec::new(),
             resized: std::collections::BTreeSet::new(),
-            layout: layout_now(),
+            composed: Composed::Desk { layout: layout_now() },
         };
         // Before the first frame, not on the first resize: a display whose slot
         // is smaller than itself has to be told so, and at native scale a wall
         // of two differently sized screens already has one.
         wall.resize_panels();
         Ok(wall)
+    }
+
+    /// Compose these windows, tiled, capturing each one.
+    ///
+    /// # Why a grid and not where the windows are
+    ///
+    /// Screens are composed where the host has them because that is a fact:
+    /// they sit beside each other on a desk, and reproducing the arrangement
+    /// reproduces the desk. Windows are not like that. They overlap, in a stack
+    /// whose order changes as somebody works — so laying them out by position
+    /// would hide whichever is underneath, and two maximised windows would
+    /// compose into a picture of one window. Seeing all of them is the entire
+    /// reason for asking for this view.
+    ///
+    /// The cost is that the pointer can no longer map through one rectangle,
+    /// which is what [`Self::input_tiles`] is for.
+    ///
+    /// # Why the cells are the size of the largest window
+    ///
+    /// So nothing is enlarged. A small window in a big cell sits in the middle
+    /// of it with space around; the alternative — a cell per window sized to
+    /// that window — makes a grid with ragged rows, and the alternative to
+    /// *that* is upscaling a 400-pixel utility window to fill a cell beside a
+    /// 4K editor, which spends the picture's resolution on the thing that
+    /// needed it least.
+    ///
+    /// Fails only if not one window could be captured. One out of three failing
+    /// leaves a gap, which is better than no picture — and the log says which.
+    pub fn of_windows(windows: &[super::protocol::WindowInfo]) -> Result<Self> {
+        anyhow::ensure!(!windows.is_empty(), "a composite of no windows is not a picture");
+
+        let sizes: Vec<(u16, u16)> =
+            windows.iter().map(|w| (w.width.max(1), w.height.max(1))).collect();
+        let (bounds, places) = grid(&sizes);
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let fresh = Arc::new((Mutex::new(false), Condvar::new()));
+        let (mut panels, mut pumps, mut present) = (Vec::new(), Vec::new(), Vec::new());
+
+        // # Built at the same time, because each one is slow and none of them
+        // wait for each other
+        //
+        // Measured on the machine that reported this: about 200 ms per window —
+        // roughly a third of it creating a graphics device and the rest setting
+        // up the frame pool and capture session — done one after another. Eight
+        // windows took **3.7 seconds**, which is what "switching back to the
+        // composite takes a while" was.
+        //
+        // Nothing about them is shared, so the only reason it was serial is
+        // that it was written as a loop. Done at once it is the slowest single
+        // window plus the cost of starting some threads.
+        let built: Vec<_> = std::thread::scope(|scope| {
+            let starting: Vec<_> = windows
+                .iter()
+                .map(|window| {
+                    scope.spawn(move || {
+                        (window, super::capture_wgc::WgcCapturer::for_window(window.id))
+                    })
+                })
+                .collect();
+            // In the order they were asked for, not the order they finished:
+            // the grid is positional, and a composite whose cells shuffled
+            // according to which window's driver answered first would be a
+            // different picture every time it was opened.
+            starting.into_iter().filter_map(|one| one.join().ok()).collect()
+        });
+
+        for (index, (window, capturer)) in built.into_iter().enumerate() {
+            let capturer = match capturer {
+                Ok(capturer) => capturer,
+                Err(e) => {
+                    // A gap rather than a failure. A window that is minimised
+                    // cannot be captured and is entitled to come back, which is
+                    // what `stale` watches for.
+                    warn!("Leaving {} out of the composite: {e:#}", window.title);
+                    continue;
+                }
+            };
+
+            // By position in the request, not in the built list: a window that
+            // refused leaves its cell empty rather than shuffling every window
+            // after it one place along. The gap lasts until `stale` notices and
+            // the composite is rebuilt without it, which is the next tick.
+            let panel = Arc::new(Panel {
+                name: window.title.clone(),
+                capturer: Mutex::new(Box::new(capturer)),
+                at: Mutex::new(places[index]),
+                frame: Mutex::new(None),
+                fitted: Mutex::new(None),
+            });
+            panels.push(Arc::clone(&panel));
+            present.push(window.id);
+            pumps.push(spawn_pump(
+                format!("window-{}", window.id),
+                panel,
+                Arc::clone(&stopping),
+                Arc::clone(&fresh),
+            )?);
+        }
+
+        anyhow::ensure!(!panels.is_empty(), "none of the shared windows could be captured");
+
+        let out = QualityScale::Native.apply((
+            bounds.0.min(u16::MAX as u32) as u16,
+            bounds.1.min(u16::MAX as u32) as u16,
+        ));
+        info!(
+            "Composing {} of {} window(s) into a {}x{} grid",
+            panels.len(),
+            windows.len(),
+            out.0,
+            out.1
+        );
+
+        let wall = Self {
+            panels,
+            pumps,
+            stopping,
+            fresh,
+            bounds,
+            out,
+            scale: QualityScale::Native,
+            ceiling: None,
+            granularity: (2, 2),
+            buffer: Vec::new(),
+            resized: std::collections::BTreeSet::new(),
+            composed: Composed::Windows {
+                wanted: windows.iter().map(|w| w.id).collect(),
+                present,
+            },
+        };
+        wall.resize_panels();
+        Ok(wall)
+    }
+
+    /// Re-place the windows for the sizes they are now.
+    ///
+    /// # Why this is not a rebuild
+    ///
+    /// A window being resized changes nothing about the capture behind it — the
+    /// compositor follows the window and does not care what shape it is — so
+    /// tearing down N capture sessions and building N more would be a second of
+    /// black picture to fix some arithmetic. What is stale is only the
+    /// arithmetic: the panel's slot, the cell size derived from the largest
+    /// window, and the bounding box derived from that.
+    ///
+    /// The symptom without it is specific and was reported as such: an
+    /// odd-shaped window keeps the slot it had when the composite was built, so
+    /// a frame of its new shape is squashed into the old one. Switching to that
+    /// window and back rebuilt the wall and corrected it, which is exactly what
+    /// a layout that only refreshes on rebuild looks like from outside.
+    ///
+    /// Returns whether anything moved, so the caller only pays for the resize
+    /// when there was one.
+    fn relayout(&mut self) -> bool {
+        let Composed::Windows { present, .. } = &self.composed else {
+            return false;
+        };
+
+        // What each window is now. A window that has gone missing keeps the
+        // size it had: `stale` is what deals with those, and guessing here
+        // would shrink the grid for a moment before rebuilding it anyway.
+        let sizes: Vec<(u16, u16)> = self
+            .panels
+            .iter()
+            .zip(present)
+            .map(|(panel, id)| {
+                super::window_capture::on_screen(*id)
+                    .map(|at| (at.width.max(1), at.height.max(1)))
+                    .unwrap_or(panel.placement().source)
+            })
+            .collect();
+
+        // The same arithmetic the composite was built with, not a second copy
+        // of it: two implementations of a layout would eventually disagree, and
+        // the symptom would be the picture jumping the first time anybody
+        // resized a window.
+        let (bounds, places) = grid(&sizes);
+
+        let mut moved = self.bounds != bounds;
+        for (panel, want) in self.panels.iter().zip(places) {
+            let mut at = panel.at.lock().unwrap_or_else(|e| e.into_inner());
+            if *at != want {
+                *at = want;
+                moved = true;
+            }
+        }
+
+        if !moved {
+            return false;
+        }
+        self.bounds = bounds;
+        debug!("A shared window changed shape — the composite is now {bounds:?}");
+        true
+    }
+
+    /// Where each panel sits in the composed picture, and where it came from on
+    /// this machine.
+    ///
+    /// `None` for a wall of screens: those already tile the desktop, so the
+    /// pointer maps through one rectangle and needs nothing per panel.
+    fn tiles(&self) -> Option<Vec<super::input_inject::Tile>> {
+        let Composed::Windows { present, .. } = &self.composed else {
+            return None;
+        };
+
+        let mut tiles = Vec::new();
+        for (panel, id) in self.panels.iter().zip(present) {
+            // Asked now rather than remembered: the grid does not move when a
+            // window does, but where the click has to *land* certainly does.
+            let Some(at) = super::window_capture::on_screen(*id) else {
+                continue;
+            };
+            let placed = place_panel(panel, self.bounds, self.out);
+            tiles.push(super::input_inject::Tile {
+                picture: (placed.x, placed.y, placed.width, placed.height),
+                desktop: at,
+            });
+        }
+        (!tiles.is_empty()).then_some(tiles)
     }
 
     /// The size this should emit, from the wall's own size and what has been
@@ -273,7 +569,7 @@ impl Wall {
 
     /// The size and position this display occupies on the wall.
     fn slot(&self, panel: &Panel) -> (u16, u16) {
-        let placed = place(panel.source, (panel.x, panel.y), self.bounds, self.out);
+        let placed = place_panel(panel, self.bounds, self.out);
         (placed.width, placed.height)
     }
 
@@ -284,7 +580,32 @@ impl Wall {
     /// — but asked on a timer anyway, because "cheap" and "sixty times a
     /// second" are a bad combination when the answer changes twice a year.
     pub fn stale(&self) -> bool {
-        layout_now() != self.layout
+        match &self.composed {
+            Composed::Desk { layout } => layout_now() != *layout,
+            // # Which windows *could* be shown, against which are
+            //
+            // Not "has anything changed about them": moving or resizing a
+            // window is not a reason to tear a composite down, and doing it
+            // would rebuild the whole thing on every frame of a drag.
+            //
+            // Comparing against `wanted` rather than only `present` is what
+            // lets a window come *back*. A minimised one cannot be captured, so
+            // it is not a panel — and without asking after it, restoring it
+            // would leave a gap in the picture for the rest of the session.
+            //
+            // Self-limiting in the other direction too: a window that closed
+            // drops out of the answer, the wall is rebuilt without it once, and
+            // the two agree again. Comparing against the original request alone
+            // would make it permanently stale and rebuild every frame.
+            Composed::Windows { wanted, present } => {
+                let showing: Vec<u64> = wanted
+                    .iter()
+                    .copied()
+                    .filter(|id| super::window_capture::state_of(*id).is_live())
+                    .collect();
+                showing != *present
+            }
+        }
     }
 
     /// Say once that a display is not producing the size it was asked for.
@@ -333,7 +654,7 @@ impl Wall {
             // Where this panel starts on the wall, scaled from its position on
             // the desk. Computed per frame because the emitted size changes
             // when the guest resizes its window.
-            let placed = place(panel.source, (panel.x, panel.y), self.bounds, self.out);
+            let placed = place_panel(panel, self.bounds, self.out);
             let (x, y) = (usize::from(placed.x), usize::from(placed.y));
             if x >= usize::from(out_w) || y >= usize::from(out_h) {
                 continue;
@@ -361,16 +682,36 @@ impl Wall {
             // So the slot is authoritative and the frame is fitted to it. The
             // equal case is still a memcpy, which is what it is in the ordinary
             // run where every panel did as it was asked.
+            //
+            // # And it is fitted once, not once a frame
+            //
+            // A panel that is the wrong size is usually the wrong size for a
+            // while: it is showing a still window whose last frame was captured
+            // before the slot was worked out, and nothing new will arrive until
+            // that window changes. Resampling it on every composition meant
+            // paying for a picture that had not moved — measured at 3.2 seconds
+            // per composed frame across seven windows, which is a composite
+            // running at a third of a frame per second while the GPUs sit idle.
+            //
+            // So the fitted copy is kept beside the frame it came from, and the
+            // pump throws it away when it stores a new one.
             let slot = (placed.width, placed.height);
-            let scaled;
+            let fitted = panel.fitted.lock().unwrap_or_else(|e| e.into_inner());
+            let mut fitted = fitted;
             let (pixels, src_w, src_h) = if (frame.width, frame.height) == slot {
                 (&frame.data[..], frame.width, frame.height)
             } else {
-                // Noted rather than logged here: `self.panels` is borrowed by
-                // this loop, and saying so needs `&mut self`.
-                mismatched.push((panel.name.clone(), (frame.width, frame.height), slot));
-                scaled = super::screen_capture::box_downscale(frame, slot.0, slot.1);
-                (&scaled[..], slot.0, slot.1)
+                if fitted.as_ref().map(|(at, _)| *at) != Some(slot) {
+                    // Noted rather than logged here: `self.panels` is borrowed
+                    // by this loop, and saying so needs `&mut self`.
+                    mismatched.push((panel.name.clone(), (frame.width, frame.height), slot));
+                    *fitted = Some((
+                        slot,
+                        super::screen_capture::box_downscale(frame, slot.0, slot.1),
+                    ));
+                }
+                let held = fitted.as_ref().map(|(_, pixels)| &pixels[..]).unwrap_or(&[]);
+                (held, slot.0, slot.1)
             };
 
             let src_stride = usize::from(src_w) * 4;
@@ -418,6 +759,56 @@ struct Placed {
 ///
 /// Sizes are forced even because every codec here needs even dimensions, and a
 /// panel is a picture in its own right before it is part of a bigger one.
+/// Lay these window sizes out in a grid: the bounding box, and where each sits.
+///
+/// # Why a grid and not where the windows are
+///
+/// Screens are composed where the host has them because that is a fact — they
+/// sit beside each other on a desk. Windows overlap, in a stack whose order
+/// changes as somebody works, so laying them out by position would hide
+/// whichever is underneath and two maximised windows would compose into a
+/// picture of one.
+///
+/// Free and taking only sizes, so the arrangement can be tested for counts and
+/// shapes this machine does not happen to have open — and so the composite and
+/// the relayout that follows a resize cannot drift apart.
+fn grid(sizes: &[(u16, u16)]) -> ((u32, u32), Vec<Placement>) {
+    // Square-ish, favouring width, because screens are wider than they are tall
+    // and so is nearly every window on them.
+    let columns = (sizes.len() as f64).sqrt().ceil().max(1.0) as u32;
+    // The largest window, so nothing is enlarged: a small window sits in the
+    // middle of its cell with space around it, where sizing each cell to its
+    // own window makes ragged rows and upscaling a 400-pixel utility window
+    // beside a 4K editor spends the picture on whatever needed it least.
+    let cell = (
+        sizes.iter().map(|s| s.0).max().unwrap_or(1).max(1),
+        sizes.iter().map(|s| s.1).max().unwrap_or(1).max(1),
+    );
+    let rows = sizes.len().div_ceil(columns.max(1) as usize) as u32;
+
+    let inset = |span: u16, of: u16| u32::from(of.saturating_sub(span)) / 2;
+    let places = sizes
+        .iter()
+        .enumerate()
+        .map(|(index, size)| {
+            let (column, row) = (index as u32 % columns, index as u32 / columns);
+            Placement {
+                x: column * u32::from(cell.0) + inset(size.0, cell.0),
+                y: row * u32::from(cell.1) + inset(size.1, cell.1),
+                source: (size.0.max(1), size.1.max(1)),
+            }
+        })
+        .collect();
+
+    ((columns * u32::from(cell.0), rows * u32::from(cell.1)), places)
+}
+
+/// [`place`] for a panel, reading the placement it currently holds.
+fn place_panel(panel: &Panel, bounds: (u32, u32), out: (u16, u16)) -> Placed {
+    let at = panel.placement();
+    place(at.source, (at.x, at.y), bounds, out)
+}
+
 fn place(source: (u16, u16), at: (u32, u32), bounds: (u32, u32), out: (u16, u16)) -> Placed {
     let scale = |value: u64, span: u32, out: u16| {
         (value * u64::from(out) / u64::from(span.max(1))) as u16
@@ -461,13 +852,33 @@ fn spawn_pump(
                 match got {
                     Ok(Some(frame)) => {
                         *panel.frame.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame);
+                        // What was fitted belonged to the frame just replaced.
+                        *panel.fitted.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         let (lock, cv) = &*fresh;
                         *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
                         cv.notify_all();
                     }
-                    // Nothing changed on this display, which is the ordinary
-                    // case for a wall: most screens are still most of the time.
-                    Ok(None) => {}
+                    // # Nothing changed, which is the ordinary case
+                    //
+                    // Most sources are still most of the time, and this loop
+                    // was written for one that *blocks* while that is true — a
+                    // display subscriber waits about twenty-five milliseconds
+                    // for its screen to change, so an empty answer already cost
+                    // a wait and going straight round again was free.
+                    //
+                    // A window does not work that way. `TryGetNextFrame` is in
+                    // its name: the compositor answers "not yet" immediately,
+                    // so this became a spin, at whatever rate the CPU allows,
+                    // holding and releasing the panel's lock the whole time —
+                    // one core per shared window, plus the contention with the
+                    // side trying to compose.
+                    //
+                    // Measured as a composite running at six to ten frames a
+                    // second on a machine whose GPUs were idle, and reported as
+                    // "slow capture" with nothing on either end struggling.
+                    // Both were true: nothing was struggling, and the capture
+                    // thread could not get scheduled.
+                    Ok(None) => std::thread::sleep(IDLE_POLL),
                     Err(e) => {
                         warn!("{name} stopped contributing to the wall: {e:#}");
                         return;
@@ -510,8 +921,13 @@ fn wall_target(
 
 impl ScreenCaptureBackend for Wall {
     fn capture_next(&mut self) -> Result<Option<ScreenFrame>> {
+        // A window that has been resized changes the grid it sits in — see
+        // `relayout`. Asked before the target, because the target is derived
+        // from the bounding box this may have just moved.
+        let moved = self.relayout();
+
         let target = self.target();
-        if target != self.out {
+        if moved || target != self.out {
             self.out = target;
             self.resize_panels();
         }
@@ -565,6 +981,10 @@ impl ScreenCaptureBackend for Wall {
         self.stale()
     }
 
+    fn input_tiles(&self) -> Option<Vec<super::input_inject::Tile>> {
+        self.tiles()
+    }
+
     fn request_format(&mut self, format: PixelFormat) -> bool {
         // See `compose`: a wall is composed in BGRA and nothing else.
         format == PixelFormat::Bgra
@@ -591,6 +1011,197 @@ impl Drop for Wall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows are tiled without overlapping and without being enlarged.
+    ///
+    /// # The two things that would ruin this view
+    ///
+    /// Overlap, because the entire reason for asking for it is seeing every
+    /// window at once — a composite where one covers another is a worse picture
+    /// of the same thing you get by sharing one window. And enlargement,
+    /// because a 400-pixel utility window blown up to fill a cell beside a 4K
+    /// editor spends the picture's resolution on the thing that needed it
+    /// least.
+    #[test]
+    fn a_composite_tiles_its_windows_without_overlap_or_enlargement() {
+        // Deliberately mismatched: a wide one, a tall one, a small one, and a
+        // count that does not fill its last row.
+        let windows = [(1920u16, 1080u16), (800, 1400), (400, 300), (2560, 1440), (640, 480)];
+        let (bounds, places) = grid(&windows);
+
+        // Three across and two down, of cells the size of the largest window.
+        assert_eq!(
+            bounds,
+            (2560 * 3, 1440 * 2),
+            "five windows want a three-by-two grid of the largest window's size"
+        );
+        let out = (bounds.0 as u16, bounds.1 as u16);
+
+        // Every window inside the picture, and no two of them touching.
+        let placed: Vec<Placed> = places
+            .iter()
+            .map(|at| place(at.source, (at.x, at.y), bounds, out))
+            .collect();
+        for (index, one) in placed.iter().enumerate() {
+            assert!(
+                u32::from(one.x) + u32::from(one.width) <= bounds.0
+                    && u32::from(one.y) + u32::from(one.height) <= bounds.1,
+                "window {index} at {one:?} runs off the picture"
+            );
+            for (other_index, other) in placed.iter().enumerate().skip(index + 1) {
+                let apart = u32::from(one.x) + u32::from(one.width) <= u32::from(other.x)
+                    || u32::from(other.x) + u32::from(other.width) <= u32::from(one.x)
+                    || u32::from(one.y) + u32::from(one.height) <= u32::from(other.y)
+                    || u32::from(other.y) + u32::from(other.height) <= u32::from(one.y);
+                assert!(apart, "windows {index} and {other_index} overlap: {one:?} and {other:?}");
+            }
+        }
+
+        // And each keeps its own size, since the picture is the grid at native
+        // scale. Within a pixel, because panels are forced to even dimensions.
+        for (window, one) in windows.iter().zip(&placed) {
+            assert!(
+                one.width.abs_diff(window.0) <= 1 && one.height.abs_diff(window.1) <= 1,
+                "a {}x{} window was drawn {}x{}",
+                window.0,
+                window.1,
+                one.width,
+                one.height
+            );
+        }
+    }
+
+    /// What a live composite costs to run, per frame and in CPU.
+    ///
+    /// Reported rather than asserted. It exists because a composite was
+    /// measured at six to ten frames a second with both machines' GPUs idle,
+    /// and the numbers that answer "why" are the composition cost and how much
+    /// of a core the pumps burn while nothing is changing.
+    #[test]
+    #[ignore = "builds a real capture of every window on this machine — run explicitly"]
+    fn report_what_a_live_composite_costs() {
+        let windows = crate::window_capture::shareable();
+        if windows.len() < 2 {
+            println!("need at least two windows open to compose");
+            return;
+        }
+        let Ok(mut wall) = Wall::of_windows(&windows) else {
+            println!("could not compose them");
+            return;
+        };
+        // What a guest's window would ask for, so the panels are shrunk the way
+        // they are in a real session.
+        wall.set_size_ceiling(Some((1600, 900)));
+
+        // The first composition pays for whatever the panels captured before
+        // they were told their size, so it is not the steady state and is not
+        // what a session spends its life doing.
+        let warmup = std::time::Instant::now();
+        while warmup.elapsed() < std::time::Duration::from_secs(2) {
+            let _ = wall.capture_next();
+        }
+
+        let started = std::time::Instant::now();
+        let (mut frames, mut cost) = (0u32, std::time::Duration::ZERO);
+        while started.elapsed() < std::time::Duration::from_secs(5) {
+            if let Ok(Some(frame)) = wall.capture_next() {
+                frames += 1;
+                cost += frame.cost;
+            }
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        println!(
+            "{} window(s) at {}x{}: {:.1} composed/s, {:.1} ms each",
+            windows.len(),
+            wall.frame_size().0,
+            wall.frame_size().1,
+            f64::from(frames) / seconds,
+            cost.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+        );
+    }
+
+    /// How long a composite takes to build, on this machine, right now.
+    ///
+    /// Reported rather than asserted: it depends on what is open and on the
+    /// graphics driver. It exists because "switching back to the composite
+    /// takes a while" is a complaint with no number in it, and the number is
+    /// what says whether the cost is the capture sessions or something else.
+    #[test]
+    #[ignore = "builds a real capture of every window on this machine — run explicitly"]
+    fn report_how_long_a_composite_takes_to_build() {
+        let windows = crate::window_capture::shareable();
+        if windows.is_empty() {
+            println!("nothing open to compose");
+            return;
+        }
+
+        // One at a time first, so the per-window cost is visible against the
+        // total rather than inferred from it.
+        for window in &windows {
+            let started = std::time::Instant::now();
+            let one = crate::capture_wgc::WgcCapturer::for_window(window.id);
+            println!(
+                "  {:>7.1} ms  {} — {}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                window.app,
+                if one.is_ok() { "ok" } else { "refused" }
+            );
+        }
+
+        let started = std::time::Instant::now();
+        let wall = Wall::of_windows(&windows);
+        println!(
+            "{:.1} ms to compose {} window(s) — {}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            windows.len(),
+            if wall.is_ok() { "ok" } else { "failed" }
+        );
+    }
+
+    /// One window is still one window, not a grid of one.
+    #[test]
+    fn a_composite_of_one_window_is_that_window() {
+        let (bounds, places) = grid(&[(1280, 720)]);
+        assert_eq!(bounds, (1280, 720), "one window is the whole picture");
+        assert_eq!(
+            places,
+            vec![Placement { x: 0, y: 0, source: (1280, 720) }],
+            "with one cell there is nothing to inset it by"
+        );
+    }
+
+    /// A window resized while the composite is showing re-places everything.
+    ///
+    /// # The bug this is for
+    ///
+    /// A panel kept the slot it was given when the composite was built, so a
+    /// window whose shape changed had its frames squashed into the old one.
+    /// Switching to that window and back corrected it, which was the report:
+    /// "doesn't respect aspect ratio when it's changed live". The layout has to
+    /// follow the windows without the capture being rebuilt.
+    #[test]
+    fn resizing_a_window_re_places_the_grid_around_it() {
+        // Two windows, the second much smaller and centred in its cell.
+        let before = grid(&[(1000, 1000), (500, 500)]);
+        assert_eq!(before.0, (2000, 1000), "cells are the larger window");
+        assert_eq!(before.1[1], Placement { x: 1250, y: 250, source: (500, 500) });
+
+        // Now the small one is dragged wider than the big one. The cell grows,
+        // the bounding box grows with it, and *both* windows move — which is
+        // why this cannot be a per-panel fix-up.
+        let after = grid(&[(1000, 1000), (3000, 500)]);
+        assert_eq!(after.0, (6000, 1000), "the cell follows the largest window");
+        assert_eq!(
+            after.1[0],
+            Placement { x: 1000, y: 0, source: (1000, 1000) },
+            "the window that did not change still moved, because its cell did"
+        );
+        assert_eq!(
+            after.1[1],
+            Placement { x: 3000, y: 250, source: (3000, 500) },
+            "the resized window keeps its own shape rather than the old cell's"
+        );
+    }
 
     fn screen(id: u32, x: i32, y: i32, w: u16, h: u16) -> DisplayInfo {
         DisplayInfo {

@@ -72,6 +72,13 @@ windows = { version = "0.58", features = [
     "Win32_System_StationsAndDesktops",
     "Win32_System_Environment",
     "Win32_System_RemoteDesktop",
+    # Letting the installed service receive packets. The service runs from a
+    # copy in ProgramData, which Windows Firewall treats as a different program
+    # from the application — and a service in session zero cannot raise the
+    # prompt that would otherwise create the rule. See `allow_through_firewall`.
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_System_Com",
+    "Win32_System_Variant",
 ] }
 
 # Locating dumpbin.exe and lib.exe for the import-library regeneration.

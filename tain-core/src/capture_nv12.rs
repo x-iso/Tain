@@ -61,11 +61,14 @@ const RGB_SPACE: windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_TYPE =
 const YUV_SPACE: windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_TYPE =
     DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
 
-/// Converts a BGRA desktop texture into a packed NV12 buffer.
+/// Converts and resizes a BGRA texture on the GPU, and reads the result back.
 ///
-/// Owns the whole chain: the video processor, the NV12 render target it writes
-/// to, and the staging texture the result is read back through.
-pub struct Nv12Converter {
+/// Owns the whole chain: the video processor, the render target it writes to,
+/// and the staging texture the result is read back through. What it leaves in
+/// the target is [`Output`].
+pub struct VideoScaler {
+    /// What the target holds, which decides its format and how it is read.
+    output: Output,
     context: ID3D11DeviceContext,
     video_device: ID3D11VideoDevice,
     video: ID3D11VideoContext1,
@@ -90,10 +93,59 @@ pub struct Nv12Converter {
 // SAFETY: every interface held here is `Send`/`Sync` in windows-rs, and the
 // device this was built from is multithread-protected (see `Duplication`). The
 // raw pointer in `input_view` is only ever compared, never dereferenced.
-unsafe impl Send for Nv12Converter {}
-unsafe impl Sync for Nv12Converter {}
+unsafe impl Send for VideoScaler {}
+unsafe impl Sync for VideoScaler {}
 
-impl Nv12Converter {
+/// What the video processor should leave in the target.
+///
+/// # Why the same machinery answers two questions
+///
+/// It was built to convert BGRA to NV12, because that is what the encoder
+/// wants — and resizing came along for free, since the processor rescales in
+/// the same pass. That made the *resize* the valuable part for anything the
+/// encoder does not take NV12 from: a window composite is assembled in BGRA,
+/// and every panel of it was being resized on the CPU at twenty to thirty
+/// milliseconds a frame.
+///
+/// Converting to BGRA is a conversion to the format it already is, which the
+/// driver treats as a scaling blit. One video processor, two answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    /// What the encoder wants: converted and, if asked, resized.
+    Nv12,
+    /// The same pixels at a different size, for a consumer that needs colour it
+    /// can compose with rather than colour an encoder can take.
+    Bgra,
+}
+
+impl Output {
+    fn format(self) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+        match self {
+            Self::Nv12 => DXGI_FORMAT_NV12,
+            Self::Bgra => DXGI_FORMAT_B8G8R8A8_UNORM,
+        }
+    }
+
+    /// The colour space the target is written in.
+    fn space(self) -> windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_TYPE {
+        match self {
+            Self::Nv12 => YUV_SPACE,
+            // Not a conversion at all: the same space in, the same space out.
+            // Saying otherwise would have the driver apply a matrix to pixels
+            // that are already where they should be.
+            Self::Bgra => RGB_SPACE,
+        }
+    }
+
+    fn packed_len(self, width: u16, height: u16) -> usize {
+        match self {
+            Self::Nv12 => nv12_len(width, height),
+            Self::Bgra => usize::from(width) * usize::from(height) * 4,
+        }
+    }
+}
+
+impl VideoScaler {
     /// Build a converter for frames of exactly this size.
     ///
     /// Fails — rather than falling back silently — if the driver cannot do this
@@ -105,16 +157,16 @@ impl Nv12Converter {
         width: u16,
         height: u16,
     ) -> Result<Self> {
-        Self::scaling(device, context, width, height, width, height)
+        Self::scaling(device, context, width, height, width, height, Output::Nv12)
     }
 
     /// Build a converter that also **resizes**, from `src` to `dst`.
     ///
     /// The video processor rescales in the same pass it converts, for free. The
-    /// CPU alternative — `box_downscale` over 4.1 million source pixels, single
-    /// threaded, on the capture thread — is what the host was reporting as
-    /// "Slow capture" every time the controller dropped below full resolution.
-    /// Which is exactly when it is least able to afford it.
+    /// CPU alternative — `box_downscale` over 4.1 million source pixels — is
+    /// what the host was reporting as "Slow capture" every time the controller
+    /// dropped below full resolution. Which is exactly when it is least able to
+    /// afford it.
     pub fn scaling(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -122,11 +174,12 @@ impl Nv12Converter {
         src_height: u16,
         width: u16,
         height: u16,
+        output: Output,
     ) -> Result<Self> {
         // NV12 has a half-resolution chroma plane, so both axes must be even.
         // An odd size is not a driver problem to discover later.
         anyhow::ensure!(
-            width.is_multiple_of(2) && height.is_multiple_of(2),
+            output != Output::Nv12 || (width.is_multiple_of(2) && height.is_multiple_of(2)),
             "NV12 needs even dimensions, got {width}x{height}"
         );
         anyhow::ensure!(
@@ -171,12 +224,15 @@ impl Nv12Converter {
                 enumerator1.CheckVideoProcessorFormatConversion(
                     DXGI_FORMAT_B8G8R8A8_UNORM,
                     RGB_SPACE,
-                    DXGI_FORMAT_NV12,
-                    YUV_SPACE,
+                    output.format(),
+                    output.space(),
                 )
             }
-            .context("could not query BGRA to NV12 support")?;
-            anyhow::ensure!(supported.as_bool(), "this GPU will not convert BGRA to NV12");
+            .context("could not query the format conversion")?;
+            anyhow::ensure!(
+                supported.as_bool(),
+                "this GPU will not convert BGRA to {output:?}"
+            );
         }
 
         // SAFETY: the enumerator outlives the processor it produces.
@@ -186,7 +242,7 @@ impl Nv12Converter {
         // SAFETY: processor is live; both colour spaces are valid enum values.
         unsafe {
             video.VideoProcessorSetStreamColorSpace1(&processor, 0, RGB_SPACE);
-            video.VideoProcessorSetOutputColorSpace1(&processor, YUV_SPACE);
+            video.VideoProcessorSetOutputColorSpace1(&processor, output.space());
             // No deinterlacing, no cadence detection — the desktop is progressive
             // and telling the driver so keeps it out of the reference-frame
             // machinery entirely.
@@ -201,20 +257,22 @@ impl Nv12Converter {
             device,
             width,
             height,
+            output.format(),
             D3D11_USAGE_DEFAULT,
             D3D11_BIND_RENDER_TARGET.0 as u32,
             0,
         )
-        .context("could not create the NV12 render target")?;
+        .context("could not create the render target")?;
         let staging = create_texture(
             device,
             width,
             height,
+            output.format(),
             D3D11_USAGE_STAGING,
             0,
             D3D11_CPU_ACCESS_READ.0 as u32,
         )
-        .context("could not create the NV12 staging texture")?;
+        .context("could not create the staging texture")?;
 
         let view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -233,13 +291,15 @@ impl Nv12Converter {
         .context("could not create the NV12 output view")?;
 
         if (src_width, src_height) == (width, height) {
-            info!("GPU colour conversion ready — BGRA to NV12 at {width}x{height}");
+            info!("GPU conversion ready — BGRA to {output:?} at {width}x{height}");
         } else {
             info!(
-                "GPU colour conversion ready — BGRA {src_width}x{src_height} to NV12 {width}x{height}"
+                "GPU conversion ready — BGRA {src_width}x{src_height} to \
+                 {output:?} {width}x{height}"
             );
         }
         Ok(Self {
+            output,
             context: context.clone(),
             video_device,
             video,
@@ -254,9 +314,9 @@ impl Nv12Converter {
         })
     }
 
-    /// Packed NV12 bytes for one frame of this converter's size.
+    /// Packed bytes for one frame of this converter's size and format.
     pub fn output_len(&self) -> usize {
-        nv12_len(self.width, self.height)
+        self.output.packed_len(self.width, self.height)
     }
 
     /// Convert one BGRA desktop texture and read the NV12 result back.
@@ -312,8 +372,11 @@ impl Nv12Converter {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
                 .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .context("could not map the NV12 staging texture")?;
-            let out = read_nv12(&mapped, self.width, self.height);
+                .context("could not map the staging texture")?;
+            let out = match self.output {
+                Output::Nv12 => read_nv12(&mapped, self.width, self.height),
+                Output::Bgra => read_bgra(&mapped, self.width, self.height),
+            };
             self.context.Unmap(&self.staging, 0);
             out
         }
@@ -367,6 +430,42 @@ fn nv12_len(width: u16, height: u16) -> usize {
 ///
 /// # Safety
 /// `mapped.pData` must point to at least `RowPitch * height * 3 / 2` readable bytes.
+/// Copy a mapped BGRA surface into a tightly packed buffer.
+///
+/// # SAFETY
+///
+/// `mapped` must describe a live, readable mapping of a BGRA surface at least
+/// `width` by `height`.
+unsafe fn read_bgra(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    width: u16,
+    height: u16,
+) -> Result<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    let row = w * 4;
+    let pitch = mapped.RowPitch as usize;
+    // The driver pads rows for alignment, so the mapping is almost never
+    // `width * 4` wide — copying it as one block produces a skewed picture. The
+    // duplication path learned this the same way.
+    anyhow::ensure!(pitch >= row, "BGRA row pitch {pitch} is narrower than {row} bytes");
+    anyhow::ensure!(!mapped.pData.is_null(), "BGRA mapping has no data");
+
+    let mut out = vec![0u8; row * h];
+    // SAFETY: the contract above — `pitch * h` bytes are readable, and each
+    // destination row is exactly `row` bytes of it.
+    unsafe {
+        let base = mapped.pData as *const u8;
+        for y in 0..h {
+            std::ptr::copy_nonoverlapping(
+                base.add(y * pitch),
+                out.as_mut_ptr().add(y * row),
+                row,
+            );
+        }
+    }
+    Ok(out)
+}
+
 unsafe fn read_nv12(
     mapped: &D3D11_MAPPED_SUBRESOURCE,
     width: u16,
@@ -420,6 +519,7 @@ fn create_texture(
     device: &ID3D11Device,
     width: u16,
     height: u16,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE,
     bind: u32,
     cpu_access: u32,
@@ -429,7 +529,7 @@ fn create_texture(
         Height: height as u32,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_NV12,
+        Format: format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: usage,
         BindFlags: bind,
@@ -618,14 +718,15 @@ mod tests {
         let source = test_texture(&device, &bgra, sw, sh);
 
         let mut converter =
-            Nv12Converter::scaling(&device, &context, sw, sh, dw, dh).expect("converter");
+            VideoScaler::scaling(&device, &context, sw, sh, dw, dh, Output::Nv12)
+                .expect("converter");
         let out = converter.convert(&source).expect("convert");
 
         assert_eq!(out.len(), nv12_len(dw, dh), "output must be the requested size");
 
         // Compare against converting the same colour without a resize: scaling
         // must not shift the colour, only the pixel count.
-        let mut same_size = Nv12Converter::new(&device, &context, sw, sh).expect("converter");
+        let mut same_size = VideoScaler::new(&device, &context, sw, sh).expect("converter");
         let reference = same_size.convert(&source).expect("convert");
 
         let mid = (dh as usize / 2) * dw as usize + dw as usize / 2;
@@ -636,6 +737,84 @@ mod tests {
         );
     }
 
+    /// Scaling BGRA to BGRA moves the pixels and leaves the colour alone.
+    ///
+    /// # What this is guarding
+    ///
+    /// The composite is assembled in BGRA and its panels are now shrunk by the
+    /// same video processor that converts for the encoder. That processor's
+    /// whole job is colour, and asking it for a *resize* means telling it the
+    /// output is in the space the input already was — get that wrong and every
+    /// window in a composite is tinted, consistently, in a way that looks like a
+    /// display setting rather than a bug.
+    ///
+    /// Compared against the CPU resize the GPU is replacing, which is the thing
+    /// it has to agree with.
+    #[test]
+    #[ignore = "requires a D3D11 device with video support"]
+    fn scaling_bgra_on_the_gpu_keeps_the_colours_the_cpu_would() {
+        let (sw, sh) = (64u16, 64u16);
+        let (dw, dh) = (32u16, 32u16);
+        let Some((device, context)) = test_device() else { return };
+
+        // A colour per quadrant, so a resize that lost a channel or shifted the
+        // space cannot pass by averaging into grey.
+        let mut bgra = vec![0u8; sw as usize * sh as usize * 4];
+        for y in 0..sh as usize {
+            for x in 0..sw as usize {
+                let quadrant = (x >= sw as usize / 2, y >= sh as usize / 2);
+                let colour = match quadrant {
+                    (false, false) => [20u8, 40, 200, 255],
+                    (true, false) => [30, 200, 50, 255],
+                    (false, true) => [220, 60, 40, 255],
+                    (true, true) => [200, 200, 200, 255],
+                };
+                bgra[(y * sw as usize + x) * 4..][..4].copy_from_slice(&colour);
+            }
+        }
+        let source = test_texture(&device, &bgra, sw, sh);
+
+        let mut scaler =
+            match VideoScaler::scaling(&device, &context, sw, sh, dw, dh, Output::Bgra) {
+                Ok(scaler) => scaler,
+                // A driver that will not do this is a supported answer; the
+                // caller keeps the CPU path. Nothing to compare in that case.
+                Err(e) => {
+                    println!("this GPU will not scale BGRA: {e:#}");
+                    return;
+                }
+            };
+        let got = scaler.convert(&source).expect("convert");
+        assert_eq!(got.len(), usize::from(dw) * usize::from(dh) * 4);
+
+        let reference = crate::screen_capture::box_downscale(
+            &crate::screen_capture::ScreenFrame::new(
+                sw,
+                sh,
+                bytes::Bytes::from(bgra),
+                std::time::Duration::ZERO,
+            ),
+            dw,
+            dh,
+        );
+
+        // Sampled well inside each quadrant, so the two resamplers' differing
+        // treatment of the boundary is not what is being compared. A colour
+        // space or channel mistake is tens of levels; this allows eight.
+        for (x, y) in [(8usize, 8usize), (24, 8), (8, 24), (24, 24)] {
+            let at = (y * dw as usize + x) * 4;
+            for channel in 0..3 {
+                let (gpu, cpu) = (got[at + channel] as i32, reference[at + channel] as i32);
+                assert!(
+                    (gpu - cpu).abs() <= 8,
+                    "at ({x}, {y}) channel {channel}: GPU {gpu}, CPU {cpu} — the GPU resize \
+                     is not the same colour"
+                );
+            }
+            assert_eq!(got[at + 3], 255, "alpha should come through opaque");
+        }
+    }
+
     /// The real thing, on whatever GPU is in this machine.
     #[test]
     #[ignore = "requires a D3D11 device with video support"]
@@ -643,7 +822,7 @@ mod tests {
         let (w, h) = (64u16, 64u16);
         let Some((device, context)) = test_device() else { return };
 
-        let mut converter = Nv12Converter::new(&device, &context, w, h).expect("converter");
+        let mut converter = VideoScaler::new(&device, &context, w, h).expect("converter");
         let mut cpu = vec![0u8; nv12_len(w, h)];
         // A few levels: the fixed-function path rounds differently from the
         // scalar one. A colour-space or range mismatch is tens of levels, so

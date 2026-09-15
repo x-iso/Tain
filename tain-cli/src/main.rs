@@ -211,6 +211,9 @@ async fn main() -> Result<()> {
     let _running = display_driver::presence::announce();
 
     let state = gui::AppState::persistent();
+    // Before anything draws. The catalogues are compiled in, so this is a
+    // lookup rather than any kind of load — see `tain_core::i18n`.
+    tain_core::i18n::follow(&state.settings().language);
     #[cfg(debug_assertions)]
     gui::app::seed_demo_data(&state);
 

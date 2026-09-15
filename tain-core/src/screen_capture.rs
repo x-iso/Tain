@@ -13,6 +13,64 @@ use tracing::*;
 /// Assumed display size when the platform cannot be queried.
 const FALLBACK_DISPLAY: (u16, u16) = (1920, 1080);
 
+/// A capture failure that has something to be done about it, named rather than
+/// worded.
+///
+/// # Why this is not simply a sentence
+///
+/// The remedy for a wrong-GPU failure is four paragraphs of advice about the
+/// *host's* Windows settings, and the only screen it ever reaches is the
+/// *guest's* — the host logs it and hands it to the session, which sends it on.
+/// Written as prose it is therefore prose in the wrong language by
+/// construction, which is the same fault [`super::protocol::SessionEnd`] was
+/// carrying and for the same reason.
+///
+/// So it travels as a key and its placeholder values, and the machine that
+/// shows it is the machine that picks the words. `Display` renders English,
+/// because the only thing that reads it locally is the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remedy {
+    /// One of [`super::protocol::end_reason::wrong_gpu`], which is also what
+    /// travels as `SessionEnd::reason`.
+    pub code: &'static str,
+    /// Values for that sentence's `{placeholders}`.
+    pub args: Vec<(String, String)>,
+}
+
+impl Remedy {
+    pub fn new(code: &'static str, args: &[(&str, &str)]) -> Self {
+        let args = args.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        Self { code, args }
+    }
+
+    /// The remedy inside an error chain, if there is one.
+    ///
+    /// Looked for by type rather than by text, so it survives however many
+    /// layers of context the session-start path puts on top of it.
+    pub fn in_chain(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|link| link.downcast_ref::<Self>())
+    }
+
+    /// Where the words live. The same shape the guest builds from a
+    /// `SessionEnd`, and the reason both ends read the same sentence.
+    pub fn key(&self) -> String {
+        format!("end.{}", self.code)
+    }
+
+    /// The args as `i18n::format` wants them.
+    pub fn pairs(&self) -> Vec<(&str, &str)> {
+        self.args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+    }
+}
+
+impl std::fmt::Display for Remedy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&super::i18n::format_in_english(&self.key(), &self.pairs()))
+    }
+}
+
+impl std::error::Error for Remedy {}
+
 /// Fraction of the host's native resolution to stream.
 ///
 /// Downscaling is the main bandwidth lever while the pipeline is uncompressed —
@@ -43,12 +101,12 @@ impl QualityScale {
     }
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Native => "Native",
-            Self::High => "High (75%)",
-            Self::Medium => "Medium (50%)",
-            Self::Low => "Low (33%)",
-        }
+        crate::i18n::text(match self {
+            Self::Native => "quality.native",
+            Self::High => "quality.high",
+            Self::Medium => "quality.medium",
+            Self::Low => "quality.low",
+        })
     }
 
     /// Apply to a native size, keeping both axes even and at least 2px.
@@ -185,6 +243,24 @@ pub enum DisplayTarget {
     /// Every display, composed into one picture laid out as the host has them.
     /// See [`super::capture_wall`].
     All,
+    /// One application window, by handle, and nothing around it.
+    ///
+    /// Only the compositor can produce this — a window that is partly covered
+    /// is not in the desktop image to be cropped out of. See
+    /// [`super::window_capture`] and [`super::capture_wgc`].
+    Window(u64),
+    /// Several application windows, tiled into one picture, and nothing else.
+    ///
+    /// The window answer to [`Self::All`], and laid out differently for a
+    /// reason. Screens are composed where the host has them because they *are*
+    /// somewhere: they sit beside each other on a desk and the arrangement is a
+    /// fact. Windows overlap, in a stack whose order changes as somebody works,
+    /// so composing them by position would hide the ones underneath — two
+    /// maximised windows would show as one. A grid shows all of them, which is
+    /// the entire reason for asking.
+    ///
+    /// See [`super::capture_wall::Wall::of_windows`].
+    Windows(Vec<u64>),
 }
 
 /// What the monitor calls itself, for a person choosing between them.
@@ -606,6 +682,20 @@ pub trait ScreenCaptureBackend: Send + Sync {
         false
     }
 
+    /// How a guest's coordinates map back to this machine, when one rectangle
+    /// will not do.
+    ///
+    /// `None` from everything that produces a picture of one region of the
+    /// desktop — a screen, a window, a wall of screens — because a uniform
+    /// scale of one rectangle is what the injector already assumes.
+    ///
+    /// `Some` only from a composite of windows, which is an arrangement this
+    /// end invented out of sources scattered across the desk. See
+    /// [`super::input_inject::Tile`].
+    fn input_tiles(&self) -> Option<Vec<super::input_inject::Tile>> {
+        None
+    }
+
     /// Emit only sizes whose axes are multiples of these.
     ///
     /// The encoder's constraint, not the capturer's — see
@@ -680,7 +770,12 @@ pub fn negotiate_format(
         );
         return PixelFormat::Bgra;
     }
-    debug!("Capture format: {wanted:?}, as the encoder asked");
+    // At `info` like the refusal above, and for the same reason: which of the
+    // two happened decides whether the resize and the colour pass run on the
+    // GPU or on the CPU, and that is the first question to ask about a session
+    // that will not reach its frame rate. A line each way means the log answers
+    // it rather than only recording the bad case.
+    info!("Capture format: {wanted:?}, as the encoder asked — converted on the GPU");
     wanted
 }
 
@@ -835,6 +930,41 @@ impl ScreenCaptureBackend for Scaled {
         true
     }
 
+    /// Forwarded, with the tiles moved into the size this actually emits.
+    ///
+    /// # Why this is here for a case that should not arise
+    ///
+    /// Only a composite of windows has tiles, and it scales itself — so
+    /// [`create_capturer`] never wraps one in this. "Never" of that kind is a
+    /// property of code somewhere else, and the failure if it stops holding is
+    /// silent: the tiles would describe a picture larger than the one being
+    /// sent, and every click would land short of where the guest aimed.
+    fn input_tiles(&self) -> Option<Vec<super::input_inject::Tile>> {
+        let tiles = self.inner.input_tiles()?;
+        let (from_w, from_h) = self.inner.frame_size();
+        let across = |value: u16, from: u16, to: u16| -> u16 {
+            (u32::from(value) * u32::from(to) / u32::from(from.max(1))).min(u32::from(u16::MAX))
+                as u16
+        };
+        Some(
+            tiles
+                .into_iter()
+                .map(|tile| {
+                    let (x, y, w, h) = tile.picture;
+                    super::input_inject::Tile {
+                        picture: (
+                            across(x, from_w, self.width),
+                            across(y, from_h, self.height),
+                            across(w, from_w, self.width),
+                            across(h, from_h, self.height),
+                        ),
+                        ..tile
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// Always BGRA.
     ///
     /// Deliberately not forwarded to the inner backend. This wrapper resamples
@@ -917,7 +1047,45 @@ pub fn snap_to(size: (u16, u16), granularity: (u16, u16)) -> (u16, u16) {
 ///
 /// Box-averaging rather than nearest-neighbour: point sampling a desktop makes
 /// text shimmer as it moves, which reads as a streaming fault.
+///
+/// # Why this is worth threading
+///
+/// It is the whole cost of the capture path that cannot hand its resize to the
+/// GPU: a window captured as BGRA, and every panel of a composite. Measured on
+/// one thread at **22 ms** for a 2446x1516 window and **33 ms** for a 4K one —
+/// against a 16.7 ms budget at 60 fps, so the frame rate could not reach its
+/// target however idle the machines were. A single shared window was reported
+/// streaming at sixteen frames a second, which is exactly where the adaptive
+/// controller settles when capture costs this much.
+///
+/// The rows of the output are independent, which is what makes this a band per
+/// worker and no synchronisation beyond the join — the same shape as the NV12
+/// conversion in `codec_mf`, and for the same reason.
 pub(crate) fn box_downscale(frame: &ScreenFrame, dst_w: u16, dst_h: u16) -> Vec<u8> {
+    /// Below this, threading costs more than it saves: spawning is tens of
+    /// microseconds and a small resize is not much more than that.
+    const ROWS_PER_WORKER: usize = 64;
+
+    /// Source pixels one worker is worth asking for.
+    ///
+    /// # Why a resize does not simply take every core
+    ///
+    /// It is not the only one running. A composite resizes every panel at once,
+    /// on a thread each, so a core per worker meant a sixteen-thread machine
+    /// spawning ninety-six threads per composed frame — reported as every core
+    /// pinned, with no gain in frame rate, because there was none to be had.
+    ///
+    /// Asking for workers in proportion to the *work* settles both ends of
+    /// that: a panel in a grid is small and asks for one or two, while a 4K
+    /// window on its own asks for eight and gets its resize back under the
+    /// frame budget. The whole machine is never handed to one caller, and no
+    /// caller is capped for the sake of a neighbour it does not have.
+    const PIXELS_PER_WORKER: usize = 1_000_000;
+
+    /// However much work there is. Beyond this the measurement flattens and the
+    /// spawns start costing more than the split saves.
+    const MAX_WORKERS: usize = 8;
+
     let (sw, sh) = (frame.width as usize, frame.height as usize);
     let (dw, dh) = (dst_w as usize, dst_h as usize);
     let mut out = vec![0u8; dw * dh * 4];
@@ -925,7 +1093,39 @@ pub(crate) fn box_downscale(frame: &ScreenFrame, dst_w: u16, dst_h: u16) -> Vec<
         return out;
     }
 
-    for dy in 0..dh {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(MAX_WORKERS)
+        .min((sw * sh).div_ceil(PIXELS_PER_WORKER))
+        .min(dh.div_ceil(ROWS_PER_WORKER))
+        .max(1);
+    let band = dh.div_ceil(workers);
+    let source = &frame.data[..];
+
+    if workers == 1 {
+        downscale_band(source, (sw, sh), (dw, dh), 0, &mut out);
+        return out;
+    }
+
+    std::thread::scope(|scope| {
+        for (index, rows) in out.chunks_mut(band * dw * 4).enumerate() {
+            scope.spawn(move || downscale_band(source, (sw, sh), (dw, dh), index * band, rows));
+        }
+    });
+    out
+}
+
+/// Resample the destination rows starting at `first_row` into `out`.
+fn downscale_band(
+    source: &[u8],
+    (sw, sh): (usize, usize),
+    (dw, dh): (usize, usize),
+    first_row: usize,
+    out: &mut [u8],
+) {
+    for local in 0..out.len() / (dw * 4) {
+        let dy = first_row + local;
         let y0 = dy * sh / dh;
         let y1 = (((dy + 1) * sh).div_ceil(dh)).min(sh).max(y0 + 1);
         for dx in 0..dw {
@@ -939,20 +1139,19 @@ pub(crate) fn box_downscale(frame: &ScreenFrame, dst_w: u16, dst_h: u16) -> Vec<
                 for sx in x0..x1 {
                     let i = row + sx * 4;
                     for (channel, sum) in acc.iter_mut().enumerate() {
-                        *sum += frame.data[i + channel] as u32;
+                        *sum += source[i + channel] as u32;
                     }
                     count += 1;
                 }
             }
 
-            let o = (dy * dw + dx) * 4;
+            let o = (local * dw + dx) * 4;
             let count = count.max(1);
             for (channel, sum) in acc.iter().enumerate() {
                 out[o + channel] = (sum / count) as u8;
             }
         }
     }
-    out
 }
 
 /// Create a screen capturer for the given configuration.
@@ -970,6 +1169,16 @@ pub(crate) fn box_downscale(frame: &ScreenFrame, dst_w: u16, dst_h: u16) -> Vec<
 /// cannot start fails the session, and the stub is only ever used where it is
 /// asked for by name — a synthetic display size in tests — or on a platform that
 /// genuinely has no capture at all.
+/// A capturer that produces nothing, for a session with nothing to capture.
+///
+/// Used while a shared window is minimised. The alternative — keeping the real
+/// capturer — is a compositor session held open against a window the compositor
+/// has stopped drawing, and the alternative to *that* is tearing the session
+/// down, which turns "the host minimised it" into "the connection dropped".
+pub fn create_stub(config: &CaptureConfig) -> Box<dyn ScreenCaptureBackend> {
+    Box::new(StubCapturer::new(config))
+}
+
 pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBackend>> {
     let backend: Box<dyn ScreenCaptureBackend> = if config.native_override.is_some() {
         // An explicit display size means a synthetic one was asked for.
@@ -996,6 +1205,31 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
                             "this host cannot enumerate its displays, so it cannot compose them"
                         );
                         Box::new(super::capture_wall::Wall::new(&all)?)
+                    }
+                    // Only the compositor holds a window's own pixels, so there
+                    // is no fallback here and none is wanted: a window share
+                    // that quietly became a screen share would be a promise
+                    // broken silently. See `window_capture`.
+                    DisplayTarget::Window(id) => Box::new(
+                        super::capture_wgc::WgcCapturer::for_window(*id)
+                            .context("could not capture that window")?,
+                    ),
+                    // Asked about again here rather than carried in the target:
+                    // the grid needs each window's size, and a size recorded
+                    // when the grant was made is the size it was then.
+                    DisplayTarget::Windows(ids) => {
+                        let known: Vec<_> = ids
+                            .iter()
+                            .filter_map(|id| super::window_capture::info_of(*id))
+                            .collect();
+                        anyhow::ensure!(
+                            !known.is_empty(),
+                            "none of the shared windows are still open"
+                        );
+                        Box::new(
+                            super::capture_wall::Wall::of_windows(&known)
+                                .context("could not compose those windows")?,
+                        )
                     }
                     chosen => {
                         let want = match chosen {
@@ -1078,6 +1312,115 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Threading the resize does not change the picture it produces.
+    ///
+    /// # Why this needs its own test
+    ///
+    /// The bands are disjoint slices of the output, so nothing is shared and
+    /// nothing needs a lock — but each worker addresses its rows twice, once as
+    /// a position in the *source* and once as an offset into its own slice, and
+    /// getting that pair wrong is a picture that is subtly striped rather than a
+    /// crash. The existing tests use frames small enough to stay on one thread,
+    /// so they would not see it.
+    #[test]
+    fn resizing_in_bands_matches_resizing_in_one_pass() {
+        /// The obvious implementation, kept here as the thing to agree with.
+        fn reference(frame: &ScreenFrame, dw: usize, dh: usize) -> Vec<u8> {
+            let (sw, sh) = (frame.width as usize, frame.height as usize);
+            let mut out = vec![0u8; dw * dh * 4];
+            for dy in 0..dh {
+                let y0 = dy * sh / dh;
+                let y1 = (((dy + 1) * sh).div_ceil(dh)).min(sh).max(y0 + 1);
+                for dx in 0..dw {
+                    let x0 = dx * sw / dw;
+                    let x1 = (((dx + 1) * sw).div_ceil(dw)).min(sw).max(x0 + 1);
+                    let mut acc = [0u32; 4];
+                    let mut count = 0u32;
+                    for sy in y0..y1 {
+                        for sx in x0..x1 {
+                            let i = (sy * sw + sx) * 4;
+                            for (c, sum) in acc.iter_mut().enumerate() {
+                                *sum += frame.data[i + c] as u32;
+                            }
+                            count += 1;
+                        }
+                    }
+                    for (c, sum) in acc.iter().enumerate() {
+                        out[(dy * dw + dx) * 4 + c] = (sum / count.max(1)) as u8;
+                    }
+                }
+            }
+            out
+        }
+
+        // Tall enough to be split across workers, and content that varies in
+        // both axes so a band drawn from the wrong rows cannot match by luck.
+        let (sw, sh) = (640usize, 700usize);
+        let pixels: Vec<u8> = (0..sw * sh * 4)
+            .map(|i| {
+                let px = i / 4;
+                let (x, y) = (px % sw, px / sw);
+                ((x * 7 + y * 13 + i % 4) % 251) as u8
+            })
+            .collect();
+        let frame = ScreenFrame::new(
+            sw as u16,
+            sh as u16,
+            bytes::Bytes::from(pixels),
+            std::time::Duration::ZERO,
+        );
+
+        // Sizes that do not divide evenly, so the band boundaries land mid-row
+        // of the source and the rounding has to agree as well.
+        for (dw, dh) in [(320usize, 350usize), (211, 173), (639, 699)] {
+            let threaded = box_downscale(&frame, dw as u16, dh as u16);
+            assert_eq!(
+                threaded,
+                reference(&frame, dw, dh),
+                "resizing to {dw}x{dh} in bands did not match one pass"
+            );
+        }
+    }
+
+    /// What resizing a frame costs on the CPU, at the sizes sessions use.
+    ///
+    /// Reported rather than asserted. A window session was measured at sixteen
+    /// frames a second, which is where the adaptive controller settles when
+    /// capture spends forty to sixty milliseconds a frame — and this is the one
+    /// thing on that path that could plausibly cost it. Run in release; a debug
+    /// build says nothing useful about a per-pixel loop.
+    #[test]
+    #[ignore = "a measurement — run explicitly, and in release"]
+    fn report_what_resizing_a_frame_costs() {
+        for (from, to) in [
+            ((2446u16, 1516u16), (1200u16, 750u16)),
+            ((2560, 1440), (1280, 720)),
+            ((3840, 2160), (1920, 1080)),
+        ] {
+            let pixels = vec![0x7Fu8; usize::from(from.0) * usize::from(from.1) * 4];
+            let frame = ScreenFrame::new(
+                from.0,
+                from.1,
+                bytes::Bytes::from(pixels),
+                std::time::Duration::ZERO,
+            );
+
+            let started = std::time::Instant::now();
+            const ROUNDS: u32 = 10;
+            for _ in 0..ROUNDS {
+                let _ = box_downscale(&frame, to.0, to.1);
+            }
+            println!(
+                "  {}x{} -> {}x{}: {:.1} ms each",
+                from.0,
+                from.1,
+                to.0,
+                to.1,
+                started.elapsed().as_secs_f64() * 1000.0 / f64::from(ROUNDS),
+            );
+        }
+    }
 
     fn config_for(native: (u16, u16), quality: QualityScale) -> CaptureConfig {
         CaptureConfig {
@@ -1526,5 +1869,98 @@ mod display_tests {
                 if screen.virtual_display { "virtual" } else { "real" }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod remedy_tests {
+    use super::Remedy;
+    use crate::i18n;
+    use crate::protocol::end_reason::wrong_gpu;
+
+    const ALL: [&str; 1] = [wrong_gpu::NEITHER_WAY];
+
+    /// A remedy with no words is a code shown to a person.
+    #[test]
+    fn every_wrong_gpu_ending_has_a_sentence_in_every_catalogue() {
+        for code in ALL {
+            let key = Remedy::new(code, &[]).key();
+            for language in i18n::languages() {
+                let said = language.get(&key);
+                assert!(said.is_some(), "{} has nothing for {key}", language.tag);
+                assert!(
+                    said.is_some_and(|text| text.contains("{screen}")),
+                    "{} loses the display name from {key}",
+                    language.tag
+                );
+            }
+        }
+    }
+
+    /// The display is an identifier and travels as itself; the words around it
+    /// do not.
+    #[test]
+    fn the_display_a_remedy_is_about_reaches_the_sentence() {
+        let remedy = Remedy::new(wrong_gpu::NEITHER_WAY, &[("screen", r"\\.\DISPLAY2")]);
+        assert!(remedy.to_string().contains(r"\\.\DISPLAY2"), "{remedy}");
+    }
+
+    /// The log stays English however the interface is set.
+    ///
+    /// Asserted without switching the active language, which is process-wide
+    /// and would race every other test in this binary: what makes the claim
+    /// real is that `Display` reads the English catalogue directly, and that
+    /// the Russian one genuinely says something else — so the two cannot be
+    /// passing by being identical.
+    #[test]
+    fn a_remedy_speaks_english_to_the_log_whatever_the_screen_shows() {
+        let key = Remedy::new(wrong_gpu::NEITHER_WAY, &[]).key();
+        let english = i18n::languages().iter().find(|l| l.tag == "en").expect("English");
+        let russian = i18n::languages().iter().find(|l| l.tag == "ru").expect("Russian");
+
+        assert_eq!(i18n::in_english(&key), english.get(&key).expect("English has it"));
+        assert_ne!(
+            english.get(&key),
+            russian.get(&key),
+            "{key} reads the same in both, so this proves nothing"
+        );
+    }
+
+    /// Each ending says its own thing.
+    ///
+    /// There were five, one per branch of an automatic fix that pinned Tain to
+    /// the integrated chip. The fix is gone — it bought duplication at the cost
+    /// of the encoder — and with it four of the endings. This guards the shape
+    /// rather than the count: whatever is here, no two of them may be the same
+    /// sentence, or one of them is not worth sending.
+    #[test]
+    fn no_two_wrong_gpu_endings_say_the_same_thing() {
+        let mut seen = std::collections::BTreeSet::new();
+        for code in ALL {
+            let key = Remedy::new(code, &[]).key();
+            assert!(seen.insert(i18n::in_english(&key)), "{code} repeats another ending");
+        }
+    }
+
+    /// Nothing in the capture path writes a graphics preference any more.
+    ///
+    /// # What this is guarding
+    ///
+    /// The old code wrote one as a *side effect* of duplication failing —
+    /// before the compositor had even been tried, and on a path nobody was
+    /// looking at. It worked, capture started, and the cost only showed up
+    /// later as an encoder that would not use the discrete card. A grep is a
+    /// crude test and it is the right shape for this: the fault was that a
+    /// registry write existed somewhere it had no business being.
+    #[test]
+    fn the_capture_path_does_not_change_this_machines_graphics_settings() {
+        let capture = include_str!("capture_dxgi.rs");
+        assert!(
+            !capture.contains("gpu_preference::set"),
+            "the capture path is writing a graphics preference again — that is what \
+             pinned Tain to the integrated chip and kept the encoder off the discrete one"
+        );
+        let shared = include_str!("capture_shared.rs");
+        assert!(!shared.contains("gpu_preference::set"), "and neither should this one");
     }
 }

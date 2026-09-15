@@ -26,23 +26,21 @@ impl ShortcutAction {
     ];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Disconnect => "Disconnect",
-            Self::ToggleFullscreen => "Toggle fullscreen",
-            Self::ToggleToolbar => "Toggle toolbar",
-            Self::ToggleImmersive => "Toggle immersive mode",
-        }
+        tain_core::i18n::text(match self {
+            Self::Disconnect => "shortcut.disconnect",
+            Self::ToggleFullscreen => "shortcut.fullscreen",
+            Self::ToggleToolbar => "shortcut.toolbar",
+            Self::ToggleImmersive => "shortcut.immersive",
+        })
     }
 
     pub fn description(self) -> &'static str {
-        match self {
-            Self::Disconnect => "End the current session and return to the connection list",
-            Self::ToggleFullscreen => "Switch the window between fullscreen and windowed",
-            Self::ToggleToolbar => "Show or hide the session controls overlay",
-            Self::ToggleImmersive => {
-                "Send every key to the host, including Win and Alt, and keep the pointer inside the window"
-            }
-        }
+        tain_core::i18n::text(match self {
+            Self::Disconnect => "shortcut.disconnect_detail",
+            Self::ToggleFullscreen => "shortcut.fullscreen_detail",
+            Self::ToggleToolbar => "shortcut.toolbar_detail",
+            Self::ToggleImmersive => "shortcut.immersive_detail",
+        })
     }
 
     fn default_binding(self) -> Shortcut {

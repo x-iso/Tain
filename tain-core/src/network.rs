@@ -180,6 +180,147 @@ pub struct ApprovalRequest {
 /// Pure, and separate from the connection it is asked about, because it is the
 /// whole of the authorisation decision and every case of it should be readable
 /// without a network.
+/// How long everything that can say where the host is *now* gets before the
+/// address it answered on last time joins the dial.
+///
+/// # Why this is a clock and not "when nothing was found"
+///
+/// It was the latter, and that turned out to mean the opposite of what it said.
+/// On a filtered link mDNS and DNS do not hang — they complete, with nothing,
+/// in a second or two — so `connect` returned `NoAddress` almost at once and
+/// the saved address went in at about two seconds. The mainline DHT needs
+/// eight, and often a second ask. So the lookup that still works where the
+/// others are blocked never got a turn, and the fallback written to be a last
+/// resort was in practice tried before the thing it was meant to come after.
+///
+/// Being gated on the two lookups that fail *fastest* is what made it first. A
+/// clock is gated on the slowest one, which is the one that matters.
+///
+/// Public because the ordering is the property, and a property that has been
+/// got wrong twice deserves a test that can name the boundary it must not
+/// cross. See `a_host_that_can_be_reached_directly_is_carried_directly`.
+pub const DISCOVERY_GRACE: Duration = Duration::from_secs(15);
+
+/// This machine's identity for connections it makes to other machines.
+///
+/// # Why outgoing connections need a name at all
+///
+/// An endpoint id is a public key, and iroh mints a fresh one for any endpoint
+/// that is not given a key — which is fine for a dial that only has to reach
+/// somebody, and wrong the moment the far end wants to *recognise* us.
+///
+/// It is what broke trusting an admin device. The host remembers the endpoint
+/// ids it has approved, checks the next connection against that list, and the
+/// list could never match: every dial arrived under a new key, so the owner of
+/// the machine was asked to approve their own laptop again on every single
+/// connection. Nothing was wrong with the remembering; there was simply nothing
+/// stable to remember.
+///
+/// Set once at startup from the same stored key the host side uses, so a
+/// machine is one identity in both directions — which is what "trust this
+/// device" has to mean for the sentence to be true.
+static OUTGOING_IDENTITY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// Give this process a stable identity for the connections it makes.
+///
+/// Call once, before dialling anything. Later calls are ignored rather than
+/// refused: an endpoint id that changed mid-run would be a second machine as
+/// far as every host is concerned, and that is never what a caller means.
+pub fn adopt_identity(secret_key: [u8; 32]) {
+    if OUTGOING_IDENTITY.set(secret_key).is_err() {
+        debug!("An outgoing identity was already adopted; keeping the first one");
+    }
+}
+
+/// Whether this process has an identity of its own to dial with.
+pub fn has_identity() -> bool {
+    OUTGOING_IDENTITY.get().is_some()
+}
+
+/// The key this machine dials with: its own, and **not** the one it hosts on.
+///
+/// # Why not simply the machine's key
+///
+/// It was, and two endpoints then lived under one endpoint id — the host
+/// listening and the client dialling — which is not a thing iroh supports and
+/// not a thing the relays tolerate. The relay allows one connection per id and
+/// boots the other:
+///
+/// ```text
+/// Relay server reports problem: Another endpoint connected with the same
+/// endpoint id. No more messages will be received.
+/// ```
+///
+/// Sixty-two of those in one log. Whichever of the two connected last held the
+/// slot, so making an outgoing connection knocked this machine's *host* off the
+/// relay — and being on the relay is how a distant guest finds it and how hole
+/// punching is arranged. A host that works or does not depending on whether
+/// anybody has dialled out from it lately is exactly the intermittency this
+/// looked like.
+///
+/// It also made a loopback connection impossible: pasting this machine's own
+/// code asked iroh to dial its own id, which it refuses outright.
+///
+/// # Why derived rather than stored
+///
+/// Recognition needs the id to be *stable*, not to be the host's — a host that
+/// trusts a returning admin device remembers whichever id dialled it. Deriving
+/// one from the machine key gives stability with nothing new to store,
+/// nothing to migrate, and no second secret to keep safe. The derivation is
+/// one-way, so the dialling key never discloses the hosting one.
+///
+/// **Upgrading asks once more.** A device already trusted was trusted under the
+/// old id, and it now arrives under this one. That is one approval per trusted
+/// device, once.
+fn outgoing_key() -> Option<iroh::SecretKey> {
+    let host = OUTGOING_IDENTITY.get()?;
+    // Domain-separated: the context string is what stops this key ever
+    // coinciding with one derived elsewhere from the same secret.
+    Some(iroh::SecretKey::from_bytes(&blake3::derive_key(
+        "tain 2026 outgoing endpoint v1",
+        host,
+    )))
+}
+
+/// An endpoint builder carrying this machine's dialling identity, when it has
+/// one.
+///
+/// Without one the dial still works — it is only recognition that is lost, and
+/// a host will simply ask about the connection as it would about a stranger.
+fn outgoing_builder() -> iroh::endpoint::Builder {
+    let builder = super::discovery::endpoint_builder();
+    match outgoing_key() {
+        Some(key) => builder.secret_key(key),
+        None => builder,
+    }
+}
+
+/// The endpoint this machine dials from, bound once and shared.
+///
+/// # Why one and not one per connection
+///
+/// Every dial used to bind its own, which was fine while each carried a fresh
+/// throwaway key. With a stable identity it stops being fine: two endpoints
+/// live at once under one node id are two machines claiming the same name, and
+/// a person with two session tabs open has exactly that. It shows up as the
+/// second connection failing for no visible reason.
+///
+/// One endpoint is also what a client normally is. It is bound on first use,
+/// kept for the life of the process, and shared by every session — which is why
+/// [`GuestClient::shutdown`] closes its *connection* and leaves this alone.
+///
+/// The discovery services are held here too. They are what mDNS and the DHT
+/// lookups run on, and dropping them would quietly turn both off.
+static OUTGOING_ENDPOINT: tokio::sync::OnceCell<(iroh::Endpoint, super::discovery::Attached)> =
+    tokio::sync::OnceCell::const_new();
+
+/// Bind — or return — the endpoint this machine dials from.
+async fn outgoing_endpoint() -> Result<&'static (iroh::Endpoint, super::discovery::Attached)> {
+    OUTGOING_ENDPOINT
+        .get_or_try_init(|| async { super::discovery::bind(outgoing_builder()).await })
+        .await
+}
+
 pub fn must_be_approved(
     typ: PasscodeType,
     endpoint_id: &[u8; 32],
@@ -564,7 +705,37 @@ impl HostServer {
         self.sessions.set_control(session_id, grants)
     }
 
+    /// Change what a live session may see.
+    ///
+    /// Takes effect immediately, in both directions: the permission bounds what
+    /// the guest may ask for from the next request onward, and the stream moves
+    /// if what it was showing is no longer permitted. The guest is told through
+    /// `Message::SharedChanged`. Returns false if the session is not (or no
+    /// longer) active.
+    ///
+    /// `available` is this machine's displays, passed in because the session
+    /// table has no business enumerating them.
+    pub fn share_with_session(
+        &self,
+        session_id: u32,
+        displays: super::protocol::DisplayGrant,
+        available: &[super::protocol::DisplayInfo],
+    ) -> bool {
+        self.sessions.set_displays(session_id, displays, available)
+    }
+
+    /// What a live session may currently see, for a dialog that offers to
+    /// change it.
+    pub fn shared_with_session(
+        &self,
+        session_id: u32,
+    ) -> Option<super::protocol::DisplayGrant> {
+        self.sessions.displays_of(session_id)
+    }
+
     /// Disconnect a guest from the host side.
+    ///
+    /// `reason` is one of [`super::protocol::end_reason`] — see `SessionEnd`.
     pub fn kick_session(&self, session_id: u32, reason: &str) -> bool {
         self.sessions.kick(session_id, reason)
     }
@@ -720,7 +891,8 @@ impl HostServer {
                 &mut send,
                 &Message::SessionEnd(super::protocol::SessionEnd {
                     session_id: 0,
-                    reason: "invalid_passcode".into(),
+                    reason: super::protocol::end_reason::INVALID_PASSCODE.into(),
+                    args: Vec::new(),
                 }),
             )
             .await?;
@@ -742,7 +914,9 @@ impl HostServer {
             PasscodeType::Guest => ControlGrants::NONE,
         };
         let session_id = self.sessions.add_session(secret, initial_grants, typ);
-        let label = client_name.clone().unwrap_or_else(|| format!("Guest #{session_id}"));
+        let label = client_name
+            .clone()
+            .unwrap_or_else(|| super::i18n::format("session.guest_number", &[("n", &session_id.to_string())]));
         self.sessions.set_label(session_id, label.clone());
         // Recorded once. The address does not change for the life of the
         // connection, and the number that does — the round trip — comes back
@@ -914,12 +1088,30 @@ impl HostServer {
                     grants
                 }
                 ApprovalDecision::Deny => {
-                    info!("Session #{} was refused by the host", session_id);
+                    // # Which refusal this was
+                    //
+                    // Determined here rather than carried out of
+                    // `await_approval`, because the condition is the same one
+                    // it tested and this keeps `ApprovalDecision` a decision
+                    // rather than a decision plus an explanation.
+                    //
+                    // An admin refused by a host with no approval channel was
+                    // never asked about — there was nobody to ask. Saying "the
+                    // host did not allow this connection" points the owner at a
+                    // decision that was never made, and the usual next thought
+                    // is that the code is wrong. See `end_reason::NOT_APPROVED`.
+                    let reason = if is_admin && self.approval_tx.is_none() {
+                        super::protocol::end_reason::NOT_APPROVED
+                    } else {
+                        super::protocol::end_reason::NOT_ALLOWED
+                    };
+                    info!("Session #{} was refused by the host ({reason})", session_id);
                     write_stream_message(
                         &mut send,
                         &Message::SessionEnd(super::protocol::SessionEnd {
                             session_id,
-                            reason: "the host did not allow this connection".into(),
+                            reason: reason.into(),
+                            args: Vec::new(),
                         }),
                     )
                     .await?;
@@ -934,6 +1126,33 @@ impl HostServer {
             initial_grants
         };
 
+        // # A window grant overrides what the host settings capture
+        //
+        // The settings say what this machine shares by default; a grant says
+        // what *this guest* was allowed. When the two disagree the grant wins,
+        // because it is the more specific and the more recent — somebody chose
+        // it, for this connection, in the approval dialog.
+        //
+        // Applied to the snapshot rather than at each use, so every later
+        // reader — the capture thread, the display switch, the pointer mapping
+        // — sees one answer and cannot disagree with another.
+        //
+        // Several windows open on all of them at once, matching what
+        // `DisplayGrant::opens_on` tells the guest to expect — the two disagreeing
+        // would show one window while the switcher claimed the composite.
+        let mut config = config;
+        match allowed.windows() {
+            [] => {}
+            [only] => {
+                config.capture.display = super::screen_capture::DisplayTarget::Window(*only);
+            }
+            several => {
+                config.capture.display =
+                    super::screen_capture::DisplayTarget::Windows(several.to_vec());
+            }
+        }
+        let config = config;
+
         // Build the capturer *before* announcing the session. The backend is the
         // authority on frame size — a display that changed since the config was
         // written would otherwise make SessionStart advertise dimensions the
@@ -946,11 +1165,23 @@ impl HostServer {
                 // and a connection that simply vanishes looks like a network
                 // fault, which sends them looking in the wrong place entirely.
                 error!("Session #{session_id} could not start capturing: {e:#}");
+                // A failure with a remedy already carries the code for it, and
+                // the guest is the only screen that will ever show it. Anything
+                // else is the operating system's own words, which no catalogue
+                // can carry and which travel as an argument instead.
+                let (reason, args) = match super::screen_capture::Remedy::in_chain(&e) {
+                    Some(remedy) => (remedy.code.to_string(), remedy.args.clone()),
+                    None => (
+                        super::protocol::end_reason::CAPTURE_FAILED.to_string(),
+                        vec![("detail".to_string(), format!("{e}"))],
+                    ),
+                };
                 write_stream_message(
                     &mut send,
                     &Message::SessionEnd(super::protocol::SessionEnd {
                         session_id,
-                        reason: format!("the host could not capture its screen: {e}"),
+                        reason,
+                        args,
                     }),
                 )
                 .await?;
@@ -1019,6 +1250,35 @@ impl HostServer {
                 // dialog — so this is filtered once there is something to
                 // filter it by.
                 displays: available_displays,
+                // Sent from the first message rather than waited for as a
+                // change: a window that is *already* minimised when the guest
+                // arrives has no transition to announce, and would otherwise be
+                // a blank window with nothing saying why.
+                //
+                // `None` for a composite. This field names the *one* window
+                // being watched, and a session showing several is not watching
+                // one — filling it with the first would put "waiting for Excel
+                // to be restored" over a picture that is showing three other
+                // windows perfectly well.
+                window: match allowed.windows() {
+                    [only] => Some(super::window_capture::describe(*only, None)),
+                    _ => None,
+                },
+                // Asked of each granted handle rather than filtered out of the
+                // shareable list, because that list is what a person could
+                // *pick* and excludes minimised windows — which a granted
+                // window is perfectly entitled to be. One that has closed since
+                // the grant drops out here, and the guest never offers it.
+                windows: allowed
+                    .windows()
+                    .iter()
+                    .filter_map(|id| super::window_capture::on_offer(*id))
+                    .collect(),
+                // From the *grant*, not from the list above: a session that
+                // shares windows still shares windows when every one of them
+                // has been closed, and that is exactly the case the guest
+                // needs to be able to name.
+                sharing_windows: !allowed.windows().is_empty(),
             }),
         )
         .await?;
@@ -1234,6 +1494,17 @@ where
     // owner and gets all of them; a guest gets what the approval dialog chose,
     // which is written here when the decision arrives.
     let allowed_displays: AllowedDisplays = Arc::new(std::sync::Mutex::new(allowed));
+    // Handed to the session table so the person at this machine can change what
+    // is shared while the session runs, rather than only when it starts. Both
+    // handles, because narrowing a grant has to move the picture as well — see
+    // `SessionManager::set_displays`.
+    sessions.register_shows(
+        session_id,
+        super::session::Shows {
+            allowed: Arc::clone(&allowed_displays),
+            wanted: Arc::clone(&wanted_display),
+        },
+    );
     let mut reader = tokio::spawn(run_reader(
         recv,
         session_id,
@@ -1295,7 +1566,9 @@ where
         Arc::clone(&keyframe_wanted),
         cursor_tx,
         Arc::clone(&wanted_display),
+        Arc::clone(&allowed_displays),
         Arc::clone(&injector),
+        out_tx.clone(),
     );
 
     // Written from the select loop rather than handed to a task of its own,
@@ -2082,7 +2355,12 @@ fn spawn_capture_pipeline(
     keyframe_wanted: KeyframeWanted,
     cursor_tx: mpsc::UnboundedSender<super::cursor::CursorUpdate>,
     wanted_display: WantedDisplay,
+    allowed_displays: AllowedDisplays,
     injector: Arc<dyn super::input_inject::InputInjector>,
+    // For the messages the capture thread has to send that are not frames —
+    // what the shared window is doing, and which shared windows are still open.
+    // See `SharedWindowWatch` and `Offer`.
+    out_tx: mpsc::UnboundedSender<Message>,
 ) -> (mpsc::Receiver<PipelineEvent>, std::thread::JoinHandle<()>) {
     let mut capturer = capturer;
     // Settle the pixel format before either thread starts. If the encoder wants
@@ -2125,10 +2403,12 @@ fn spawn_capture_pipeline(
         viewport,
         cursor_tx,
         wanted_display,
+        allowed_displays,
         config.capture.clone(),
         format,
         granularity,
         Arc::clone(&injector),
+        out_tx,
     );
 
     let handle = std::thread::Builder::new()
@@ -2545,6 +2825,276 @@ fn spawn_capture_pipeline(
 /// What the capture thread is currently asked to produce: scale, and rate.
 type CapturePlan = Arc<std::sync::Mutex<(QualityScale, u32)>>;
 
+/// What a session is showing, said in the guest's terms.
+///
+/// The two vocabularies differ: the host captures a [`DisplayTarget`], which
+/// names a device, and the guest picks a [`DisplayChoice`], which names an id
+/// from the list it was sent. This is the translation, and it exists because
+/// every "the request could not be honoured" path has to answer the same
+/// question — what *is* it showing, then.
+fn showing_now(
+    current: &super::screen_capture::DisplayTarget,
+    available: &[super::protocol::DisplayInfo],
+) -> super::protocol::DisplayChoice {
+    use super::protocol::DisplayChoice;
+    use super::screen_capture::DisplayTarget;
+    match current {
+        // Both composites answer the same way: "everything this session may
+        // see, at once". Which of the two it is follows from the grant, and the
+        // guest already knows that.
+        DisplayTarget::All | DisplayTarget::Windows(_) => DisplayChoice::All,
+        DisplayTarget::Window(id) => DisplayChoice::Window(*id),
+        DisplayTarget::One(name) => {
+            DisplayChoice::One(available.iter().find(|d| &d.name == name).map_or(0, |d| d.id))
+        }
+        DisplayTarget::Primary => {
+            DisplayChoice::One(available.iter().find(|d| d.primary).map_or(0, |d| d.id))
+        }
+    }
+}
+
+/// How often a shared window that is away is asked whether it is back.
+///
+/// Four times a second. Fast enough that restoring a window does not feel like
+/// it stuck, slow enough that a session parked on a minimised window costs
+/// nothing — which it otherwise would, since there is no frame to wait on and
+/// the loop would spin.
+const WINDOW_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What the capture loop should do about the shared window this tick.
+enum WindowStep {
+    /// It is doing what it was doing.
+    Unchanged,
+    /// It changed, and the guest has not been told.
+    Announce(super::protocol::SharedWindow),
+}
+
+/// Follows the window a session is currently showing.
+///
+/// Only exists for a session that shares windows; a screen session has `None`
+/// and never pays for any of this. See [`super::window_capture`] for why a
+/// window needs watching where a monitor does not.
+///
+/// One at a time, even when several were granted: a session streams one window,
+/// and the others are not being captured and have nothing to report. Switching
+/// replaces the watch — see [`Self::switched_to`].
+struct SharedWindowWatch {
+    id: u64,
+    /// The last state read, which is what "changed" is measured against — the
+    /// title moves on its own as a program is used, and a re-announced
+    /// identical state would be noise on the wire.
+    told: super::protocol::SharedWindow,
+    /// Whether the guest has actually been sent what [`Self::told`] holds.
+    ///
+    /// False at the start of a session, where `SessionStart` carried it, and
+    /// true after a switch, where nothing has. Without the distinction a guest
+    /// that switched between two windows in the same state would be told
+    /// nothing and would go on naming the window it left.
+    owed: bool,
+    /// Set when the window comes back, cleared once a capture exists again.
+    restored: bool,
+}
+
+impl SharedWindowWatch {
+    /// The watch a session starts with. `SessionStart` has already said what
+    /// this window is doing, so nothing is owed until the answer moves.
+    fn for_target(target: &super::screen_capture::DisplayTarget) -> Option<Self> {
+        Self::watching(target, false)
+    }
+
+    /// The watch that replaces it when the guest picks a different window.
+    ///
+    /// Owes an announcement from the outset: the guest asked for a window and
+    /// has been told nothing about it, and "the same state as the last one" is
+    /// still news when it is a different window.
+    fn switched_to(target: &super::screen_capture::DisplayTarget) -> Option<Self> {
+        Self::watching(target, true)
+    }
+
+    fn watching(
+        target: &super::screen_capture::DisplayTarget,
+        owed: bool,
+    ) -> Option<Self> {
+        let super::screen_capture::DisplayTarget::Window(id) = target else {
+            return None;
+        };
+        Some(Self {
+            id: *id,
+            told: super::window_capture::describe(*id, None),
+            owed,
+            restored: false,
+        })
+    }
+
+    /// Whether frames can be expected.
+    fn live(&self) -> bool {
+        self.told.state == super::protocol::SharedWindowState::Showing
+    }
+
+    /// Whether the capture has to be built again before frames will come.
+    fn needs_rebuild(&self) -> bool {
+        self.restored
+    }
+
+    fn rebuilt(&mut self) {
+        self.restored = false;
+    }
+
+    /// Ask the window what it is doing, and say so if the answer moved.
+    fn poll(&mut self) -> WindowStep {
+        let now = super::window_capture::describe(self.id, Some(&self.told));
+        self.settle(now)
+    }
+
+    /// Apply a fresh reading. Split from [`Self::poll`] so the decision can be
+    /// tested without a real window to minimise.
+    fn settle(&mut self, now: super::protocol::SharedWindow) -> WindowStep {
+        if now == self.told && !self.owed {
+            return WindowStep::Unchanged;
+        }
+        self.owed = false;
+        self.restored |= came_back(&self.told, &now);
+        self.told = now.clone();
+        WindowStep::Announce(now)
+    }
+}
+
+/// Whether a window has just come back from being away.
+///
+/// The one transition the capture loop has to *act* on rather than merely
+/// report: the capturer was dropped while the window was gone, so there is
+/// nothing to take frames from until a new one is built. Every other change —
+/// a retitle, going away, closing — only needs telling the guest about.
+fn came_back(
+    told: &super::protocol::SharedWindow,
+    now: &super::protocol::SharedWindow,
+) -> bool {
+    use super::protocol::SharedWindowState::Showing;
+    told.state != Showing && now.state == Showing
+}
+
+/// Which of a session's granted windows are open, and telling the guest when
+/// that changes.
+///
+/// # Why the capture loop owns this
+///
+/// It is the only part of a session that already asks, every tick, what the
+/// shared windows are doing — the composite is rebuilt from that answer and the
+/// pointer is remapped from it. Anywhere else would be a second poller of the
+/// same handles, and the two would disagree about when a window went.
+///
+/// What it buys the guest is a switcher that means something: a window that has
+/// closed loses its button rather than keeping one that reports it closed
+/// forever, and a session whose windows have *all* gone can say so instead of
+/// showing a frozen picture. See [`super::protocol::SharedChanged`].
+struct Offer {
+    /// Every window the session was granted, open or not.
+    granted: Vec<u64>,
+    /// The ones open the last time the guest was told, and what each was doing.
+    ///
+    /// # Why the state and not only the list
+    ///
+    /// A window being minimised does not take it off the offer — it is still
+    /// granted and can come back — so a list of ids alone does not move when
+    /// one goes away. But the guest cannot tell a composite of minimised
+    /// windows from a working one without knowing, and what it showed was the
+    /// last frame, frozen, with nothing saying why. Reported as exactly that.
+    ///
+    /// The *title* is deliberately not compared. A browser retitles on every
+    /// navigation and this is asked sixty times a second; the window being
+    /// watched already carries its live title on its own message.
+    told: Vec<(u64, super::protocol::SharedWindowState)>,
+}
+
+impl Offer {
+    /// `None` for a session that shares screens, which has none of this to do.
+    fn for_grant(allowed: &super::protocol::DisplayGrant) -> Option<Self> {
+        let granted = allowed.windows().to_vec();
+        if granted.is_empty() {
+            return None;
+        }
+        // Seeded with what `SessionStart` already said, so an offer that has
+        // not changed is not re-announced on the first tick.
+        let told = Self::read(&granted).iter().map(|w| (w.id, w.state)).collect();
+        Some(Self { granted, told })
+    }
+
+    fn read(granted: &[u64]) -> Vec<super::protocol::SharedWindow> {
+        granted.iter().filter_map(|id| super::window_capture::on_offer(*id)).collect()
+    }
+
+    /// The offer as it stands now, if it has changed since the guest was told.
+    fn moved(&mut self) -> Option<Vec<super::protocol::SharedWindow>> {
+        let open = Self::read(&self.granted);
+        let now: Vec<(u64, super::protocol::SharedWindowState)> =
+            open.iter().map(|w| (w.id, w.state)).collect();
+        if now == self.told {
+            return None;
+        }
+        self.told = now;
+        Some(open)
+    }
+}
+
+/// Tell the guest what is now being streamed.
+///
+/// # Why the capture thread says this and the reader does not
+///
+/// The reader decides whether a request is allowed, which is immediate, and the
+/// capture thread decides when it takes effect, which is not: building a
+/// composite of several windows takes the better part of a second, and the old
+/// view keeps being sent until it is ready.
+///
+/// Announced from the reader, the message described a view whose *previous*
+/// pictures were still arriving — so a guest waiting on the new one stopped
+/// waiting at the first frame after it, which was a frame of what it had just
+/// left. Reported as the loading indicator going away too early and showing a
+/// stale window.
+fn announce(
+    out_tx: &mpsc::UnboundedSender<Message>,
+    showing: &super::screen_capture::DisplayTarget,
+    why: Option<String>,
+) -> Result<(), ()> {
+    // Enumerated here rather than carried, because this runs on a switch and
+    // not per frame, and a display list a second old could name a monitor that
+    // has since been unplugged.
+    let available = super::screen_capture::displays();
+    // The error is discarded rather than returned: a closed channel means the
+    // session is over, which is all the caller does anything about, and the
+    // undeliverable `Message` inside it is large enough that carrying it back
+    // is worth avoiding.
+    out_tx
+        .send(Message::DisplayChanged(super::protocol::DisplayChanged {
+            showing: showing_now(showing, &available),
+            why,
+        }))
+        .map_err(|_| ())
+}
+
+/// Whether the capture loop should sit still rather than go round again.
+///
+/// # Why this is a function and not two lines in the loop
+///
+/// It was two lines in the loop, and they were wrong in a way that took a bug
+/// report to find. A shared window that is minimised or closed has nothing to
+/// give, so the loop parks on a stub and sleeps instead of spinning — which is
+/// right, and which it did by skipping straight back to the top.
+///
+/// The display switch is *below* that point. So a guest that closed one of
+/// several shared windows, looked at the tab that said so, and then asked for
+/// the composite again was held there for the rest of the session by a watch on
+/// a window that had gone: the picture froze and every further switch was
+/// ignored. Reported as "stopped reacting", which is exactly what it was.
+///
+/// Parking is only correct while nobody is waiting for something else.
+fn should_park(
+    live: bool,
+    asked: &super::screen_capture::DisplayTarget,
+    applied: &super::screen_capture::DisplayTarget,
+) -> bool {
+    !live && asked == applied
+}
+
 /// Grab frames at the requested rate and hand them to the encoder.
 ///
 /// Separate from encoding so the two **overlap**. They used to run in sequence
@@ -2565,10 +3115,12 @@ fn spawn_capture_thread(
     viewport: SharedViewport,
     cursor_tx: mpsc::UnboundedSender<super::cursor::CursorUpdate>,
     wanted_display: WantedDisplay,
+    allowed_displays: AllowedDisplays,
     capture_config: super::screen_capture::CaptureConfig,
     format: super::screen_capture::PixelFormat,
     granularity: (u16, u16),
     injector: Arc<dyn super::input_inject::InputInjector>,
+    out_tx: mpsc::UnboundedSender<Message>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("tain-capture-{session_id}"))
@@ -2580,8 +3132,172 @@ fn spawn_capture_thread(
             let mut next_frame_at = std::time::Instant::now();
             let (mut produced, mut unchanged, mut dropped) = (0u32, 0u32, 0u32);
             let mut produced_at = std::time::Instant::now();
+            let mut window = SharedWindowWatch::for_target(&capture_config.display);
+            // Where the shared window last was, so the pointer is only remapped
+            // when it actually moves. See the block that maintains it below.
+            let mut window_at: Option<super::window_capture::OnScreen> = None;
+            // The same, for a composite: what the guest's coordinates were last
+            // told to map through.
+            let mut tiled_at: Option<Vec<super::input_inject::Tile>> = None;
+            // Whether the composite has already reported having nothing left.
+            // It is asked again on every tick and the answer does not change on
+            // its own, so without this it is a log line per frame — which is
+            // how a diagnosis gets buried.
+            let mut nothing_to_compose = false;
+            // Which of the granted windows are still open, so the guest's
+            // switcher does not go on offering ones that have gone.
+            let mut offer = Offer::for_grant(&allowed_displays.lock().unwrap().clone());
 
             loop {
+                // # What the guest may still switch to
+                //
+                // Ahead of everything else, because the answer decides what the
+                // rest of this tick is about — and because a window that has
+                // gone should leave the guest's switcher at the same moment it
+                // leaves the picture, not a tick later.
+                if let Some(offer) = offer.as_mut()
+                    && let Some(open) = offer.moved()
+                {
+                    info!(
+                        "Session #{session_id}: {} of {} shared window(s) still open",
+                        open.len(),
+                        offer.granted.len()
+                    );
+                    let told = out_tx.send(Message::SharedChanged(
+                        super::protocol::SharedChanged {
+                            displays: Vec::new(),
+                            windows: open,
+                            sharing_windows: true,
+                        },
+                    ));
+                    if told.is_err() {
+                        return;
+                    }
+                }
+
+                // # A shared window that is not on screen
+                //
+                // Minimising is ordinary and reversible, so it is not a failure
+                // and must not end the session — but the compositor produces
+                // nothing for a window in that state, so there is also nothing
+                // to send. The capture is dropped while it is away (it would
+                // only sit there producing nothing) and rebuilt when it comes
+                // back, and the guest is told either way so it can say what
+                // happened instead of showing a frozen picture.
+                if let Some(watch) = window.as_mut() {
+                    match watch.poll() {
+                        WindowStep::Unchanged => {}
+                        WindowStep::Announce(state) => {
+                            if out_tx.send(Message::SharedWindow(state)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    // # Parking here must not swallow a request to look
+                    // elsewhere
+                    //
+                    // There is nothing to capture and nothing to burn a core
+                    // on, so the loop sleeps — but the display switch is
+                    // *below* this, and skipping straight back to the top means
+                    // it is never reached. A guest that closed one of several
+                    // shared windows, looked at the tab that said so, and then
+                    // asked for the composite again was held here for the rest
+                    // of the session by a watch on a window that had gone: the
+                    // stream froze and every further switch was ignored.
+                    //
+                    // Reported as "stopped reacting", which is exactly what it
+                    // was. So the loop only parks while nothing else has been
+                    // asked for.
+                    let asked = wanted_display.lock().unwrap().clone();
+                    if should_park(watch.live(), &asked, &applied_display) {
+                        capturer = super::screen_capture::create_stub(&capture_config);
+                        std::thread::sleep(WINDOW_POLL);
+                        continue;
+                    }
+                    if watch.needs_rebuild() {
+                        let mut config = capture_config.clone();
+                        config.display = applied_display.clone();
+                        match super::screen_capture::create_capturer(config) {
+                            Ok(mut fresh) => {
+                                super::screen_capture::negotiate_format(&mut *fresh, format);
+                                fresh.set_size_granularity(granularity);
+                                fresh.set_scale(applied_scale);
+                                fresh.set_size_ceiling(applied_ceiling);
+                                capturer = fresh;
+                                watch.rebuilt();
+                                info!("Session #{session_id}: the shared window is back");
+                            }
+                            Err(e) => {
+                                // Restored but not yet capturable — the
+                                // compositor can take a moment. Tried again on
+                                // the next tick rather than failed on.
+                                debug!("Session #{session_id}: window not ready yet: {e:#}");
+                                std::thread::sleep(WINDOW_POLL);
+                                continue;
+                            }
+                        }
+                    }
+
+                    // # The pointer maps through the window, not the screen
+                    //
+                    // A guest sends positions across the picture it was sent,
+                    // and the injector turns them back into desktop pixels
+                    // through the rectangle being shown. With nothing set that
+                    // rectangle is the whole primary screen — so in a window
+                    // session a click in the middle of the window landed in the
+                    // middle of the *screen*, which is the sort of wrongness
+                    // that reads as a calibration problem.
+                    //
+                    // Checked every tick rather than on the switch, because a
+                    // window is not a monitor: it is dragged and resized while
+                    // somebody is using it, and a rectangle fixed at session
+                    // start is wrong the first time the window moves. The DWM
+                    // read is cheap and the injector is only told when the
+                    // answer changes.
+                    if let super::screen_capture::DisplayTarget::Window(id) = &applied_display {
+                        let now = super::window_capture::on_screen(*id);
+                        if let Some(rect) = now
+                            && window_at != now
+                        {
+                            injector.set_shown(super::input_inject::Shown {
+                                x: rect.x,
+                                y: rect.y,
+                                width: rect.width,
+                                height: rect.height,
+                            });
+                            window_at = now;
+                        }
+                    }
+                }
+
+                // # A composite of windows maps through several rectangles
+                //
+                // The block above is for a session showing *one* window and
+                // never runs for a composite — there is no single window to
+                // watch. But a grid of windows needs the same thing more
+                // urgently: its picture is an arrangement this end invented out
+                // of sources scattered across the desk, so there is no one
+                // rectangle to map through at all.
+                //
+                // Asked of the capturer rather than worked out here, because
+                // the capturer is what decided the layout and a second
+                // implementation of that arithmetic would eventually disagree
+                // with the first. Per tick for the same reason as above: the
+                // grid does not move when a window does, but where a click has
+                // to *land* certainly does.
+                if matches!(applied_display, super::screen_capture::DisplayTarget::Windows(_)) {
+                    let tiles = capturer.input_tiles();
+                    if let Some(tiles) = tiles
+                        && tiled_at.as_deref() != Some(&tiles[..])
+                    {
+                        injector.set_mapping(super::input_inject::Mapping::Tiled {
+                            size: capturer.frame_size(),
+                            tiles: tiles.clone(),
+                        });
+                        tiled_at = Some(tiles);
+                    }
+                }
+
                 // # Switching display
                 //
                 // Rebuilt rather than reconfigured: a duplication belongs to one
@@ -2602,38 +3318,129 @@ fn spawn_capture_thread(
                 // It cannot repair itself: its panels are attached to
                 // particular displays. Asking for the same target again is what
                 // rebuilds it, through the switch below that already knows how.
+                //
+                // # A composite of windows goes out of date differently
+                //
+                // It says so for its own reason — one of the shared windows has
+                // gone away or come back — and the recovery below is written
+                // entirely for screens: it names the primary display as what is
+                // being shown, and remaps the pointer to the whole desk. Both
+                // are wrong for a window session. The first is a lie the rest of
+                // the loop then acts on; the second silently sends every click
+                // to a coordinate on the desktop rather than into a window.
+                //
+                // So it rebuilds in place, keeping the target it has. Nothing
+                // else needs to change: the pointer's tiles are maintained just
+                // above and follow the new capture on the next tick.
                 if capturer.layout_changed() {
-                    info!(
-                        "Session #{session_id}: the displays have been rearranged —                          rebuilding the composed view"
-                    );
-                    applied_display = super::screen_capture::DisplayTarget::Primary;
-                    // Cleared so the rebuilt wall is asked for its own size
-                    // again rather than keeping the old arrangement's.
-                    applied_ceiling = None;
+                    if matches!(applied_display, super::screen_capture::DisplayTarget::Windows(_)) {
+                        let mut config = capture_config.clone();
+                        config.display = applied_display.clone();
+                        match super::screen_capture::create_capturer(config) {
+                            Ok(mut fresh) => {
+                                info!(
+                                    "Session #{session_id}: the shared windows have changed — \
+                                     composing them again"
+                                );
+                                super::screen_capture::negotiate_format(&mut *fresh, format);
+                                fresh.set_size_granularity(granularity);
+                                fresh.set_scale(applied_scale);
+                                // Cleared so the new grid is asked for its own
+                                // size rather than keeping the old one's.
+                                applied_ceiling = None;
+                                fresh.set_size_ceiling(applied_ceiling);
+                                capturer = fresh;
+                                nothing_to_compose = false;
+                            }
+                            Err(e) => {
+                                // Every shared window has gone. The old
+                                // composite is kept — a last picture beats a
+                                // black one — and this deliberately does *not*
+                                // skip to the top of the loop: parking here
+                                // would swallow the switch below, which is the
+                                // same bug the watch above had. There is no
+                                // spin either, because the composite it kept
+                                // still waits its own tick for a frame.
+                                if !nothing_to_compose {
+                                    warn!(
+                                        "Session #{session_id}: none of the shared windows are \
+                                         open any more ({e:#})"
+                                    );
+                                    nothing_to_compose = true;
+                                }
+                            }
+                        }
+                    } else {
+                        info!(
+                            "Session #{session_id}: the displays have been rearranged — \
+                             rebuilding the composed view"
+                        );
+                        applied_display = super::screen_capture::DisplayTarget::Primary;
+                        // Cleared so the rebuilt wall is asked for its own size
+                        // again rather than keeping the old arrangement's.
+                        applied_ceiling = None;
 
-                    // And the pointer, which maps through the desk's bounding
-                    // box. Rebuilding the picture without this leaves clicks
-                    // landing against the arrangement that has just gone —
-                    // which is the half of the bug that is not visible, because
-                    // the picture looks right while the pointer does not.
-                    let desk = super::screen_capture::displays();
-                    if !desk.is_empty() {
-                        let left = desk.iter().map(|d| d.x).min().unwrap_or(0);
-                        let top = desk.iter().map(|d| d.y).min().unwrap_or(0);
-                        let right =
-                            desk.iter().map(|d| d.x + i32::from(d.width)).max().unwrap_or(0);
-                        let bottom =
-                            desk.iter().map(|d| d.y + i32::from(d.height)).max().unwrap_or(0);
-                        injector.set_shown(super::input_inject::Shown {
-                            x: left,
-                            y: top,
-                            width: (right - left).clamp(0, u16::MAX as i32) as u16,
-                            height: (bottom - top).clamp(0, u16::MAX as i32) as u16,
-                        });
+                        // And the pointer, which maps through the desk's
+                        // bounding box. Rebuilding the picture without this
+                        // leaves clicks landing against the arrangement that has
+                        // just gone — which is the half of the bug that is not
+                        // visible, because the picture looks right while the
+                        // pointer does not.
+                        let desk = super::screen_capture::displays();
+                        if !desk.is_empty() {
+                            let left = desk.iter().map(|d| d.x).min().unwrap_or(0);
+                            let top = desk.iter().map(|d| d.y).min().unwrap_or(0);
+                            let right =
+                                desk.iter().map(|d| d.x + i32::from(d.width)).max().unwrap_or(0);
+                            let bottom =
+                                desk.iter().map(|d| d.y + i32::from(d.height)).max().unwrap_or(0);
+                            injector.set_shown(super::input_inject::Shown {
+                                x: left,
+                                y: top,
+                                width: (right - left).clamp(0, u16::MAX as i32) as u16,
+                                height: (bottom - top).clamp(0, u16::MAX as i32) as u16,
+                            });
+                        }
                     }
                 }
 
                 let wanted = wanted_display.lock().unwrap().clone();
+
+                // # Switching to a window that is not on screen
+                //
+                // A guest granted several windows can pick one that has since
+                // been minimised, and there is nothing to build a capture from
+                // while it is away — `create_capturer` would fail, the switch
+                // would be reverted, and the guest would be left with its
+                // switcher pointing at a window it is not being shown.
+                //
+                // So the switch is taken anyway. The watch installed here is
+                // what carries it: the guest is told the window is minimised,
+                // the loop above parks on a stub, and the capture is built for
+                // real the moment it comes back — which is the same path a
+                // window minimised *during* a session already takes.
+                if let super::screen_capture::DisplayTarget::Window(id) = &wanted
+                    && wanted != applied_display
+                    && !super::window_capture::state_of(*id).is_live()
+                {
+                    info!(
+                        "Session #{session_id}: switching to window {id}, which is not on \
+                         screen — waiting for it"
+                    );
+                    applied_display = wanted.clone();
+                    window = SharedWindowWatch::switched_to(&applied_display);
+                    capturer = super::screen_capture::create_stub(&capture_config);
+                    // Switched, even though there will be no picture until the
+                    // window comes back. The guest is waiting on this answer to
+                    // stop waiting; what it gets instead of frames is the watch
+                    // above saying the window is minimised, which is the useful
+                    // thing to be told.
+                    if announce(&out_tx, &applied_display, None).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+
                 if wanted != applied_display {
                     let mut config = capture_config.clone();
                     config.display = wanted.clone();
@@ -2642,6 +3449,13 @@ fn spawn_capture_thread(
                         super::screen_capture::DisplayTarget::All => "every screen".to_string(),
                         super::screen_capture::DisplayTarget::Primary => {
                             "the primary display".to_string()
+                        }
+                        super::screen_capture::DisplayTarget::Window(id) => {
+                            super::window_capture::title_of(*id)
+                                .unwrap_or_else(|| format!("window {id}"))
+                        }
+                        super::screen_capture::DisplayTarget::Windows(ids) => {
+                            format!("{} shared window(s)", ids.len())
                         }
                     };
                     // # Drop first only when the two overlap
@@ -2681,12 +3495,49 @@ fn spawn_capture_thread(
                             info!("Session #{session_id}: now streaming {named} ({w}x{h})");
                             capturer = fresh;
                             applied_display = wanted;
+                            // # The watch follows the switch
+                            //
+                            // It is pointed at one handle, and a session that
+                            // was granted several windows can be told to show a
+                            // different one at any moment. Left where it was,
+                            // it would report the state of a window nobody is
+                            // watching — pausing the stream because the window
+                            // the guest *left* got minimised, and saying
+                            // nothing when the one on screen does.
+                            //
+                            // Built as a *switch* rather than as a start: at
+                            // session start the guest was told what it is
+                            // looking at by `SessionStart`, and here nothing
+                            // has told it. So the new window is announced on
+                            // the next tick even when its state happens to
+                            // match the state of the one just left.
+                            window = SharedWindowWatch::switched_to(&applied_display);
+                            // # Announced here, because here is where it became
+                            // true
+                            //
+                            // The reader accepted the request and said nothing;
+                            // this is the moment the guest is looking at
+                            // something else. Sent before the first frame of it
+                            // rather than after, so a guest waiting on the
+                            // picture is told the wait is nearly over rather
+                            // than being told by the picture arriving.
+                            if announce(&out_tx, &applied_display, None).is_err() {
+                                return;
+                            }
                         }
                         Err(e) => {
                             warn!("Session #{session_id}: could not switch to {named}: {e:#}");
                             // Do not ask again every tick for something that
                             // just failed.
                             *wanted_display.lock().unwrap() = applied_display.clone();
+                            // And the guest is told, or it waits for a picture
+                            // that was never going to come. The reader says
+                            // nothing for an accepted request precisely so this
+                            // can be the one answer, whichever way it goes.
+                            if announce(&out_tx, &applied_display, Some(format!("{e}"))).is_err()
+                            {
+                                return;
+                            }
 
                             if let Some(old) = kept {
                                 // Never let go of, so there is nothing to
@@ -2905,6 +3756,73 @@ async fn run_reader<R>(
                     .filter(|d| allowed.allows(d.id))
                     .collect();
                 let (showing, why) = match choice {
+                    // # A window grant is a menu with no screens on it
+                    //
+                    // Switching *within* the granted set is allowed, and is
+                    // what makes granting several windows worth doing. Anything
+                    // else is not: a session confined to windows cannot be
+                    // talked into a screen by asking for one, whatever the
+                    // guest's menu happens to be showing.
+                    DisplayChoice::Window(id) if allowed.allows_window(id) => {
+                        info!("Session #{session_id}: guest asked for window {id}");
+                        *wanted_display.lock().unwrap() = DisplayTarget::Window(id);
+                        (DisplayChoice::Window(id), None)
+                    }
+                    // # "All of it" means all of the windows, here
+                    //
+                    // The same request a screen session uses to ask for the
+                    // whole desk, answered with the whole of what *this* session
+                    // was given. Nothing outside the grant becomes reachable by
+                    // asking for everything — the composite is built from the
+                    // granted list and no other window can enter it.
+                    //
+                    // Refused for a grant of one, where a grid of one window is
+                    // the window with the overhead of composing it.
+                    DisplayChoice::All if allowed.windows().len() > 1 => {
+                        let ids = allowed.windows().to_vec();
+                        info!(
+                            "Session #{session_id}: guest asked for all {} shared windows",
+                            ids.len()
+                        );
+                        *wanted_display.lock().unwrap() = DisplayTarget::Windows(ids);
+                        (DisplayChoice::All, None)
+                    }
+                    _ if !allowed.windows().is_empty() => {
+                        // Whatever it asked for, it is not on offer. The reply
+                        // carries what is actually being shown so the guest's
+                        // switcher corrects itself rather than showing a
+                        // selection that never took.
+                        let current = wanted_display.lock().unwrap().clone();
+                        let showing = match current {
+                            DisplayTarget::Window(id) => DisplayChoice::Window(id),
+                            DisplayTarget::Windows(_) => DisplayChoice::All,
+                            // Cannot happen — a window session's target is one
+                            // window or several — but the reply has to say
+                            // something, and the first granted window is the one
+                            // it would have opened on.
+                            _ => DisplayChoice::Window(
+                                allowed.windows().first().copied().unwrap_or_default(),
+                            ),
+                        };
+                        let why = (showing != choice)
+                            .then(|| "this session is sharing windows, not screens".to_string());
+                        if why.is_some() {
+                            warn!(
+                                "Session #{session_id}: refused {choice:?} — the grant is \
+                                 {} window(s)",
+                                allowed.windows().len()
+                            );
+                        }
+                        (showing, why)
+                    }
+                    // A window nobody granted. Same reasoning as an unknown
+                    // display id: a stale menu, not a thing to honour.
+                    DisplayChoice::Window(id) => {
+                        let why = format!("window {id} is not shared with this session");
+                        warn!("Session #{session_id}: {why}");
+                        let current = wanted_display.lock().unwrap().clone();
+                        (showing_now(&current, &available), Some(why))
+                    }
                     DisplayChoice::All if available.len() < 2 => {
                         // Nothing to compose. Not an error — one screen shown
                         // whole is what "all of them" means here — but the guest
@@ -2964,26 +3882,31 @@ async fn run_reader<R>(
                                 format!("display {id} is not one of this host's {}", available.len());
                             warn!("Session #{session_id}: {why}");
                             let current = wanted_display.lock().unwrap().clone();
-                            let showing = match &current {
-                                DisplayTarget::All => DisplayChoice::All,
-                                DisplayTarget::One(name) => DisplayChoice::One(
-                                    available
-                                        .iter()
-                                        .find(|d| &d.name == name)
-                                        .map_or(id, |d| d.id),
-                                ),
-                                DisplayTarget::Primary => DisplayChoice::One(
-                                    available.iter().find(|d| d.primary).map_or(id, |d| d.id),
-                                ),
-                            };
-                            (showing, Some(why))
+                            (showing_now(&current, &available), Some(why))
                         }
                     },
                 };
-                let _ = out_tx.send(Message::DisplayChanged(super::protocol::DisplayChanged {
-                    showing,
-                    why,
-                }));
+                // # Only the answers that are already true are sent from here
+                //
+                // A refusal is final the moment it is decided, so it goes now.
+                // An acceptance is not: `wanted_display` has been set and the
+                // capture thread has yet to act on it, which takes as long as
+                // building the new capture takes — the better part of a second
+                // for a composite of several windows.
+                //
+                // Sent from here, it announced a view the host was still
+                // producing the *old* pictures of. The guest cleared its "this
+                // is on the way" indicator on the next frame, which was a frame
+                // of what it had just left — reported as the loading screen
+                // going away too early, showing a stale window.
+                //
+                // So the capture thread sends it when the switch has actually
+                // happened. See `spawn_capture_thread`.
+                if why.is_some() {
+                    let _ = out_tx.send(Message::DisplayChanged(
+                        super::protocol::DisplayChanged { showing, why },
+                    ));
+                }
             }
             Ok(Message::Input(event)) => {
                 // Re-read grants per event: they can change at any point during
@@ -3115,6 +4038,7 @@ pub fn inject_input(
 
     match event {
         InputEvent::MouseMove(m) => injector.move_mouse(MousePosition { x: m.x, y: m.y }),
+        InputEvent::MouseMotion(m) => injector.move_mouse_by(m.dx.into(), m.dy.into()),
         InputEvent::MouseButton(b) => injector.mouse_button(MouseButtonInput {
             button: b.button,
             pressed: b.pressed,
@@ -3140,7 +4064,6 @@ pub fn inject_input(
 
 /// A guest client that connects to a host via iroh P2P using a passcode ticket.
 pub struct GuestClient {
-    endpoint: iroh::Endpoint,
     connection: Option<iroh::endpoint::Connection>,
     /// Which address lookup located this host. See [`super::discovery::Found`].
     found: super::discovery::Found,
@@ -3182,14 +4105,14 @@ pub enum DialStep {
 impl DialStep {
     /// What to show while this step is the one in progress.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Starting => "Starting up…",
-            Self::ReachingRelay => "Looking up where the host is…",
-            Self::ViaRelay => "Reaching the host through its relay…",
-            Self::Direct => "Reaching the host directly…",
-            Self::Punching => "Opening a direct path…",
-            Self::Authenticating => "Sending the passcode…",
-        }
+        super::i18n::text(match self {
+            Self::Starting => "step.starting",
+            Self::ReachingRelay => "step.reaching_relay",
+            Self::ViaRelay => "step.via_relay",
+            Self::Direct => "step.direct",
+            Self::Punching => "step.punching",
+            Self::Authenticating => "step.authenticating",
+        })
     }
 
     /// What to say when the attempt gave up here.
@@ -3197,35 +4120,21 @@ impl DialStep {
     /// Phrased as the thing that did not happen rather than as an error code,
     /// because the useful next action differs at every step.
     pub fn stalled_at(self) -> &'static str {
-        match self {
-            Self::Starting => "this machine could not open a connection of its own",
-            Self::ReachingRelay => {
-                "no relay could be reached from here, and the code carries no address to \
-                 try directly — ask for a fresh code, or connect once on a network that \
-                 works so an address can be remembered"
-            }
-            Self::ViaRelay => {
-                "the host's relay could not be reached from here. The host may be fine and \
-                 the relay blocked"
-            }
-            Self::Direct => {
-                "the host did not answer on the address it last used. It may be switched \
-                 off, asleep, or on another network"
-            }
-            Self::Punching => {
-                "the host answered, but only through a relay — no direct path could be \
-                 opened, and a relay cannot carry video. A VPN or a strict NAT on either \
-                 machine is the usual reason"
-            }
-            Self::Authenticating => "the host answered but did not accept the passcode",
-        }
+        super::i18n::text(match self {
+            Self::Starting => "stalled.starting",
+            Self::ReachingRelay => "stalled.reaching_relay",
+            Self::ViaRelay => "stalled.via_relay",
+            Self::Direct => "stalled.direct",
+            Self::Punching => "stalled.punching",
+            Self::Authenticating => "stalled.authenticating",
+        })
     }
 }
 
 impl GuestClient {
     /// Connect to the host identified by its PublicKey (EndpointId).
     pub async fn connect(host_public_key: &iroh::PublicKey) -> Result<Self> {
-        Self::connect_via(host_public_key, None, &[]).await
+        Self::connect_via(host_public_key, None).await
     }
 
     /// Connect, using a relay the code supplied rather than looking one up.
@@ -3243,9 +4152,8 @@ impl GuestClient {
     pub async fn connect_via(
         host_public_key: &iroh::PublicKey,
         relay_url: Option<&str>,
-        known_addrs: &[std::net::SocketAddr],
     ) -> Result<Self> {
-        Self::connect_reporting(host_public_key, relay_url, known_addrs, &|_| {}).await
+        Self::connect_reporting(host_public_key, relay_url, &|_| {}).await
     }
 
     /// As [`Self::connect_via`], saying which step it has reached as it goes.
@@ -3257,7 +4165,6 @@ impl GuestClient {
     pub async fn connect_reporting(
         host_public_key: &iroh::PublicKey,
         relay_url: Option<&str>,
-        known_addrs: &[std::net::SocketAddr],
         on_step: &(dyn Fn(DialStep) + Send + Sync),
     ) -> Result<Self> {
         /// How long to wait for the endpoint to report itself online.
@@ -3269,29 +4176,36 @@ impl GuestClient {
         /// nothing — and waiting forever is what "it just never connects" was.
         const ONLINE_WAIT: Duration = Duration::from_secs(5);
 
-        /// How long one dial may take before the host is called unreachable.
+        /// How long one dial may take before it is abandoned and asked again.
         ///
-        /// Generous for the same reason the paste check is: a cold path may
-        /// need a relay handshake and hole punching first, and iroh retries
-        /// inside this with a growing backoff. But it is bounded, because the
-        /// alternative is a session that sits on "Connecting" with nothing to
-        /// report and nothing to cancel.
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+        /// A cold path may need a relay handshake and hole punching first, and
+        /// iroh retries inside this with a growing backoff. Shorter than it was,
+        /// because it is no longer the end of the attempt: a dial that spends
+        /// this without an answer is now one ask among several, and a budget
+        /// spent on more asks finds more hosts than a budget spent waiting
+        /// longer on one.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 
-        /// How long to keep asking where a host is before calling it not found.
+        /// How long to keep trying before calling the host unreachable.
         ///
-        /// Discovery is allowed to be slow. mDNS answers in under a second and
-        /// DNS in a few, but the mainline DHT — the one that still works when
-        /// the others are blocked — needed about eight seconds and a second ask
-        /// when measured, because a freshly published record has to settle on
-        /// the nodes that will be asked for it.
-        ///
-        /// Waiting costs nothing that matters. How fast the session then runs
-        /// is a property of the path it found, not of how long finding it took.
-        const FIND_WAIT: Duration = Duration::from_secs(30);
+        /// Discovery is allowed to be slow, and so is a link that needs several
+        /// asks. Waiting costs nothing that matters: how fast the session then
+        /// runs is a property of the path it found, not of how long finding it
+        /// took, and the progress graph says what is being waited on.
+        const FIND_WAIT: Duration = Duration::from_secs(45);
 
         /// How long to leave between asking again.
         const FIND_RETRY: Duration = Duration::from_secs(2);
+
+        // The budget has to leave room for at least one whole attempt *after*
+        // discovery's run, or the saved address would never be reached and the
+        // fallback would silently stop existing. Checked here rather than in a
+        // test because it is three constants, and a mismatch should fail the
+        // build rather than wait for somebody to connect on a filtered link.
+        const _: () = assert!(
+            DISCOVERY_GRACE.as_secs() + DIAL_TIMEOUT.as_secs() < FIND_WAIT.as_secs(),
+            "no room left to try the address this host answered on last time"
+        );
 
         // The cached resolver, as everywhere else — this is the path a user on
         // a censored link actually presses, and the one where three seconds of
@@ -3300,8 +4214,12 @@ impl GuestClient {
         // The guest needs these more than the host does: this is the side that
         // has to *find* somebody, and mDNS answers that on a local network
         // without the relay this dial would otherwise have to reach first.
-        let (endpoint, lookups) =
-            super::discovery::bind(super::discovery::endpoint_builder()).await?;
+        //
+        // Shared rather than bound per dial — see `OUTGOING_ENDPOINT`, which
+        // explains why two of them under one identity is two machines with the
+        // same name.
+        let (endpoint, lookups) = outgoing_endpoint().await?;
+        let endpoint = endpoint.clone();
 
         // Only worth naming as a step when there is nothing else to go on. With
         // a relay in the code or an address on file, this wait is a courtesy
@@ -3334,35 +4252,31 @@ impl GuestClient {
             None => info!("Connecting to host (no relay in the code — looking it up)"),
         }
 
-        // # Where this host answered last time is the last thing to try
+        // # There is no address from last time any more
         //
-        // These used to be added here, alongside the relay, on the reasoning
-        // that iroh races every candidate and a stale one simply loses. That is
-        // wrong, and was reported as such: deleting the saved address made a
-        // connection succeed that had been failing repeatedly with it.
+        // Tain used to keep the address a host answered on and hand it to the
+        // next dial. Three attempts were made to make that safe — added
+        // alongside the relay, then only when no lookup answered, then only
+        // after a discovery grace — and each one was reported as still breaking
+        // connections that worked the moment the saved address was deleted.
         //
-        // An address is not evidence about the present. A host that has moved
-        // network, been given a different port by its NAT, or gone behind a
-        // tunnel leaves an address behind that still *routes* — to a NAT that
-        // now maps it to somebody else, or to nothing at all. Those do not lose
-        // the race quickly; they take the dial with them while the path that
-        // would have worked goes unused.
+        // The idea itself was wrong. An address is not evidence about the
+        // present: a host that has changed network, been given a different port
+        // by its NAT, or gone behind a tunnel leaves one behind that still
+        // *routes*, to a NAT that now maps it to somebody else or to nothing at
+        // all. Those do not lose a race quickly — they take the dial with them.
+        // And the cache could only ever be refreshed by a *successful* session,
+        // so a stale entry was cleared by the one thing it was preventing.
         //
-        // So the order is: everything that can say where the host is *now* —
-        // the relay in the code, mDNS, DNS, the DHT — and only if all of that
-        // comes back with nothing, the address from last time. Which is what it
-        // is actually good for: a machine whose relays are unreachable and
-        // whose lookups are all blocked, where an old address is the only thing
-        // left and worth a try precisely because there is no alternative.
+        // It was also duplicating work that is already done better. iroh keeps
+        // its own path state per endpoint; mDNS answers on a local network with
+        // no relay and no internet; and the DHT record carries dialable
+        // addresses rather than only a relay — see `discovery::publishable`,
+        // which exists for exactly the case a remembered address was supposed
+        // to cover. Where the host *is* is a question with three live answers,
+        // and a fourth stale one was not helping any of them.
         //
-        // It cannot reach the wrong machine either way: the endpoint id is a
-        // public key and the handshake checks it. Being safe was never the
-        // question — being preferred was.
-        let fallback: Vec<iroh::TransportAddr> =
-            known_addrs.iter().map(|a| iroh::TransportAddr::Ip(*a)).collect();
-
-        // Whichever way this is going to be reached, said before the wait
-        // rather than after it — a step nobody sees is not a step.
+        // So: the relay in the code, mDNS, DNS, the DHT. Nothing else.
         on_step(DialStep::ViaRelay);
 
         // # "Nobody knows yet" is not "nobody knows"
@@ -3385,80 +4299,101 @@ impl GuestClient {
         // afterwards is decided by the path it found, not by how long finding
         // it took — so where more time is the whole fix, this spends it.
         //
-        // Only for `NoAddress`, though: that is the difference between nobody
-        // having said where this host is, and a host that answered and refused,
-        // where retrying only turns a clear failure into a slow one.
-        let deadline = std::time::Instant::now() + FIND_WAIT;
+        // # One failure is not worth a second of the budget
+        //
+        // Everything below retries, on the reasoning that a route which did not
+        // work this second may work the next. That reasoning does not cover
+        // dialling *ourselves*: iroh refuses it outright, instantly, and will go
+        // on refusing it. Left to the loop it burned the whole 45-second budget
+        // over 24 identical refusals, and then the outer retry did it twice more
+        // — two and a half minutes to be told something knowable before the
+        // first attempt.
+        //
+        // It should not be reachable any more: this machine hosts on one key and
+        // dials with another derived from it, so its own code is a legitimate
+        // thing to paste. The check stays because the alternative to a clear
+        // answer here is that same silent quarter-hour.
+        if addr.id == endpoint.id() {
+            return Err(anyhow::anyhow!(
+                "this code is for the machine it was pasted on, and its host and client are \
+                 the same endpoint — which iroh cannot dial"
+            ));
+        }
+
+        let started = std::time::Instant::now();
+        let deadline = started + FIND_WAIT;
         let mut attempts = 0u32;
-        let mut using_fallback = false;
+        // The most recent failure, which is what gets reported if the budget
+        // runs out. The last one rather than the first: by then the earlier
+        // ones are "we had not found it yet", and the useful sentence is what
+        // was still wrong at the end.
+        let mut last;
         let conn = loop {
             attempts += 1;
-            let outcome =
-                tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN)).await;
 
-            // # A dial that hangs found the host no better than one that
-            // came back empty
-            //
-            // This used to ask only about `NoAddress`, and treating a dial
-            // that spent its whole budget as fatal quietly made the fallback
-            // unreachable in the one situation it exists for. A lookup that is
-            // *blocked* does not answer "nothing" — it hangs, waiting on a
-            // relay or a resolver that will never reply — and a network where
-            // lookups hang is exactly the network where an address from last
-            // time is the only thing left to try.
-            //
-            // Caught by `a_host_that_can_be_reached_directly_is_carried_directly`,
-            // which handed a loopback address to a guest that could not
-            // discover anything and watched it give up without ever dialling
-            // the address it had been given.
-            let nothing_found = match &outcome {
-                Ok(Ok(_)) => false,
-                Ok(Err(e)) => not_found_yet(e),
-                Err(_elapsed) => true,
-            };
+            let why: anyhow::Error =
+                match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr.clone(), ALPN))
+                    .await
+                {
+                    Ok(Ok(conn)) => break conn,
+                    Ok(Err(e)) => anyhow::Error::new(e),
+                    // # A dial that hangs is an ask that did not answer
+                    //
+                    // It used to end the whole attempt. On a link where the
+                    // relay is filtered that is the *ordinary* outcome of the
+                    // first ask, so the one network this software is written
+                    // for got a single try and a failure — with the rest of the
+                    // budget unspent and the DHT never consulted.
+                    Err(_elapsed) => {
+                        anyhow::anyhow!("no answer within {DIAL_TIMEOUT:?}")
+                    }
+                };
 
-            // Nothing said where this host is, and there is an address from
-            // last time. Now it is worth having — this is the "nothing else at
-            // all" it was kept for. Added once and then left in place, so the
-            // remaining retries include it.
-            if nothing_found && !using_fallback && !fallback.is_empty() {
-                using_fallback = true;
-                for known in &fallback {
-                    addr.addrs.insert(known.clone());
-                }
-                info!(
-                    "Nothing could say where this host is — trying {} address(es) it \
-                     answered on before",
-                    fallback.len()
+            if attempts == 1 {
+                debug!("Nowhere to reach this host yet ({why:#}) — still looking");
+            }
+            last = why;
+
+            // # Every failure is retried, while there is time
+            //
+            // This used to retry only `NoAddress`, on the reasoning that
+            // anything else was a definite refusal and retrying would turn a
+            // clear failure into a slow one. On a good link that is true. On a
+            // filtered one it is not: a relay handshake that fails is not a
+            // refusal, it is a route that did not work this second, and there
+            // are other routes that might. The deadline is what stops this
+            // being unbounded — not the first discouraging answer.
+            if std::time::Instant::now() >= deadline {
+                // # What was actually tried, said once, at the end
+                //
+                // Several rounds of "it cannot find my other PC" have been
+                // diagnosed by reading code rather than a log, because nothing
+                // anywhere said which ways of finding a host this machine even
+                // had. Two PCs on one LAN that cannot see each other is mDNS
+                // not running; the same pair on a filtered link is the DHT not
+                // running. The log said neither.
+                warn!(
+                    "Could not place this host in {:?} over {attempts} attempt(s). \
+                     Ways of finding it on this machine: mDNS {}, DNS {}, DHT {}. \
+                     Relay in the code: {}.",
+                    started.elapsed(),
+                    if lookups.mdns { "on" } else { "OFF" },
+                    if lookups.dns { "on" } else { "OFF" },
+                    if lookups.dht { "on" } else { "OFF" },
+                    if relay_url.is_some_and(|url| !url.is_empty()) { "yes" } else { "no" },
                 );
-                on_step(DialStep::Direct);
-                continue;
+                return Err(anyhow::Error::context(
+                    last,
+                    format!(
+                        "gave up after {attempts} attempt(s) over {:?}",
+                        started.elapsed()
+                    ),
+                ));
             }
-
-            match outcome {
-                Ok(Ok(conn)) => break conn,
-                Ok(Err(e)) => {
-                    // The other case worth repeating: a first attempt made
-                    // before this endpoint was online had no relay to fall back
-                    // on, and the next one may.
-                    let worth_waiting = not_found_yet(&e) || (!online && attempts == 1);
-                    if !worth_waiting || std::time::Instant::now() >= deadline {
-                        return Err(e).context("Failed to connect to host");
-                    }
-                    if attempts == 1 {
-                        debug!("Nowhere to reach this host yet ({e}) — still looking");
-                    }
-                    if !online {
-                        let _ = tokio::time::timeout(ONLINE_WAIT, endpoint.online()).await;
-                    }
-                    tokio::time::sleep(FIND_RETRY).await;
-                }
-                Err(_) => anyhow::bail!(
-                    "That host did not answer within {DIAL_TIMEOUT:?}. It may be offline, or \
-                     the relay in its code may be unreachable from here — ask for a fresh code \
-                     if the host has moved network."
-                ),
+            if !online {
+                let _ = tokio::time::timeout(ONLINE_WAIT, endpoint.online()).await;
             }
+            tokio::time::sleep(FIND_RETRY).await;
         };
         if attempts > 1 {
             debug!("Found the host on attempt {attempts}");
@@ -3497,7 +4432,10 @@ impl GuestClient {
             }
         }
 
-        Ok(Self { endpoint, connection: Some(conn), found: lookups.found })
+        // Cloned because the lookups outlive this connection now: they belong
+        // to the shared endpoint, and a second session will read the same
+        // record to say how *it* found its host.
+        Ok(Self { connection: Some(conn), found: lookups.found.clone() })
     }
 
     /// Which address lookup found this host.
@@ -3519,26 +4457,21 @@ impl GuestClient {
     ///
     /// This is the whole point of the code format: the guest needs no separate
     /// ticket, because the address travels with the secret.
-    pub async fn connect_with_code(
-        code: &ConnectionCode,
-        known_addrs: &[std::net::SocketAddr],
-    ) -> Result<Self> {
-        Self::connect_with_code_reporting(code, known_addrs, &|_| {}).await
+    pub async fn connect_with_code(code: &ConnectionCode) -> Result<Self> {
+        Self::connect_with_code_reporting(code, &|_| {}).await
     }
 
     /// As [`Self::connect_with_code`], saying which step it has reached.
     pub async fn connect_with_code_reporting(
         code: &ConnectionCode,
-        known_addrs: &[std::net::SocketAddr],
         on_step: &(dyn Fn(DialStep) + Send + Sync),
     ) -> Result<Self> {
         let public_key =
             iroh::PublicKey::from_bytes(&code.endpoint_id).context("Invalid endpoint ID bytes")?;
         // The relay the host put in the code, so no lookup is needed to find
         // it. Codes issued before this existed carry none, and fall back to the
-        // lookup path. `known_addrs` is where this host answered last time,
-        // which can remove the relay from the path entirely.
-        Self::connect_reporting(&public_key, code.relay_url.as_deref(), known_addrs, on_step).await
+        // lookup path.
+        Self::connect_reporting(&public_key, code.relay_url.as_deref(), on_step).await
     }
 
     /// Take ownership of the underlying connection's stream pair, authenticating first.
@@ -3588,9 +4521,16 @@ impl GuestClient {
         path_of(self.connection.as_ref()?)
     }
 
-    /// Shut down the guest endpoint.
+    /// Close this session's connection.
+    ///
+    /// The endpoint underneath is shared by every session this process has open
+    /// and is deliberately left alone — see [`OUTGOING_ENDPOINT`]. Closing it
+    /// here used to be right, when each connection had one of its own; now it
+    /// would take down the other tabs.
     pub async fn shutdown(&self) -> Result<()> {
-        self.endpoint.close().await;
+        if let Some(ref connection) = self.connection {
+            connection.close(0u32.into(), b"done");
+        }
         Ok(())
     }
 }
@@ -3664,27 +4604,10 @@ impl ConnectionPath {
     /// What to tell the user when the path is the problem.
     pub fn advice(&self) -> String {
         match self {
-            Self::Direct { .. } => "Connected peer to peer.".to_string(),
-            Self::Relay { host, .. } => format!(
-                "Relayed through {host} because a direct connection could not be established. Relays are shared and rate-limited, so video over one stutters no matter what quality is chosen. A VPN on either machine is a common cause."
-            ),
+            Self::Direct { .. } => super::i18n::text("path.direct").to_string(),
+            Self::Relay { host, .. } => super::i18n::format("path.relayed", &[("host", host)]),
         }
     }
-}
-
-/// Whether a dial failed because nobody has said where the host is *yet*.
-///
-/// The distinction the retry loop in `connect_reporting` turns on: this is the
-/// one failure that more time can fix on its own, because it means every
-/// address lookup came back empty rather than that anything was refused.
-fn not_found_yet(e: &iroh::endpoint::ConnectError) -> bool {
-    matches!(
-        e,
-        iroh::endpoint::ConnectError::Connect {
-            source: iroh::endpoint::ConnectWithOptsError::NoAddress { .. },
-            ..
-        }
-    )
 }
 
 /// Which path a connection settled on, once it has had time to settle.
@@ -3807,17 +4730,9 @@ pub async fn await_direct_path(conn: &iroh::endpoint::Connection, limit: Duratio
 /// one that most often works — connecting once on a network where it succeeds —
 /// looks like it has nothing to do with the problem.
 fn relay_only_message(via: &str) -> String {
-    format!(
-        "Connected to the host through the relay {via}, but no direct path opened within \
-         {DIRECT_PATH_WAIT:?}, so the session was refused rather than run over the relay — \
-         relays are shared and rate limited, and video over one is a slideshow.\n\n\
-         A VPN or tunnel on either machine is the usual cause, because it hides the address \
-         the other side needs to punch to. A strict or symmetric NAT on either side does the \
-         same. If both machines are on the same network, they should be reachable directly: \
-         check that neither is on a guest or isolated Wi-Fi network, and that the host's \
-         firewall is not blocking incoming UDP.\n\n\
-         Connecting once from a network where a direct path does open teaches this machine \
-         the host's address, and that address is tried first next time."
+    super::i18n::format(
+        "path.relay_only",
+        &[("via", via), ("wait", &format!("{DIRECT_PATH_WAIT:?}"))],
     )
 }
 
@@ -3949,13 +4864,8 @@ impl Prober {
     /// Never raises an approval request on the host, and never fails the caller:
     /// every outcome, including "could not reach it", is an answer worth showing
     /// on the card.
-    pub async fn probe(
-        &self,
-        code: &ConnectionCode,
-        known_addrs: &[std::net::SocketAddr],
-        timeout: Duration,
-    ) -> ProbeOutcome {
-        match tokio::time::timeout(timeout, self.try_probe(code, known_addrs)).await {
+    pub async fn probe(&self, code: &ConnectionCode, timeout: Duration) -> ProbeOutcome {
+        match tokio::time::timeout(timeout, self.try_probe(code)).await {
             Ok(Ok(outcome)) => outcome,
             // The reason travels with the answer now. A card that says a host
             // is offline is making a claim, and the claim is worth a lot more
@@ -3972,11 +4882,7 @@ impl Prober {
         }
     }
 
-    async fn try_probe(
-        &self,
-        code: &ConnectionCode,
-        known_addrs: &[std::net::SocketAddr],
-    ) -> Result<ProbeOutcome> {
+    async fn try_probe(&self, code: &ConnectionCode) -> Result<ProbeOutcome> {
         let public_key =
             iroh::PublicKey::from_bytes(&code.endpoint_id).context("bad endpoint id")?;
 
@@ -4004,32 +4910,29 @@ impl Prober {
             }
         }
 
-        // # The same addresses the Connect button would use
+        // # And nothing else
         //
-        // This probed with the relay alone. Connecting also tries wherever the
-        // host answered last time, and that difference showed: a host on the
-        // same network as this machine was reported offline by every sweep,
-        // while Connect reached it directly and immediately. A list that is
-        // confidently wrong about the one thing it exists to answer is worse
-        // than no list.
-        for known in known_addrs {
-            addr.addrs.insert(iroh::TransportAddr::Ip(*known));
-        }
+        // This used to also insert the address the host answered on last time,
+        // to match what the Connect button did. Both are gone: an address from
+        // a previous session is not evidence about the present, and here it was
+        // worse than in the dial loop — inserted unconditionally and first,
+        // with no lookup given a chance ahead of it. A sweep that clung to a
+        // stale address reported a reachable host as offline, which is the one
+        // thing a card exists to answer.
+        //
+        // What is left is what can actually say where the host is now: the
+        // relay in the code, and the lookups attached to this endpoint.
 
         let conn = self
             .endpoint
             .connect(addr, ALPN)
             .await
-            .with_context(|| {
-                // Named in the same vocabulary the Connect button uses, so a
-                // card and a session window explain a failure the same way.
-                let step = if known_addrs.is_empty() {
-                    DialStep::ViaRelay
-                } else {
-                    DialStep::Direct
-                };
-                step.stalled_at().to_string()
-            })?;
+            // Named in the same vocabulary the Connect button uses, so a card
+            // and a session window explain a failure the same way. Always the
+            // relay step now: with no saved address there is no other way this
+            // can have been reached, and there is nothing left for `Direct` to
+            // describe.
+            .with_context(|| DialStep::ViaRelay.stalled_at().to_string())?;
 
         let (mut send, mut recv) = conn.open_bi().await?;
         write_stream_message(
@@ -4138,6 +5041,415 @@ mod tests {
 
     fn endpoint(byte: u8) -> [u8; 32] {
         [byte; 32]
+    }
+
+    /// Two dials from this machine arrive as the same machine.
+    ///
+    /// # The bug this exists for
+    ///
+    /// Trusting an admin device remembers the endpoint id its connection
+    /// arrived under. That could never match a second time, because this side
+    /// bound with no key and iroh mints a fresh keypair for an endpoint that is
+    /// not given one — so every connection from one laptop looked like a
+    /// different laptop, and the owner was asked to approve their own machine
+    /// every single time.
+    ///
+    /// Checked by building two endpoints rather than by inspecting the builder:
+    /// what matters is the id that reaches the far end, and that is a property
+    /// of the bound endpoint.
+    #[tokio::test]
+    async fn every_dial_from_this_machine_carries_the_same_identity() {
+        let secret = [0x5Au8; 32];
+        adopt_identity(secret);
+        assert!(has_identity(), "the identity was not taken up");
+
+        let hosting = *iroh::SecretKey::from_bytes(&secret).public().as_bytes();
+        let dialling = outgoing_key().expect("an adopted identity yields a dialling key");
+
+        // Two separate binds, as two separate connection attempts would be.
+        let (first, _a) = super::super::discovery::bind(outgoing_builder())
+            .await
+            .expect("bind an endpoint");
+        let (second, _b) = super::super::discovery::bind(outgoing_builder())
+            .await
+            .expect("bind a second endpoint");
+
+        assert_eq!(
+            *first.id().as_bytes(),
+            *dialling.public().as_bytes(),
+            "a dial did not carry the identity this machine adopted"
+        );
+        assert_eq!(
+            *first.id().as_bytes(),
+            *second.id().as_bytes(),
+            "two dials from one machine looked like two machines — this is the bug"
+        );
+
+        // # And it is not the key this machine *hosts* on
+        //
+        // Two endpoints under one id is not a thing iroh supports: the relay
+        // allows one connection per id and boots the other, so dialling out
+        // knocked this machine's own host off the relay. See `outgoing_key`.
+        assert_ne!(
+            *first.id().as_bytes(),
+            hosting,
+            "the client and the host are the same endpoint id — they will fight over the relay"
+        );
+
+        first.close().await;
+        second.close().await;
+    }
+
+    /// Dialling yourself is refused before the budget, not after it.
+    ///
+    /// # Why this is worth its own test
+    ///
+    /// The dial retries every failure while time remains, deliberately: on a
+    /// filtered link a route that failed this second is not a refusal. But a
+    /// dial to our own id is refused by iroh instantly and permanently, and the
+    /// loop turned that into twenty-four identical refusals over forty-five
+    /// seconds — then the outer retry ran it twice more. Two and a half minutes
+    /// of "looking for the host" for something knowable before the first
+    /// attempt.
+    #[tokio::test]
+    async fn dialling_our_own_endpoint_fails_at_once() {
+        // The endpoint every dial from this process goes out of, asked for its
+        // own id — which is what pasting this machine's own code amounts to
+        // when the host and the client share one key.
+        let (endpoint, _) = outgoing_endpoint().await.expect("bind the outgoing endpoint");
+        let ourselves = endpoint.id();
+
+        let started = std::time::Instant::now();
+        let outcome = GuestClient::connect_via(&ourselves, None).await;
+        let spent = started.elapsed();
+
+        assert!(outcome.is_err(), "dialling ourselves cannot succeed");
+        // Comfortably inside the dial's own find budget, which is 45 seconds and
+        // is what this used to spend on exactly this answer. Not asserted in
+        // microseconds: the check is before the loop, but binding the shared
+        // outgoing endpoint happens on the way in and is real work.
+        assert!(
+            spent < std::time::Duration::from_secs(10),
+            "took {spent:?} to refuse a dial that can never work"
+        );
+    }
+
+    /// Adopting twice keeps the first, because an id that moved mid-run would
+    /// be a second machine to every host this process has talked to.
+    #[test]
+    fn the_identity_this_machine_dials_under_does_not_move() {
+        adopt_identity([0x5Au8; 32]);
+        let settled = *OUTGOING_IDENTITY.get().expect("an identity");
+        adopt_identity([0x99u8; 32]);
+        assert_eq!(
+            *OUTGOING_IDENTITY.get().expect("an identity"),
+            settled,
+            "the second call replaced the first"
+        );
+    }
+
+    // ── Following a shared window ────────────────────────────
+
+    /// A window in a given state, named as a real one would be.
+    fn window_in(state: super::super::protocol::SharedWindowState) -> super::super::protocol::SharedWindow {
+        super::super::protocol::SharedWindow {
+            id: 0x2A,
+            title: "Budget 2026.xlsx".into(),
+            app: "Excel".into(),
+            state,
+        }
+    }
+
+    fn watching(state: super::super::protocol::SharedWindowState) -> SharedWindowWatch {
+        SharedWindowWatch { id: 0x2A, told: window_in(state), owed: false, restored: false }
+    }
+
+    /// Nothing is sent while nothing changes.
+    ///
+    /// This runs on every capture tick — sixty times a second on a live session
+    /// — and a message per tick would be a message per frame for a fact that
+    /// changes twice an hour.
+    #[test]
+    fn a_window_that_is_doing_what_it_was_says_nothing() {
+        use super::super::protocol::SharedWindowState::*;
+        for state in [Showing, Minimised, Closed] {
+            let mut watch = watching(state);
+            assert!(
+                matches!(watch.settle(window_in(state)), WindowStep::Unchanged),
+                "{state:?} re-reported itself"
+            );
+        }
+    }
+
+    /// Minimising is announced, and stops the frames.
+    #[test]
+    fn minimising_is_announced_and_ends_the_stream() {
+        use super::super::protocol::SharedWindowState::*;
+        let mut watch = watching(Showing);
+        assert!(watch.live());
+
+        let step = watch.settle(window_in(Minimised));
+        let WindowStep::Announce(said) = step else {
+            panic!("the guest was not told the window went away");
+        };
+        assert_eq!(said.state, Minimised);
+        assert_eq!(said.app, "Excel", "the guest needs a name to put in the sentence");
+        assert!(!watch.live(), "a minimised window produces no frames");
+        assert!(!watch.needs_rebuild(), "nothing to rebuild while it is still away");
+    }
+
+    /// Coming back is the one change the capture loop has to act on.
+    #[test]
+    fn restoring_a_window_asks_for_the_capture_to_be_built_again() {
+        use super::super::protocol::SharedWindowState::*;
+        let mut watch = watching(Minimised);
+
+        assert!(matches!(watch.settle(window_in(Showing)), WindowStep::Announce(_)));
+        assert!(watch.live());
+        assert!(
+            watch.needs_rebuild(),
+            "the capturer was dropped while it was away, so frames need a new one"
+        );
+
+        watch.rebuilt();
+        assert!(!watch.needs_rebuild(), "asking twice would rebuild it every tick");
+    }
+
+    /// A retitle is worth telling the guest and is not worth rebuilding for.
+    ///
+    /// Browsers rename their window on every navigation, so this is the common
+    /// change — and treating it as a restore would tear the capture down and
+    /// build it again on every page load.
+    #[test]
+    fn a_window_that_only_changed_its_title_keeps_its_capture() {
+        use super::super::protocol::SharedWindowState::Showing;
+        let mut watch = watching(Showing);
+
+        let renamed = super::super::protocol::SharedWindow {
+            title: "Forecast.xlsx".into(),
+            ..window_in(Showing)
+        };
+        let WindowStep::Announce(said) = watch.settle(renamed) else {
+            panic!("a retitle should reach the guest — it is what the toolbar shows");
+        };
+        assert_eq!(said.title, "Forecast.xlsx");
+        assert!(!watch.needs_rebuild(), "a retitle must not tear the capture down");
+        assert!(watch.live());
+    }
+
+    /// A window that closes stays closed, and nothing waits for it.
+    #[test]
+    fn a_closed_window_is_not_waited_for() {
+        use super::super::protocol::SharedWindowState::*;
+        let mut watch = watching(Showing);
+        assert!(matches!(watch.settle(window_in(Closed)), WindowStep::Announce(_)));
+        assert!(!watch.live());
+        assert!(!watch.needs_rebuild());
+
+        // And it keeps its name, so the guest can say *what* closed.
+        assert_eq!(watch.told.app, "Excel");
+    }
+
+    /// Switching between two granted windows tells the guest which one it got.
+    ///
+    /// # Why this needs saying out loud
+    ///
+    /// The watch reports *changes*, measured against the last thing it read.
+    /// Point a fresh one at a second window that happens to be doing the same
+    /// thing as the first — both showing, which is the ordinary case — and
+    /// nothing has changed, so on the old rule nothing was sent. The guest went
+    /// on naming the window it had left, and its switcher showed a selection
+    /// that had never been confirmed.
+    ///
+    /// A switch is news even when the state is not.
+    #[test]
+    fn switching_to_another_window_is_announced_even_when_nothing_changed() {
+        use super::super::protocol::SharedWindowState::Showing;
+        use super::super::screen_capture::DisplayTarget;
+
+        // What a session starts with: `SessionStart` already carried this, so
+        // an unchanged reading is silence.
+        let mut opened = watching(Showing);
+        assert!(matches!(opened.settle(window_in(Showing)), WindowStep::Unchanged));
+
+        // What replaces it when the guest picks a different window.
+        let mut switched = SharedWindowWatch {
+            owed: true,
+            ..watching(Showing)
+        };
+        let WindowStep::Announce(said) = switched.settle(window_in(Showing)) else {
+            panic!("a guest that asked for a different window has to be told it got one");
+        };
+        assert_eq!(said.app, "Excel");
+        assert!(
+            !switched.needs_rebuild(),
+            "the capture for the new window was just built; rebuilding it would drop the \
+             first frame"
+        );
+
+        // Once said, it is not said again every tick.
+        assert!(matches!(switched.settle(window_in(Showing)), WindowStep::Unchanged));
+
+        // And the two constructors differ in exactly that.
+        let target = DisplayTarget::Window(0x2A);
+        assert!(!SharedWindowWatch::for_target(&target).expect("a window watch").owed);
+        assert!(SharedWindowWatch::switched_to(&target).expect("a window watch").owed);
+    }
+
+    /// The guest is told which shared windows are open, once per change.
+    ///
+    /// # Why "once" is half the requirement
+    ///
+    /// This is asked on every capture tick — sixty times a second — and the
+    /// answer changes twice an hour. A message per tick would be a message per
+    /// frame carrying a fact nobody asked about, on the same connection as the
+    /// video.
+    #[test]
+    fn the_offer_is_announced_when_it_changes_and_not_otherwise() {
+        use super::super::protocol::DisplayGrant;
+
+        // A screen session has none of this to do.
+        assert!(Offer::for_grant(&DisplayGrant::All).is_none());
+        assert!(Offer::for_grant(&DisplayGrant::Only(vec![0])).is_none());
+        assert!(Offer::for_grant(&DisplayGrant::none()).is_none());
+
+        // Handles that never existed, so none of them are ever open — which is
+        // the "every shared window has been closed" case, reached without
+        // needing a window to close.
+        let mut offer = Offer::for_grant(&DisplayGrant::Windows(vec![0x11, 0x22]))
+            .expect("a window grant is watched");
+        assert_eq!(offer.granted.len(), 2, "the grant is remembered whole");
+        assert!(offer.told.is_empty(), "none of those handles are open");
+
+        // Seeded from what `SessionStart` already said, so an unchanged offer
+        // says nothing on the first tick or on any after it.
+        assert!(offer.moved().is_none(), "an offer that has not moved was announced anyway");
+        assert!(offer.moved().is_none());
+
+        // And a grant of real windows starts out knowing they are open, so it
+        // does not announce them either.
+        let open: Vec<u64> = super::super::window_capture::shareable()
+            .iter()
+            .take(2)
+            .map(|w| w.id)
+            .collect();
+        if !open.is_empty() {
+            let mut offer =
+                Offer::for_grant(&DisplayGrant::Windows(open.clone())).expect("watched");
+            assert_eq!(
+                offer.told.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                open,
+                "windows that are open start out offered"
+            );
+            assert!(offer.moved().is_none(), "nothing changed, so nothing to say");
+
+            // Now pretend the guest was told something else. The next ask
+            // reports the truth, once.
+            offer.told.clear();
+            let announced = offer.moved().expect("the offer changed and was not announced");
+            assert_eq!(announced.len(), open.len());
+            assert!(offer.moved().is_none(), "announced twice for one change");
+
+            // # A window merely going away still moves the offer
+            //
+            // It keeps its place in the list — it is still granted and can come
+            // back — so an offer compared by id alone would not move, and a
+            // composite of nothing but minimised windows would look exactly
+            // like a working one.
+            let away: Vec<_> = offer
+                .told
+                .iter()
+                .map(|(id, _)| (*id, super::super::protocol::SharedWindowState::Minimised))
+                .collect();
+            offer.told = away;
+            assert!(
+                offer.moved().is_some(),
+                "a window that came back was not announced, because only the ids were compared"
+            );
+        }
+    }
+
+    /// A source with nothing to give never holds up a request for another one.
+    ///
+    /// # The freeze this is for
+    ///
+    /// Close one of several shared windows, open the tab that says so, then ask
+    /// for the composite again: the loop was parked on a watch for a window
+    /// that had gone, and the display switch sits below that point. The stream
+    /// froze and stopped answering every further switch.
+    ///
+    /// The rule is that parking is an optimisation for having nothing to do,
+    /// and "somebody asked for a different picture" is something to do.
+    #[test]
+    fn a_dead_window_does_not_hold_up_a_switch_to_something_else() {
+        use super::super::screen_capture::DisplayTarget;
+
+        let closed = DisplayTarget::Window(0x2A);
+        let composite = DisplayTarget::Windows(vec![0x2A, 0x3B]);
+
+        // Nothing to capture and nothing else asked for: park, which is what
+        // stops a session on a minimised window burning a core.
+        assert!(should_park(false, &closed, &closed));
+
+        // Nothing to capture, and a different picture asked for. This is the
+        // one that froze.
+        assert!(
+            !should_park(false, &composite, &closed),
+            "a request to show something else was swallowed by a window that had gone"
+        );
+        assert!(!should_park(false, &DisplayTarget::Window(0x3B), &closed));
+
+        // And a live window never parks, whatever is asked for — the ordinary
+        // path, where the loop goes round and captures a frame.
+        assert!(!should_park(true, &closed, &closed));
+        assert!(!should_park(true, &composite, &closed));
+    }
+
+    /// Only a screen session skips all of this.
+    #[test]
+    fn a_screen_session_never_watches_a_window() {
+        use super::super::screen_capture::DisplayTarget;
+        assert!(SharedWindowWatch::for_target(&DisplayTarget::Primary).is_none());
+        assert!(SharedWindowWatch::for_target(&DisplayTarget::All).is_none());
+        assert!(
+            SharedWindowWatch::for_target(&DisplayTarget::One(r"\\.\DISPLAY1".into())).is_none()
+        );
+        // And a window session does, whatever state the window is in — the
+        // handle is all this needs to start following it.
+        assert!(SharedWindowWatch::for_target(&DisplayTarget::Window(0x2A)).is_some());
+    }
+
+    /// What the guest is told it is watching, for each way of capturing.
+    #[test]
+    fn what_a_session_is_showing_is_said_in_the_guests_terms() {
+        use super::super::protocol::{DisplayChoice, DisplayInfo};
+        use super::super::screen_capture::DisplayTarget;
+
+        let screen = DisplayInfo {
+            id: 3,
+            name: r"\\.\DISPLAY2".into(),
+            monitor: None,
+            width: 1920,
+            height: 1080,
+            x: 0,
+            y: 0,
+            primary: true,
+            hdr: false,
+            virtual_display: false,
+        };
+        let available = [screen.clone()];
+
+        assert_eq!(showing_now(&DisplayTarget::All, &available), DisplayChoice::All);
+        assert_eq!(
+            showing_now(&DisplayTarget::Window(9), &available),
+            DisplayChoice::Window(9)
+        );
+        assert_eq!(
+            showing_now(&DisplayTarget::One(r"\\.\DISPLAY2".into()), &available),
+            DisplayChoice::One(3),
+            "a device name has to come back as the id the guest was given"
+        );
+        assert_eq!(showing_now(&DisplayTarget::Primary, &available), DisplayChoice::One(3));
     }
 
     /// A guest is asked about every time, whatever else is remembered.

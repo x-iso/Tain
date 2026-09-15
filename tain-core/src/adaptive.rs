@@ -85,45 +85,26 @@ impl Bottleneck {
     }
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::SlowCapture => "Slow capture",
-            Self::SlowEncode => "Slow encoding",
-            Self::SlowNetwork => "Slow network",
-            Self::SlowDecode => "Slow decoding",
-            Self::SlowRender => "Slow display",
-            Self::HighLatency => "High latency",
-        }
+        crate::i18n::text(match self {
+            Self::SlowCapture => "bottleneck.slow_capture",
+            Self::SlowEncode => "bottleneck.slow_encode",
+            Self::SlowNetwork => "bottleneck.slow_network",
+            Self::SlowDecode => "bottleneck.slow_decode",
+            Self::SlowRender => "bottleneck.slow_render",
+            Self::HighLatency => "bottleneck.high_latency",
+        })
     }
 
     /// What the user can actually do about it.
     pub fn advice(self) -> &'static str {
-        match self {
-            Self::SlowCapture => {
-                "The host cannot grab frames fast enough — usually another program \
-                 saturating its GPU. Stream settings will not help."
-            }
-            Self::SlowEncode => {
-                "Encoding a frame takes longer than the frame budget. Enable the \
-                 hardware encoder on the host, or stream fewer pixels."
-            }
-            Self::SlowNetwork => {
-                "The link cannot carry the frames being produced. Lowering the \
-                 bitrate or resolution is what helps here."
-            }
-            Self::SlowDecode => {
-                "This machine cannot decode frames as fast as they arrive. A lower \
-                 resolution costs it less work."
-            }
-            Self::SlowRender => {
-                "Frames decode in time but the window cannot draw them. Usually \
-                 another program competing for this machine's GPU."
-            }
-            Self::HighLatency => {
-                "The round trip to the host is long — distance, or a relayed \
-                 connection rather than a direct one. Quality settings cannot \
-                 shorten it."
-            }
-        }
+        crate::i18n::text(match self {
+            Self::SlowCapture => "bottleneck.slow_capture_advice",
+            Self::SlowEncode => "bottleneck.slow_encode_advice",
+            Self::SlowNetwork => "bottleneck.slow_network_advice",
+            Self::SlowDecode => "bottleneck.slow_decode_advice",
+            Self::SlowRender => "bottleneck.slow_render_advice",
+            Self::HighLatency => "bottleneck.high_latency_advice",
+        })
     }
 
     /// Whether reducing the stream can actually relieve this.

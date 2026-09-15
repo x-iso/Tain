@@ -12,7 +12,7 @@
 //! approval on the secret would mean approving one guest approves all of them.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::*;
 
@@ -30,7 +30,22 @@ struct SessionState {
     sessions: HashMap<u32, SessionInfo>,
     /// Per-session channel into the writer loop, for pushing host-initiated messages.
     outbound: HashMap<u32, mpsc::UnboundedSender<Message>>,
+    /// Per-session handles on what it is showing, for changing it while it runs.
+    shows: HashMap<u32, Shows>,
     next_session_id: u32,
+}
+
+/// A running session's view of what it may show, and of what it is showing.
+///
+/// Shared with the session's own tasks rather than copied: the capture thread
+/// reads `wanted` every tick and the reader checks `allowed` on every request,
+/// so a change made here is picked up without anybody being told.
+#[derive(Clone)]
+pub struct Shows {
+    /// What the host permitted. Bounds everything the guest may ask for.
+    pub allowed: Arc<Mutex<crate::protocol::DisplayGrant>>,
+    /// What is being captured, which the guest moves within that bound.
+    pub wanted: Arc<Mutex<crate::screen_capture::DisplayTarget>>,
 }
 
 /// Which session has taken which virtual display, for its own size.
@@ -118,6 +133,7 @@ impl SessionManager {
             inner: Mutex::new(SessionState {
                 sessions: HashMap::new(),
                 outbound: HashMap::new(),
+                shows: HashMap::new(),
                 next_session_id: 1,
             }),
         }
@@ -183,11 +199,129 @@ impl SessionManager {
         state.outbound.insert(session_id, tx);
     }
 
+    /// Attach what a running session shows, so it can be changed while it runs.
+    pub fn register_shows(&self, session_id: u32, shows: Shows) {
+        let mut state = self.inner.lock().unwrap();
+        state.shows.insert(session_id, shows);
+    }
+
+    /// What this session is currently allowed to see.
+    ///
+    /// `None` for a session that has not reached the point of having an answer,
+    /// which is a moment at the very start of one. A caller that wants to
+    /// *change* it has nothing to seed a dialog from until then.
+    pub fn displays_of(&self, session_id: u32) -> Option<crate::protocol::DisplayGrant> {
+        let state = self.inner.lock().unwrap();
+        let shows = state.shows.get(&session_id)?;
+        Some(shows.allowed.lock().unwrap().clone())
+    }
+
+    /// Change what a running session may see. Returns false if unknown.
+    ///
+    /// # Why this moves the stream as well as the permission
+    ///
+    /// Narrowing a grant to something that excludes what is currently on screen
+    /// leaves the session streaming a thing it is no longer allowed to stream.
+    /// The permission would be right and the picture would be wrong, which is
+    /// the worst of the two to get wrong — so the target moves with it, to
+    /// whatever the new grant opens on.
+    ///
+    /// A target still inside the new grant is left alone: somebody adding a
+    /// second window should not have the guest's view jump away from the one it
+    /// was watching.
+    pub fn set_displays(
+        &self,
+        session_id: u32,
+        allowed: crate::protocol::DisplayGrant,
+        available: &[crate::protocol::DisplayInfo],
+    ) -> bool {
+        use crate::protocol::{DisplayChoice, SharedChanged};
+        use crate::screen_capture::DisplayTarget;
+
+        let (notify, showing) = {
+            let state = self.inner.lock().unwrap();
+            let Some(shows) = state.shows.get(&session_id) else {
+                warn!("set_displays for unknown session #{session_id}");
+                return false;
+            };
+
+            *shows.allowed.lock().unwrap() = allowed.clone();
+
+            // Whether what is on screen survives the change.
+            let mut wanted = shows.wanted.lock().unwrap();
+            let kept = match &*wanted {
+                DisplayTarget::Window(id) => allowed.allows_window(*id),
+                DisplayTarget::Windows(ids) => {
+                    !ids.is_empty() && ids.iter().all(|id| allowed.allows_window(*id))
+                }
+                DisplayTarget::One(name) => available
+                    .iter()
+                    .find(|d| d.name == *name)
+                    .is_some_and(|d| allowed.allows(d.id)),
+                // Every screen, which is only still true if every screen is
+                // still granted.
+                DisplayTarget::All => allowed.covers_all(available),
+                DisplayTarget::Primary => {
+                    available.iter().find(|d| d.primary).is_some_and(|d| allowed.allows(d.id))
+                }
+            };
+
+            let showing = if kept {
+                None
+            } else {
+                let opens = allowed.opens_on(available);
+                *wanted = match (&allowed, opens) {
+                    (_, Some(DisplayChoice::Window(id))) => DisplayTarget::Window(id),
+                    (grant, Some(DisplayChoice::All)) if !grant.windows().is_empty() => {
+                        DisplayTarget::Windows(grant.windows().to_vec())
+                    }
+                    (_, Some(DisplayChoice::All)) => DisplayTarget::All,
+                    (_, Some(DisplayChoice::One(id))) => available
+                        .iter()
+                        .find(|d| d.id == id)
+                        .map_or(DisplayTarget::Primary, |d| DisplayTarget::One(d.name.clone())),
+                    // Nothing granted at all. The session stays up and shows
+                    // nothing, which is a state it already has a picture for —
+                    // ending it is the kick button's job, not this one's.
+                    (_, None) => DisplayTarget::Windows(Vec::new()),
+                };
+                opens
+            };
+            drop(wanted);
+
+            info!("Session #{session_id} may now see {allowed:?}");
+            (state.outbound.get(&session_id).cloned(), showing)
+        };
+
+        // Sent after releasing the lock — the writer loop drains this channel on
+        // another thread.
+        let Some(tx) = notify else { return true };
+        let _ = tx.send(Message::SharedChanged(SharedChanged {
+            displays: available.iter().filter(|d| allowed.allows(d.id)).cloned().collect(),
+            windows: allowed
+                .windows()
+                .iter()
+                .filter_map(|id| crate::window_capture::on_offer(*id))
+                .collect(),
+            sharing_windows: !allowed.windows().is_empty(),
+        }));
+        // Only when it moved. A guest told its view changed when it did not
+        // would reopen its decoder for nothing.
+        if let Some(showing) = showing {
+            let _ = tx.send(Message::DisplayChanged(crate::protocol::DisplayChanged {
+                showing,
+                why: Some("the host changed what is shared".to_string()),
+            }));
+        }
+        true
+    }
+
     /// Remove a session by ID. Must be called when a connection ends, or
     /// `guest_session_count` never drops and passcode auto-regen never fires.
     pub fn remove_session(&self, session_id: u32) -> Option<SessionInfo> {
         let mut state = self.inner.lock().unwrap();
         state.outbound.remove(&session_id);
+        state.shows.remove(&session_id);
         let info = state.sessions.remove(&session_id);
         if info.is_some() {
             info!("Session #{} removed", session_id);
@@ -230,6 +364,9 @@ impl SessionManager {
     /// Pushes a `SessionEnd` down the session's outbound channel; the writer
     /// loop closes the stream once it has been sent, so the guest is told *why*
     /// it was dropped rather than just seeing the connection vanish.
+    ///
+    /// `reason` is one of [`super::protocol::end_reason`], not a sentence — the
+    /// guest renders it in its own language.
     /// Returns false if the session is not (or no longer) active.
     pub fn kick(&self, session_id: u32, reason: &str) -> bool {
         let outbound = {
@@ -246,6 +383,7 @@ impl SessionManager {
                 .send(Message::SessionEnd(super::protocol::SessionEnd {
                     session_id,
                     reason: reason.to_string(),
+                    args: Vec::new(),
                 }))
                 .is_ok(),
             // No writer attached yet; removing the session is the best we can do.
@@ -360,6 +498,108 @@ mod tests {
     use crate::passcode::PasscodeType;
     use crate::protocol::InputDevice;
 
+    /// A session registered with the table, showing `wanted`, allowed `allowed`.
+    fn showing(
+        manager: &SessionManager,
+        allowed: crate::protocol::DisplayGrant,
+        wanted: crate::screen_capture::DisplayTarget,
+    ) -> (u32, Shows) {
+        let id = manager.add_session([0; 32], ControlGrants::NONE, PasscodeType::Guest);
+        let shows = Shows {
+            allowed: Arc::new(Mutex::new(allowed)),
+            wanted: Arc::new(Mutex::new(wanted)),
+        };
+        manager.register_shows(id, shows.clone());
+        (id, shows)
+    }
+
+    fn screen(id: u32, primary: bool) -> crate::protocol::DisplayInfo {
+        crate::protocol::DisplayInfo {
+            id,
+            name: format!(r"\\.\DISPLAY{}", id + 1),
+            monitor: None,
+            width: 1920,
+            height: 1080,
+            x: i32::from(id as u16) * 1920,
+            y: 0,
+            primary,
+            hdr: false,
+            virtual_display: false,
+        }
+    }
+
+    /// Changing what a session may see moves the picture only when it has to.
+    ///
+    /// # The failure this is here for
+    ///
+    /// Narrowing a grant so that it excludes what is on screen leaves the
+    /// session streaming something it is no longer permitted to stream: the
+    /// permission is right and the picture is wrong, which is the worse half to
+    /// get wrong. And the opposite mistake is nearly as bad — moving the view
+    /// when the change did not require it means adding a second window yanks
+    /// the guest away from the one they were reading.
+    #[test]
+    fn changing_what_is_shared_moves_the_view_only_when_it_must() {
+        use crate::protocol::DisplayGrant;
+        use crate::screen_capture::DisplayTarget;
+
+        let manager = SessionManager::new();
+        let desk = [screen(0, true), screen(1, false)];
+
+        // Watching the second screen, then told only the first is allowed.
+        let (id, shows) = showing(
+            &manager,
+            DisplayGrant::All,
+            DisplayTarget::One(r"\\.\DISPLAY2".into()),
+        );
+        assert!(manager.set_displays(id, DisplayGrant::Only(vec![0]), &desk));
+        assert_eq!(
+            *shows.wanted.lock().unwrap(),
+            DisplayTarget::One(r"\\.\DISPLAY1".into()),
+            "a session went on streaming a screen it had just been forbidden"
+        );
+
+        // Watching one window, then granted a second as well: it stays put.
+        let (id, shows) = showing(
+            &manager,
+            DisplayGrant::Windows(vec![0x11]),
+            DisplayTarget::Window(0x11),
+        );
+        assert!(manager.set_displays(id, DisplayGrant::Windows(vec![0x11, 0x22]), &desk));
+        assert_eq!(
+            *shows.wanted.lock().unwrap(),
+            DisplayTarget::Window(0x11),
+            "widening a grant pulled the guest off what they were watching"
+        );
+
+        // And the window it *was* watching being dropped moves it to the one
+        // that is left.
+        assert!(manager.set_displays(id, DisplayGrant::Windows(vec![0x22]), &desk));
+        assert_eq!(*shows.wanted.lock().unwrap(), DisplayTarget::Window(0x22));
+
+        // Switching a screen session to windows entirely.
+        let (id, shows) = showing(&manager, DisplayGrant::All, DisplayTarget::All);
+        assert!(manager.set_displays(id, DisplayGrant::Windows(vec![0x33, 0x44]), &desk));
+        assert_eq!(
+            *shows.wanted.lock().unwrap(),
+            DisplayTarget::Windows(vec![0x33, 0x44]),
+            "a grant of several windows opens on all of them, as it does at session start"
+        );
+
+        // Granted nothing at all. The session stays — ending it is the kick
+        // button's job — and shows nothing.
+        assert!(manager.set_displays(id, DisplayGrant::none(), &desk));
+        assert_eq!(*shows.wanted.lock().unwrap(), DisplayTarget::Windows(Vec::new()));
+    }
+
+    /// A session nobody registered cannot be changed, and says so.
+    #[test]
+    fn changing_an_unknown_session_is_refused() {
+        let manager = SessionManager::new();
+        assert!(!manager.set_displays(99, crate::protocol::DisplayGrant::All, &[]));
+        assert!(manager.displays_of(99).is_none());
+    }
+
     #[test]
     fn test_session_lifecycle() {
         let mgr = SessionManager::new();
@@ -462,12 +702,12 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         mgr.register_outbound(id, tx);
 
-        assert!(mgr.kick(id, "removed by host"));
+        assert!(mgr.kick(id, super::super::protocol::end_reason::DISCONNECTED_BY_HOST));
 
         match rx.recv().await.expect("guest should be told") {
             Message::SessionEnd(se) => {
                 assert_eq!(se.session_id, id);
-                assert_eq!(se.reason, "removed by host");
+                assert_eq!(se.reason, super::super::protocol::end_reason::DISCONNECTED_BY_HOST);
             }
             other => panic!("unexpected message: {other:?}"),
         }

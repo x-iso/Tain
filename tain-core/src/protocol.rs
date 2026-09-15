@@ -43,6 +43,19 @@ pub struct MouseEvent {
 /// Upper bound of the normalized coordinate space used by [`MouseEvent`].
 pub const ABSOLUTE_MAX: u16 = u16::MAX;
 
+/// Pointer movement, in host pixels, with no position attached.
+///
+/// See [`InputEvent::MouseMotion`] for why this exists beside [`MouseEvent`].
+/// Signed and sixteen bits because a delta is small — a fast flick across a
+/// screen is a few hundred pixels — where a position is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MouseMotion {
+    /// Positive is right.
+    pub dx: i16,
+    /// Positive is down, matching the screen and not the maths.
+    pub dy: i16,
+}
+
 impl MouseEvent {
     /// Build from a fraction of the way across the screen, clamped to range.
     pub fn from_fraction(fx: f32, fy: f32) -> Self {
@@ -201,6 +214,27 @@ pub mod modifier {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputEvent {
     MouseMove(MouseEvent),
+    /// Pointer movement as a *delta*, for when there is no position to send.
+    ///
+    /// # Why an absolute position is not enough
+    ///
+    /// It is enough for anything that follows a cursor — a desktop, a menu, a
+    /// game's own interface — and it is what every other pointer event here
+    /// carries, because it survives a dropped packet and needs no state at
+    /// either end.
+    ///
+    /// A game that looks around does not follow a cursor. It captures the
+    /// pointer, hides it, reads *movement*, and warps the cursor back to the
+    /// middle after every frame so it can keep reading movement forever.
+    /// Injecting an absolute position into that fights it: the game centres the
+    /// cursor, the next position arrives from wherever the guest's pointer is,
+    /// and the game reads the jump between the two as an enormous flick. The
+    /// reported symptom is a camera that spins uncontrollably while the menus
+    /// in the same game work perfectly.
+    ///
+    /// So this exists, and the two are chosen between by what the host's cursor
+    /// is doing — see [`CursorUpdate::visible`].
+    MouseMotion(MouseMotion),
     MouseButton(MouseButtonEvent),
     Scroll(ScrollEvent),
     Key(KeyEvent),
@@ -212,6 +246,7 @@ impl InputEvent {
     pub fn device(&self) -> InputDevice {
         match self {
             Self::MouseMove(_)
+            | Self::MouseMotion(_)
             | Self::MouseButton(_)
             | Self::Scroll(_)
             // Touch counts as the pointer, deliberately. It is the same act —
@@ -428,6 +463,22 @@ pub enum DisplayGrant {
     All,
     /// Only these, by [`DisplayInfo::id`].
     Only(Vec<u32>),
+    /// These application windows, by [`WindowInfo::id`], and no screen at all.
+    ///
+    /// # Why a set, when the point is to show less
+    ///
+    /// Because "less" is not the same as "one". Somebody walking a colleague
+    /// through a spreadsheet usually has the spreadsheet *and* the mail it
+    /// arrived in open, and being able to grant both is what stops them
+    /// granting the whole screen instead — which is what a one-window share
+    /// pushes people towards the moment they need a second one.
+    ///
+    /// What matters is not the count but the boundary: nothing outside this
+    /// list is ever streamed, so a guest switching between the windows in it
+    /// cannot arrive at one that was not permitted. Anything the host did not
+    /// name stays private, which is the property [`Self::All`] and
+    /// [`Self::Only`] have for screens.
+    Windows(Vec<u64>),
 }
 
 impl DisplayGrant {
@@ -441,12 +492,40 @@ impl DisplayGrant {
         match self {
             Self::All => true,
             Self::Only(ids) => ids.contains(&id),
+            // A window share is not a screen share with one screen in it.
+            Self::Windows(_) => false,
         }
     }
 
+    /// The windows this session is confined to. Empty for a screen share.
+    ///
+    /// Order is the host's: the first is what the session opens on, and the
+    /// guest's switcher lists them as they are given here.
+    pub fn windows(&self) -> &[u64] {
+        match self {
+            Self::Windows(ids) => ids,
+            _ => &[],
+        }
+    }
+
+    /// Whether this session may watch that window.
+    ///
+    /// The window counterpart of [`Self::allows`], and the check that makes a
+    /// multi-window grant safe: a guest may name any window it likes, and only
+    /// the ones the host chose are honoured.
+    pub fn allows_window(&self, id: u64) -> bool {
+        self.windows().contains(&id)
+    }
+
     /// Whether this permits no screen at all.
+    ///
+    /// A window grant is not empty — it shows something, just not a screen.
     pub fn is_empty(&self) -> bool {
-        matches!(self, Self::Only(ids) if ids.is_empty())
+        match self {
+            Self::Only(ids) => ids.is_empty(),
+            Self::Windows(ids) => ids.is_empty(),
+            Self::All => false,
+        }
     }
 
     /// Whether every screen in `available` is permitted.
@@ -457,8 +536,95 @@ impl DisplayGrant {
         match self {
             Self::All => true,
             Self::Only(ids) => available.iter().all(|d| ids.contains(&d.id)),
+            Self::Windows(_) => false,
         }
     }
+
+    /// What a session with this grant should be showing, before the guest has
+    /// asked for anything.
+    ///
+    /// A window grant opens on the first window the host named; a screen grant
+    /// opens on whichever screen it names, or the whole desk when it names them
+    /// all.
+    pub fn opens_on(&self, available: &[DisplayInfo]) -> Option<DisplayChoice> {
+        match self {
+            // Several windows open on all of them, the same as several screens
+            // do: what the host chose to share is what the session should show
+            // before anybody asks for anything narrower.
+            //
+            // There is no arrangement to compose them by — windows overlap, in
+            // a stack whose order changes — so the composite tiles them into a
+            // grid rather than reproducing a layout. See
+            // [`super::screen_capture::DisplayTarget::Windows`].
+            Self::Windows(ids) if ids.len() > 1 => Some(DisplayChoice::All),
+            Self::Windows(ids) => ids.first().map(|id| DisplayChoice::Window(*id)),
+            Self::All => Some(DisplayChoice::All),
+            Self::Only(ids) if ids.is_empty() => None,
+            Self::Only(ids) => {
+                if self.covers_all(available) && available.len() > 1 {
+                    Some(DisplayChoice::All)
+                } else {
+                    ids.first().map(|id| DisplayChoice::One(*id))
+                }
+            }
+        }
+    }
+}
+
+/// Host → guest: what the shared window is doing.
+///
+/// Sent only when the answer changes, and only for a session that is sharing a
+/// window at all. A minimised window produces no frames — the compositor has
+/// nothing to give for it — so without this the guest would see the picture
+/// stop and have no way to tell that from a dead link. It is the difference
+/// between "waiting for the host to restore it" and "reconnect and hope".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedWindow {
+    /// The window, as [`WindowInfo::id`].
+    pub id: u64,
+    /// Its caption as it reads now. Re-read rather than remembered: a browser's
+    /// title is whatever page it is on.
+    pub title: String,
+    /// What the program is called, for a sentence that names it.
+    pub app: String,
+    /// Whether frames should be arriving.
+    pub state: SharedWindowState,
+}
+
+/// The states a shared window can be in, on the wire.
+///
+/// Mirrors [`super::window_capture::State`], which is the host-side type. Two
+/// enums rather than one because this one is a wire format and may not change
+/// its shape freely, while the other is free to gain whatever the host needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SharedWindowState {
+    /// On screen. Frames are coming.
+    Showing,
+    /// Minimised, hidden, or on another virtual desktop. Nothing is coming
+    /// until it is put back.
+    Minimised,
+    /// Gone. Nothing is coming at all, and there is nothing to wait for.
+    Closed,
+}
+
+/// One application window the host could share.
+///
+/// The id is the window handle. It is host-local and opaque to the guest, and
+/// Windows does reuse handles once a window has gone — which is why the host
+/// re-checks that the window it was told to share is still the one it agreed
+/// to, rather than trusting the number on its own. See
+/// [`super::window_capture`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub id: u64,
+    /// What the program is called — "Excel", "chrome". The title alone does not
+    /// identify a window: three browser windows are three page titles with
+    /// nothing saying they are the browser.
+    pub app: String,
+    /// The window's own caption, as it reads right now.
+    pub title: String,
+    pub width: u16,
+    pub height: u16,
 }
 
 /// What a guest wants to see.
@@ -474,6 +640,52 @@ pub enum DisplayChoice {
     /// Every display the session may see, composed into one picture laid out
     /// the way the host has them arranged.
     All,
+    /// One application window, by [`WindowInfo::id`], and nothing around it.
+    ///
+    /// Not a display at all, and it is in this enum because it is the same
+    /// question — what is this session looking at — answered a third way. See
+    /// [`super::window_capture`] for why a window cannot be had by cropping a
+    /// screen.
+    Window(u64),
+}
+
+/// Host → guest: what this session is allowed to see, now that it has changed.
+///
+/// # Why sharing is not decided once
+///
+/// The approval dialog answers "may this connection start, and showing what",
+/// and a session then runs for an hour while what is on the screen changes.
+/// Somebody who shared a screen to demonstrate one thing should be able to
+/// narrow it to a window without disconnecting the person they are helping, and
+/// somebody who shared one window should be able to add a second.
+///
+/// It replaces the offer wholesale rather than describing a change, for the
+/// same reason [`SessionStart`] carries a list: a guest that missed one message
+/// would otherwise hold a menu assembled from edits it half received.
+/// [`DisplayChanged`] follows this and says which of the new offer is on screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SharedChanged {
+    /// Every display this session may now watch. Empty for a window share.
+    pub displays: Vec<DisplayInfo>,
+    /// Every window it may now watch, and **only the ones still open**. A
+    /// window that has closed drops out, which is what takes its button off the
+    /// guest's switcher.
+    ///
+    /// Carries each window's state, because a guest cannot work out for itself
+    /// which of them can be shown: a minimised window is still granted, still
+    /// listed, and produces nothing.
+    pub windows: Vec<SharedWindow>,
+    /// Whether this session shares windows rather than screens.
+    ///
+    /// # Why an empty list is not enough to tell
+    ///
+    /// Both lists empty happens two ways, and they are not the same thing. A
+    /// window session whose every window has been closed has nothing to show
+    /// and should say so; a host that cannot enumerate its displays also sends
+    /// no displays and is streaming its screen perfectly well — see
+    /// [`SessionStart::displays`]. Guessing from the lists would put "all the
+    /// shared windows are closed" over a working screen share.
+    pub sharing_windows: bool,
 }
 
 /// Host → guest: which display the stream is now showing.
@@ -580,6 +792,28 @@ pub struct SessionStart {
     /// platform without a real capture backend. A guest must treat that as "one
     /// screen, the one I am being sent" rather than as no screens at all.
     pub displays: Vec<DisplayInfo>,
+    /// The window this session is showing, when it is showing one.
+    ///
+    /// `None` for an ordinary screen session. Present here rather than waited
+    /// for as a [`SharedWindow`] message so the guest can name what it is
+    /// looking at from its first frame — including the case where the window is
+    /// already minimised when the session opens, which has no change to
+    /// announce and would otherwise show as a blank window with no explanation.
+    pub window: Option<SharedWindow>,
+    /// Every window this session is allowed to see, in the order the host
+    /// chose them.
+    ///
+    /// Empty for a screen session. The window counterpart of [`Self::displays`]
+    /// and there for the same reason: a guest cannot offer a switch to the
+    /// second window if nothing has told it there is one. [`Self::window`] says
+    /// which of these is on screen now.
+    ///
+    /// Only the windows still open, with what each is doing, and it is kept
+    /// current — see [`SharedChanged`].
+    pub windows: Vec<SharedWindow>,
+    /// Whether this session shares windows rather than screens. See
+    /// [`SharedChanged::sharing_windows`] for why the lists cannot say.
+    pub sharing_windows: bool,
 }
 
 // ── Reachability probe ───────────────────────────────────────
@@ -618,7 +852,82 @@ pub struct ProbeResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEnd {
     pub session_id: u32,
+    /// Why, as one of the codes in [`end_reason`] — never as a sentence.
+    ///
+    /// # Why a code and not the words
+    ///
+    /// This is the one string in the protocol that is written on one machine
+    /// and read out on the other, so prose here is prose in the *sender's*
+    /// language: a Russian host telling an English guest, in Russian, that it
+    /// would not allow the connection. A code is rendered by whichever end is
+    /// showing it, in whatever language that end is set to.
     pub reason: String,
+    /// Values for the `{placeholders}` in that sentence.
+    ///
+    /// Everything a reason needs to be specific travels here rather than baked
+    /// into the words: a display name, an adapter's setting, the operating
+    /// system's own account of a failure. Empty for the codes that need
+    /// nothing, and a placeholder with no value is left on screen as written
+    /// rather than dropped — see [`super::i18n::substitute`].
+    pub args: Vec<(String, String)>,
+}
+
+/// The codes [`SessionEnd::reason`] carries.
+///
+/// Each has an `end.<code>` entry in every catalogue under `i18n/`. Never
+/// reword one — it is matched by value on the other machine, which may well be
+/// running a different version of this program. Adding one means adding the
+/// key everywhere, and older peers will fall back to `end.unknown`.
+pub mod end_reason {
+    /// The code the guest presented is not one this host currently accepts.
+    pub const INVALID_PASSCODE: &str = "invalid_passcode";
+    /// The host was asked and said no.
+    pub const NOT_ALLOWED: &str = "not_allowed";
+    /// The admin code was right, but this device has never been approved and
+    /// the host has no interface to approve it with.
+    ///
+    /// # Why this is not [`NOT_ALLOWED`]
+    ///
+    /// Nobody said no. Nobody was asked — the host is running with nobody
+    /// signed in, and an admin connection from an unapproved device is refused
+    /// there rather than left hanging on a question no one can answer. Told as
+    /// "the host did not allow this connection", it reads as a decision
+    /// somebody made, and the natural conclusion is that the code is wrong. It
+    /// is not: the remedy is to approve the device once from a Tain window on
+    /// that machine, which is a different action entirely and worth naming.
+    pub const NOT_APPROVED: &str = "not_approved";
+    /// The host could not start capturing, for a reason with no remedy to
+    /// offer. Carries `detail`: whatever the operating system said.
+    pub const CAPTURE_FAILED: &str = "capture_failed";
+
+    /// A machine with two graphics chips where *neither* way of capturing
+    /// worked. Carries `screen`.
+    ///
+    /// # Why there is one of these and there were five
+    ///
+    /// The five were the branches of an automatic fix: Tain wrote a
+    /// per-executable graphics preference pinning itself to the integrated
+    /// chip, and each ending said which part of that had happened. The fix was
+    /// the wrong trade — it moved the encoder onto the weaker chip to make
+    /// duplication work, so a laptop with a real GPU ended up encoding on its
+    /// processor — and it is gone.
+    ///
+    /// What is left is the case that is actually a fault. A desktop drawn by
+    /// the other chip is ordinary, and the compositor captures it with no
+    /// adapter rule; both ways failing is not ordinary, and is worth a sentence
+    /// the person at the host can act on. Note that the person who has to act
+    /// is at the *host* while the only screen showing it is the *guest's* —
+    /// which is the whole reason it is a code and not prose.
+    pub mod wrong_gpu {
+        pub const NEITHER_WAY: &str = "capture_wrong_gpu_neither_way";
+    }
+    /// The host disconnected this guest from its connection list.
+    pub const DISCONNECTED_BY_HOST: &str = "disconnected_by_host";
+    /// The host is shutting down.
+    pub const HOST_CLOSED: &str = "host_closed";
+    /// Sent by the guest on its way out, so the host does not wait for QUIC to
+    /// notice. Only ever logged.
+    pub const GUEST_CLOSED: &str = "guest_closed";
 }
 
 // ── Top-level message enum ───────────────────────────────────
@@ -689,6 +998,11 @@ pub enum Message {
     CodecChanged(CodecChanged),
     /// Which display the stream is showing. See [`DisplayChanged`].
     DisplayChanged(DisplayChanged),
+    /// What the shared window is doing. See [`SharedWindow`].
+    SharedWindow(SharedWindow),
+    /// What this session may see, after the host changed it mid-session. See
+    /// [`SharedChanged`].
+    SharedChanged(SharedChanged),
     Frame(FrameMessage),
     GuestApprovalRequest(GuestApprovalRequest),
     /// Input permissions for this session were granted or revoked.
@@ -829,6 +1143,9 @@ mod tests {
                     virtual_display: false,
                 },
             ],
+            window: None,
+            windows: Vec::new(),
+            sharing_windows: false,
         };
 
         let bytes = bincode::serialize(&Message::SessionStart(start.clone())).expect("serialize");
@@ -857,12 +1174,100 @@ mod tests {
             encoder_type: "h264".into(),
             host_name: None,
             displays: Vec::new(),
+            window: None,
+            windows: Vec::new(),
+            sharing_windows: false,
         };
         let bytes = bincode::serialize(&Message::SessionStart(start)).expect("serialize");
         let Message::SessionStart(back) = bincode::deserialize(&bytes).expect("deserialize") else {
             panic!("a SessionStart did not come back as one");
         };
         assert!(back.displays.is_empty());
+        // # The distinction an empty list cannot carry
+        //
+        // This host shares its screen and simply cannot enumerate it. A window
+        // session whose windows have all closed sends two empty lists as well,
+        // and means something else entirely — so the guest is told which,
+        // rather than guessing and putting "every shared window is closed" over
+        // a working screen share.
+        assert!(
+            !back.sharing_windows,
+            "a host that cannot list its displays is still sharing a screen"
+        );
+    }
+
+    /// A window session says so from its first message.
+    ///
+    /// Carried in `SessionStart` rather than waited for as a change, because a
+    /// window that is *already* minimised when the guest arrives has no change
+    /// to announce — and the guest would otherwise show a blank picture with
+    /// nothing saying why.
+    #[test]
+    fn a_window_session_names_its_window_before_the_first_frame() {
+        let start = SessionStart {
+            session_id: 2,
+            screen_info: ScreenInfo { width: 1280, height: 800, dpi_scale: 1.0 },
+            encoder_type: "h264".into(),
+            host_name: None,
+            displays: Vec::new(),
+            window: Some(SharedWindow {
+                id: 0xABCD,
+                title: "Budget 2026.xlsx".into(),
+                app: "Excel".into(),
+                state: SharedWindowState::Minimised,
+            }),
+            windows: vec![
+                SharedWindow {
+                    id: 0xABCD,
+                    app: "Excel".into(),
+                    title: "Budget 2026.xlsx".into(),
+                    state: SharedWindowState::Minimised,
+                },
+                SharedWindow {
+                    id: 0xBEEF,
+                    app: "chrome".into(),
+                    title: "Pull request #12".into(),
+                    state: SharedWindowState::Showing,
+                },
+            ],
+            sharing_windows: true,
+        };
+        let bytes = bincode::serialize(&Message::SessionStart(start)).expect("serialize");
+        let Message::SessionStart(back) = bincode::deserialize(&bytes).expect("deserialize") else {
+            panic!("a SessionStart did not come back as one");
+        };
+        let window = back.window.expect("the window survived the wire");
+        assert_eq!(window.id, 0xABCD);
+        assert_eq!(window.app, "Excel");
+        assert_eq!(
+            window.state,
+            SharedWindowState::Minimised,
+            "a guest arriving at a minimised window has to be told so, not left guessing"
+        );
+
+        // The rest of the grant, which is what the guest's switcher is built
+        // from. Without it a session granted two windows can only ever show
+        // the one it opened on.
+        assert_eq!(back.windows.len(), 2, "the granted windows did not survive the wire");
+        assert_eq!(back.windows[1].id, 0xBEEF);
+        assert_eq!(back.windows[1].app, "chrome");
+        assert_eq!(
+            back.windows[0].id, window.id,
+            "the window being shown has to be one of the windows on offer"
+        );
+
+        // # And what each of them is doing
+        //
+        // The offer carries state per window because the guest cannot work it
+        // out: a minimised window is still granted and still listed, and
+        // produces nothing. A session whose windows have *all* gone away has to
+        // be able to say so rather than showing its last frame, frozen.
+        assert_eq!(back.windows[0].state, SharedWindowState::Minimised);
+        assert_eq!(back.windows[1].state, SharedWindowState::Showing);
+        assert!(
+            back.windows.iter().any(|w| w.state == SharedWindowState::Showing),
+            "this session has something to show, and the guest can tell"
+        );
     }
 
     #[test]
@@ -981,6 +1386,111 @@ mod tests {
             hdr: false,
             virtual_display: false,
         }
+    }
+
+    /// A window grant is not a screen grant with one screen in it.
+    ///
+    /// The distinction is the whole security property: "let them see the
+    /// spreadsheet" is only true if they cannot then ask for a screen, and
+    /// every one of these is a way that could have leaked.
+    #[test]
+    fn a_window_grant_permits_no_screen_at_all() {
+        let window = DisplayGrant::Windows(vec![0x1234]);
+
+        for id in [0, 1, 99] {
+            assert!(!window.allows(id), "screen {id} is not part of a window share");
+        }
+        assert_eq!(window.windows(), [0x1234]);
+        assert!(!window.covers_all(&[]), "a window share is not every screen");
+
+        // Not empty, though: it shows something. A caller treating this as
+        // "nothing granted" would refuse a session that should run.
+        assert!(!window.is_empty(), "a window share is not a refusal");
+
+        // And the screen grants have no window in them.
+        assert!(DisplayGrant::All.windows().is_empty());
+        assert!(DisplayGrant::Only(vec![0]).windows().is_empty());
+        assert!(DisplayGrant::none().windows().is_empty());
+    }
+
+    /// Several windows granted are several windows permitted, and nothing else.
+    ///
+    /// # Why this is the test that matters for multi-select
+    ///
+    /// Widening a grant from one window to a set is exactly the change that
+    /// could turn "let them see these two" into "let them see anything they
+    /// name". The boundary has to be the list: every id in it allowed, every id
+    /// outside it refused, and no screen reachable by either.
+    #[test]
+    fn a_grant_of_several_windows_permits_those_and_no_others() {
+        let granted = DisplayGrant::Windows(vec![0x1111, 0x2222]);
+
+        assert!(granted.allows_window(0x1111));
+        assert!(granted.allows_window(0x2222));
+        assert!(!granted.allows_window(0x3333), "a window nobody granted is not on offer");
+        assert!(!granted.allows_window(0), "a handle that never was is not on offer");
+        for id in [0, 1, 99] {
+            assert!(!granted.allows(id), "screen {id} is still not part of a window share");
+        }
+
+        // No window is reachable through a screen grant, however it is phrased.
+        assert!(!DisplayGrant::All.allows_window(0x1111), "every *screen* is not every window");
+        assert!(!DisplayGrant::Only(vec![0]).allows_window(0x1111));
+
+        // Granting no windows is granting nothing, the same as naming no
+        // screens — a session with this in hand has nothing to show.
+        assert!(DisplayGrant::Windows(Vec::new()).is_empty());
+        assert_eq!(DisplayGrant::Windows(Vec::new()).opens_on(&[]), None);
+    }
+
+    /// What a session opens on, for each shape of grant.
+    #[test]
+    fn a_grant_decides_what_the_first_frame_shows() {
+        let one = DisplayInfo {
+            id: 0,
+            name: r"\\.\DISPLAY1".into(),
+            monitor: None,
+            width: 1920,
+            height: 1080,
+            x: 0,
+            y: 0,
+            primary: true,
+            hdr: false,
+            virtual_display: false,
+        };
+        let two = DisplayInfo { id: 1, name: r"\\.\DISPLAY2".into(), primary: false, ..one.clone() };
+        let both = [one.clone(), two.clone()];
+
+        assert_eq!(
+            DisplayGrant::Windows(vec![7]).opens_on(&both),
+            Some(DisplayChoice::Window(7)),
+            "a window share has one answer and it is the window"
+        );
+        // Several windows open on all of them, the same as several screens do.
+        // The composite tiles them rather than reproducing a layout — windows
+        // overlap and screens do not — but "show me what you shared" is the
+        // same answer either way.
+        assert_eq!(
+            DisplayGrant::Windows(vec![7, 9]).opens_on(&both),
+            Some(DisplayChoice::All),
+            "several windows granted open on all of them, not on whichever came first"
+        );
+        assert_eq!(DisplayGrant::All.opens_on(&both), Some(DisplayChoice::All));
+        assert_eq!(
+            DisplayGrant::Only(vec![1]).opens_on(&both),
+            Some(DisplayChoice::One(1)),
+            "one screen granted is the screen it opens on"
+        );
+        // Every screen named individually still means the whole desk: composing
+        // is what "all of them" looks like, and it is what was meant.
+        assert_eq!(DisplayGrant::Only(vec![0, 1]).opens_on(&both), Some(DisplayChoice::All));
+        // One screen, granted, on a machine that only has one: nothing to
+        // compose, so the screen itself.
+        assert_eq!(
+            DisplayGrant::Only(vec![0]).opens_on(&[one]),
+            Some(DisplayChoice::One(0))
+        );
+        assert_eq!(DisplayGrant::none().opens_on(&both), None, "nothing granted shows nothing");
     }
 
     /// A grant permits what it names and nothing else.

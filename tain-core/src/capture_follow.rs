@@ -54,6 +54,13 @@ use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, Scr
 /// them.
 pub const SECURE_DESKTOP: &str = "Winlogon";
 
+/// The desktop a signed-in user's session lives on.
+///
+/// Uninteresting to a process that has one of its own — it is simply where it
+/// already is. It matters to the service, which has no desktop at all and must
+/// name this one to be handed its frames.
+pub const ORDINARY_DESKTOP: &str = "Default";
+
 #[cfg(target_os = "windows")]
 pub use platform::{
     capture_through_agent_only, release_agent_touches, send_input_to_agent, touch_route_changed,
@@ -389,21 +396,111 @@ mod platform {
         /// side alone, and the first time this failed it took both logs to see
         /// that nothing had failed at all — the picture simply stopped.
         from_agent: u64,
+        /// Which agent is being asked, as an index into [`AGENT_DESKTOPS`].
+        ///
+        /// Only moves in agent-only mode. A process with a desktop of its own
+        /// asks the secure desktop or nothing, because the only reason it ever
+        /// asks is that the input went somewhere it cannot see.
+        asking: usize,
+        /// When the current agent last had something to say.
+        ///
+        /// Silence is the whole signal here. See [`Self::rotate_if_silent`].
+        heard: std::time::Instant,
     }
+
+    /// The desktops an agent-only capturer will ask, in order.
+    ///
+    /// Ordinary first: a machine with somebody signed in is the common case and
+    /// settling on the first try saves a rotation. With nobody signed in the
+    /// ordinary desktop has no input, says nothing, and the secure desktop —
+    /// where the sign-in screen is — answers on the next pass.
+    const AGENT_DESKTOPS: [&str; 2] = [ORDINARY_DESKTOP, SECURE_DESKTOP];
+
+    /// How long an agent may say nothing before another is tried.
+    ///
+    /// This is not a timeout on a slow desktop. An agent that owns the input
+    /// sends frames whether or not the picture changed, so silence this long
+    /// means it does not own the input rather than that nothing is happening.
+    /// Long enough not to rotate across the moment a desktop switch is
+    /// half-done, short enough that a guest waits about a second.
+    const SILENCE_BEFORE_ROTATING: std::time::Duration = std::time::Duration::from_millis(1000);
 
     impl DesktopFollowing {
         pub fn new(local: Box<dyn ScreenCaptureBackend>) -> Self {
-            Self { local: Some(local), agent: None, had_local_input: true, from_agent: 0 }
+            Self {
+                local: Some(local),
+                agent: None,
+                had_local_input: true,
+                from_agent: 0,
+                // The secure desktop, and never moved: see `asking`.
+                asking: 1,
+                heard: std::time::Instant::now(),
+            }
         }
 
         /// A capturer with no desktop of its own, for the service.
         ///
-        /// Every frame comes from the agent. There is no local backend to fall
-        /// back to and no question about which desktop to ask: with nobody
-        /// signed in, the sign-in screen *is* the secure desktop, and it is the
-        /// only thing there is to show.
+        /// Every frame comes from an agent. Which agent is not a constant, and
+        /// assuming it was is what made this show the wrong thing: it always
+        /// asked the secure desktop, which is right at the sign-in screen and
+        /// wrong the moment somebody is signed in with no application running —
+        /// then the input is on the ordinary desktop, the secure desktop's
+        /// agent owns nothing and sends nothing, and a guest connects to a
+        /// picture that never arrives.
+        ///
+        /// So it asks each in turn and settles on whichever answers. There is
+        /// no need to work out which desktop has the input, which is fortunate:
+        /// session zero cannot. `OpenInputDesktop` answers for the caller's own
+        /// window station, and the service is not in one that can see these.
+        /// The agents can each tell, and the one that can is the one that
+        /// speaks.
         pub fn agent_only() -> Self {
-            Self { local: None, agent: None, had_local_input: false, from_agent: 0 }
+            Self {
+                local: None,
+                agent: None,
+                had_local_input: false,
+                from_agent: 0,
+                asking: 0,
+                heard: std::time::Instant::now(),
+            }
+        }
+
+        /// The desktop currently being asked for frames.
+        fn asking(&self) -> &'static str {
+            AGENT_DESKTOPS[self.asking % AGENT_DESKTOPS.len()]
+        }
+
+        /// Move to the next agent when this one has gone quiet.
+        ///
+        /// Dropping the reader closes the pipe, which stops that agent
+        /// capturing, and clears [`LINK`] so no click is sent down a pipe that
+        /// is about to close — the same order as a desktop switch, for the same
+        /// reason.
+        ///
+        /// Only in agent-only mode. A process with a desktop of its own is
+        /// asking an agent precisely because the input went to the one desktop
+        /// it cannot see, so there is no second candidate to try — and rotating
+        /// onto the ordinary desktop would have it ask an agent for the very
+        /// desktop it is standing on.
+        fn rotate_if_silent(&mut self) {
+            if !capture_through_agent_only() {
+                return;
+            }
+            if self.heard.elapsed() < SILENCE_BEFORE_ROTATING {
+                return;
+            }
+            let was = self.asking();
+            self.asking += 1;
+            self.heard = std::time::Instant::now();
+            if let Ok(mut link) = LINK.lock() {
+                *link = None;
+            }
+            self.agent = None;
+            tracing::debug!(
+                "The {was} agent has nothing to show — it does not have the input, so \
+                 asking {} instead",
+                self.asking(),
+            );
         }
 
         /// Whether this process can still see the desktop receiving input.
@@ -457,8 +554,13 @@ mod platform {
                 } else {
                     tracing::info!(
                         "The input has moved to a desktop this process cannot see — \
-                         asking the {SECURE_DESKTOP} agent for frames"
+                         asking the {} agent for frames",
+                        self.asking(),
                     );
+                    // A fresh look, so the silence that decides whether to try
+                    // another agent is measured from here and not from whenever
+                    // this capturer happened to be built.
+                    self.heard = std::time::Instant::now();
                 }
             }
 
@@ -466,14 +568,20 @@ mod platform {
                 return local.capture_next();
             }
 
+            let desktop = self.asking();
+
             // Connecting is retried on each call rather than once, because the
             // agent may not have its pipe up at the instant the desktop
             // switches, and the alternative is giving up for the whole prompt.
             if self.agent.is_none() {
-                match AgentReader::start(SECURE_DESKTOP) {
+                match AgentReader::start(desktop) {
                     Ok(reader) => self.agent = Some(reader),
                     Err(e) => {
-                        tracing::debug!("No frames from the {SECURE_DESKTOP} agent yet: {e:#}");
+                        tracing::debug!("No frames from the {desktop} agent yet: {e:#}");
+                        // An agent that is not there at all is as good as one
+                        // with nothing to say, and on a machine where only one
+                        // desktop has an agent this is how the other is found.
+                        self.rotate_if_silent();
                         // Not an error to the caller. The session carries on
                         // with the last frame it had, which is what it would do
                         // anyway, and recovers when the prompt closes.
@@ -485,10 +593,11 @@ mod platform {
             let Some(reader) = self.agent.as_mut() else { return Ok(None) };
             match reader.take() {
                 Some(frame) => {
+                    self.heard = std::time::Instant::now();
                     self.from_agent += 1;
                     if self.from_agent == 1 {
                         tracing::info!(
-                            "First frame from the {SECURE_DESKTOP} agent: {}x{}",
+                            "First frame from the {desktop} agent: {}x{}",
                             frame.width,
                             frame.height,
                         );
@@ -496,14 +605,20 @@ mod platform {
                     Ok(Some(frame))
                 }
                 None if reader.finished() => {
-                    tracing::info!("The {SECURE_DESKTOP} agent stopped sending");
+                    tracing::info!("The {desktop} agent stopped sending");
                     if let Ok(mut link) = LINK.lock() {
                         *link = None;
                     }
                     self.agent = None;
                     Ok(None)
                 }
-                None => Ok(None),
+                // Connected and quiet. Either this desktop has nothing new to
+                // show, or it does not have the input and never will have
+                // anything to show; only time tells those apart.
+                None => {
+                    self.rotate_if_silent();
+                    Ok(None)
+                }
             }
         }
 
@@ -564,6 +679,13 @@ mod platform {
         /// that has to act on it — which is how `set_size_ceiling` went missing.
         fn layout_changed(&self) -> bool {
             self.local.as_ref().is_some_and(|local| local.layout_changed())
+        }
+
+        /// Forwarded for the same reason, and it matters more: a composite of
+        /// windows that lost its tiles here would have every click mapped
+        /// through the primary screen instead.
+        fn input_tiles(&self) -> Option<Vec<crate::input_inject::Tile>> {
+            self.local.as_ref().and_then(|local| local.input_tiles())
         }
 
         fn request_format(&mut self, format: PixelFormat) -> bool {

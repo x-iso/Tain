@@ -158,6 +158,22 @@ pub fn encode_input(event: &crate::protocol::InputEvent) -> [u8; INPUT_LEN] {
             out[1] = b.button;
             out[2] = b.pressed as u8;
         }
+        // # Why the secure desktop gets movement too
+        //
+        // Nothing on it captures the pointer the way a game does, so this
+        // should never arrive there. Encoded anyway rather than dropped,
+        // because the alternative is a guest whose pointer stops responding
+        // for the seconds a consent prompt is up, with no way to tell that
+        // from the session having died.
+        InputEvent::MouseMotion(m) => {
+            // 8, because 5 and 7 are not input at all — they are the frames
+            // request and the touch release, which share this record's shape.
+            // `each_record_kind_decodes_as_itself` is what says so out loud,
+            // and it is what caught this taking 7.
+            out[0] = 8;
+            out[1..3].copy_from_slice(&m.dx.to_le_bytes());
+            out[3..5].copy_from_slice(&m.dy.to_le_bytes());
+        }
         InputEvent::Scroll(s) => {
             out[0] = 3;
             out[1..3].copy_from_slice(&s.dx.to_le_bytes());
@@ -249,6 +265,10 @@ pub fn decode_input(bytes: &[u8; INPUT_LEN]) -> Option<crate::protocol::InputEve
             pressed: bytes[2] != 0,
         }),
         3 => InputEvent::Scroll(ScrollEvent { dx: signed(1), dy: signed(3) }),
+        8 => InputEvent::MouseMotion(crate::protocol::MouseMotion {
+            dx: signed(1),
+            dy: signed(3),
+        }),
         4 => InputEvent::Key(KeyEvent {
             keycode: pair(1),
             pressed: bytes[5] != 0,
@@ -590,6 +610,10 @@ mod tests {
             InputEvent::MouseButton(MouseButtonEvent { button: 2, pressed: true }),
             InputEvent::MouseButton(MouseButtonEvent { button: 0, pressed: false }),
             InputEvent::Scroll(ScrollEvent { dx: -120, dy: 240 }),
+            // Movement rather than a position — negative in both axes, which is
+            // the half a byte-packing gets wrong.
+            InputEvent::MouseMotion(crate::protocol::MouseMotion { dx: -3000, dy: -1 }),
+            InputEvent::MouseMotion(crate::protocol::MouseMotion { dx: 1, dy: 32767 }),
             InputEvent::Key(KeyEvent {
                 keycode: 0x5B,
                 pressed: true,
