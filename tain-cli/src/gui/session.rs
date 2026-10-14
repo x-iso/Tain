@@ -93,6 +93,27 @@ pub struct GuestSession {
     pub pointer_sensitivity: f32,
     /// What it opened at, so the control can offer to put it back.
     opened_with_sensitivity: f32,
+    /// Whether the pointer has been taken deliberately, rather than because
+    /// the host was seen to hide its own.
+    ///
+    /// # Why the host's cursor cannot be the only way in
+    ///
+    /// [`Self::wants_relative_pointer`] was decided entirely by
+    /// [`Self::host_cursor_hidden`], which is a real signal and the right
+    /// default — but it only exists on one capture backend. Desktop
+    /// Duplication reports the pointer separately, so whether it is showing is
+    /// known; Windows Graphics Capture draws it into the frame and reports
+    /// nothing at all. Every window share, and every display captured that
+    /// way, therefore looks exactly like a host whose cursor is visible.
+    ///
+    /// On those, movement never engaged and positions were sent instead — and
+    /// a position runs out at the edge of the window, which is a game that
+    /// cannot be turned any further however far the mouse keeps going.
+    ///
+    /// So this is the way in that does not depend on seeing anything. It is in
+    /// addition to the automatic path and never instead of it: a host that
+    /// does hide its cursor still captures on its own.
+    pub pointer_captured: bool,
     /// Whether this session ever reached the streaming state.
     ///
     /// The difference between "the host hung up on us" and "we never got in".
@@ -237,6 +258,7 @@ impl GuestSession {
             volume: 1.0,
             pointer_sensitivity: settings.pointer_sensitivity,
             opened_with_sensitivity: settings.pointer_sensitivity,
+            pointer_captured: false,
             was_streaming: false,
             show_remote_cursor: true,
             mouse_seeded: false,
@@ -286,10 +308,19 @@ impl GuestSession {
     /// their own menus, which put the cursor back, go straight back to
     /// positions — mid-session, without anybody switching a mode.
     ///
+    /// # And why it is not the only way in
+    ///
+    /// Because the host can only answer when it is capturing in a way that has
+    /// a pointer to report, which is Desktop Duplication and nothing else. See
+    /// [`Self::pointer_captured`], which is the deliberate way and takes
+    /// precedence over being able to see anything.
+    ///
     /// Gated on input being wanted at all, so a view-only session never grabs
-    /// the pointer of the machine it is being watched from.
+    /// the pointer of the machine it is being watched from — and so revoking
+    /// the pointer mid-game hands this machine's cursor straight back rather
+    /// than leaving it pinned to a picture it can no longer drive.
     pub fn wants_relative_pointer(&self) -> bool {
-        self.sends_mouse() && self.host_cursor_hidden()
+        self.sends_mouse() && (self.pointer_captured || self.host_cursor_hidden())
     }
 
     /// What this session opened at, for the control that offers to go back.
@@ -375,6 +406,7 @@ impl GuestSession {
             volume: 1.0,
             pointer_sensitivity: 1.0,
             opened_with_sensitivity: 1.0,
+            pointer_captured: false,
             was_streaming: false,
             show_remote_cursor: true,
             mouse_seeded: false,
@@ -1467,6 +1499,40 @@ mod tests {
         assert!(
             !session.wants_relative_pointer(),
             "a session that sends no pointer must not capture one"
+        );
+    }
+
+    /// Asking for it works where the host cannot be seen to ask.
+    ///
+    /// # The case this exists for
+    ///
+    /// A host captured through the compositor reports no pointer at all, so
+    /// `host_cursor_hidden` is false for a game and a desktop alike. Leaving
+    /// that as the only way in meant every shared window sent positions, and a
+    /// position stops at the edge of the picture — a camera that will not turn
+    /// any further however far the mouse goes.
+    #[test]
+    fn the_pointer_can_be_taken_deliberately_when_the_host_cannot_be_read() {
+        let mut session = super::GuestSession::test_stub();
+        session.want_mouse = true;
+        *session.shared.grants.lock().unwrap() = tain_core::ControlGrants::ALL;
+
+        // Exactly the state a WGC capture leaves behind: nothing reported.
+        assert!(session.shared.cursor.lock().unwrap().position.is_none());
+        assert!(!session.wants_relative_pointer());
+
+        session.pointer_captured = true;
+        assert!(
+            session.wants_relative_pointer(),
+            "asked for it, and nothing about the host can refuse that"
+        );
+
+        // The grant still outranks it, for the same reason it outranks the
+        // automatic path: this pins the cursor of the machine it runs on.
+        session.want_mouse = false;
+        assert!(
+            !session.wants_relative_pointer(),
+            "a session that sends no pointer must not capture one, however asked"
         );
     }
 

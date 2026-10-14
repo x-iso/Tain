@@ -156,6 +156,12 @@ pub struct WgcCapturer {
     granularity: (u16, u16),
     format: PixelFormat,
 
+    /// Whether the pointer was showing the last time anybody asked.
+    ///
+    /// `None` until the first look. Kept so [`Self::take_cursor`] can report a
+    /// change rather than the same answer on every frame.
+    cursor_visible: Option<bool>,
+
     /// The last picture produced, **with the size it was produced at**.
     ///
     /// # Why the size travels with the bytes
@@ -343,6 +349,7 @@ impl WgcCapturer {
             ceiling: None,
             granularity: (2, 2),
             format: PixelFormat::Bgra,
+            cursor_visible: None,
             last_frame: None,
             last_emitted: None,
             label,
@@ -613,10 +620,46 @@ impl ScreenCaptureBackend for WgcCapturer {
         )))
     }
 
-    /// Nothing. The pointer is drawn into the frame instead — see the note in
+    /// Whether the pointer is showing, and nothing else.
+    ///
+    /// # No shape, deliberately
+    ///
+    /// The pointer is already drawn into the frame — see the note in
     /// [`WgcCapturer::new`], where that is decided and why there is no choice.
+    /// Sending an image as well would put a second pointer on top of the first.
+    /// The guest only draws when it has both a position *and* a shape, so an
+    /// update with no shape carries the fact without the ghost.
+    ///
+    /// # Why the fact is worth carrying on its own
+    ///
+    /// Because the guest decides whether to send the pointer as a movement or
+    /// as a place by exactly this, and until now this path answered nothing at
+    /// all. A host captured through the compositor therefore looked, from the
+    /// guest, like one whose cursor was showing — so positions were sent, and a
+    /// position runs out at the edge of the window. In a game that is a camera
+    /// that stops turning while the mouse keeps moving. See
+    /// `GuestSession::wants_relative_pointer`.
+    ///
+    /// Reported only when it changes. `x` and `y` are the pointer's place on
+    /// the desktop rather than within whatever is being captured, which is of
+    /// no use to anybody here and is why nothing reads them: a window share's
+    /// frame does not start at the desktop's origin. Only `visible` is meant.
     fn take_cursor(&mut self) -> Option<super::cursor::CursorUpdate> {
-        None
+        let (showing, at) = pointer_showing()?;
+        if self.cursor_visible == Some(showing) {
+            return None;
+        }
+        self.cursor_visible = Some(showing);
+        Some(super::cursor::CursorUpdate {
+            position: super::cursor::CursorPosition {
+                x: at.0,
+                y: at.1,
+                desktop_width: self.width,
+                desktop_height: self.height,
+                visible: showing,
+            },
+            shape: None,
+        })
     }
 
     fn frame_size(&self) -> (u16, u16) {
@@ -668,6 +711,36 @@ impl Drop for WgcCapturer {
         let _ = self.pool.Close();
         let _ = &self.item;
     }
+}
+
+/// Whether the pointer is being drawn anywhere, and where it is.
+///
+/// # Why this is asked of Windows rather than of the capture
+///
+/// Because the capture has no answer. Desktop Duplication reports the pointer
+/// as a thing apart — shape, place, whether it is showing — and the compositor
+/// does not: it either paints the pointer into the frame or leaves it out, and
+/// says nothing either way. `GetCursorInfo` is the same fact from the other
+/// direction, it costs a syscall, and it is true regardless of which backend
+/// is running. See [`WgcCapturer::take_cursor`] for what it is used for.
+///
+/// `None` when the call fails, which leaves the previous answer standing
+/// rather than reporting a change that was never observed.
+///
+/// Shared with [`super::capture_wall`], which bakes the pointer into its
+/// panels for exactly the same reason and so needs exactly the same answer.
+pub(crate) fn pointer_showing() -> Option<(bool, (i32, i32))> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
+
+    let mut info =
+        CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    // SAFETY: `cbSize` is filled in as the call documents, and `info` outlives
+    // it. Nothing is retained.
+    unsafe { GetCursorInfo(&mut info) }.ok()?;
+    Some((
+        info.flags.0 & CURSOR_SHOWING.0 != 0,
+        (info.ptScreenPos.x, info.ptScreenPos.y),
+    ))
 }
 
 /// A size the rest of the pipeline can carry, and never zero.

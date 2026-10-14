@@ -172,6 +172,13 @@ pub struct Wall {
     resized: std::collections::BTreeSet<String>,
     /// What this wall is made of, and what would make it out of date.
     composed: Composed,
+    /// Whether the pointer was showing the last time anybody asked.
+    ///
+    /// Panels are captured through the compositor, which draws the pointer
+    /// into them and reports nothing about it — so the wall answers the same
+    /// question the same way a single compositor capture does. See
+    /// [`Self::take_cursor`].
+    cursor_visible: Option<bool>,
 }
 
 /// What a wall is composed from, and what "out of date" means for it.
@@ -307,6 +314,7 @@ impl Wall {
             buffer: Vec::new(),
             resized: std::collections::BTreeSet::new(),
             composed: Composed::Desk { layout: layout_now() },
+            cursor_visible: None,
         };
         // Before the first frame, not on the first resize: a display whose slot
         // is smaller than itself has to be told so, and at native scale a wall
@@ -443,6 +451,7 @@ impl Wall {
                 wanted: windows.iter().map(|w| w.id).collect(),
                 present,
             },
+            cursor_visible: None,
         };
         wall.resize_panels();
         Ok(wall)
@@ -960,6 +969,37 @@ impl ScreenCaptureBackend for Wall {
     /// being sent cost an evening.
     fn frame_size(&self) -> (u16, u16) {
         self.target()
+    }
+
+    /// Whether the pointer is showing, and nothing else.
+    ///
+    /// Panels come from the compositor, which draws the pointer into them and
+    /// says nothing about it — so there is no shape to send, and sending one
+    /// would put a second pointer over the first. The guest draws only when it
+    /// has both a position and a shape, so this carries the fact alone.
+    ///
+    /// The fact is what decides whether the guest sends its mouse as movement
+    /// or as a place, and a wall that answered nothing looked exactly like a
+    /// host whose cursor was showing — so a game shared as a window got
+    /// positions, and a position stops at the edge of the picture. See
+    /// [`super::capture_wgc::pointer_showing`], which is the same answer for
+    /// the same reason, and `GuestSession::wants_relative_pointer`.
+    fn take_cursor(&mut self) -> Option<super::cursor::CursorUpdate> {
+        let (showing, at) = super::capture_wgc::pointer_showing()?;
+        if self.cursor_visible == Some(showing) {
+            return None;
+        }
+        self.cursor_visible = Some(showing);
+        Some(super::cursor::CursorUpdate {
+            position: super::cursor::CursorPosition {
+                x: at.0,
+                y: at.1,
+                desktop_width: self.out.0,
+                desktop_height: self.out.1,
+                visible: showing,
+            },
+            shape: None,
+        })
     }
 
     fn set_scale(&mut self, scale: QualityScale) -> bool {

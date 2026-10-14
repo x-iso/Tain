@@ -2680,3 +2680,43 @@ briefly across the moment the service's single pipe instance is rebuilt, which
 is what had delayed the handover by one heartbeat; and a session logs the first
 input it cannot inject rather than every one — one report held 450 identical
 warnings in three seconds.
+
+
+## The Pointer Can Be Taken Without Being Asked For
+
+**Decision**: capturing the pointer is no longer decided only by whether the
+host was seen to hide its own. There is a toggle and a shortcut, and the
+compositor paths now answer the question they used to ignore.
+
+Reported as a game whose camera stopped turning at the edge of the window: the
+local cursor reached the border, and the host stopped moving with it.
+
+**The switch existed and could never fire.** `wants_relative_pointer` was
+`sends_mouse() && host_cursor_hidden()`, and `host_cursor_hidden` reads a
+visibility flag that arrives with the pointer — which only Desktop Duplication
+sends. `WgcCapturer::take_cursor` returned `None` by design, because the
+compositor bakes the pointer into the frame and reports nothing separate, and
+`Wall` never implemented it at all. So on every shared window, every composite
+and every display captured through the compositor, the host looked exactly like
+one whose cursor was showing. Positions were sent, and a position has nowhere
+left to go at the edge of the picture.
+
+**`GetCursorInfo` is the same fact from the other side.** It costs a syscall,
+it is true whichever backend is running, and both compositor paths now report
+it — on change only, and with no shape. No shape matters: the guest draws a
+remote pointer only when it has a position *and* an image, so the fact travels
+without a second pointer appearing over the one already painted into the frame.
+
+**And a way in that depends on seeing nothing.** Automatic capture is still the
+default and still right — a game that hides its cursor should not need anybody
+to know that is what it did. But a heuristic reached through one backend is not
+a feature, so there is now a checkbox beside the sensitivity it governs, and a
+bindable shortcut, defaulting to Ctrl+Shift+C alongside the other four. The
+shortcut matters more than the checkbox: capture hides the cursor and pins it to
+the middle of the video, so the button that turned it on cannot be clicked to
+turn it off.
+
+**Everything that frees the keyboard frees the pointer.** The hook's escape
+shortcut and the window losing the foreground both end immersive mode, and both
+now drop capture as well — ending the mode while leaving the cursor hidden and
+pinned is indistinguishable from the escape having failed.

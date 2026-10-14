@@ -1053,6 +1053,13 @@ Toggle immersive mode
 Send every key to the host, including Win and Alt, and keep the pointer inside
 the window
 
+[shortcut.capture]
+Capture pointer
+
+[shortcut.capture_detail]
+Hide this machine's cursor and send the mouse as movement instead of as a
+place, which is what a game needs. The same keys give it back
+
 
 # ── During a session ──────────────────────────────────────────
 
@@ -1099,12 +1106,21 @@ Pointer goes to the host — click to keep it local
 [session.pointer_off]
 Pointer stays on this machine — click to send it
 
+[session.capture_pointer]
+Capture pointer
+
+[session.capture_pointer_hint]
+Hides this machine's cursor and sends the mouse as movement, so looking around
+never runs out at the edge of the window. Turns itself on when the host is seen
+to hide its own pointer — switch it on here when that cannot be seen, which is
+any shared window and some shared displays.
+
 [session.pointer_sensitivity]
 Aim sensitivity
 
 [session.pointer_sensitivity_hint]
-Applies only while the host has captured its pointer, which is what a game does
-to look around. Right-click the pointer button to open this.
+Applies only while the pointer is captured, which a game does on its own to
+look around. Right-click the pointer button to open this.
 
 [session.pointer_sensitivity_reset]
 Back to the default

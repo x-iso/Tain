@@ -79,7 +79,7 @@ fn handle_shortcuts(
     window: &mut SessionWindow,
     settings: &Settings,
     immersive: &mut Immersive,
-    active_tab_id: Option<u64>,
+    mut active: Option<&mut GuestSession>,
     actions: &mut SessionWindowActions,
 ) -> Vec<egui::Key> {
     use super::shortcuts::ShortcutAction;
@@ -112,18 +112,31 @@ fn handle_shortcuts(
     // The hook reports this rather than egui, for the reason above.
     if immersive.escape_requested() {
         immersive.set_active(false);
+        // And the pointer with it. The hook's shortcut is the one way out that
+        // is guaranteed to work while every other key is being swallowed, so
+        // it has to free *everything* immersive mode took — otherwise it ends
+        // the mode and leaves the cursor still hidden and still pinned to the
+        // middle of the picture, which looks exactly like the escape failing.
+        if let Some(session) = active.as_mut() {
+            session.pointer_captured = false;
+        }
     }
 
     if let Some(action) = ctx.input(|i| bindings.triggered(i)) {
         match action {
             ShortcutAction::Disconnect => {
-                if let Some(id) = active_tab_id {
-                    actions.close.push(id);
+                if let Some(session) = active.as_ref() {
+                    actions.close.push(session.tab_id);
                 }
             }
             ShortcutAction::ToggleFullscreen => window.toggle_fullscreen(),
             ShortcutAction::ToggleToolbar => window.show_toolbar = !window.show_toolbar,
             ShortcutAction::ToggleImmersive => immersive.set_active(!immersive.is_active()),
+            ShortcutAction::ToggleCapture => {
+                if let Some(session) = active.as_mut() {
+                    session.pointer_captured = !session.pointer_captured;
+                }
+            }
         }
         if let Some(key) = bindings.get(action).egui_key() {
             consumed.push(key);
@@ -247,11 +260,23 @@ impl SessionWindow {
                     for event in session.modifiers_mut().release_all() {
                         session.send_input(InputEvent::Key(event));
                     }
+                    // The pointer too: something else is in front, and a
+                    // window that is no longer being used must not still be
+                    // holding this machine's cursor in the middle of itself.
+                    session.pointer_captured = false;
                 }
 
-                let active_tab_id = sessions.get(self.active_tab).map(|s| s.tab_id);
-                let reserved =
-                    handle_shortcuts(ctx, self, settings, immersive, active_tab_id, &mut actions);
+                // Read before the call: `self` goes in mutably, so the index
+                // cannot be fetched from it while the slice is being indexed.
+                let active_tab = self.active_tab;
+                let reserved = handle_shortcuts(
+                    ctx,
+                    self,
+                    settings,
+                    immersive,
+                    sessions.get_mut(active_tab),
+                    &mut actions,
+                );
 
                 self.render_contents(ctx, sessions, immersive, &reserved, &mut actions);
 
@@ -1820,19 +1845,10 @@ fn forward_pointer(
     }
 }
 
-/// Forward every contact egui saw this frame.
+/// Taking the pointer, and how far it goes once taken.
 ///
-/// # Why each finger travels on its own
-///
-/// The host has to keep the set of live contacts regardless, because the
-/// Windows call that injects them wants all of them on every update. Given
-/// that, one finger per message is the smaller protocol, it fits the fixed
-/// record the agent pipe carries to the secure desktop, and it passes the same
-/// per-event permission check as a click. See `protocol::TouchEvent`.
-/// The pointer sensitivity, when somebody has asked to see it.
-///
-/// Shown as a popup under the pointer button rather than as a permanent
-/// control: it governs one mode, most sessions never enter that mode, and a
+/// Shown as a popup under the pointer button rather than as permanent
+/// controls: they govern one mode, most sessions never enter that mode, and a
 /// toolbar is a scarce thing. Live, and per session — a value that suited the
 /// last game is not evidence about this one.
 fn render_sensitivity_popup(
@@ -1848,6 +1864,25 @@ fn render_sensitivity_popup(
         egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
             ui.set_min_width(190.0);
+
+            // # The way in that does not wait to be noticed
+            //
+            // Capture engages on its own when the host is seen to hide its
+            // cursor, which is the right default and covers most games — but
+            // only where the host is capturing in a way that *has* a pointer
+            // to report. See `GuestSession::pointer_captured`. This is the
+            // switch for every other case, and it sits above the sensitivity
+            // because it is the thing the sensitivity applies to.
+            let mut captured = session.pointer_captured;
+            if ui
+                .checkbox(&mut captured, i18n::text("session.capture_pointer"))
+                .on_hover_text(i18n::text("session.capture_pointer_hint"))
+                .changed()
+            {
+                session.pointer_captured = captured;
+            }
+            ui.add_space(4.0);
+
             ui.label(
                 RichText::new(i18n::text("session.pointer_sensitivity")).size(12.0).color(TEXT),
             );
@@ -1971,6 +2006,15 @@ fn pointer_delta_from(_hold: (i32, i32)) -> Option<(i32, i32)> {
     None
 }
 
+/// Forward every contact egui saw this frame.
+///
+/// # Why each finger travels on its own
+///
+/// The host has to keep the set of live contacts regardless, because the
+/// Windows call that injects them wants all of them on every update. Given
+/// that, one finger per message is the smaller protocol, it fits the fixed
+/// record the agent pipe carries to the secure desktop, and it passes the same
+/// per-event permission check as a click. See `protocol::TouchEvent`.
 fn forward_touch(session: &mut GuestSession, ui: &egui::Ui, rect: egui::Rect) {
     // Collected before sending: `ui.input` holds a lock and sending takes the
     // session mutably.
