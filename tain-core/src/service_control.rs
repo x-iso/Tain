@@ -47,7 +47,8 @@ pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 /// What the application asks of the service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMessage {
-    /// Take over hosting when nobody is signed in, using this identity.
+    /// Host on this machine's behalf while the application is not, as this
+    /// identity and with these settings.
     ///
     /// Sent when unattended access is on, and re-sent whenever the identity or
     /// the codes change — a regenerated passcode that the service did not hear
@@ -93,7 +94,7 @@ pub enum ControlMessage {
         /// side of it.
         settings: String,
     },
-    /// Stop hosting when nobody is signed in, and forget what was adopted.
+    /// Stop hosting on this machine's behalf, and forget what was adopted.
     ///
     /// Sent when the setting is turned off. Forgetting is the point: leaving
     /// the key in Local System's store after somebody has said they do not want

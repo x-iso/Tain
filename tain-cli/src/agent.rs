@@ -17,12 +17,13 @@
 //!
 //! # What runs where
 //!
-//! On the ordinary desktop the agent runs as the logged-in user, because that
-//! is whose session it is capturing and whose profile and audio endpoints it
-//! needs. On the secure desktop it runs as SYSTEM, because no user token is
-//! permitted to interact with it — this is the boundary UAC exists to enforce,
-//! and the service is on the right side of it only because an administrator
-//! installed it.
+//! Both agents run as SYSTEM in the console session. On the secure desktop
+//! nothing else is possible: no user token is permitted to interact with it —
+//! this is the boundary UAC exists to enforce, and the service is on the right
+//! side of it only because an administrator installed it. On the ordinary
+//! desktop it once ran as the signed-in user, and gave that up so it could
+//! deliver input to elevated windows; see `spawn_agent`. The unattended host is
+//! started the same way, beside them on the ordinary desktop.
 //!
 //! # One agent per desktop, not one that follows
 //!
@@ -243,7 +244,7 @@ mod platform {
     /// means the agent that is not in use costs precisely nothing.
     fn serve_frames(desktop: String) {
         use tain_core::agent_pipe::{serve_forever, PipeFrame};
-        use tain_core::screen_capture::{create_capturer, CaptureConfig};
+        use tain_core::screen_capture::{create_desktop_capturer, CaptureConfig};
 
         let served = serve_forever(&desktop, &RUNNING, |writer| {
             // Nothing is duplicated until somebody asks. A host that opened
@@ -273,7 +274,11 @@ mod platform {
                 // captured. A guest moving the pointer over a still prompt
                 // produces input and no frames, and holding those until the
                 // picture changed would make the pointer lag behind the hand.
-                for request in writer.take_input() {
+                //
+                // And it is how a host that has gone is noticed while nothing
+                // is being sent: the error ends this connection and frees the
+                // pipe for the next one. See `take_input`.
+                for request in writer.take_input()? {
                     match request {
                         tain_core::agent_pipe::PipeRequest::Input(event) => {
                             if let Err(e) = tain_core::network::inject_input(&*injector, &event) {
@@ -284,7 +289,7 @@ mod platform {
                             if capturer.is_none() =>
                         {
                             capturer = Some(
-                                create_capturer(CaptureConfig::default())
+                                create_desktop_capturer(&CaptureConfig::default())
                                     .context("could not start capturing for the host")?,
                             );
                             tracing::info!("Serving {desktop}: capture started");
@@ -342,7 +347,7 @@ mod platform {
                         writer.send(&PipeFrame {
                             width: frame.width,
                             height: frame.height,
-                            format: frame.format as u8,
+                            format: frame.format.to_wire(),
                             data: frame.data.to_vec(),
                         })?;
                         sent += 1;
@@ -373,57 +378,10 @@ mod platform {
         input_desktop_name().is_some_and(|live| live.eq_ignore_ascii_case(desktop))
     }
 
-    /// The name of the desktop this thread is on.
-    fn current_desktop_name() -> Option<String> {
-        use windows::Win32::System::StationsAndDesktops::GetThreadDesktop;
-        use windows::Win32::System::Threading::GetCurrentThreadId;
-
-        // SAFETY: the handle belongs to this thread and must not be closed.
-        let handle = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok()?;
-        desktop_name(handle)
-    }
-
-    /// The name of the desktop currently receiving input, if it can be opened.
-    ///
-    /// `None` covers the case that matters as much as any name: a process on
-    /// the ordinary desktop cannot open the secure one, so the refusal *is* the
-    /// signal that something else now owns the screen.
-    pub fn input_desktop_name() -> Option<String> {
-        use windows::Win32::System::StationsAndDesktops::{
-            CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
-        };
-
-        // SAFETY: documented; the handle is closed below.
-        unsafe {
-            let handle =
-                OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS).ok()?;
-            let name = desktop_name(handle);
-            let _ = CloseDesktop(handle);
-            name
-        }
-    }
-
-    fn desktop_name(
-        handle: windows::Win32::System::StationsAndDesktops::HDESK,
-    ) -> Option<String> {
-        use windows::Win32::System::StationsAndDesktops::{GetUserObjectInformationW, UOI_NAME};
-
-        let mut buffer = [0u16; 128];
-        let mut needed = 0u32;
-        // SAFETY: a documented read into a buffer we own, sized in bytes.
-        unsafe {
-            GetUserObjectInformationW(
-                windows::Win32::Foundation::HANDLE(handle.0),
-                UOI_NAME,
-                Some(buffer.as_mut_ptr().cast()),
-                std::mem::size_of_val(&buffer) as u32,
-                Some(&mut needed),
-            )
-            .ok()?;
-        }
-        let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-        Some(String::from_utf16_lossy(&buffer[..len]))
-    }
+    // One copy of these, in the capture code that has to ask the same
+    // question — the unattended host decides whether to capture or ask this
+    // agent by comparing exactly the same two names.
+    use tain_core::capture_follow::{input_desktop_name, own_desktop_name as current_desktop_name};
 
     /// Which Windows session this process is in. Zero means the service session.
     fn session_id() -> u32 {

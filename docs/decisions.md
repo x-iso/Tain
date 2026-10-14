@@ -2566,3 +2566,117 @@ holds the live value.
 **Clamped on the way out as well as on the way in.** It multiplies every delta in
 the one mode with no cursor on screen to show what went wrong, and a NaN rounds
 to zero — a pointer that has simply stopped, in a game, with nothing saying why.
+
+## The Unattended Host Runs Where the Desktop Is
+
+**Decision**: the service no longer hosts. It starts a separate process — this
+executable with `--unattended-host` — on the ordinary desktop of the console
+session, as Local System, the same way it starts the agents, and that process
+runs the application's own hosting path.
+
+Hosting from inside the service meant hosting from session zero, which has no
+desktop. Every frame therefore came from an agent: raw pixels over a named pipe,
+at native resolution, in BGRA, sent whether or not anyone wanted them. The
+controls that make the application's picture cheap — the quality scale, the
+guest's viewport ceiling, the GPU format conversion — all talk to a local
+capturer, and in agent-only mode there was none, so all three answered "not
+honoured" and changed nothing. At 4K that is about 33 MB a frame through a pipe
+before encoding. The low-level hook that lets somebody at the machine take the
+mouse back sat in a session with no input. The pointer was painted into the
+frames instead of being sent separately.
+
+**Why not forward those controls down the agent pipe.** It was the plan, and it
+fixes three of the symptoms while keeping the architecture that produced all of
+them: frames would still cross a process boundary uncompressed, the pointer and
+the local-input hook would still be missing, and every future capture feature
+would need a second implementation for the pipe. The only thing the application
+has that the service lacked is a desktop, and a process on one is something the
+service already knows how to start.
+
+**"Does this desktop have the input" is now asked by name.** It used to be
+"can `OpenInputDesktop` open it", which is the same question for the application
+— the signed-in user is refused the secure desktop — and the wrong one for Local
+System, which is refused nothing. The host would have believed the input was
+still on its desktop through every consent prompt and every lock. The agents
+already compared names; that code now lives in one place and both use it.
+
+**A capturer can start before its desktop is in front.** Desktop Duplication
+opens an output only for the input desktop, so a session that began while the
+machine was locked failed before its first frame. The application met this only
+when a guest connected during a consent prompt; the unattended host meets it
+whenever the machine is locked, which is most of the time nobody is at it. The
+wrapper now shows the secure desktop's agent, builds its local capturer when its
+own desktop comes back, and replays the scale, ceiling, granularity and format
+the session asked for in the meantime — without the replay, a session that began
+locked would have run at native size in BGRA for its whole life.
+
+**Stopped by a named event, bound to the service by a job.** A pipe on the host's
+standard input would have been one mechanism for both, but `CreateProcessAsUser`
+documents that handles cannot be inherited across sessions. A `Global\` event
+crosses sessions by design and cannot be pre-created by anyone without
+`SeCreateGlobalPrivilege`. Set, the host tells its guests and closes its endpoint
+properly, which is what keeps the application's endpoint — same identity — from
+being refused by the relay as a duplicate. The job has `KILL_ON_JOB_CLOSE`, so a
+host cannot outlive a service that crashed and go on answering as the machine.
+
+**Gotcha, found before it shipped**: the host runs from the same copy of the
+executable a reinstall replaces, and stopping it gracefully can take longer than
+the two seconds `uninstall` waited for the service to stop. That is the race that
+left a week-old service running after a "successful" reinstall. The wait is now
+ten seconds, agents are waited for after they are terminated, and the copy is
+retried across the moment a just-ended process still holds the file.
+
+**Removed**: agent-only capture, and with it the rotation between desktops that
+was added to make it show the right one. Nothing hosts from session zero any
+more.
+
+## A Link to the Agent Has to Close When It Is Let Go
+
+**Decision**: a process holds at most one connection to the secure desktop's
+agent, shared by every session that needs it, and closing it cancels the pending
+read. The host's end of the pipe is opened for overlapped I/O. An agent treats a
+failed peek as its host having gone.
+
+Reported as: lock the machine from the guest, click the lock screen, and the
+picture freezes — and no new connection shows anything until somebody unlocks
+it at the machine. The first lock of the session had worked.
+
+**Three faults, each enough on its own.** The agent's pipe has one instance.
+The host's frame reader held that pipe from a thread blocked in `ReadFile`, so
+when the input came back and the session let go of its reader, the pipe stayed
+open behind it. The agent, which by then was sending nothing because its desktop
+no longer had the input, never found out: `take_input` read a failed
+`PeekNamedPipe` as "nothing waiting". So the pipe stayed busy until the agent
+exited, and every later connection — the next lock, and every reconnect — was
+told `All pipe instances are busy`. Separately, each session opened a connection
+of its own, so a second session could not have had the secure desktop even with
+the first two fixed.
+
+**Why overlapped, found by the test for the fix.** The first version of the
+close path sent "frames no longer wanted" before cancelling the read, and hung.
+Windows performs the I/O on a handle opened without `FILE_FLAG_OVERLAPPED` one
+operation at a time, per handle: the write waited behind a read waiting for a
+frame that was never coming. The same rule had been delaying every click and
+key sent to the agent until the next frame arrived, which on a still consent
+prompt is whenever the caret next blinks. Overlapped, each operation stands
+alone, and `CancelIoEx` abandons a wait from any thread.
+
+**The agents capture with `create_desktop_capturer`.** Once desktops were told
+apart by name, an agent's own capturer — wrapped, like every capturer, to follow
+the input — noticed the input leave and opened its own pipe to ask for frames.
+Refused only because a host already held it; between hosts it would have taken
+the pipe from itself.
+
+**Verified against a real named pipe**, served the way the agents serve theirs.
+Removing either the host's cancel or the agent's disconnect check reproduces the
+reported error exactly; the tests run inside a time limit so that a
+regression fails with a name instead of hanging the run, which is how the
+deadlock above first showed itself.
+
+**Also**: the app hands its settings over again at the moment it hands over
+hosting, because a service installed while the app was running had never been
+sent them; the second of two control messages sent back to back is retried
+briefly across the moment the service's single pipe instance is rebuilt, which
+is what had delayed the handover by one heartbeat; and a session logs the first
+input it cannot inject rather than every one — one report held 450 identical
+warnings in three seconds.

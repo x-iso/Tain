@@ -387,7 +387,7 @@ impl AppState {
 ///
 /// Failure is ordinary and quiet. Most machines have no service installed, and
 /// "the pipe is not there" is the expected answer rather than a fault.
-pub fn sync_unattended(state: &AppState) {
+pub fn sync_unattended(state: &AppState) -> bool {
     use tain_core::service_control::{send, ControlMessage};
 
     let message = if state.settings().unattended_access {
@@ -396,7 +396,7 @@ pub fn sync_unattended(state: &AppState) {
             // — and a service adopting a key that changes next launch would
             // answer to codes nobody has.
             tracing::debug!("No stored identity yet — nothing to hand the service");
-            return;
+            return false;
         };
         let codes = [tain_core::PasscodeType::Master, tain_core::PasscodeType::Guest]
             .into_iter()
@@ -421,8 +421,45 @@ pub fn sync_unattended(state: &AppState) {
     };
 
     match send(&message) {
-        Ok(()) => tracing::debug!("Told the service about unattended access"),
-        Err(e) => tracing::debug!("The service is not listening ({e:#})"),
+        Ok(()) => {
+            tracing::debug!("Told the service about unattended access");
+            true
+        }
+        Err(e) => {
+            tracing::debug!("The service is not listening ({e:#})");
+            false
+        }
+    }
+}
+
+/// Send `message`, asking again for a moment if the first attempt is refused.
+///
+/// # For the second of two messages sent back to back
+///
+/// The service's control pipe has a single instance, and it puts up the next
+/// one only once it has read the last message to its end. A message sent
+/// straight after another can arrive in the moment there is no pipe at all and
+/// be refused by a service that is running perfectly well. Where that happened
+/// to "this process is hosting", the service did not hear it until the next
+/// heartbeat five seconds later, and for those five seconds both it and this
+/// application were bound to the same identity.
+///
+/// Only for a service that was just reached. Asking again on a machine with no
+/// service installed would add half a second to nothing.
+fn send_again_shortly(
+    message: &tain_core::service_control::ControlMessage,
+) -> anyhow::Result<()> {
+    const WITHIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+    let started = std::time::Instant::now();
+    loop {
+        match tain_core::service_control::send(message) {
+            Ok(()) => return Ok(()),
+            Err(_) if started.elapsed() < WITHIN => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -463,7 +500,17 @@ fn keep_telling_the_service_we_host() {
             // every five seconds saying so would be the whole log.
             let mut reached: Option<bool> = None;
             loop {
-                let ok = send(&ControlMessage::ApplicationHosting(true)).is_ok();
+                let claim = ControlMessage::ApplicationHosting(true);
+                // The first beat follows the handover this application sends
+                // as it starts hosting, so it is the second of two messages and
+                // may land in the gap between them — see `send_again_shortly`.
+                // Missing it is the five seconds during which the service goes
+                // on hosting too. On this thread, the half second it can cost a
+                // machine with no service is paid by nobody.
+                let ok = match reached {
+                    None => send_again_shortly(&claim).is_ok(),
+                    Some(_) => send(&claim).is_ok(),
+                };
                 if reached != Some(ok) {
                     match ok {
                         true => tracing::debug!("The service knows this process is hosting"),
@@ -492,10 +539,28 @@ fn keep_telling_the_service_we_host() {
 /// way out, and those are not exotic on a machine nobody is sitting at. What
 /// this buys is the difference between the service taking over immediately and
 /// taking over a lease later, for the one case that can afford to be polite.
-fn stopped_hosting() {
+///
+/// # Everything the service needs goes with it
+///
+/// The handover — identity, codes, settings, approved devices — was sent when
+/// this application started and whenever settings were saved, and at no other
+/// time. A service installed or reinstalled while this was already running
+/// therefore never received it: it had the identity and codes an older service
+/// had stored, but no settings, and its first unattended session ran on
+/// defaults. Sending it again at the moment of handing over means the service
+/// takes over with exactly what this application had, however long ago the
+/// service started.
+fn stopped_hosting(state: &AppState) {
     use tain_core::service_control::{send, ControlMessage};
 
-    match send(&ControlMessage::ApplicationHosting(false)) {
+    let released = ControlMessage::ApplicationHosting(false);
+    // Back to back with the handover, so asked again across the gap between
+    // them when the service took the first — see `send_again_shortly`.
+    let told = match sync_unattended(state) {
+        true => send_again_shortly(&released),
+        false => send(&released),
+    };
+    match told {
         Ok(()) => tracing::info!("Told the service to take over hosting"),
         Err(e) => tracing::debug!("Could not tell the service we stopped ({e:#})"),
     }
@@ -4357,7 +4422,7 @@ impl eframe::App for GuestApp {
         // to take unattended access down with it: the service went on yielding
         // to a host that no longer existed, and the only way back was to restart
         // the service. See `stopped_hosting`.
-        stopped_hosting();
+        stopped_hosting(&self.state);
         // A virtual display belongs to the application that put it on the
         // desktop, and this is that application closing. Leaving it behind
         // gives somebody a screen they cannot see, cannot use and have nothing

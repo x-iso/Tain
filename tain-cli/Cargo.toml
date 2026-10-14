@@ -79,6 +79,9 @@ windows = { version = "0.58", features = [
     "Win32_NetworkManagement_WindowsFirewall",
     "Win32_System_Com",
     "Win32_System_Variant",
+    # Tying the unattended host's life to the service's, so a host can never
+    # outlive the service that started it. See `spawn_unattended_host`.
+    "Win32_System_JobObjects",
 ] }
 
 # Locating dumpbin.exe and lib.exe for the import-library regeneration.

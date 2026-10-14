@@ -578,6 +578,29 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
+    /// The byte this format travels as between processes.
+    ///
+    /// Written out rather than `as u8`, which is what the agent pipe used: that
+    /// ties the meaning of a frame to the order these variants happen to be
+    /// declared in, and the far end was not reading it at all — it labelled
+    /// every agent frame BGRA whatever the byte said. Harmless only while the
+    /// agent had no way to produce anything else.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::Bgra => 0,
+            Self::Nv12 => 1,
+        }
+    }
+
+    /// The format a byte from [`to_wire`](Self::to_wire) names, if it names one.
+    pub fn from_wire(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Bgra),
+            1 => Some(Self::Nv12),
+            _ => None,
+        }
+    }
+
     /// Bytes one frame of this size occupies.
     pub fn frame_bytes(&self, width: u16, height: u16) -> usize {
         let (w, h) = (width as usize, height as usize);
@@ -1179,6 +1202,75 @@ pub fn create_stub(config: &CaptureConfig) -> Box<dyn ScreenCaptureBackend> {
     Box::new(StubCapturer::new(config))
 }
 
+/// The capturer for this process's own desktop, as the configuration asks.
+///
+/// Separate from [`create_capturer`] so it can be run again: a capturer that
+/// could not start because another desktop had the input is built here once
+/// its own desktop is back in front. See `DesktopFollowing::deferred`.
+#[cfg(target_os = "windows")]
+fn build_local_capturer(config: &CaptureConfig) -> Result<Box<dyn ScreenCaptureBackend>> {
+    use anyhow::Context;
+
+    // Resolved to a real device name where the displays can be enumerated, so
+    // "the primary" and its own name do not become two registry entries for one
+    // display — which would mean two duplications of it, and the second one
+    // failing.
+    Ok(match &config.display {
+        DisplayTarget::All => {
+            let all = displays();
+            anyhow::ensure!(
+                !all.is_empty(),
+                "this host cannot enumerate its displays, so it cannot compose them"
+            );
+            Box::new(super::capture_wall::Wall::new(&all)?)
+        }
+        // Only the compositor holds a window's own pixels, so there is no
+        // fallback here and none is wanted: a window share that quietly became
+        // a screen share would be a promise broken silently. See
+        // `window_capture`.
+        DisplayTarget::Window(id) => Box::new(
+            super::capture_wgc::WgcCapturer::for_window(*id)
+                .context("could not capture that window")?,
+        ),
+        // Asked about again here rather than carried in the target: the grid
+        // needs each window's size, and a size recorded when the grant was made
+        // is the size it was then.
+        DisplayTarget::Windows(ids) => {
+            let known: Vec<_> =
+                ids.iter().filter_map(|id| super::window_capture::info_of(*id)).collect();
+            anyhow::ensure!(!known.is_empty(), "none of the shared windows are still open");
+            Box::new(
+                super::capture_wall::Wall::of_windows(&known)
+                    .context("could not compose those windows")?,
+            )
+        }
+        chosen => {
+            let want = match chosen {
+                DisplayTarget::One(name) => Some(name.clone()),
+                _ => displays().into_iter().find(|d| d.primary).map(|d| d.name),
+            };
+            super::capture_shared::attach(want).context("could not start screen capture")?
+        }
+    })
+}
+
+/// A capturer for this process's own desktop and nothing else — for the agents.
+///
+/// Everything else wants [`create_capturer`], which follows the input to
+/// whichever desktop has it by asking the secure desktop's agent for frames.
+/// An agent doing that would be asking itself. It did, once desktops were told
+/// apart by name: the secure desktop's agent noticed the input leave, opened its
+/// own pipe to ask for frames, and was refused only because a host already had
+/// the pipe. Between hosts it would have succeeded, and taken the pipe from
+/// every host that came after.
+///
+/// No quality scale is applied. An agent sends its desktop at the size it is,
+/// and the host scales what it receives.
+#[cfg(target_os = "windows")]
+pub fn create_desktop_capturer(config: &CaptureConfig) -> Result<Box<dyn ScreenCaptureBackend>> {
+    build_local_capturer(config)
+}
+
 pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBackend>> {
     let backend: Box<dyn ScreenCaptureBackend> = if config.native_override.is_some() {
         // An explicit display size means a synthetic one was asked for.
@@ -1186,63 +1278,42 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
     } else {
         #[cfg(target_os = "windows")]
         {
-            // The service has no desktop to duplicate — session zero has
-            // nothing on it — so it takes every frame from an agent instead of
-            // wrapping a local backend that would refuse to start.
-            if super::capture_follow::capture_through_agent_only() {
-                Box::new(super::capture_follow::DesktopFollowing::agent_only())
-            } else {
-                use anyhow::Context;
-                // Resolved to a real device name where the displays can be
-                // enumerated, so "the primary" and its own name do not become
-                // two registry entries for one display — which would mean two
-                // duplications of it, and the second one failing.
-                let local: Box<dyn ScreenCaptureBackend> = match &config.display {
-                    DisplayTarget::All => {
-                        let all = displays();
-                        anyhow::ensure!(
-                            !all.is_empty(),
-                            "this host cannot enumerate its displays, so it cannot compose them"
-                        );
-                        Box::new(super::capture_wall::Wall::new(&all)?)
-                    }
-                    // Only the compositor holds a window's own pixels, so there
-                    // is no fallback here and none is wanted: a window share
-                    // that quietly became a screen share would be a promise
-                    // broken silently. See `window_capture`.
-                    DisplayTarget::Window(id) => Box::new(
-                        super::capture_wgc::WgcCapturer::for_window(*id)
-                            .context("could not capture that window")?,
-                    ),
-                    // Asked about again here rather than carried in the target:
-                    // the grid needs each window's size, and a size recorded
-                    // when the grant was made is the size it was then.
-                    DisplayTarget::Windows(ids) => {
-                        let known: Vec<_> = ids
-                            .iter()
-                            .filter_map(|id| super::window_capture::info_of(*id))
-                            .collect();
-                        anyhow::ensure!(
-                            !known.is_empty(),
-                            "none of the shared windows are still open"
-                        );
-                        Box::new(
-                            super::capture_wall::Wall::of_windows(&known)
-                                .context("could not compose those windows")?,
-                        )
-                    }
-                    chosen => {
-                        let want = match chosen {
-                            DisplayTarget::One(name) => Some(name.clone()),
-                            _ => displays().into_iter().find(|d| d.primary).map(|d| d.name),
-                        };
-                        super::capture_shared::attach(want)
-                            .context("could not start screen capture")?
-                    }
-                };
-                // Wrapped so a consent prompt does not end the picture. See
-                // `capture_follow`: everything above this sees one capturer.
-                Box::new(super::capture_follow::DesktopFollowing::new(local))
+            use super::capture_follow::{this_desktop_has_input, DesktopFollowing};
+
+            // Wrapped so a consent prompt does not end the picture. See
+            // `capture_follow`: everything above this sees one capturer.
+            match build_local_capturer(&config) {
+                Ok(local) => Box::new(DesktopFollowing::new(local)),
+                // # A desktop that is not in front cannot be duplicated yet
+                //
+                // Desktop Duplication opens an output only for the desktop
+                // receiving input. A session that begins while that is some
+                // other desktop — the machine is locked, a consent prompt is
+                // up, nobody has signed in — used to fail right here, before a
+                // frame was asked for, even though there was a picture to show:
+                // the secure desktop's agent has it.
+                //
+                // The application met this only when a guest happened to
+                // connect during a prompt. The unattended host meets it every
+                // time the machine locks, which is the ordinary state of a
+                // machine nobody is sitting at. So the capturer starts with
+                // nothing of its own, shows the agent's frames, and builds its
+                // local capturer the moment this desktop has the input again.
+                //
+                // Only when this desktop really is not in front. A capturer
+                // that cannot start while its own desktop *has* the input is a
+                // real failure and is reported as one, as before.
+                Err(e) if !this_desktop_has_input() => {
+                    tracing::info!(
+                        "Cannot capture this desktop while the input is elsewhere ({e:#}) — \
+                         showing the secure desktop until it comes back"
+                    );
+                    let later = config.clone();
+                    Box::new(DesktopFollowing::deferred(Box::new(move || {
+                        build_local_capturer(&later)
+                    })))
+                }
+                Err(e) => return Err(e),
             }
         }
         #[cfg(not(target_os = "windows"))]
@@ -1312,6 +1383,21 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every format survives the trip between processes as itself.
+    ///
+    /// The agent sends the byte and the host reads it back. Two agents and a
+    /// host ship in one executable, so the values only have to agree with
+    /// themselves — but they have to agree, and a byte that meant nothing
+    /// must be refused rather than read as the nearest format.
+    #[test]
+    fn a_pixel_format_crosses_the_agent_pipe_as_itself() {
+        for format in [PixelFormat::Bgra, PixelFormat::Nv12] {
+            assert_eq!(PixelFormat::from_wire(format.to_wire()), Some(format));
+        }
+        assert_ne!(PixelFormat::Bgra.to_wire(), PixelFormat::Nv12.to_wire());
+        assert_eq!(PixelFormat::from_wire(0xFF), None);
+    }
 
     /// Threading the resize does not change the picture it produces.
     ///

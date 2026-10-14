@@ -16,12 +16,16 @@
 //! run it keeps working unchanged. The service is opt-in, switched on from
 //! Settings, and removable from the same place.
 //!
-//! ## Scope of this piece
+//! ## What it does
 //!
-//! Registration, removal, and reporting which of those states the machine is
-//! in. The service starts and stops cleanly and does nothing else yet: the
-//! per-desktop agent, the control pipe and the capture handover come next, and
-//! land against a service that already installs and runs.
+//! Registration and removal, from the elevated half of the buttons in
+//! Settings, including the firewall rule its own copy of the executable needs.
+//! Once running it supervises processes in the console session rather than
+//! doing any work there itself, because session zero has no desktop to work on:
+//! an agent on each desktop, and — while the application is not hosting — the
+//! unattended host, which runs the application's own hosting path on the
+//! ordinary desktop. The application talks to it over the control pipe to hand
+//! over what that host needs. See `unattended_host` and `service_control`.
 
 use anyhow::{bail, Context, Result};
 
@@ -156,7 +160,6 @@ mod windows_impl {
         SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
         SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     };
-    use std::sync::Arc;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::TerminateProcess;
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -233,10 +236,11 @@ mod windows_impl {
     /// The one part that *is* security-relevant, the approved admin devices,
     /// does not come from here. It is mirrored into the credential store and
     /// read back from there, so editing this file cannot grant anybody access.
-    /// See `apply_settings` and [`HostSecrets::trusted_admins`].
+    /// See [`session_config_from`] and [`HostSecrets::trusted_admins`].
     ///
+    /// [`session_config_from`]: crate::unattended_host::session_config_from
     /// [`HostSecrets::trusted_admins`]: crate::gui::secrets::HostSecrets::trusted_admins
-    fn settings_path() -> Result<std::path::PathBuf> {
+    pub fn settings_path() -> Result<std::path::PathBuf> {
         Ok(installed_exe_path()?.with_file_name("settings.json"))
     }
 
@@ -245,7 +249,7 @@ mod windows_impl {
 
     /// Shown beside the rule in Windows Defender Firewall.
     const FIREWALL_RULE_DESCRIPTION: &str =
-        "Lets the Tain service answer connections while nobody is signed in. \
+        "Lets the Tain service answer connections while the Tain application is not running. \
          Removed when the Tain service is removed.";
 
     /// Let the installed copy receive the packets a connection is made of.
@@ -378,13 +382,33 @@ mod windows_impl {
         // caller stops the service first. Reported plainly rather than left as
         // a bare OS error, because "Access is denied" on an install is not
         // self-explanatory.
-        std::fs::copy(&source, &target).with_context(|| {
-            format!(
-                "could not copy {} to {} — stop the service first if it is running",
-                source.display(),
-                target.display()
-            )
-        })?;
+        //
+        // # Tried for a few seconds, not once
+        //
+        // The service, its two agents and the unattended host all run from this
+        // one file, and a process that has been told to end still holds it for
+        // the moment it takes to go. One attempt made in that moment fails, and
+        // a failed copy is the install that leaves an old build running while
+        // everything says the new one is installed. So the copy is retried
+        // across that moment; a file that is still held after it is a real
+        // failure and is reported as one.
+        let mut attempts = 0;
+        loop {
+            match std::fs::copy(&source, &target) {
+                Ok(_) => break,
+                Err(_) if attempts < 15 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "could not copy {} to {} — stop the service first if it is running",
+                        source.display(),
+                        target.display()
+                    )));
+                }
+            }
+        }
 
         // Written after the copy, so a stamp only ever describes a copy that
         // was actually made. A failed copy leaves the previous stamp naming the
@@ -735,7 +759,17 @@ mod windows_impl {
         // Deleting a running service leaves it marked for deletion until it
         // exits, and a reinstall in that window fails confusingly. Waiting a
         // moment for it to stop avoids the whole situation.
-        for _ in 0..20 {
+        //
+        // # Long enough for the unattended host to leave
+        //
+        // This was two seconds, which was a moment when stopping meant clearing
+        // a flag. It now means asking the unattended host to tell its guests and
+        // close its endpoint, which is allowed `STOP_GRACE` — and the host runs
+        // from the same copy the reinstall is about to replace. A service that
+        // reported itself stopped while its host still held that file is how an
+        // install fails its copy and leaves last week's build running. Stopping
+        // normally takes a tenth of a second; this is the ceiling, not the wait.
+        for _ in 0..100 {
             // SAFETY: a handle with query access.
             if unsafe { QueryServiceStatus(service.0, &mut status) }.is_err()
                 || status.dwCurrentState == SERVICE_STOPPED
@@ -872,11 +906,19 @@ mod windows_impl {
         }
 
         fn stop_all(&mut self) {
+            use windows::Win32::System::Threading::WaitForSingleObject;
+
             for (desktop, handle) in std::mem::take(&mut self.running) {
                 if process_is_alive(handle) {
                     // SAFETY: a process handle this supervisor created.
                     unsafe {
                         let _ = TerminateProcess(handle, 0);
+                        // `TerminateProcess` returns before the process has
+                        // gone, and a process that has not gone still holds the
+                        // executable. Waited for, briefly, so a service that
+                        // reports itself stopped really has released the file a
+                        // reinstall is about to replace.
+                        let _ = WaitForSingleObject(handle, 1000);
                     }
                     tracing::debug!("Agent on {desktop} stopped");
                 }
@@ -941,7 +983,122 @@ mod windows_impl {
     /// pipe, which is the part that has to stay narrow.
     fn spawn_agent(session: u32, desktop: &str) -> Result<HANDLE> {
         let token = system_token_for_session(session)?;
-        start_with_token(&token, desktop)
+        let arguments = format!(
+            "{} {} \"{}\"",
+            crate::agent::AGENT_FLAG,
+            crate::agent::DESKTOP_ARG,
+            desktop
+        );
+        start_in_session(&token, desktop, &arguments)
+    }
+
+    /// The unattended host, and everything the service holds to end it.
+    ///
+    /// Declared in the order the handles should close in: the process handle is
+    /// only for watching, the stop event only for asking, and the job last,
+    /// because closing the job is what ends a host that did not stop when asked.
+    struct HostProcess {
+        process: OwnedHandle,
+        /// Set to ask the host to stop. See `unattended_host`.
+        stop: OwnedHandle,
+        /// Holding this keeps the host alive; closing it ends the host.
+        _job: OwnedHandle,
+        /// The console session the host was started in.
+        session: u32,
+    }
+
+    /// Start the unattended host on the ordinary desktop of `session`.
+    ///
+    /// # Why an event and a job, and not the host's standard input
+    ///
+    /// A pipe on the host's standard input would have done both jobs at once:
+    /// closing it asks, and the service dying closes it too. It needs the handle
+    /// inherited, and `CreateProcessAsUser` documents that handles cannot be
+    /// inherited across sessions — the service is in session zero and the host
+    /// is not. That is not a limit to discover on somebody's unattended machine.
+    ///
+    /// A named event in the global namespace crosses sessions by design, and
+    /// nobody without `SeCreateGlobalPrivilege` — which ordinary users do not
+    /// have — could have made one by that name first. A job with
+    /// `KILL_ON_JOB_CLOSE` is the operating system's own guarantee that the
+    /// host ends when the service does, however the service ends.
+    fn spawn_unattended_host(session: u32) -> Result<HostProcess> {
+        use std::sync::atomic::AtomicU32;
+        use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows::Win32::System::Threading::CreateEventW;
+
+        /// Distinguishes the stop events of successive hosts in one service run.
+        static STARTED: AtomicU32 = AtomicU32::new(0);
+
+        let name = format!(
+            r"Global\TainUnattendedHostStop-{}-{}",
+            std::process::id(),
+            STARTED.fetch_add(1, Ordering::Relaxed)
+        );
+        let wide_name = wide(&name);
+        // Manual reset and initially clear: once set it stays set, so a host
+        // that is slow to reach its wait still sees it.
+        // SAFETY: the name outlives the call; the handle is owned immediately.
+        let stop = OwnedHandle(
+            unsafe { CreateEventW(None, true, false, PCWSTR(wide_name.as_ptr())) }
+                .context("could not create the unattended host's stop event")?,
+        );
+        // Read at once, before anything else can overwrite it.
+        // SAFETY: a documented read of this thread's last error.
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            bail!("an event named {name} already existed — refusing one this service did not make");
+        }
+
+        // SAFETY: an unnamed job with default security, owned immediately.
+        let job = OwnedHandle(
+            unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+                .context("could not create a job for the unattended host")?,
+        );
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the structure the information class documents, sized to match.
+        unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        }
+        .context("could not tie the unattended host to the service")?;
+
+        let token = system_token_for_session(session)?;
+        let arguments = format!(
+            "{} {} \"{}\"",
+            crate::unattended_host::HOST_FLAG,
+            crate::unattended_host::STOP_EVENT_ARG,
+            name
+        );
+        let process = OwnedHandle(start_in_session(
+            &token,
+            tain_core::capture_follow::ORDINARY_DESKTOP,
+            &arguments,
+        )?);
+
+        // Straight after it starts. The host starts nothing of its own, so
+        // there is nothing it could launch in that moment that would escape.
+        // SAFETY: both handles are live and owned by this function.
+        if let Err(e) = unsafe { AssignProcessToJobObject(job.0, process.0) } {
+            // A host not in the job is one that could outlive the service, and
+            // that is the one outcome this exists to prevent.
+            // SAFETY: the process this function just started.
+            unsafe {
+                let _ = TerminateProcess(process.0, 1);
+            }
+            return Err(anyhow::Error::new(e).context("could not tie the unattended host to the service"));
+        }
+
+        Ok(HostProcess { process, stop, _job: job, session })
     }
 
     /// A copy of this service's own SYSTEM token, moved into `session`.
@@ -996,27 +1153,25 @@ mod windows_impl {
         Ok(primary)
     }
 
-    /// Start the agent with `token`, on `desktop`.
-    fn start_with_token(token: &OwnedHandle, desktop: &str) -> Result<HANDLE> {
+    /// Start this executable with `arguments`, using `token`, on `desktop`.
+    ///
+    /// Shared by the agents and the unattended host, which differ only in what
+    /// they are told to be: both are this executable, as Local System, in the
+    /// console session.
+    fn start_in_session(token: &OwnedHandle, desktop: &str, arguments: &str) -> Result<HANDLE> {
         use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
         use windows::Win32::System::Threading::{
             CreateProcessAsUserW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
             PROCESS_INFORMATION, STARTUPINFOW,
         };
 
-        // The environment that goes with the token, so the agent reads the
+        // The environment that goes with the token, so the process reads the
         // right profile. Not fatal if it cannot be built.
         let mut environment = std::ptr::null_mut();
         // SAFETY: documented; destroyed below if it was created.
         let have_env = unsafe { CreateEnvironmentBlock(&mut environment, token.0, false) }.is_ok();
 
-        let mut command = wide(&format!(
-            "\"{}\" {} {} \"{}\"",
-            exe_path()?,
-            crate::agent::AGENT_FLAG,
-            crate::agent::DESKTOP_ARG,
-            desktop
-        ));
+        let mut command = wide(&format!("\"{}\" {arguments}", exe_path()?));
         let mut desktop_path = wide(&format!("WinSta0\\{desktop}"));
         let startup = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -1049,7 +1204,7 @@ mod windows_impl {
                 let _ = DestroyEnvironmentBlock(environment);
             }
         }
-        started.context("CreateProcessAsUser refused to start the agent")?;
+        started.with_context(|| format!("CreateProcessAsUser refused to start `{arguments}`"))?;
 
         // The thread handle is of no use to anyone here.
         // SAFETY: returned by the call above, closed once.
@@ -1262,10 +1417,21 @@ mod windows_impl {
         }
     }
 
-    /// Hosts on this machine's behalf while nobody is signed in.
+    /// Keeps the unattended host running in the console session while it is
+    /// wanted.
+    ///
+    /// The host is a process on the desktop, not a thread in here — see
+    /// `unattended_host` for what hosting from session zero cost.
     struct UnattendedHost {
-        /// The running host, and the flag that stops it.
-        running: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
+        /// The running host, while there is one.
+        running: Option<HostProcess>,
+        /// When the last host was started.
+        ///
+        /// A host that exits the moment it starts — a bind that fails, a store
+        /// it cannot read — would otherwise be started again twice a second for
+        /// as long as the cause lasts, each time a process, a relay connection
+        /// and a line in two logs.
+        started_at: Option<std::time::Instant>,
         /// When starting was last attempted and found nothing to start with.
         ///
         /// The supervisor loop runs twice a second, and looking for an identity
@@ -1277,6 +1443,13 @@ mod windows_impl {
         /// made it rare; wanting to host whenever the application is not makes
         /// it the ordinary state.
         idle_since: Option<std::time::Instant>,
+        /// Whether a failure to keep a host running has already been reported.
+        ///
+        /// A host that cannot start, or dies as it starts, fails the same way
+        /// every few seconds for as long as the cause lasts. The first failure
+        /// is the one worth a warning; the rest would bury it. Cleared once a
+        /// host has stayed up, so the next failure after that is reported too.
+        complained: bool,
     }
 
     /// How long to leave the credential store alone after finding no identity.
@@ -1294,9 +1467,29 @@ mod windows_impl {
     /// answer you cached is out of date.
     static IDENTITY_CHANGED: AtomicBool = AtomicBool::new(false);
 
+    /// How soon a host that exited may be started again.
+    const RELAUNCH_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How long a host asked to stop is given before its job ends it.
+    ///
+    /// Enough to tell connected guests and close the endpoint properly — the
+    /// difference between the application's endpoint binding cleanly and the
+    /// relay refusing it as a duplicate of one that has not finished leaving.
+    const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
     impl UnattendedHost {
         fn new() -> Self {
-            Self { running: None, idle_since: None }
+            Self { running: None, started_at: None, idle_since: None, complained: false }
+        }
+
+        /// Report a failure to keep a host running, once per run of them.
+        fn complain(&mut self, what: std::fmt::Arguments<'_>) {
+            if self.complained {
+                tracing::debug!("{what}");
+            } else {
+                tracing::warn!("{what}");
+                self.complained = true;
+            }
         }
 
         /// Start or stop hosting to match what the machine currently needs.
@@ -1332,20 +1525,47 @@ mod windows_impl {
         /// Shutting down, the application says so on its way out and hosting
         /// moves within half a second. When it does not get to say so, the
         /// claim expires a lease later instead. Both paths end here.
+        ///
+        /// # And a host belongs to one session
+        ///
+        /// It is started on that session's desktop. Signing out ends the
+        /// session, and a host left in it would be capturing a desktop nobody
+        /// will see again — so a changed console session moves the host, and no
+        /// console session at all, which is the moment between two, stops it.
         fn poll(&mut self) {
-            let wanted = !application_is_hosting();
+            let session = console_session();
 
-            // A host that stopped on its own — a bind that failed, a network
-            // that went away — is restarted by the next pass.
-            if let Some((_, handle)) = &self.running
-                && handle.is_finished()
+            // A host that ended on its own — a bind that failed, a network that
+            // went away — is gone, and the pass below may start another.
+            if let Some(host) = &self.running
+                && !process_is_alive(host.process.0)
             {
+                self.running = None;
+                self.complain(format_args!(
+                    "The unattended host exited on its own — its log, unattended-host.log, says why"
+                ));
+            }
+
+            // Up for longer than a failing host lasts, so whatever was failing
+            // has stopped, and the next failure deserves a warning of its own.
+            if self.running.is_some()
+                && self.started_at.is_some_and(|at| at.elapsed() > RELAUNCH_AFTER)
+            {
+                self.complained = false;
+            }
+
+            if let Some(host) = &self.running
+                && Some(host.session) != session
+            {
+                tracing::info!("The console session changed — stopping the unattended host");
                 self.stop();
             }
 
-            match (wanted, self.running.is_some()) {
-                (true, false) => self.start(),
-                (false, true) => {
+            let application = application_is_hosting();
+            let running = self.running.is_some();
+            match session {
+                Some(session) if !running && !application => self.start(session),
+                _ if running && application => {
                     tracing::info!("The application is hosting — handing hosting back");
                     self.stop();
                 }
@@ -1353,7 +1573,10 @@ mod windows_impl {
             }
         }
 
-        fn start(&mut self) {
+        fn start(&mut self, session: u32) {
+            if self.started_at.is_some_and(|at| at.elapsed() < RELAUNCH_AFTER) {
+                return;
+            }
             // Asked at most every `RETRY_LOOKING_FOR_AN_IDENTITY` once the
             // answer has been "nothing adopted" once, and immediately whenever
             // the control channel says the answer has changed. See
@@ -1381,7 +1604,10 @@ mod windows_impl {
                 .into_iter()
                 .any(|typ| secrets.code(typ).is_some());
 
-            let (Some(identity), true) = (identity, has_a_code) else {
+            // Checked here although the host reads them itself, so a machine
+            // with unattended access switched off does not start a process
+            // twice a second only for it to find nothing and exit.
+            let (Some(_), true) = (identity, has_a_code) else {
                 // Nothing adopted, so unattended access is off or was never
                 // configured. Not a failure and not worth a line every pass.
                 self.idle_since = Some(std::time::Instant::now());
@@ -1389,26 +1615,59 @@ mod windows_impl {
             };
             self.idle_since = None;
 
-            tracing::info!("Nothing else is hosting — hosting on this machine's behalf");
-            let stop = Arc::new(AtomicBool::new(false));
-            let flag = stop.clone();
-            let spawned = std::thread::Builder::new()
-                .name("tain-unattended-host".into())
-                .spawn(move || host_until_stopped(identity, &flag));
-
-            match spawned {
-                Ok(handle) => self.running = Some((stop, handle)),
-                Err(e) => tracing::warn!("Could not start the unattended host: {e}"),
+            // Quiet while failures are being counted rather than reported, or a
+            // host that keeps dying would put this line in the log every few
+            // seconds and bury the warning that says why.
+            if self.complained {
+                tracing::debug!("Starting the unattended host again in session {session}");
+            } else {
+                tracing::info!(
+                    "Nothing else is hosting — starting the unattended host in session {session}"
+                );
+            }
+            self.started_at = Some(std::time::Instant::now());
+            match spawn_unattended_host(session) {
+                Ok(host) => self.running = Some(host),
+                Err(e) => self.complain(format_args!("Could not start the unattended host: {e:#}")),
             }
         }
 
+        /// Ask the host to stop, give it a moment, then end it regardless.
+        ///
+        /// # Why this blocks the supervisor loop
+        ///
+        /// Briefly, and only here. A host still closing its endpoint while the
+        /// next one binds — the application's, or this service's own in a new
+        /// session — is two endpoints on one identity, which the relay resolves
+        /// by refusing one. Waiting is the only way to be sure the first has
+        /// gone, and stops happen at a handover or a sign-out, never on a
+        /// schedule.
         fn stop(&mut self) {
-            let Some((stop, handle)) = self.running.take() else { return };
-            stop.store(true, Ordering::Relaxed);
-            // Not joined. The host is inside its own runtime and may be waiting
-            // on a socket; the flag ends it at the next tick, and blocking the
-            // service's own loop on that would delay a stop request.
-            drop(handle);
+            use windows::Win32::Foundation::WAIT_OBJECT_0;
+            use windows::Win32::System::Threading::{SetEvent, WaitForSingleObject};
+
+            let Some(host) = self.running.take() else { return };
+
+            // SAFETY: an event this service created and still holds.
+            match unsafe { SetEvent(host.stop.0) } {
+                Ok(()) => {
+                    // SAFETY: a process handle this service holds.
+                    let waited = unsafe {
+                        WaitForSingleObject(host.process.0, STOP_GRACE.as_millis() as u32)
+                    };
+                    if waited != WAIT_OBJECT_0 {
+                        tracing::warn!(
+                            "The unattended host did not stop within {STOP_GRACE:?} — ending it"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not ask the unattended host to stop ({e}) — ending it");
+                }
+            }
+            // Closing the job ends the process if it is still there, and does
+            // nothing if it has already gone.
+            drop(host);
         }
     }
 
@@ -1416,156 +1675,6 @@ mod windows_impl {
         fn drop(&mut self) {
             self.stop();
         }
-    }
-
-    /// The session configuration an unattended host should run with.
-    ///
-    /// The application's own settings, translated the same way the application
-    /// translates them — one call to `to_session_config`, so the frame rate,
-    /// bitrate, codec, resolution ceiling, audio exclusions, host name and
-    /// local-input window are the ones the owner chose rather than the library
-    /// defaults an unattended session used to get.
-    ///
-    /// # Two things are not taken from the file
-    ///
-    /// `trusted_admins` comes from the credential store instead, because it is
-    /// the one field here that decides who gets in. Reading it from a file that
-    /// sits beside the service would mean anybody who could write that file
-    /// could approve themselves; reading it from the store means they would
-    /// need the rights to write the store, which is a level of access that
-    /// already implies everything else.
-    ///
-    /// `auto_regen_guest_passcode` is forced off. Issuing a fresh guest code
-    /// when the last guest leaves is right for a host with somebody at it — the
-    /// new code is on screen the moment it exists. Here there is no screen, and
-    /// a code regenerated by the service is one the application's stored copy
-    /// no longer matches, leaving a machine that answers to neither.
-    fn session_config(
-        approved: std::collections::BTreeSet<[u8; 32]>,
-    ) -> tain_core::SessionConfig {
-        let saved = settings_path()
-            .ok()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| serde_json::from_str::<crate::gui::settings::Settings>(&text).ok());
-
-        let mut config = match saved {
-            Some(settings) => settings.to_session_config(),
-            None => {
-                // No file yet, or one this build cannot read. Defaults are a
-                // working session rather than no session, and the line says why
-                // the picture may not look like the settings panel promises.
-                tracing::warn!(
-                    "No usable settings for the unattended host — falling back to defaults, \
-                     so the frame rate, bitrate and codec are not this machine's chosen ones"
-                );
-                tain_core::SessionConfig::default()
-            }
-        };
-        config.trusted_admins = approved;
-        config.auto_regen_guest_passcode = false;
-        config
-    }
-
-    /// Run a host with the adopted identity until told to stop.
-    ///
-    /// On its own runtime rather than the application's: the service main runs
-    /// on a thread the control manager created, with no runtime of its own, and
-    /// borrowing one across that boundary is more machinery than a runtime
-    /// costs.
-    fn host_until_stopped(identity: [u8; 32], stop: &AtomicBool) {
-        // Session zero has no desktop, so every frame has to come from an
-        // agent. Which agent is not fixed: with nobody signed in it is the
-        // sign-in screen on the secure desktop, and with somebody signed in but
-        // no application running it is their ordinary desktop. The capturer
-        // follows whichever currently has the input — see `DesktopFollowing`.
-        tain_core::capture_follow::use_agent_only();
-
-        let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-            Ok(runtime) => runtime,
-            Err(e) => {
-                tracing::warn!("Could not start a runtime for the unattended host: {e}");
-                return;
-            }
-        };
-
-        runtime.block_on(async move {
-            let server = match tain_core::HostServer::bind_with_identity(Some(identity)).await {
-                Ok(server) => Arc::new(server),
-                Err(e) => {
-                    tracing::warn!("The unattended host could not bind: {e:#}");
-                    return;
-                }
-            };
-
-            // Codes are restored rather than reissued. A new one would name the
-            // same endpoint and still be a code nobody has been given.
-            let secrets = crate::gui::secrets::HostSecrets::os();
-            let endpoint_id = server.endpoint_id_bytes();
-            for typ in [tain_core::PasscodeType::Master, tain_core::PasscodeType::Guest] {
-                let Some(saved) = secrets.code(typ) else { continue };
-                match tain_core::ConnectionCode::parse(&saved) {
-                    Ok(parsed) if parsed.endpoint_id == endpoint_id => {
-                        server.adopt_passcode(typ, parsed.secret).await;
-                    }
-                    // A code for a different endpoint is one the application
-                    // regenerated without telling us. Refusing it is right:
-                    // adopting it would answer to a secret whose code names
-                    // somewhere else.
-                    Ok(_) => tracing::warn!(
-                        "The stored {} code is for a different endpoint — ignoring it",
-                        typ.prefix()
-                    ),
-                    Err(e) => tracing::warn!("The stored {} code is unreadable: {e}", typ.prefix()),
-                }
-            }
-
-            // Who the owner has already approved for the admin passcode.
-            //
-            // Without this the host runs on `SessionConfig::default()`, whose
-            // trusted set is empty — and an empty set means every admin
-            // connection needs approving, from a host that has nobody to ask.
-            // So a correct master code from the owner's own approved laptop
-            // authenticated and was then refused, which read from the far end
-            // as the code being wrong. See `must_be_approved`.
-            let approved = secrets.trusted_admins();
-            let approved_count = approved.len();
-            server.set_session_config(session_config(approved));
-
-            // No approval channel, deliberately. Nobody is signed in to answer
-            // one, and `await_approval` refuses a guest that has no channel —
-            // so a MASTER code from an approved device connects, and a GUEST
-            // code is declined rather than hanging until it times out or,
-            // worse, being let through.
-            match approved_count {
-                0 => tracing::warn!(
-                    "Unattended host listening, but no device is approved for the admin \
-                     passcode — every connection will be refused. Connect once from a Tain \
-                     window on this machine to approve the device."
-                ),
-                n => tracing::info!(
-                    "Unattended host listening — master codes from {n} approved device(s)"
-                ),
-            }
-
-            let serving = server.clone().run();
-            tokio::pin!(serving);
-            loop {
-                tokio::select! {
-                    result = &mut serving => {
-                        if let Err(e) = result {
-                            tracing::warn!("The unattended host stopped: {e:#}");
-                        }
-                        return;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                        if stop.load(Ordering::Relaxed) {
-                            tracing::info!("The unattended host was asked to stop");
-                            return;
-                        }
-                    }
-                }
-            }
-        });
     }
 
     fn report(state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE) {

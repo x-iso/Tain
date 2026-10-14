@@ -312,14 +312,17 @@ mod platform {
     use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE};
 
     use crate::pipe_security::{console_user_sid, wide, OwnedHandle as Owned, PipeSecurity};
+    use windows::Win32::Foundation::ERROR_IO_PENDING;
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
-        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_MODE, OPEN_EXISTING,
+        PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe,
         PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
+    use windows::Win32::System::Threading::{CreateEventW, ResetEvent};
+    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
     /// One connected host: frames out, input in.
     ///
@@ -345,26 +348,36 @@ mod platform {
         /// eight-byte units and a short read would mean the next event is
         /// assembled from the tail of one and the head of another — a click at
         /// coordinates nobody asked for.
-        pub fn take_input(&mut self) -> Vec<PipeRequest> {
+        ///
+        /// # An error means the host has gone
+        ///
+        /// A peek that fails is not "nothing waiting", and this used to treat it
+        /// as though it were. A pipe whose host has closed its end cannot be
+        /// peeked, so an agent that was not sending frames — which is every
+        /// agent whose desktop does not have the input, and every input-only
+        /// link — never found out its host had left. It went on holding the
+        /// pipe's one instance for a connection nobody was on, and every host
+        /// that tried to connect after that was told the pipe was busy, for as
+        /// long as the agent lived. On the secure desktop that is a picture that
+        /// freezes on the second lock and every one after.
+        pub fn take_input(&mut self) -> Result<Vec<PipeRequest>> {
             let mut events = Vec::new();
             loop {
                 let mut available = 0u32;
                 // SAFETY: a live pipe handle; every out parameter is a local.
-                let peeked = unsafe {
-                    PeekNamedPipe(self.pipe, None, 0, None, Some(&mut available), None)
-                };
-                if peeked.is_err() || (available as usize) < INPUT_LEN {
-                    return events;
+                unsafe { PeekNamedPipe(self.pipe, None, 0, None, Some(&mut available), None) }
+                    .context("the host disconnected")?;
+                if (available as usize) < INPUT_LEN {
+                    return Ok(events);
                 }
 
                 let mut record = [0u8; INPUT_LEN];
                 let mut read = 0u32;
                 // SAFETY: as above, into a local buffer.
-                let got = unsafe {
-                    ReadFile(self.pipe, Some(&mut record), Some(&mut read), None)
-                };
-                if got.is_err() || read as usize != INPUT_LEN {
-                    return events;
+                unsafe { ReadFile(self.pipe, Some(&mut record), Some(&mut read), None) }
+                    .context("the host disconnected")?;
+                if read as usize != INPUT_LEN {
+                    bail!("the host sent a partial input record");
                 }
                 // An unknown kind is skipped, not fatal. See `decode_input`.
                 if let Some(request) = decode_request(&record) {
@@ -461,21 +474,42 @@ mod platform {
     }
 
     /// Frames arriving from an agent on another desktop, and input going back.
+    ///
+    /// # Opened for overlapped I/O, and why that is not a detail
+    ///
+    /// Windows performs the I/O on a handle opened without
+    /// `FILE_FLAG_OVERLAPPED` one operation at a time — per handle, not per
+    /// direction. This link is read on one thread and written from others, and
+    /// the read is almost always waiting, because the agent sends a frame only
+    /// when its desktop changes. So every write queued behind a read that was
+    /// waiting for the picture to change: a click on a still consent prompt
+    /// waited for the caret to blink, and the message sent while letting the
+    /// link go waited for a frame that was never coming — taking the capture
+    /// thread with it.
+    ///
+    /// Overlapped, each operation stands alone. The calls below still wait for
+    /// completion, so nothing about using the link changes, and a wait can now
+    /// be abandoned from another thread: see [`Self::cancel_pending`].
     pub struct AgentFrames {
         pipe: Owned,
+        /// Signalled when a read finishes. One is enough: reads are serialised
+        /// by `reading`.
+        read_done: Owned,
+        /// Signalled when a write finishes, serialised by `writing` likewise.
+        write_done: Owned,
         /// Held for the length of one input record. See [`Self::send_input`].
         writing: std::sync::Mutex<()>,
         /// Held for the length of one frame. See [`Self::next_frame`].
         reading: std::sync::Mutex<()>,
     }
 
-    // SAFETY: the handle inside is a kernel object, not a pointer into this
-    // process, and nothing here caches thread state. Reading and writing happen
-    // on different threads, which a duplex pipe supports directly, and the
-    // write side is serialised by the mutex below.
+    // SAFETY: the handles inside are kernel objects, not pointers into this
+    // process, and nothing here caches thread state. Reads and writes happen on
+    // different threads, which an overlapped duplex pipe supports directly.
     unsafe impl Send for AgentFrames {}
-    // SAFETY: as above. `send_input` takes `&self` and holds `writing` for the
-    // whole of each record, so two threads cannot interleave halves of one.
+    // SAFETY: as above. Each direction is serialised by its own mutex, held for
+    // a whole record or frame, so two threads cannot interleave halves of one or
+    // share an `OVERLAPPED` event.
     unsafe impl Sync for AgentFrames {}
 
     impl AgentFrames {
@@ -504,18 +538,67 @@ mod platform {
 
             let mut sent = 0usize;
             while sent < record.len() {
-                let mut wrote = 0u32;
-                // SAFETY: a live pipe handle and a slice that outlives the call.
-                unsafe {
-                    WriteFile(self.pipe.0, Some(&record[sent..]), Some(&mut wrote), None)
-                }
-                .context("the agent stopped accepting input")?;
+                let rest = &record[sent..];
+                let wrote = self
+                    .complete(self.write_done.0, |overlapped| {
+                        // SAFETY: a live handle, and a slice and `OVERLAPPED`
+                        // that outlive the operation — `complete` does not
+                        // return until it has finished.
+                        unsafe { WriteFile(self.pipe.0, Some(rest), None, Some(overlapped)) }
+                    })
+                    .context("the agent stopped accepting input")?;
                 if wrote == 0 {
                     bail!("the agent stopped accepting input");
                 }
                 sent += wrote as usize;
             }
             Ok(())
+        }
+
+        /// Abandon whatever read or write is waiting on this link, from any
+        /// thread.
+        ///
+        /// The waiting call returns an error, which to a reader is the agent
+        /// having stopped sending. Harmless when nothing is waiting, so a caller
+        /// that may have landed between two reads can simply call it again.
+        pub fn cancel_pending(&self) {
+            // SAFETY: a live handle; `None` cancels every operation on it.
+            unsafe {
+                let _ = CancelIoEx(self.pipe.0, None);
+            }
+        }
+
+        /// Start one overlapped operation with `start`, and wait until it has
+        /// finished — done, failed or cancelled — returning the bytes moved.
+        ///
+        /// # The wait is what makes this sound
+        ///
+        /// The buffer and the `OVERLAPPED` the operation was handed live in the
+        /// caller's frame, and the kernel may write into them until the
+        /// operation completes. Returning any earlier would leave it writing
+        /// into memory that has moved on. So this never returns while the
+        /// operation is pending, and the event is cleared before starting,
+        /// because a wait on an event still signalled from the last operation
+        /// would come back early.
+        fn complete(
+            &self,
+            event: HANDLE,
+            start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
+        ) -> Result<u32> {
+            // SAFETY: an event this link owns.
+            unsafe { ResetEvent(event) }.context("could not reset an I/O event")?;
+            let mut overlapped = OVERLAPPED { hEvent: event, ..Default::default() };
+            if let Err(e) = start(&mut overlapped)
+                && e.code() != ERROR_IO_PENDING.to_hresult()
+            {
+                // Refused before it began, so nothing is pending.
+                return Err(e.into());
+            }
+            let mut transferred = 0u32;
+            // SAFETY: the operation was started with this `OVERLAPPED`, and
+            // waiting means this returns only once it has finished.
+            unsafe { GetOverlappedResult(self.pipe.0, &overlapped, &mut transferred, true) }?;
+            Ok(transferred)
         }
     }
 
@@ -532,13 +615,28 @@ mod platform {
                 FILE_SHARE_MODE(0),
                 None,
                 OPEN_EXISTING,
-                FILE_FLAGS_AND_ATTRIBUTES(0),
+                // See `AgentFrames` for why this one flag matters as much as
+                // it does.
+                FILE_FLAG_OVERLAPPED,
                 None,
             )
         }
         .with_context(|| format!("no agent is serving {desktop}"))?;
+        let pipe = Owned(pipe);
+
+        // Manual reset, which overlapped I/O needs: the operation signals it
+        // and `complete` clears it before the next one starts.
+        let event = || -> Result<Owned> {
+            // SAFETY: an unnamed event with default security, owned at once.
+            let handle = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+                .context("could not create an I/O event for the agent link")?;
+            Ok(Owned(handle))
+        };
+
         Ok(AgentFrames {
-            pipe: Owned(pipe),
+            pipe,
+            read_done: event()?,
+            write_done: event()?,
             writing: std::sync::Mutex::new(()),
             reading: std::sync::Mutex::new(()),
         })
@@ -574,9 +672,11 @@ mod platform {
 
         fn read_exact(&self, mut into: &mut [u8]) -> Result<()> {
             while !into.is_empty() {
-                let mut read = 0u32;
-                // SAFETY: a live pipe handle and a slice that outlives the call.
-                unsafe { ReadFile(self.pipe.0, Some(into), Some(&mut read), None) }
+                let read = self
+                    .complete(self.read_done.0, |overlapped| {
+                        // SAFETY: as in `send_record`.
+                        unsafe { ReadFile(self.pipe.0, Some(&mut *into), None, Some(overlapped)) }
+                    })
                     .context("the agent stopped sending")?;
                 if read == 0 {
                     bail!("the agent closed the pipe");

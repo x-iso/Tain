@@ -3705,6 +3705,16 @@ async fn run_reader<R>(
     // cannot lift those contacts, because the message that would do it is the
     // one being refused.
     let mut touch_refused = false;
+    // How many events in a row could not be injected, so the first gets a
+    // warning and the rest do not.
+    //
+    // A refusal is rarely one event. It is the input desktop having moved
+    // somewhere this process cannot inject into, and every event the guest
+    // sends until that changes fails identically — a pointer moving over a
+    // lock screen is hundreds a second. One report of it logged four hundred
+    // and fifty warnings in three seconds, which buried the lines that said
+    // what had actually gone wrong.
+    let mut injection_failures = 0u64;
 
     loop {
         let data = match read_stream_message(&mut recv).await {
@@ -3924,8 +3934,24 @@ async fn run_reader<R>(
                 if touch {
                     touch_refused = false;
                 }
-                if let Err(e) = inject_input(injector.as_ref(), &event) {
-                    warn!("Session #{}: input injection failed: {}", session_id, e);
+                match inject_input(injector.as_ref(), &event) {
+                    Ok(()) => {
+                        if injection_failures > 1 {
+                            info!(
+                                "Session #{session_id}: input is being injected again, after \
+                                 {injection_failures} events that could not be"
+                            );
+                        }
+                        injection_failures = 0;
+                    }
+                    Err(e) => {
+                        injection_failures += 1;
+                        if injection_failures == 1 {
+                            warn!("Session #{session_id}: input injection failed: {e}");
+                        } else {
+                            trace!("Session #{session_id}: input injection failed: {e}");
+                        }
+                    }
                 }
             }
             Ok(Message::FrameAck(sequence)) => acks.lock().unwrap().record(sequence),

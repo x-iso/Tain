@@ -15,6 +15,7 @@
 .DS_Store
 Thumbs.db
 
+
 # ── Vendored ffmpeg ───────────────────────────────────────────
 #
 # Deliberately not committed, for two reasons that both get worse with time:
