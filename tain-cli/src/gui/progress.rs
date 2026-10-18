@@ -46,26 +46,26 @@ impl Stage {
 
     /// One word, because six of these sit in a row.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Start => "Start",
-            Self::Find => "Find",
-            Self::Direct => "Direct",
-            Self::Auth => "Auth",
-            Self::Session => "Session",
-            Self::Video => "Video",
-        }
+        tain_core::i18n::text(match self {
+            Self::Start => "dial.start",
+            Self::Find => "dial.find",
+            Self::Direct => "dial.direct",
+            Self::Auth => "dial.auth",
+            Self::Session => "dial.session",
+            Self::Video => "dial.video",
+        })
     }
 
     /// What this step is waiting on, for the tooltip.
     pub fn describe(self) -> &'static str {
-        match self {
-            Self::Start => "Opening this machine's own connection",
-            Self::Find => "Working out where the host is",
-            Self::Direct => "Opening a direct path, so no relay carries the video",
-            Self::Auth => "Sending the passcode, and waiting for the host to accept it",
-            Self::Session => "The host is starting its capture and encoder",
-            Self::Video => "Frames are arriving and decoding",
-        }
+        tain_core::i18n::text(match self {
+            Self::Start => "dial.start_detail",
+            Self::Find => "dial.find_detail",
+            Self::Direct => "dial.direct_detail",
+            Self::Auth => "dial.auth_detail",
+            Self::Session => "dial.session_detail",
+            Self::Video => "dial.video_detail",
+        })
     }
 }
 
@@ -107,26 +107,25 @@ pub struct Outcomes {
     pub fps: Option<f32>,
 }
 
-/// How the host was reached, including the ways that involved no lookup.
+/// How the host was reached.
 ///
 /// # Why "known" was not good enough
 ///
 /// The first version of this said "known" whenever no address lookup had
-/// answered, which folded together three situations that want different
-/// responses — and made the common case look like the interesting one.
+/// answered, which folded together situations that want different responses —
+/// and made the common case look like the interesting one. A connection code
+/// carries a relay, so most dials never need a lookup at all and "known" was
+/// mostly saying "the code worked", while the state that then fails at `Direct`
+/// looked exactly the same.
 ///
-/// A connection code carries a relay, so most dials never need a lookup at all
-/// and "known" was mostly saying "the code worked". It was also what a session
-/// showed after arriving on a *stale* remembered address, and after arriving on
-/// the code's relay with nothing else having contributed — which is the exact
-/// state that then fails at `Direct`, and the one place where knowing which of
-/// the three happened tells you what to do about it.
+/// There used to be a third case here: arriving on an address the host answered
+/// on last time. Tain no longer keeps one — see
+/// `GuestClient::connect_reporting` — so a dial that no lookup contributed to
+/// can only have come from the relay in the code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Located {
     /// An address lookup answered. See [`Branch`].
     Looked(Branch),
-    /// An address this host answered on before, tried first and reachable.
-    Remembered,
     /// The relay named in the connection code, and nothing else.
     Code,
 }
@@ -135,27 +134,14 @@ impl Located {
     pub fn label(self) -> &'static str {
         match self {
             Self::Looked(branch) => branch.label(),
-            Self::Remembered => "saved",
-            Self::Code => "code",
+            Self::Code => tain_core::i18n::text("found.code"),
         }
     }
 
     pub fn describe(self) -> String {
         match self {
             Self::Looked(branch) => branch.describe().to_string(),
-            Self::Remembered => {
-                "Reached on an address this host answered on before, so nothing had to be \
-                 looked up. Addresses are raced, so a remembered one that has gone stale \
-                 simply loses rather than holding anything back."
-                    .to_string()
-            }
-            Self::Code => {
-                "Reached through the relay carried in the connection code. No address lookup \
-                 contributed anything, so the relay is the only route there was — which is \
-                 why a direct path has to be punched from it, and why there is nothing else \
-                 to fall back on if that fails."
-                    .to_string()
-            }
+            Self::Code => tain_core::i18n::text("found.code_detail").to_string(),
         }
     }
 }
@@ -163,16 +149,13 @@ impl Located {
 impl Outcomes {
     /// How the host was reached, once `Find` is behind us.
     ///
-    /// Derived rather than reported, because the three cases are distinguished
-    /// by what actually happened: a lookup noting an answer, or — failing that
-    /// — whether the connection landed on a relay, which only the code could
-    /// have supplied. A direct path with no lookup behind it can only have come
-    /// from a remembered address, since nothing else offers one.
+    /// Derived rather than reported: a lookup noting an answer is the only way
+    /// to be placed at all now, and anything else arrived on the relay the code
+    /// carried, which is the only address a dial starts with.
     pub fn located(&self) -> Located {
         match self.found_via {
             Some(branch) => Located::Looked(branch),
-            None if self.on_relay => Located::Code,
-            None => Located::Remembered,
+            None => Located::Code,
         }
     }
 }
@@ -267,12 +250,20 @@ pub fn summary(progress: Option<Progress>, outcomes: &Outcomes) -> String {
     let mut lines = Vec::with_capacity(Stage::ALL.len());
     for (index, stage) in Stage::ALL.iter().enumerate() {
         let complete = index < progress.at || progress.done;
+        // # These are the marks the bundled fonts can draw
+        //
+        // `✓` (U+2713) and `✗` (U+2717) are the obvious pair and neither has a
+        // glyph, so both rendered as empty boxes. Nothing fails and nothing
+        // logs — see `theme::tests::every_symbol_the_ui_draws_has_a_glyph`,
+        // which now reads the source rather than a list somebody has to
+        // remember to add to, and `report_which_marks_have_glyphs`, which is
+        // how these two were chosen rather than guessed.
         let mark = if complete {
-            '✓'
+            '✔'
         } else if index == progress.at {
             // The step it stopped on, versus the step it is working on.
             if progress.failed {
-                '✗'
+                '×'
             } else {
                 '·'
             }
@@ -286,7 +277,7 @@ pub fn summary(progress: Option<Progress>, outcomes: &Outcomes) -> String {
                 format!("{} — {}", located.label(), located.describe())
             }
             Stage::Direct if complete => match outcomes.peer.as_deref() {
-                Some(peer) => format!("peer to peer with {peer}"),
+                Some(peer) => tain_core::i18n::format("session.peer_to_peer", &[("peer", peer)]),
                 None => stage.describe().to_string(),
             },
             // What it was left holding when it stopped, which is more use than
@@ -388,7 +379,7 @@ mod tests {
         for stage in Stage::ALL {
             assert!(text.contains(stage.label()), "{} is missing from the path", stage.label());
         }
-        assert_eq!(text.matches('✓').count(), Stage::ALL.len(), "a finished path is all ticks");
+        assert_eq!(text.matches('✔').count(), Stage::ALL.len(), "a finished path is all ticks");
     }
 
     /// The three ways of arriving are told apart, not lumped together.
@@ -406,15 +397,15 @@ mod tests {
         assert_eq!(looked.located(), Located::Looked(Branch::Lan));
         assert_eq!(looked.located().label(), "LAN");
 
-        // No lookup answered and the connection is on a relay: the only thing
-        // that could have supplied it is the relay in the code.
-        let by_code = Outcomes { found_via: None, on_relay: true, ..Outcomes::default() };
-        assert_eq!(by_code.located(), Located::Code);
-
-        // No lookup answered and the path is direct: nothing but a remembered
-        // address offers a direct address, so that is where it came from.
-        let remembered = Outcomes { found_via: None, on_relay: false, ..Outcomes::default() };
-        assert_eq!(remembered.located(), Located::Remembered);
+        // No lookup answered: the relay in the code is the only address a dial
+        // starts with, so it is the only thing that can have supplied one.
+        // True whether or not the connection then punched its way off it —
+        // there used to be a third answer here, an address remembered from a
+        // previous session, and Tain no longer keeps one.
+        for on_relay in [true, false] {
+            let by_code = Outcomes { found_via: None, on_relay, ..Outcomes::default() };
+            assert_eq!(by_code.located(), Located::Code, "on_relay = {on_relay}");
+        }
 
         // A lookup answering always wins, relay or not: it is what supplied
         // the address, whatever the connection then settled on.
@@ -453,8 +444,8 @@ mod tests {
         assert!(!at.done, "a failure never counts as finished");
 
         let text = summary(Some(at), &Outcomes::default());
-        assert!(text.contains('✗'), "the failed step is not marked: {text}");
-        assert_eq!(text.matches('✓').count(), 2, "the two steps that did work should stand");
+        assert!(text.contains('×'), "the failed step is not marked: {text}");
+        assert_eq!(text.matches('✔').count(), 2, "the two steps that did work should stand");
         // The step it failed on has not produced a result, so it must not
         // claim one — this is what a summary written from `complete` avoids.
         assert!(!text.contains("peer to peer"), "a failed step claimed a result: {text}");

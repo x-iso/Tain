@@ -230,11 +230,26 @@ fn start_capturing(want: Option<String>) -> Result<Box<dyn ScreenCaptureBackend>
     }
 
     tracing::info!("Duplication would not start — trying the compositor instead");
-    match super::capture_wgc::WgcCapturer::new(want) {
+    match super::capture_wgc::WgcCapturer::new(want.clone()) {
         Ok(capturer) => Ok(Box::new(capturer)),
-        Err(compositor) => Err(duplication.context(format!(
-            "and the compositor would not capture it either ({compositor:#})"
-        ))),
+        Err(compositor) => {
+            // # Only now is it worth saying anything to the guest
+            //
+            // A desktop drawn by the other chip is the common case on a laptop
+            // and the compositor handles it silently, so it is not a fault and
+            // must not be reported as one. Both ways failing is a different
+            // thing entirely, and the one worth a sentence somebody can act on.
+            let both = super::capture_dxgi::both_ways_failed(want.as_deref());
+            let wrong_gpu = duplication
+                .chain()
+                .any(|link| link.is::<super::capture_dxgi::DesktopOnAnotherGpu>());
+            let context = format!("and the compositor would not capture it either ({compositor:#})");
+            Err(if wrong_gpu {
+                anyhow::Error::new(both).context(context).context(format!("{duplication:#}"))
+            } else {
+                duplication.context(context)
+            })
+        }
     }
 }
 

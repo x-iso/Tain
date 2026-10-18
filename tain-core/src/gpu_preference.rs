@@ -144,6 +144,45 @@ pub fn worth_switching(current: Preference) -> bool {
     matches!(current, Preference::Unset | Preference::Automatic)
 }
 
+/// Undo a graphics preference an earlier version of Tain wrote for itself.
+///
+/// # Why this exists rather than simply not writing it any more
+///
+/// A previous version pinned Tain to the *integrated* chip when Desktop
+/// Duplication failed, so that the next run would capture. It did, and it also
+/// put the encoder on the weaker of the two chips for the life of the
+/// installation — a laptop with a real GPU encoding on its processor, with the
+/// discrete card idle, because Tain had asked Windows not to use it.
+///
+/// Not writing it any more fixes nothing on a machine that already has it: the
+/// value is in `HKCU` and outlives the build that put it there. So it is taken
+/// back, once, on startup.
+///
+/// **Only `PowerSaving`, and only once.** That is the only value the old code
+/// ever wrote. Somebody who has deliberately chosen *high performance* has
+/// chosen something this never asked for and must keep it, and somebody who
+/// deliberately chooses power saving after this has run gets to keep that too —
+/// which is what `already_done` is for. Returns whether anything was removed.
+pub fn undo_our_old_preference(already_done: bool) -> bool {
+    if already_done || current() != Preference::PowerSaving {
+        return false;
+    }
+    match clear() {
+        Ok(()) => {
+            tracing::info!(
+                "Removed the graphics preference an older version of Tain wrote for itself. \
+                 It pinned this program to the integrated chip, which also kept the encoder \
+                 off the discrete one. Restart Tain for it to take effect."
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Could not remove Tain's old graphics preference: {e:#}");
+            false
+        }
+    }
+}
+
 /// Set once [`set`] has succeeded in this process.
 static SWITCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

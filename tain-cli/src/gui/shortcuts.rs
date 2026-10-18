@@ -15,39 +15,48 @@ pub enum ShortcutAction {
     ToggleFullscreen,
     ToggleToolbar,
     ToggleImmersive,
+    /// Take this machine's pointer and send it as movement, or give it back.
+    ///
+    /// Needs a shortcut more than the others do: the mode it toggles hides the
+    /// local cursor and pins it to the middle of the picture, so the toolbar
+    /// button that turned it on cannot be clicked to turn it off. Being
+    /// consumed locally, this reaches the application even while every other
+    /// key is being forwarded.
+    ToggleCapture,
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Disconnect,
         Self::ToggleFullscreen,
         Self::ToggleToolbar,
         Self::ToggleImmersive,
+        Self::ToggleCapture,
     ];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Disconnect => "Disconnect",
-            Self::ToggleFullscreen => "Toggle fullscreen",
-            Self::ToggleToolbar => "Toggle toolbar",
-            Self::ToggleImmersive => "Toggle immersive mode",
-        }
+        tain_core::i18n::text(match self {
+            Self::Disconnect => "shortcut.disconnect",
+            Self::ToggleFullscreen => "shortcut.fullscreen",
+            Self::ToggleToolbar => "shortcut.toolbar",
+            Self::ToggleImmersive => "shortcut.immersive",
+            Self::ToggleCapture => "shortcut.capture",
+        })
     }
 
     pub fn description(self) -> &'static str {
-        match self {
-            Self::Disconnect => "End the current session and return to the connection list",
-            Self::ToggleFullscreen => "Switch the window between fullscreen and windowed",
-            Self::ToggleToolbar => "Show or hide the session controls overlay",
-            Self::ToggleImmersive => {
-                "Send every key to the host, including Win and Alt, and keep the pointer inside the window"
-            }
-        }
+        tain_core::i18n::text(match self {
+            Self::Disconnect => "shortcut.disconnect_detail",
+            Self::ToggleFullscreen => "shortcut.fullscreen_detail",
+            Self::ToggleToolbar => "shortcut.toolbar_detail",
+            Self::ToggleImmersive => "shortcut.immersive_detail",
+            Self::ToggleCapture => "shortcut.capture_detail",
+        })
     }
 
     fn default_binding(self) -> Shortcut {
-        // All four share Ctrl+Shift on purpose. They are consumed locally and
-        // never forwarded, so each one is a combination the host can never
+        // All of them share Ctrl+Shift on purpose. They are consumed locally
+        // and never forwarded, so each one is a combination the host can never
         // receive — keeping them on one modifier pair makes that cost explicit
         // and memorable, instead of scattering holes through the keymap.
         let with_ctrl_shift = |key| Shortcut::new(key, true, true, false);
@@ -56,6 +65,7 @@ impl ShortcutAction {
             Self::ToggleFullscreen => with_ctrl_shift(egui::Key::W),
             Self::ToggleToolbar => with_ctrl_shift(egui::Key::A),
             Self::ToggleImmersive => with_ctrl_shift(egui::Key::E),
+            Self::ToggleCapture => with_ctrl_shift(egui::Key::C),
         }
     }
 }
@@ -156,6 +166,10 @@ pub struct ShortcutBindings {
     pub toggle_fullscreen: Shortcut,
     pub toggle_toolbar: Shortcut,
     pub toggle_immersive: Shortcut,
+    /// Absent from a settings file written before this existed, which
+    /// `#[serde(default)]` on the struct fills in with the default binding
+    /// rather than refusing to read the file.
+    pub toggle_capture: Shortcut,
 }
 
 impl Default for ShortcutBindings {
@@ -165,6 +179,7 @@ impl Default for ShortcutBindings {
             toggle_fullscreen: ShortcutAction::ToggleFullscreen.default_binding(),
             toggle_toolbar: ShortcutAction::ToggleToolbar.default_binding(),
             toggle_immersive: ShortcutAction::ToggleImmersive.default_binding(),
+            toggle_capture: ShortcutAction::ToggleCapture.default_binding(),
         }
     }
 }
@@ -176,6 +191,7 @@ impl ShortcutBindings {
             ShortcutAction::ToggleFullscreen => &self.toggle_fullscreen,
             ShortcutAction::ToggleToolbar => &self.toggle_toolbar,
             ShortcutAction::ToggleImmersive => &self.toggle_immersive,
+            ShortcutAction::ToggleCapture => &self.toggle_capture,
         }
     }
 
@@ -185,6 +201,7 @@ impl ShortcutBindings {
             ShortcutAction::ToggleFullscreen => self.toggle_fullscreen = shortcut,
             ShortcutAction::ToggleToolbar => self.toggle_toolbar = shortcut,
             ShortcutAction::ToggleImmersive => self.toggle_immersive = shortcut,
+            ShortcutAction::ToggleCapture => self.toggle_capture = shortcut,
         }
     }
 

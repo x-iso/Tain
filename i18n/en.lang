@@ -1,0 +1,1682 @@
+# Tain — English. The original, and what every other language falls back to.
+#
+# See README.md in this folder for the format and for how to add a language.
+# Keys are grouped by where they appear; the grouping is for readers, not for
+# the program, which only sees the whole key.
+
+[meta.tag]
+en
+
+[meta.name]
+English
+
+[meta.plural]
+english
+
+
+# ── The header ────────────────────────────────────────────────
+
+[header.host]
+Host:
+
+[header.copy_admin]
+Copy admin passcode
+
+[header.copy_admin_short]
+Copy admin
+
+[header.copy_guest]
+Copy guest passcode
+
+[header.copy_guest_short]
+Copy guest
+
+[header.copied]
+Copied to clipboard
+
+[header.copied_short]
+Copied
+
+[header.copy_hint]
+Copy this code and send it to the other machine
+
+[header.no_code]
+No code generated yet
+
+[header.host_offline]
+Host server is offline — {reason}
+
+[header.reveal_admin]
+Slide to reveal admin passcode
+
+[header.reveal_admin_short]
+Slide to reveal
+
+[header.reset_admin_hint]
+Generate a new admin code now. This invalidates the current one and forgets
+every device it has let in.
+
+[header.reset_guest_hint]
+Generate a new code now (invalidates the current one)
+
+[header.autoreset]
+autoreset
+
+[header.autoreset_hint]
+Regenerate automatically when the last guest disconnects.
+Turning this off keeps the code usable for reconnecting.
+
+[header.settings]
+Settings
+
+[header.connect]
+Connect:
+
+[header.paste]
+Paste passcode
+
+[header.paste_short]
+Paste
+
+[header.paste_hint]
+Read a connection code from the clipboard
+
+[header.paste_first]
+Paste a connection code first
+
+[header.checking_host]
+Checking that this host is reachable...
+
+[header.open_session]
+Open a session with this host
+
+[header.clipboard_empty]
+Clipboard is empty
+
+[paste.checking]
+Checking the host...
+
+[paste.anonymous_host]
+Host
+
+[paste.ready]
+{host} is ready
+
+[paste.ready_will_ask]
+{host} is ready - it will ask before letting you in
+
+[paste.expired]
+That code has expired - ask for a new one
+
+[paste.unreachable]
+No answer - the host may be offline
+
+
+# ── Hosts connected to before ─────────────────────────────────
+
+[previous.title]
+Previous connections:
+
+[previous.check_again]
+Check again
+
+[previous.none]
+No previous connections yet.
+
+[status.connected]
+connected
+
+[status.connecting]
+connecting...
+
+[status.waiting]
+waiting for approval...
+
+[status.failed]
+last attempt failed
+
+[status.checking]
+checking...
+
+[status.online]
+online
+
+[status.expired]
+code expired
+
+[status.offline]
+offline
+
+[status.no_code]
+no saved code
+
+[status.connected_detail]
+A session to this host is open.
+
+[status.connecting_detail]
+Dialling this host now.
+
+[status.waiting_detail]
+Connected — waiting for the host to allow it.
+
+[status.failed_detail]
+The last attempt to connect did not succeed.
+
+[status.checking_detail]
+Checking whether this host is reachable and the code still works.
+
+[status.online_detail]
+This host answered just now and still accepts this code.
+
+[status.expired_detail]
+This host is reachable, but the code has expired — it generates a new one after
+the last guest disconnects. Ask for the current code.
+
+[status.offline_detail]
+This host did not answer. It may be switched off, asleep, or not reachable from
+this network.
+
+[status.no_code_detail]
+No code is saved for this host, so there is nothing to dial.
+
+
+# ── What the admin passcode is ────────────────────────────────
+
+[admin_warning.title]
+This code is the whole machine
+
+[admin_warning.grants]
+The admin passcode gives whoever holds it unrestricted access to this computer:
+every screen, the mouse and the keyboard, with no approval asked for anything.
+
+[admin_warning.unattended]
+With unattended access installed that includes the lock screen and administrator
+prompts — the things a password would normally stop.
+
+[admin_warning.sharing]
+Keep it for your own devices, and send it somewhere private if you must send it
+at all — not a group chat, not a screen share. Anything that ends up holding it
+is you, as far as this machine is concerned.
+
+[admin_warning.mitigations]
+Two things soften a mistake. The first connection from each new device has to be
+approved here, so a code that gets out cannot be used behind your back. And the
+reset button beside the code revokes it — along with every device it has already
+let in.
+
+[admin_warning.understood]
+I understand
+
+
+# ── Deciding about a connection ───────────────────────────────
+
+[approval.title_guest]
+Allow this connection?
+
+[approval.title_admin]
+Allow full control of this machine?
+
+[approval.title_kick]
+Disconnect this guest?
+
+[approval.wants_to_connect]
+wants to connect to this PC
+
+[approval.wants_to_connect_admin]
+wants to connect with this PC's admin passcode — every screen, the mouse and the
+keyboard, and the lock screen too where unattended access is installed.
+
+[approval.will_be_disconnected]
+will be disconnected immediately.
+
+[approval.self_named]
+This name was chosen by the connecting machine.
+
+[approval.permissions]
+Permissions for connection:
+
+[approval.remote_inputs]
+Remote inputs:
+
+[approval.mouse]
+Mouse + Touch
+
+[approval.mouse_hint]
+Pointing at your screen, however they do it — a mouse, a trackpad or a
+touchscreen are the same act.
+
+[approval.keyboard]
+Keyboard
+
+[approval.keyboard_hint]
+Typing into whatever has focus on this machine. Revocable later from the
+connection strip.
+
+[approval.displays]
+Displays:
+
+[approval.all_displays]
+All
+
+[approval.all_displays_hint]
+Every screen, including any monitor plugged in later.
+
+[approval.nothing_chosen]
+With none chosen they connect and see nothing.
+
+[approval.whole_screens]
+Whole screens
+
+[approval.whole_screens_hint]
+Share the screens ticked above, and whatever moves across them.
+
+[approval.one_window_hint]
+Or share particular application windows and nothing else — no desktop behind
+them, and nothing that happens to be on the same screen. The guest sees one at a
+time and can switch between the ones you choose, but nothing outside them.
+
+[approval.pick_individual]
+Individual windows…
+
+[approval.windows_chosen.zero]
+No windows
+
+[approval.windows_chosen.one]
+{n} window
+
+[approval.windows_chosen.other]
+{n} windows
+
+[approval.pick_windows]
+Windows to share
+
+[approval.pick_windows_hint]
+Pick as many as you like. The guest sees one at a time and can switch between
+them; nothing else on this machine is sent.
+
+[approval.pick_done]
+Done
+
+[approval.no_windows]
+This host has no window it can offer right now.
+
+[approval.title_change]
+Change what is shared
+
+[approval.is_watching]
+This connection is live. Anything changed here takes effect at once, while they
+are watching.
+
+[approval.apply]
+Apply
+
+[approval.admin_sees_everything]
+This device connected with the admin passcode, so it sees every screen and can
+use the mouse and keyboard. There is nothing here to narrow — disconnect it
+instead if that is not wanted.
+
+[approval.admin_is_remembered]
+Allowing this makes the device trusted: it will connect with the admin passcode
+from now on without asking, until that passcode is reset.
+
+[approval.allow]
+Allow
+
+[approval.deny]
+deny
+
+[approval.deny_hint]
+Refuse and disconnect this guest
+
+[approval.disconnect]
+Disconnect
+
+
+# ── The incoming connection strip ─────────────────────────────
+
+[incoming.none]
+No incoming connections.
+
+[incoming.waiting_click]
+Waiting for you — click to decide
+
+[incoming.disconnect]
+Disconnect this guest
+
+[incoming.waiting_nothing_shared]
+Waiting for your decision — nothing shared yet
+
+[incoming.nothing_until_you_decide]
+Nothing is being shared until you decide
+
+[incoming.decide_first]
+Decide whether to allow this connection
+
+[incoming.offered_not_granted]
+Offered in the dialog above — not granted until you allow
+
+[incoming.mouse_allowed]
+Mouse allowed — click to revoke
+
+[incoming.mouse_blocked]
+Mouse blocked — click to allow
+
+[incoming.keyboard_allowed]
+Keyboard allowed — click to revoke
+
+[incoming.keyboard_blocked]
+Keyboard blocked — click to allow
+
+[incoming.sessions_open.one]
+1 session open
+
+[incoming.sessions_open.other]
+{n} sessions open
+
+[incoming.no_sessions]
+No sessions
+
+
+# ── Notifications ─────────────────────────────────────────────
+
+[notify.wants_to_connect]
+Someone wants to connect
+
+[notify.has_connected]
+Someone has connected
+
+
+# ── Settings: security ────────────────────────────────────────
+
+[settings.security]
+Security
+
+[settings.security.blurb]
+Guests are streamed nothing until you allow them, every time they connect.
+
+[settings.security.approval_timeout]
+Approval timeout
+
+[settings.security.approval_timeout_hint]
+How long a guest waits for an answer before being refused. Timing out denies —
+an unattended machine should not share its screen.
+
+[settings.security.admin_code]
+Admin code
+
+[settings.security.admin_autoreset]
+Reset automatically
+
+[settings.security.admin_autoreset_hint]
+Admin codes grant full control immediately — resetting often is safer
+
+[settings.security.guest_code]
+Guest code
+
+[settings.security.guest_autoreset]
+Reset when the last guest leaves
+
+[settings.security.give_way]
+Interrupt guest input
+
+[settings.security.give_way_hint]
+When you use this machine's own mouse or keyboard, a guest's input is ignored
+for this long, then resumes on its own.
+
+Nothing a guest is holding can be left stuck down. Zero turns this off.
+
+[settings.security.trusted_devices]
+Trusted devices
+
+[settings.security.trusted_none]
+None yet
+
+[settings.security.trusted_count.one]
+1 device
+
+[settings.security.trusted_count.other]
+{n} devices
+
+[settings.security.forget_all]
+Forget all
+
+[settings.security.forget_all_hint]
+Devices that have connected with the admin passcode and been allowed. Forgetting
+them means the next connection from each one has to be approved again. Resetting
+the admin passcode does this too, along with revoking the code itself.
+
+[settings.security.offer_by_default]
+Offer by default
+
+[settings.security.offer_hint]
+Which boxes start ticked in the approval dialog. You still have to allow each
+connection. Mouse also covers touch.
+
+[settings.security.sensitivity_hint]
+The starting value for new sessions. It only applies while the host has captured
+its pointer — a game being looked around in — and can be changed during a
+session by right-clicking the pointer button on its toolbar.
+
+[settings.security.pre_ticked_warning]
+⚠ Input will be pre-ticked — check the dialog before allowing a guest.
+
+
+# ── Settings: language ────────────────────────────────────────
+
+[settings.language]
+Language
+
+[settings.language.blurb]
+Follows this computer's language unless you choose otherwise. Anything not yet
+translated is shown in English.
+
+[settings.language.automatic]
+Automatic ({name})
+
+[settings.language.automatic_unknown]
+Automatic (English)
+
+[settings.language.contribute]
+Adding a language is one file — see i18n/README.md in the source.
+
+
+# ── Settings: the footer ──────────────────────────────────────
+
+[settings.applies_to_new]
+Hosting settings apply to new connections.
+
+[settings.reset_defaults]
+Reset to defaults
+
+
+# ── Settings: names for choices in dropdowns ──────────────────
+
+[choice.scaling.fit]
+Fit
+
+[choice.scaling.fit_detail]
+Preserve aspect ratio, letterbox the rest
+
+[choice.scaling.actual]
+1:1
+
+[choice.scaling.actual_detail]
+One remote pixel per screen pixel, panning at the edges
+
+[choice.name.anonymous]
+Anonymous
+
+[choice.name.anonymous_detail]
+Publish no name — the other machine shows "Guest #1" or similar
+
+[choice.name.system_user]
+System user name
+
+[choice.name.system_user_detail]
+The account you are signed in as
+
+[choice.name.network]
+Network PC name
+
+[choice.name.network_detail]
+This machine's network name
+
+[choice.name.custom]
+Custom
+
+[choice.name.custom_detail]
+A name you choose
+
+
+# ── Settings: this PC ─────────────────────────────────────────
+
+[settings.identity]
+This PC
+
+[settings.identity.name]
+Name
+
+[settings.identity.custom_hint]
+e.g. Studio desktop
+
+[settings.identity.shown_as]
+Shown to the other machine as "{name}"
+
+[settings.identity.no_name]
+No name is sent — the other machine shows a generated label
+
+
+# ── Codecs, encoders and quality ──────────────────────────────
+
+[codec.delta_zstd]
+Lossless (delta + zstd)
+
+[codec.delta_zstd_detail]
+Pixel-exact and CPU-only. Cheap on a still screen, very expensive once it moves.
+
+[codec.raw]
+Raw BGRA
+
+[codec.raw_detail]
+No compression. Lowest latency, needs a fast local network.
+
+[codec.h264]
+H.264 / AVC
+
+[codec.h264_detail]
+Best all-round choice. Software encoder, works on any machine.
+
+[codec.h265]
+H.265 / HEVC
+
+[codec.h265_detail]
+Smaller than H.264 at the same quality, costs more to encode.
+
+[codec.av1]
+AV1
+
+[codec.av1_detail]
+Smallest streams. Needs recent hardware to stay low-latency.
+
+[codec.vp9]
+VP9
+
+[codec.vp9_detail]
+Royalty-free. Software encoding is slower than H.264.
+
+[backend.auto]
+Automatic
+
+[backend.auto_detail]
+Use the GPU when available, otherwise the CPU
+
+[backend.hardware]
+Hardware (GPU)
+
+[backend.hardware_detail]
+GPU only — lowest latency, fails if unsupported
+
+[backend.software]
+Software (CPU)
+
+[backend.software_detail]
+CPU only — works anywhere, competes with the host's own work
+
+[rate.constant]
+Constant bitrate
+
+[rate.constant_detail]
+Steady bandwidth; quality dips when the screen moves a lot
+
+[rate.variable]
+Variable bitrate
+
+[rate.variable_detail]
+Better quality per byte, bandwidth varies
+
+[rate.quality]
+Constant quality
+
+[rate.quality_detail]
+Pick a quality and let bandwidth follow — can spike
+
+[profile.baseline]
+Baseline
+
+[profile.baseline_detail]
+Works with every guest, including one decoding on its CPU. Largest bitstream,
+and some Intel encoders stall on it.
+
+[profile.main]
+Main
+
+[profile.main_detail]
+Smaller at the same quality, and the fix if an Intel encoder stalls. The guest
+must be decoding on its GPU.
+
+[profile.high]
+High
+
+[profile.high_detail]
+A few percent smaller again. The guest must be decoding on its GPU.
+
+[quality.native]
+Native
+
+[quality.high]
+High (75%)
+
+[quality.medium]
+Medium (50%)
+
+[quality.low]
+Low (33%)
+
+
+# ── Settings: hosting ─────────────────────────────────────────
+
+[settings.video]
+Hosting — what this PC sends
+
+[settings.video.codec]
+Codec
+
+[settings.video.encoder]
+Encoder
+
+[settings.video.gpu]
+Graphics card
+
+[settings.video.gpu_hint]
+Which GPU encodes the stream. A laptop with two will otherwise use whichever
+Windows lists first — often the integrated one.
+
+[settings.video.automatic]
+Automatic
+
+[settings.video.automatic_hint]
+Let Windows choose, which is what happened before.
+
+[settings.video.not_on_this_machine]
+{name} (not on this machine)
+
+[settings.video.profile]
+H.264 profile
+
+[settings.video.profile_hint]
+How much the picture is compressed. Anything above Baseline needs the guest to
+be decoding on its GPU.
+
+[settings.video.resolution]
+Resolution
+
+[settings.video.resolution_hint]
+The most this will ever stream. It is not reduced unless something cannot keep
+up.
+
+[settings.video.frame_rate]
+Frame rate
+
+[settings.video.frame_rate_hint]
+What the host aims for. Dropped only while something is behind.
+
+[settings.video.if_behind]
+If it can't keep up
+
+[settings.video.keep_detail]
+keep detail
+
+[settings.video.keep_motion]
+keep motion
+
+[settings.video.follow_priority]
+Let the slider set the encoder details
+
+[settings.video.rate_control]
+Rate control
+
+[settings.video.bitrate_limit]
+Bitrate limit
+
+[settings.video.unlimited]
+Unlimited
+
+[settings.video.quality_target]
+Quality target
+
+[settings.video.keyframe_interval]
+Keyframe interval
+
+[settings.video.keyframe_on_request]
+on request
+
+[settings.video.keyframe_hint]
+How often a frame that stands alone is sent
+
+[settings.video.capture_cursor]
+Capture cursor
+
+[settings.video.include_pointer]
+Include the pointer in frames
+
+[settings.video.summary_full]
+Host display {w}×{h} — up to full resolution at {fps} fps
+
+[settings.video.summary_scaled]
+Host display {w}×{h} — up to {sw}×{sh} at {fps} fps
+
+[settings.video.encoding_via]
+Encoding on the GPU via {name}
+
+[settings.video.not_implemented]
+⚠ {wanted} is not implemented yet — sessions will use {instead} instead.
+
+[settings.video.raw_bandwidth]
+≈{mb} MB/s uncompressed — no bitrate limit can throttle raw video.
+
+[settings.video.planned]
+{name} (planned)
+
+[settings.video.no_encoder]
+{name} (no encoder on this PC)
+
+
+# ── Settings: audio ───────────────────────────────────────────
+
+[settings.audio]
+Audio
+
+[settings.audio.quality]
+Quality
+
+[settings.audio.quality_hint]
+Opus. 160 kbit/s is transparent for nearly all content; above 256 there is
+nothing left to gain.
+
+[settings.audio.q96]
+Noticeably compressed on music, fine for speech and game audio
+
+[settings.audio.q160]
+Transparent for nearly all content
+
+[settings.audio.q_high]
+Beyond what most people can tell from the source
+
+[settings.audio.kbits]
+kbit/s
+
+[settings.audio.exclude]
+Exclude apps
+
+[settings.audio.not_playing]
+{name} (not playing)
+
+[settings.audio.refresh]
+Refresh list
+
+[settings.audio.clear]
+Clear
+
+[settings.audio.several_excluded]
+Several excluded — the stream is mixed from the remaining apps, so anything that
+starts playing later will be missing until you reconnect.
+
+[settings.audio.only_playing_listed]
+Only applications currently playing sound are listed.
+
+[settings.audio.exclude_hint]
+Keep applications out of the streamed sound — a voice chat, say.
+
+One app is removed by Windows itself, inside the audio engine. Choosing more
+than one switches to mixing the apps that are left, which is exact but only sees
+what was already playing when the session started.
+
+
+# ── Settings: virtual display ─────────────────────────────────
+
+[settings.vdisplay]
+Virtual display
+
+[settings.vdisplay.blurb]
+A display that exists only in software. Lets a machine with no monitor be
+streamed at all, gives a guest a screen at its own resolution instead of a
+scaled copy of this one, and turns a spare tablet or laptop into a second
+screen.
+
+[settings.vdisplay.install]
+Install driver
+
+[settings.vdisplay.install_hint]
+Windows will ask twice — once for administrator rights, and once about trusting
+the publisher. The second prompt is Windows' own and cannot be skipped, which is
+rather the point of it. The name it shows is the driver's author, not Tain: the
+package is installed exactly as they signed it, because changing a byte of it
+would void the signature.
+
+[settings.vdisplay.remove_driver]
+Remove driver
+
+[settings.vdisplay.remove_driver_hint]
+Removes the driver and any display it was presenting. Everything else keeps
+working. Windows will ask for permission.
+
+[settings.vdisplay.not_bundled]
+This build was made without a driver package to install.
+
+[settings.vdisplay.count.zero]
+No virtual display.
+
+[settings.vdisplay.count.one]
+One virtual display.
+
+[settings.vdisplay.count.other]
+{n} virtual displays.
+
+[settings.vdisplay.follow_guest]
+Match the resolution of whoever connects
+
+[settings.vdisplay.follow_guest_hint]
+A virtual display takes the size of the guest watching it, so their window is
+drawn 1:1 instead of scaled. Each display follows the first guest to watch it,
+so a second guest gets a second display at their own size.
+
+[settings.vdisplay.size]
+Size
+
+[settings.vdisplay.same_as_screen]
+Same as this screen ({w}x{h})
+
+[settings.vdisplay.add]
+Add a display
+
+[settings.vdisplay.add_hint]
+Creates a virtual monitor and puts it on the desktop, to the right of everything
+else. The display driver restarts to do it, so this takes a moment.
+
+[settings.vdisplay.remove]
+Remove
+
+[settings.vdisplay.remove_hint]
+Takes the most recently added virtual display away again.
+
+[driver.ready]
+Installed. A virtual display can be created.
+
+[driver.idle]
+Installed, but no virtual monitor is present yet.
+
+[driver.not_installed]
+Not installed. Virtual displays need it.
+
+[driver.not_bundled]
+This copy of Tain ships no driver to install.
+
+
+# ── Settings: unattended access ───────────────────────────────
+
+[settings.unattended]
+Unattended access
+
+[settings.unattended.blurb]
+Reaching a UAC prompt, a lock screen, or a machine with nobody logged in needs a
+Windows service. Everything else works without it.
+
+[settings.unattended.install]
+Install service
+
+[settings.unattended.reinstall]
+Reinstall service
+
+[settings.unattended.install_hint]
+Windows will ask for permission — registering a service needs administrator
+rights, and Tain does not run with them.
+
+[settings.unattended.uninstall]
+Uninstall service
+
+[settings.unattended.uninstall_hint]
+Removes the service and everything it allowed. Tain keeps working for ordinary
+sessions. Windows will ask for permission.
+
+[settings.unattended.answer_signed_out]
+Answer when nobody is signed in
+
+[settings.unattended.answer_hint]
+Hands this machine's identity to the service, so the same connection code
+reaches it at the sign-in screen. Off, the service still covers consent prompts
+and the lock screen while somebody is signed in.
+
+[settings.unattended.needs_service]
+Needs the service installed.
+
+[settings.unattended.trust_note]
+The service runs as LocalSystem so it can reach screens an ordinary program
+cannot. That is a real amount of trust to place in this machine and in whoever
+holds a code for it — install it only where you want unattended access.
+
+[service.not_installed]
+Not installed. Admin access needs it.
+
+[service.running]
+Installed and running.
+
+[service.stopped]
+Installed but not running — unattended access is unavailable.
+
+[service.mismatched]
+Installed, but registered against a different copy of Tain.
+
+[service.unknown]
+The service database could not be read.
+
+
+# ── Settings: interface, viewing and shortcuts ────────────────
+
+[settings.interface]
+Interface — this application's own window
+
+[settings.interface.scale]
+Scale
+
+[settings.interface.scale_hint]
+Relative to what the monitor asks for, so it still follows a screen with a
+different DPI. Ctrl+plus and Ctrl+minus move it too.
+
+[settings.interface.hundred]
+100%
+
+[settings.interface.follow_monitor]
+Follow the monitor exactly
+
+[settings.interface.apply]
+Apply
+
+[settings.interface.apply_hint]
+Resize the interface to the chosen scale
+
+[settings.interface.currently]
+Currently {percent}. Apply to resize the interface.
+
+[settings.interface.apply_note]
+Applied on the button rather than as the slider moves, because this setting
+resizes the slider. Ctrl+plus and Ctrl+minus apply at once.
+
+[settings.viewing]
+Viewing — what this PC receives
+
+[settings.viewing.scaling]
+Scaling
+
+[settings.viewing.scaling_hint]
+How a remote screen that does not match this window is shown.
+
+[settings.viewing.gpu_present]
+Draw frames on the GPU
+
+[settings.viewing.gpu_present_hint]
+For sessions this machine receives. Skips copying each decoded frame off the GPU
+and back, which is most of the decode cost. It depends on a driver extension,
+and turns itself off for the session if the extension is missing or the decoder
+will not hand its textures over — but it cannot tell that the picture has
+stopped updating, so turn it off if that happens.
+
+[settings.viewing.skip_readback]
+Skip the readback (experimental)
+
+[settings.viewing.fullscreen_on_connect]
+Enter fullscreen on connect
+
+[settings.shortcuts]
+Shortcuts
+
+[settings.shortcuts.blurb]
+Handled locally during a session — never sent to the host.
+
+[settings.shortcuts.press_a_key]
+press a key…
+
+[settings.shortcuts.rebind_hint]
+Click, then press the combination you want
+
+[settings.shortcuts.duplicate]
+⚠ duplicate
+
+[settings.shortcuts.may_block]
+⚠ may block typing
+
+[settings.shortcuts.may_block_hint]
+Without a modifier this key is indistinguishable from typing, so the host will
+never receive it
+
+[shortcut.disconnect]
+Disconnect
+
+[shortcut.disconnect_detail]
+End the current session and return to the connection list
+
+[shortcut.fullscreen]
+Toggle fullscreen
+
+[shortcut.fullscreen_detail]
+Switch the window between fullscreen and windowed
+
+[shortcut.toolbar]
+Toggle toolbar
+
+[shortcut.toolbar_detail]
+Show or hide the session controls overlay
+
+[shortcut.immersive]
+Toggle immersive mode
+
+[shortcut.immersive_detail]
+Send every key to the host, including Win and Alt, and keep the pointer inside
+the window
+
+[shortcut.capture]
+Capture pointer
+
+[shortcut.capture_detail]
+Hide this machine's cursor and send the mouse as movement instead of as a
+place, which is what a game needs. The same keys give it back
+
+
+# ── During a session ──────────────────────────────────────────
+
+[session.window_title.one]
+Tain — Session
+
+[session.window_title.other]
+Tain — {n} Sessions
+
+[session.close_tab]
+Close this session
+
+[session.disconnect]
+Disconnect from this host
+
+[session.leave_fullscreen]
+Leave fullscreen
+
+[session.go_fullscreen]
+Go fullscreen
+
+[session.immersive_on]
+Immersive — every key goes to the host and the pointer stays here
+
+[session.immersive_off]
+Immersive mode: send every key, Win and Alt included, and keep the pointer in
+this window
+
+[session.hide_toolbar]
+Hide the toolbar — move the pointer to the top edge to bring it back
+
+[session.show_toolbar]
+Show the toolbar
+
+[session.pointer_loopback]
+Pointer disabled — this session is a loopback
+
+[session.pointer_unavailable]
+The host has not allowed pointer control
+
+[session.pointer_on]
+Pointer goes to the host — click to keep it local
+
+[session.pointer_off]
+Pointer stays on this machine — click to send it
+
+[session.capture_pointer]
+Capture pointer
+
+[session.capture_pointer_hint]
+Hides this machine's cursor and sends the mouse as movement, so looking around
+never runs out at the edge of the window. Turns itself on when the host is seen
+to hide its own pointer — switch it on here when that cannot be seen, which is
+any shared window and some shared displays.
+
+[session.pointer_sensitivity]
+Aim sensitivity
+
+[session.pointer_sensitivity_hint]
+Applies only while the pointer is captured, which a game does on its own to
+look around. Right-click the pointer button to open this.
+
+[session.pointer_sensitivity_reset]
+Back to the default
+
+[session.keyboard_loopback]
+Keyboard disabled — this session is a loopback
+
+[session.keyboard_unavailable]
+The host has not allowed keyboard control
+
+[session.keyboard_on]
+Typing goes to the host — click to keep it local
+
+[session.keyboard_off]
+Typing stays on this machine — click to send it
+
+[session.hide_stats]
+Hide connection stats
+
+[session.show_stats]
+Show connection stats
+
+[session.cursor_shown]
+Showing the host's pointer — click to hide it
+
+[session.cursor_hidden]
+Host's pointer hidden — click to show it
+
+[session.sound_on]
+Playing the host's sound — click to mute
+
+[session.sound_off]
+Host sound muted — click to play it
+
+[session.volume]
+Host volume {percent}%
+
+[session.screen_virtual]
+Virtual {w}×{h}
+
+[session.screen_main]
+Main {w}×{h}
+
+[session.screen_left]
+Left {w}×{h}
+
+[session.screen_right]
+Right {w}×{h}
+
+[session.screen_above]
+Above {w}×{h}
+
+[session.screen_below]
+Below {w}×{h}
+
+[session.screen_numbered]
+Screen {n} {w}×{h}
+
+
+# ── Connecting to a host ──────────────────────────────────────
+
+[dial.start]
+Start
+
+[dial.start_detail]
+Opening this machine's own connection
+
+[dial.find]
+Find
+
+[dial.find_detail]
+Working out where the host is
+
+[dial.direct]
+Direct
+
+[dial.direct_detail]
+Opening a direct path, so no relay carries the video
+
+[dial.auth]
+Auth
+
+[dial.auth_detail]
+Sending the passcode, and waiting for the host to accept it
+
+[dial.session]
+Session
+
+[dial.session_detail]
+The host is starting its capture and encoder
+
+[dial.video]
+Video
+
+[dial.video_detail]
+Frames are arriving and decoding
+
+[guest.disconnected]
+Disconnected
+
+[guest.connected]
+Connected
+
+[guest.awaiting_approval]
+Waiting for the host to allow this connection…
+
+[guest.failed]
+Failed: {reason}
+
+[guest.waiting_session]
+Connected — waiting for the host to open the session…
+
+[guest.waiting_first_frame]
+Session open — waiting for the first frame…
+
+[guest.waiting_decode]
+Video is arriving, but none of it is decoding on this machine
+
+[guest.no_codec]
+no codec agreed yet
+
+
+# ── Saved hosts ───────────────────────────────────────────────
+
+[previous.saved_here]
+Hosts you connect to will be saved here.
+
+[previous.forget]
+Forget this host, and the code saved with it
+
+[previous.connect]
+Connect
+
+[previous.connect_unchecked]
+Connect — this host has not been checked yet
+
+[previous.try_again]
+Try again
+
+[previous.already_connected]
+Already connected
+
+[previous.connecting]
+Connecting…
+
+[previous.try_anyway_expired]
+Try anyway — this code looked expired a moment ago
+
+[previous.try_anyway_unreachable]
+Try anyway — this host did not answer
+
+[previous.no_saved_code]
+No saved code for this host — paste a fresh one to connect
+
+
+# ── What a guest is allowed ───────────────────────────────────
+
+[grants.full]
+full control
+
+[grants.mouse_only]
+mouse only
+
+[grants.keyboard_only]
+keyboard only
+
+[grants.view_only]
+view-only
+
+[session.ended_by_host]
+The host ended the session
+
+[display.virtual]
+Virtual display
+
+[display.primary]
+the primary display
+
+
+# ── What the quality/latency slider is doing ──────────────────
+
+[priority.quality]
+Holds the picture. If the link or the hardware falls behind, the frame rate
+drops before the resolution does, and sound is buffered generously so it stays
+continuous.
+
+[priority.balanced]
+Balanced. Trouble is answered with bitrate first, then whichever of detail and
+smoothness is cheaper to give up.
+
+[priority.responsive]
+Favours responsiveness. Resolution softens before the frame rate is allowed to
+fall.
+
+[priority.latency]
+Holds the frame rate. Detail is spent freely, and sound is buffered as little as
+possible, to keep everything immediate.
+
+
+# ── Warnings about what this machine can encode ───────────────
+
+[settings.video.high_profile_warning]
+⚠ A guest without GPU decoding will not be able to read this. Use it when an
+Intel encoder stalls on Baseline.
+
+[settings.video.auto_quality_hint]
+Quality target and keyframe interval follow the slider. Turn off to set them
+yourself.
+
+[settings.video.gpu_but_software]
+⚠ This machine has a GPU encoder, but the backend is set to Software. Full
+resolution at a high frame rate is unlikely to keep up.
+
+[settings.video.no_gpu_encoder]
+No GPU encoder found — encoding on the CPU. Large displays may not hold a high
+frame rate at full resolution.
+
+[settings.video.hardware_only_no_gpu]
+⚠ This machine has no GPU encoder, so sessions will refuse to start. Use
+Automatic to allow the software encoder.
+
+[settings.video.lossless_cost]
+Pixel-exact, but bandwidth scales with how much of the screen changes — video
+and scrolling get expensive fast.
+
+
+# ── What is holding the picture back ──────────────────────────
+
+[bottleneck.slow_capture]
+Slow capture
+
+[bottleneck.slow_capture_advice]
+The host cannot grab frames fast enough — usually another program saturating its
+GPU. Stream settings will not help.
+
+[bottleneck.slow_encode]
+Slow encoding
+
+[bottleneck.slow_encode_advice]
+Encoding a frame takes longer than the frame budget. Enable the hardware encoder
+on the host, or stream fewer pixels.
+
+[bottleneck.slow_network]
+Slow network
+
+[bottleneck.slow_network_advice]
+The link cannot carry the frames being produced. Lowering the bitrate or
+resolution is what helps here.
+
+[bottleneck.slow_decode]
+Slow decoding
+
+[bottleneck.slow_decode_advice]
+This machine cannot decode frames as fast as they arrive. A lower resolution
+costs it less work.
+
+[bottleneck.slow_render]
+Slow display
+
+[bottleneck.slow_render_advice]
+Frames decode in time but the window cannot draw them. Usually another program
+competing for this machine's GPU.
+
+[bottleneck.high_latency]
+High latency
+
+[bottleneck.high_latency_advice]
+The round trip to the host is long — distance, or a relayed connection rather
+than a direct one. Quality settings cannot shorten it.
+
+
+# ── How the host was found ────────────────────────────────────
+
+[found.lan]
+LAN
+
+[found.lan_detail]
+Found on this local network by multicast — no relay, no DNS and no internet were
+involved in locating this host.
+
+[found.dns]
+DNS
+
+[found.dns_detail]
+Found through the public lookup service, either as a DNS record or the same data
+fetched over HTTPS.
+
+[found.dht]
+DHT
+
+[found.dht_detail]
+Found through the mainline DHT — the distributed table BitTorrent uses, which
+has no operator and keeps working where DNS is blocked.
+
+[found.code]
+code
+
+[found.code_detail]
+Reached through the relay carried in the connection code. No address lookup
+contributed anything, so the relay is the only route there was — which is why a
+direct path has to be punched from it, and why there is nothing else to fall
+back on if that fails.
+
+
+# ── The steps of a connection attempt ─────────────────────────
+
+[step.starting]
+Starting up…
+
+[step.reaching_relay]
+Looking up where the host is…
+
+[step.via_relay]
+Reaching the host through its relay…
+
+[step.direct]
+Reaching the host directly…
+
+[step.punching]
+Opening a direct path…
+
+[step.authenticating]
+Sending the passcode…
+
+[stalled.starting]
+this machine could not open a connection of its own
+
+[stalled.reaching_relay]
+no relay could be reached from here, and the code carries no address to try
+directly — ask for a fresh code, or connect once on a network that works so an
+address can be remembered
+
+[stalled.via_relay]
+the host's relay could not be reached from here. The host may be fine and the
+relay blocked
+
+[stalled.direct]
+the host did not answer on the address it last used. It may be switched off,
+asleep, or on another network
+
+[stalled.punching]
+the host answered, but only through a relay — no direct path could be opened,
+and a relay cannot carry video. A VPN or a strict NAT on either machine is the
+usual reason
+
+[stalled.authenticating]
+the host answered but did not accept the passcode
+
+[connect.unreachable]
+Could not reach that host — {reason}
+
+
+# ── The route the session took ────────────────────────────────
+
+[path.direct]
+Connected peer to peer.
+
+[path.relayed]
+Relayed through {host} because a direct connection could not be established.
+Relays are shared and rate-limited, so video over one stutters no matter what
+quality is chosen. A VPN on either machine is a common cause.
+
+[path.relay_only]
+Connected to the host through the relay {via}, but no direct path opened within
+{wait}, so the session was refused rather than run over the relay — relays are
+shared and rate limited, and video over one is a slideshow.
+
+A VPN or tunnel on either machine is the usual cause, because it hides the
+address the other side needs to punch to. A strict or symmetric NAT on either
+side does the same. If both machines are on the same network, they should be
+reachable directly: check that neither is on a guest or isolated Wi-Fi network,
+and that the host's firewall is not blocking incoming UDP.
+
+Connecting once from a network where a direct path does open teaches this
+machine the host's address, and that address is tried first next time.
+
+
+# ── Why a session ended ───────────────────────────────────────
+#
+# The host sends a short code, not a sentence, so each end renders the reason
+# in its own language. `end.unknown` catches a code from a newer version.
+
+[end.invalid_passcode]
+that code is no longer valid — the host has generated a new one
+
+[end.not_allowed]
+the host did not allow this connection
+
+[end.not_approved]
+that code was accepted, but this device has not been approved on that machine
+and there is nobody signed in there to approve it now. Connect once from a Tain
+window on the host to approve this device — after that it can connect with
+nobody at the machine.
+
+[end.capture_failed]
+the host could not capture its screen: {detail}
+
+[end.capture_wrong_gpu_neither_way]
+{screen} could not be captured either way the host knows. It is drawn by one of
+two graphics chips, which rules out Desktop Duplication, and the compositor
+refused it as well — so this is not simply the usual two-chip laptop. Check on
+the host that the screen is still attached and that nothing else has it open,
+and look at the host's log for what each attempt said.
+
+[end.disconnected_by_host]
+disconnected by the host
+
+[end.host_closed]
+the host closed Tain
+
+[end.guest_closed]
+the guest closed the session
+
+[end.unknown]
+the host ended the session ({code})
+
+
+# ── Numbers on the session window ─────────────────────────────
+
+[session.loopback]
+⚠ loopback — input disabled
+
+[session.loopback_hint]
+This session points at our own host endpoint. Forwarding input would drive this
+machine's own pointer in a feedback loop.
+
+[session.all_screens_hint]
+Every screen at once, laid out the way the host has them. Use 1:1 rather than
+Fit to see it at full resolution.
+
+[session.all_windows_hint]
+All {n} shared windows at once, side by side. They are tiled rather than placed
+where they sit on the host, so none of them can be hidden behind another. Use
+1:1 rather than Fit to see them at full resolution.
+
+[session.stats_hint]
+lat — capture on the host through to display here, the whole pipeline.
+net — round trip on the link alone.
+
+A large gap between them means the delay is in encoding or decoding rather than
+the network.
+
+[session.audio_buffer]
+audio {ms}/{target} ms
+
+[session.audio_buffer_plain]
+audio {ms} ms
+
+[session.audio_buffer_hint]
+Audio buffered ahead of the speakers, and the cushion it is aiming for. The
+target grows when the link drops audio and shrinks again when it stops.
+
+[session.decode_ms]
+Decoding {ms} ms per frame
+
+[session.draw_ms]
+Drawing {ms} ms per frame
+
+[session.host_sending]
+Host is sending {fps} fps at up to {kbps} kbit/s{reduced}
+
+[session.host_reduced]
+, reduced from what it was asked for
+
+[session.no_status]
+The host has not reported its settings yet.
+
+[session.displaced]
+{n} frames a second arrived and were replaced before this window drew them
+
+[session.path_line]
+{kind} path to {peer}, {ms} ms round trip
+
+[session.tunnelled]
+That is a private address, so this is going through a VPN or similar tunnel
+unless the other machine is on your own network. The round trip above is the
+tunnel's, not the internet's — worth comparing with the VPN off.
+
+[session.peer_to_peer]
+peer to peer with {peer}
+
+
+# ── Watching one window instead of a screen ───────────────────
+
+[session.window_minimised]
+{app} is minimised on the host
+
+[session.window_waiting]
+Waiting for it to be restored.
+
+[session.window_waiting_others]
+Waiting for it to be restored, or pick another window from the toolbar.
+
+[session.window_closed]
+{app} has closed on the host
+
+[session.window_gone]
+There is nothing left to show. The host would have to share something else.
+
+[session.window_gone_others]
+Pick another of the shared windows from the toolbar.
+
+[session.windows_all_closed]
+Every shared window has been closed
+
+[session.windows_all_closed_wait]
+Waiting for the host to share something.
+
+[session.switching]
+Getting that view…
+
+[session.windows_all_away]
+Every shared window is minimised
+
+[session.windows_all_away_wait]
+Waiting for one of them to be restored.
+
+[session.window_unnamed]
+The shared window
+
+[session.watching_window]
+Watching one window: {app}
+
+[session.watching_window_hint]
+This session was given one application window to see. There is no screen behind
+it and no other window to switch to — that is what sharing a window means.
+
+[session.guest_number]
+Guest #{n}
+
+
+# ── What is decoding the picture ──────────────────────────────
+#
+# The names in brackets are the libraries doing the work. Leave them as they
+# are — translating a name makes it impossible to search for.
+
+[decoder.h264_cpu]
+H.264 on the CPU
+
+[decoder.gpu]
+libavcodec {name} on the GPU (D3D11VA)
+
+[decoder.h264_media_foundation]
+H.264 via Media Foundation (CPU)
+
+[decoder.cannot_decode]
+this machine cannot decode {codec} — ask the host for H.264
+
+[decoder.unknown_stream]
+host is streaming '{name}', which this build cannot decode
+
+
+# ── Notification bodies ───────────────────────────────────────
+
+[notify.waiting_body]
+{name} is waiting for you to allow it.
+
+[notify.admin_body]
+{name} connected with an admin passcode and is not waiting for approval.

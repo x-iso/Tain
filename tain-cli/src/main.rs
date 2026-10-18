@@ -14,6 +14,7 @@ mod gui;
 mod logging;
 mod migrate;
 mod service;
+mod unattended_host;
 
 /// What this application calls itself, in every place it stores something.
 ///
@@ -63,6 +64,8 @@ async fn main() -> Result<()> {
             "agent-{}",
             agent::desktop_from_args(&args).unwrap_or_else(|| "unknown".to_string())
         ))
+    } else if args.iter().any(|a| a == unattended_host::HOST_FLAG) {
+        Some("unattended-host".to_string())
     } else {
         None
     };
@@ -103,6 +106,17 @@ async fn main() -> Result<()> {
     // mistaken for someone launching the application.
     if args.iter().any(|a| a == agent::AGENT_FLAG) {
         return agent::run(agent::desktop_from_args(&args));
+    }
+
+    // The host that answers while the application is closed, also started by
+    // the service, on the desktop rather than in the service. See
+    // `unattended_host` for why it is a process of its own.
+    if args.iter().any(|a| a == unattended_host::HOST_FLAG) {
+        let hosted = unattended_host::run(&args).await;
+        if let Err(e) = &hosted {
+            error!("The unattended host failed: {e:#}");
+        }
+        return hosted;
     }
 
     if args.iter().any(|a| a == service::RUN_FLAG) {
@@ -211,6 +225,9 @@ async fn main() -> Result<()> {
     let _running = display_driver::presence::announce();
 
     let state = gui::AppState::persistent();
+    // Before anything draws. The catalogues are compiled in, so this is a
+    // lookup rather than any kind of load — see `tain_core::i18n`.
+    tain_core::i18n::follow(&state.settings().language);
     #[cfg(debug_assertions)]
     gui::app::seed_demo_data(&state);
 

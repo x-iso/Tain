@@ -42,6 +42,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::*;
 
 use tain_core::network::ProbeOutcome;
+use tain_core::t;
 use tain_core::{ApprovalDecision, ConnectionCode, ControlGrants, PasscodeType, SessionManager};
 
 use super::connections::{ConnectionStatus, ConnectionStore};
@@ -116,10 +117,8 @@ fn render_passcode_row_tail(
         20.0,
         egui::include_image!("../../assets/reset_passcode.svg"),
         match typ {
-            PasscodeType::Master =>
-                "Generate a new admin code now. This invalidates the current one \
-                 and forgets every device it has let in.",
-            PasscodeType::Guest => "Generate a new code now (invalidates the current one)",
+            PasscodeType::Master => t!("header.reset_admin_hint"),
+            PasscodeType::Guest => t!("header.reset_guest_hint"),
         },
     )
     .clicked()
@@ -130,11 +129,8 @@ fn render_passcode_row_tail(
     ui.add_space(4.0);
     let mut on = autoreset_of(settings, typ);
     if ui
-        .checkbox(&mut on, egui::RichText::new("autoreset").color(TEXT))
-        .on_hover_text(
-            "Regenerate automatically when the last guest disconnects.\n\
-             Turning this off keeps the code usable for reconnecting.",
-        )
+        .checkbox(&mut on, egui::RichText::new(t!("header.autoreset")).color(TEXT))
+        .on_hover_text(t!("header.autoreset_hint"))
         .changed()
     {
         edits.set_autoreset.push((typ, on));
@@ -391,7 +387,7 @@ impl AppState {
 ///
 /// Failure is ordinary and quiet. Most machines have no service installed, and
 /// "the pipe is not there" is the expected answer rather than a fault.
-pub fn sync_unattended(state: &AppState) {
+pub fn sync_unattended(state: &AppState) -> bool {
     use tain_core::service_control::{send, ControlMessage};
 
     let message = if state.settings().unattended_access {
@@ -400,20 +396,173 @@ pub fn sync_unattended(state: &AppState) {
             // — and a service adopting a key that changes next launch would
             // answer to codes nobody has.
             tracing::debug!("No stored identity yet — nothing to hand the service");
-            return;
+            return false;
         };
         let codes = [tain_core::PasscodeType::Master, tain_core::PasscodeType::Guest]
             .into_iter()
             .filter_map(|typ| state.host.secrets.code(typ))
             .collect();
-        ControlMessage::AdoptIdentity { secret_key, codes }
+        // The whole settings object, sent on every save rather than diffed.
+        // This runs from `save_settings`, so an approval, a changed frame rate
+        // and a new audio exclusion all arrive by the same route — and the
+        // service ends up configured exactly as this application is, rather
+        // than as whatever subset somebody remembered to forward.
+        //
+        // A settings object that will not serialise is not worth failing the
+        // handover over: the identity and the codes still get across, and the
+        // service falls back to its defaults as it did before.
+        let settings = serde_json::to_string(&state.settings()).unwrap_or_else(|e| {
+            tracing::warn!("Could not send settings to the service ({e}) — it will use defaults");
+            String::new()
+        });
+        ControlMessage::AdoptIdentity { secret_key, codes, settings }
     } else {
         ControlMessage::ForgetIdentity
     };
 
     match send(&message) {
-        Ok(()) => tracing::debug!("Told the service about unattended access"),
-        Err(e) => tracing::debug!("The service is not listening ({e:#})"),
+        Ok(()) => {
+            tracing::debug!("Told the service about unattended access");
+            true
+        }
+        Err(e) => {
+            tracing::debug!("The service is not listening ({e:#})");
+            false
+        }
+    }
+}
+
+/// Send `message`, asking again for a moment if the first attempt is refused.
+///
+/// # For the second of two messages sent back to back
+///
+/// The service's control pipe has a single instance, and it puts up the next
+/// one only once it has read the last message to its end. A message sent
+/// straight after another can arrive in the moment there is no pipe at all and
+/// be refused by a service that is running perfectly well. Where that happened
+/// to "this process is hosting", the service did not hear it until the next
+/// heartbeat five seconds later, and for those five seconds both it and this
+/// application were bound to the same identity.
+///
+/// Only for a service that was just reached. Asking again on a machine with no
+/// service installed would add half a second to nothing.
+fn send_again_shortly(
+    message: &tain_core::service_control::ControlMessage,
+) -> anyhow::Result<()> {
+    const WITHIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+    let started = std::time::Instant::now();
+    loop {
+        match tain_core::service_control::send(message) {
+            Ok(()) => return Ok(()),
+            Err(_) if started.elapsed() < WITHIN => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Repeat "this process is hosting" to the service for as long as it runs.
+///
+/// # Why a thread and not the frame loop
+///
+/// The interface is not a clock. egui repaints when there is a reason to, and a
+/// host sitting minimised in the tray with nobody connected has none for
+/// minutes at a time — which is precisely the state a machine is in when
+/// somebody tries to reach it. A claim renewed only when a window happens to
+/// redraw would expire while the application it describes was running perfectly
+/// well, and the service would bind alongside it.
+///
+/// # Why it never stops
+///
+/// There is nothing to stop it for. The host server, once bound, lives as long
+/// as the process; the way this application stops hosting is by exiting, and
+/// then the thread goes with it. Ending on exit is [`stopped_hosting`]'s job
+/// and it does not need this thread's help to do it.
+fn keep_telling_the_service_we_host() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tain_core::service_control::{send, ControlMessage, HOSTING_HEARTBEAT};
+
+    /// Set once a beating thread exists, so a second host start does not add a
+    /// second one — they would say the same thing twice as often.
+    static BEATING: AtomicBool = AtomicBool::new(false);
+
+    if BEATING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let spawned = std::thread::Builder::new()
+        .name("tain-hosting-heartbeat".into())
+        .spawn(|| {
+            // Logged once each way rather than every beat. Failing is the
+            // normal state on a machine with no service installed, and a line
+            // every five seconds saying so would be the whole log.
+            let mut reached: Option<bool> = None;
+            loop {
+                let claim = ControlMessage::ApplicationHosting(true);
+                // The first beat follows the handover this application sends
+                // as it starts hosting, so it is the second of two messages and
+                // may land in the gap between them — see `send_again_shortly`.
+                // Missing it is the five seconds during which the service goes
+                // on hosting too. On this thread, the half second it can cost a
+                // machine with no service is paid by nobody.
+                let ok = match reached {
+                    None => send_again_shortly(&claim).is_ok(),
+                    Some(_) => send(&claim).is_ok(),
+                };
+                if reached != Some(ok) {
+                    match ok {
+                        true => tracing::debug!("The service knows this process is hosting"),
+                        false => tracing::debug!("The service is not listening"),
+                    }
+                    reached = Some(ok);
+                }
+                std::thread::sleep(HOSTING_HEARTBEAT);
+            }
+        });
+
+    if let Err(e) = spawned {
+        // The claim is still made — just once, by this thread, and it expires a
+        // lease later. Which is the right way to fail: the service takes over
+        // rather than neither of us hosting.
+        BEATING.store(false, Ordering::Relaxed);
+        tracing::warn!("Could not keep telling the service we host ({e}) — it will take over");
+        let _ = send(&ControlMessage::ApplicationHosting(true));
+    }
+}
+
+/// Tell the service this process has stopped hosting, so it can take over now.
+///
+/// A courtesy, not the mechanism. The claim expires on its own, and it has to:
+/// an application that is killed, panics, or loses power says nothing on the
+/// way out, and those are not exotic on a machine nobody is sitting at. What
+/// this buys is the difference between the service taking over immediately and
+/// taking over a lease later, for the one case that can afford to be polite.
+///
+/// # Everything the service needs goes with it
+///
+/// The handover — identity, codes, settings, approved devices — was sent when
+/// this application started and whenever settings were saved, and at no other
+/// time. A service installed or reinstalled while this was already running
+/// therefore never received it: it had the identity and codes an older service
+/// had stored, but no settings, and its first unattended session ran on
+/// defaults. Sending it again at the moment of handing over means the service
+/// takes over with exactly what this application had, however long ago the
+/// service started.
+fn stopped_hosting(state: &AppState) {
+    use tain_core::service_control::{send, ControlMessage};
+
+    let released = ControlMessage::ApplicationHosting(false);
+    // Back to back with the handover, so asked again across the gap between
+    // them when the service took the first — see `send_again_shortly`.
+    let told = match sync_unattended(state) {
+        true => send_again_shortly(&released),
+        false => send(&released),
+    };
+    match told {
+        Ok(()) => tracing::info!("Told the service to take over hosting"),
+        Err(e) => tracing::debug!("Could not tell the service we stopped ({e:#})"),
     }
 }
 
@@ -517,6 +666,8 @@ pub enum HostCommand {
     RegeneratePasscode(PasscodeType),
     /// Set which input devices a live session may drive.
     SetSessionControl { session_id: u32, grants: ControlGrants },
+    /// Change what a live session may see. See `SessionManager::set_displays`.
+    SetSessionDisplays { session_id: u32, displays: tain_core::protocol::DisplayGrant },
     /// Push edited settings to the host server. Applies to new sessions.
     ApplySettings(tain_core::SessionConfig),
     /// Disconnect a guest from the host side.
@@ -686,21 +837,50 @@ pub async fn init_host_server(state: &AppState) -> anyhow::Result<HostHandles> {
         warn!("No credential store — this machine's codes will change every launch");
     }
 
+    // # The same key in both directions
+    //
+    // Connections this machine *makes* carry the identity it is known by, not a
+    // fresh key per dial. Without this a host cannot recognise a returning
+    // device: trusting an admin endpoint remembers an id that would never
+    // appear again, so the owner was asked to approve their own laptop on every
+    // single connection. See `network::adopt_identity`.
+    //
+    // Taken from the server rather than from `restored_identity`, which is
+    // `None` on a first run — the key exists by this point either way.
+    tain_core::network::adopt_identity(server.identity_bytes());
+
+    // Take back the graphics preference an older Tain wrote for itself. It
+    // pinned this program to the integrated chip to make Desktop Duplication
+    // work, and kept the encoder off the discrete one for the life of the
+    // installation. See `gpu_preference::undo_our_old_preference`.
+    {
+        let done = state.settings().gpu_preference_undone;
+        if tain_core::gpu_preference::undo_our_old_preference(done) {
+            state.settings.lock().unwrap().gpu_preference_undone = true;
+            state.save_settings();
+        } else if !done {
+            // Nothing to undo on this machine, and nothing to undo later
+            // either — recorded so a preference chosen deliberately after this
+            // point is never mistaken for ours.
+            state.settings.lock().unwrap().gpu_preference_undone = true;
+            state.save_settings();
+        }
+    }
+
     // The identity exists by now, which it did not when the settings were last
     // saved on a first run. See `sync_unattended`.
     sync_unattended(state);
 
-    // And say plainly that this machine already has a host. The service yields
-    // to it: two hosts on one identity would have a guest reach whichever
-    // answered first, which is worse than either alone.
+    // And keep saying plainly that this machine already has a host. The service
+    // yields to it: two hosts on one identity would have a guest reach
+    // whichever answered first, which is worse than either alone.
     //
-    // Belt and braces rather than the main mechanism — the service also checks
-    // whether anybody is signed in, and if this is running then somebody is.
-    // It closes the window around signing out, where the token disappears
-    // before this process does.
-    let _ = tain_core::service_control::send(
-        &tain_core::service_control::ControlMessage::ApplicationHosting(true),
-    );
+    // This *is* the mechanism now rather than belt and braces. The service used
+    // to also require that nobody was signed in, which made saying so almost
+    // decorative; it no longer does, because a signed-in user with no
+    // application running is exactly the case that left the machine
+    // unreachable. Nothing else tells the service this process is alive.
+    keep_telling_the_service_we_host();
 
     // Start from the saved preferences rather than the library defaults.
     server.set_session_config(state.settings().to_session_config());
@@ -819,16 +999,7 @@ async fn run_probe_loop(
             biased;
 
             Some(code) = check_rx.recv() => {
-                // Whatever this host answered on before, as the sweep does and
-                // as Connect does. A paste of a code for a machine already on
-                // this list should not be answered worse than a sweep of it.
-                let known: Vec<_> = store
-                    .lock()
-                    .unwrap()
-                    .direct_addr(&super::connections::endpoint_hex(&code.endpoint_id))
-                    .into_iter()
-                    .collect();
-                let outcome = prober.probe(&code, &known, PROBE_TIMEOUT).await;
+                let outcome = prober.probe(&code, PROBE_TIMEOUT).await;
                 if checked_tx.send((code, outcome)).is_err() {
                     return;
                 }
@@ -873,7 +1044,7 @@ async fn run_probe_loop(
                 // so the whole sweep costs one timeout now, and each card
                 // updates as its own answer arrives rather than at the end.
                 let mut probes = tokio::task::JoinSet::new();
-                for (endpoint_hex, code, known) in targets {
+                for (endpoint_hex, code) in targets {
                     let Ok(parsed) = ConnectionCode::parse(&code) else {
                         store
                             .lock()
@@ -885,7 +1056,7 @@ async fn run_probe_loop(
                     asked += 1;
                     let prober = std::sync::Arc::clone(&prober);
                     probes.spawn(async move {
-                        let outcome = prober.probe(&parsed, &known, PROBE_TIMEOUT).await;
+                        let outcome = prober.probe(&parsed, PROBE_TIMEOUT).await;
                         (endpoint_hex, status_of(&outcome), why_of(&outcome))
                     });
                 }
@@ -974,28 +1145,22 @@ impl PasteState {
     pub fn message(&self) -> Option<(String, egui::Color32)> {
         match self {
             Self::Idle => None,
-            Self::Checking => Some(("Checking the host...".into(), TEXT_DIM)),
+            Self::Checking => Some((t!("paste.checking").into(), TEXT_DIM)),
             Self::Ready { host, needs_approval } => {
-                let who = host.as_deref().unwrap_or("Host");
+                let who = host.as_deref().unwrap_or_else(|| t!("paste.anonymous_host"));
                 Some((
                     if *needs_approval {
-                        format!("{who} is ready - it will ask before letting you in")
+                        t!("paste.ready_will_ask", host = who)
                     } else {
-                        format!("{who} is ready")
+                        t!("paste.ready", host = who)
                     },
                     LIVE_GREEN,
                 ))
             }
             // Both of these are "do not press Connect", but for different
             // reasons and with different fixes, so they do not share a message.
-            Self::Stale => Some((
-                "That code has expired - ask for a new one".into(),
-                AMBER,
-            )),
-            Self::Unreachable => Some((
-                "No answer - the host may be offline".into(),
-                OFFLINE_RED,
-            )),
+            Self::Stale => Some((t!("paste.expired").into(), AMBER)),
+            Self::Unreachable => Some((t!("paste.unreachable").into(), OFFLINE_RED)),
         }
     }
 
@@ -1028,6 +1193,17 @@ async fn run_command_loop(
             },
             HostCommand::SetSessionControl { session_id, grants } => {
                 if !server.approve_session(session_id, grants) {
+                    warn!("Session #{} is no longer active", session_id);
+                }
+            }
+            HostCommand::SetSessionDisplays { session_id, displays } => {
+                // The screens are enumerated here rather than inside the
+                // session table, which has no business walking DXGI — and the
+                // answer is needed twice: to decide whether what is on screen
+                // survives the change, and to tell the guest what it may now
+                // pick between.
+                let available = tain_core::screen_capture::displays();
+                if !server.share_with_session(session_id, displays, &available) {
                     warn!("Session #{} is no longer active", session_id);
                 }
             }
@@ -1120,6 +1296,27 @@ struct Confirm {
     /// Which of them are ticked. Ids rather than indices, so the set survives
     /// the list being re-read.
     share: std::collections::BTreeSet<u32>,
+    /// The windows this machine could share.
+    ///
+    /// Re-read when the picker opens rather than only when the dialog does. The
+    /// two are minutes apart — a guest can be left waiting while somebody
+    /// finishes what they were doing — and the point of a picker is to show
+    /// what is on the desk *now*. Frozen for as long as it is open, though, for
+    /// the same reason the screens are: a list that reorders itself under the
+    /// pointer is a list nobody can click accurately.
+    windows: Vec<tain_core::protocol::WindowInfo>,
+    /// Which of them are chosen, if windows were chosen instead of screens.
+    ///
+    /// Windows and screens are exclusive by construction rather than by
+    /// checking: a window share that also carried screens would not be a window
+    /// share. See `DisplayGrant::Windows`.
+    ///
+    /// A set of handles rather than the [`tain_core::protocol::WindowInfo`]s
+    /// themselves, so a title changing while the dialog is open — which a
+    /// browser does on every navigation — cannot silently unpick a window.
+    chosen: std::collections::BTreeSet<u64>,
+    /// Whether the window picker is open over this dialog.
+    picking: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,6 +1325,17 @@ enum ConfirmAction {
     Approve,
     /// An established guest is being removed.
     Kick,
+    /// An established guest stays, and what it may see is being changed.
+    ///
+    /// # Why this is not the approval dialog again
+    ///
+    /// It asks the same questions and means something different by them.
+    /// Approval decides whether a session starts; this decides what an existing
+    /// one shows *from now on*, while somebody is watching. Closing it changes
+    /// nothing, and there is no "deny" — refusing to change is what not
+    /// applying already is. Ending the session is the kick button, which is
+    /// still where it was.
+    Change,
 }
 
 /// What the user chose, when they chose something.
@@ -1142,6 +1350,8 @@ enum ConfirmAction {
 enum Outcome {
     Allow(ControlGrants),
     Deny,
+    /// Keep the session and change what it may see and drive.
+    Change(ControlGrants),
 }
 
 impl Confirm {
@@ -1189,6 +1399,14 @@ impl Confirm {
             grants,
             screens,
             share,
+            // Empty until the picker is opened, which is what fills it. Nothing
+            // reads it before then, and enumerating every window on the desk is
+            // work for a dialog that may only ever be denied.
+            windows: Vec::new(),
+            // Never the default. Sharing windows is the narrower answer and the
+            // deliberate one — it has to be chosen, not arrived at.
+            chosen: std::collections::BTreeSet::new(),
+            picking: false,
             is_admin: false,
         }
     }
@@ -1204,9 +1422,10 @@ impl Confirm {
 
     fn title(&self) -> &'static str {
         match (self.action, self.is_admin) {
-            (ConfirmAction::Approve, true) => "Allow full control of this machine?",
-            (ConfirmAction::Approve, false) => "Allow this connection?",
-            (ConfirmAction::Kick, _) => "Disconnect this guest?",
+            (ConfirmAction::Approve, true) => t!("approval.title_admin"),
+            (ConfirmAction::Approve, false) => t!("approval.title_guest"),
+            (ConfirmAction::Kick, _) => t!("approval.title_kick"),
+            (ConfirmAction::Change, _) => t!("approval.title_change"),
         }
     }
 
@@ -1229,28 +1448,205 @@ impl Confirm {
             // has no permissions to show — there is nothing to choose, and a
             // dialog with nothing in it would look like a smaller decision
             // than a guest's rather than a larger one.
-            (ConfirmAction::Approve, true) => {
-                "wants to connect with this PC's admin passcode — every screen, \
-                 the mouse and the keyboard, and the lock screen too where \
-                 unattended access is installed."
-                    .to_string()
-            }
-            (ConfirmAction::Approve, false) => "wants to connect to this PC".to_string(),
-            (ConfirmAction::Kick, _) => "will be disconnected immediately.".to_string(),
+            (ConfirmAction::Approve, true) => t!("approval.wants_to_connect_admin").to_string(),
+            (ConfirmAction::Approve, false) => t!("approval.wants_to_connect").to_string(),
+            (ConfirmAction::Kick, _) => t!("approval.will_be_disconnected").to_string(),
+            // # Said in the present tense, because it takes effect at once
+            //
+            // The approval dialog describes something that has not happened
+            // yet and can still be refused. This one describes what is on
+            // somebody else's screen right now, and applying narrows it while
+            // they are watching.
+            (ConfirmAction::Change, _) => t!("approval.is_watching").to_string(),
         }
     }
 
     /// Caveat shown when the name came from the other machine.
     fn name_caveat(&self) -> Option<&'static str> {
         (self.guest_named_itself && self.action == ConfirmAction::Approve)
-            .then_some("This name was chosen by the connecting machine.")
+            .then_some(t!("approval.self_named"))
     }
 
     fn confirm_label(&self) -> &'static str {
         match self.action {
-            ConfirmAction::Approve => "Allow",
-            ConfirmAction::Kick => "Disconnect",
+            ConfirmAction::Approve => t!("approval.allow"),
+            ConfirmAction::Kick => t!("approval.disconnect"),
+            ConfirmAction::Change => t!("approval.apply"),
         }
+    }
+
+    /// Open on what a running session already has, rather than on a default.
+    ///
+    /// `None` for a session the table cannot answer about, which leaves the
+    /// dialog on its default — the smallest useful answer, and the safe
+    /// direction to be wrong in.
+    ///
+    /// A window grant fills the chosen set and the list it is read against,
+    /// because [`Self::granted`] emits the windows in list order and would
+    /// otherwise emit none of them.
+    fn adopt(&mut self, current: Option<tain_core::protocol::DisplayGrant>) {
+        use tain_core::protocol::DisplayGrant;
+        let Some(current) = current else { return };
+
+        match current {
+            DisplayGrant::All => {
+                self.share = self.screens.iter().map(|d| d.id).collect();
+                self.chosen.clear();
+            }
+            DisplayGrant::Only(ids) => {
+                self.share = ids.into_iter().collect();
+                self.chosen.clear();
+            }
+            DisplayGrant::Windows(ids) => {
+                self.chosen = ids.iter().copied().collect();
+                self.windows = GuestApp::pickable(&self.chosen);
+                // Anything the host granted that has since closed cannot be
+                // offered and must not be silently re-granted either.
+                self.chosen.retain(|id| self.windows.iter().any(|w| w.id == *id));
+            }
+        }
+    }
+
+    /// What this dialog's answers add up to, as the grant the session runs
+    /// under.
+    ///
+    /// # The three answers, and why they are not one list
+    ///
+    /// Windows, when any were chosen: they *replace* the screens rather than
+    /// joining them, which is the point of choosing them. Ordered as the picker
+    /// listed them rather than by handle, because the first is what the session
+    /// opens on and the order somebody saw is the only order they could have
+    /// meant — handles sort by whatever number Windows happened to hand out.
+    ///
+    /// Every screen chosen means *all*, not "these ones that happen to be all
+    /// of them": a monitor plugged in later should follow what was meant rather
+    /// than be silently excluded.
+    fn granted(&self) -> tain_core::protocol::DisplayGrant {
+        use tain_core::protocol::DisplayGrant;
+
+        if !self.chosen.is_empty() {
+            return DisplayGrant::Windows(
+                self.windows
+                    .iter()
+                    .map(|window| window.id)
+                    .filter(|id| self.chosen.contains(id))
+                    .collect(),
+            );
+        }
+        if self.screens.is_empty() || self.share.len() == self.screens.len() {
+            return DisplayGrant::All;
+        }
+        DisplayGrant::Only(self.share.iter().copied().collect())
+    }
+}
+
+/// One window's answer to "what do you look like": its handle, and a picture if
+/// it would give one.
+type Shot = (u64, Option<tain_core::window_capture::Thumbnail>);
+
+/// Pictures of this machine's windows, taken away from the interface thread.
+///
+/// # Why this is not simply called where the tiles are drawn
+///
+/// Asking a window to draw itself is a `SendMessage` into *its* message loop,
+/// and it does not come back until that program answers. A program that is busy
+/// — or wedged, which is not rare and is often exactly the one somebody wants
+/// help with — would freeze the interface for as long as it stayed that way,
+/// while the picker was open, on the machine of the person being asked to allow
+/// a connection.
+///
+/// So the pictures are taken on a worker and arrive when they arrive. The tiles
+/// draw immediately with names in them and fill in underneath, which also means
+/// one unresponsive program costs its own tile and nothing else.
+#[derive(Default)]
+struct WindowShots {
+    /// What has come back. `None` for a window that would not draw itself —
+    /// remembered as such, so it is not asked again every frame.
+    taken: std::collections::HashMap<u64, Option<egui::TextureHandle>>,
+    /// Handed to a worker and not yet answered.
+    asked: std::collections::HashSet<u64>,
+    /// The worker's end and ours. Made on first use and kept: a channel per
+    /// batch would drop results from the batch before it.
+    post: Option<(std::sync::mpsc::Sender<Shot>, std::sync::mpsc::Receiver<Shot>)>,
+}
+
+impl WindowShots {
+    /// How big a picture to ask each window for.
+    ///
+    /// Larger than the tile it is drawn in, because the tile is measured in
+    /// points and a HiDPI screen has rather more pixels than that — a thumbnail
+    /// sized for the logical tile is visibly soft on the machines most likely
+    /// to be running this.
+    const EDGE: u16 = 256;
+
+    /// Start photographing these windows, and forget anything taken before.
+    ///
+    /// Called when the picker opens rather than kept warm: a picture of what a
+    /// window looked like the last time somebody opened this is worse than no
+    /// picture, because it is a picture that lies.
+    fn refresh(&mut self, ctx: &egui::Context, ids: Vec<u64>) {
+        self.taken.clear();
+        self.asked.clear();
+        if ids.is_empty() {
+            return;
+        }
+
+        let (tx, _) = self.post.get_or_insert_with(std::sync::mpsc::channel);
+        let tx = tx.clone();
+        self.asked.extend(ids.iter().copied());
+
+        let ctx = ctx.clone();
+        // Detached deliberately: nothing waits for it, and a picker closed
+        // before the last window answered simply throws the answer away.
+        let spawned = std::thread::Builder::new()
+            .name("tain-window-shots".into())
+            .spawn(move || {
+                for id in ids {
+                    let shot = tain_core::window_capture::thumbnail(id, Self::EDGE);
+                    // Sent one at a time rather than as a batch, so a program
+                    // that takes a second to answer delays only its own tile.
+                    if tx.send((id, shot)).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            });
+        if spawned.is_err() {
+            // No thread to be had. The tiles fall back to names, which is what
+            // they show for a window that would not draw itself anyway.
+            self.asked.clear();
+        }
+    }
+
+    /// Take delivery of whatever has arrived. Cheap, and safe to call every
+    /// frame.
+    fn collect(&mut self, ctx: &egui::Context) {
+        let Some((_, rx)) = self.post.as_ref() else {
+            return;
+        };
+        // `try_iter` rather than a blocking read: this runs inside a frame.
+        let arrived: Vec<Shot> = rx.try_iter().collect();
+        for (id, shot) in arrived {
+            self.asked.remove(&id);
+            let uploaded = shot.map(|shot| {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [usize::from(shot.width), usize::from(shot.height)],
+                    &shot.rgba,
+                );
+                ctx.load_texture(format!("window-shot-{id}"), image, egui::TextureOptions::LINEAR)
+            });
+            self.taken.insert(id, uploaded);
+        }
+    }
+
+    /// This window's picture, if one was taken.
+    fn of(&self, id: u64) -> Option<&egui::TextureHandle> {
+        self.taken.get(&id).and_then(|shot| shot.as_ref())
+    }
+
+    /// Whether a picture of this window is still on its way.
+    fn waiting_for(&self, id: u64) -> bool {
+        self.asked.contains(&id)
     }
 }
 
@@ -1299,6 +1695,12 @@ pub struct GuestApp {
     /// `&self` — the alternative is threading `&mut` through the whole list
     /// render for a decoration.
     previews: std::cell::RefCell<std::collections::HashMap<String, egui::TextureHandle>>,
+    /// Pictures of this machine's own windows, for the share picker.
+    ///
+    /// On the application rather than in the dialog because two guests waiting
+    /// at once are two dialogs looking at the same desk, and photographing
+    /// every window twice would cost twice as much for the same pictures.
+    window_shots: std::cell::RefCell<WindowShots>,
     /// Host-side session table, reconciled against the incoming list each frame.
     host_sessions: Option<Arc<SessionManager>>,
     /// The host server's channels, still being bound. See
@@ -1364,6 +1766,7 @@ impl GuestApp {
             // been told nothing yet. The first frame pushes the setting in.
             applied_ui_scale: 1.0,
             previews: std::cell::RefCell::new(std::collections::HashMap::new()),
+            window_shots: std::cell::RefCell::new(WindowShots::default()),
             host_sessions: None,
             pending_handles: None,
             connect_error: None,
@@ -1755,16 +2158,35 @@ impl GuestApp {
                     continue;
                 }
                 if let Some(card) = incoming.iter().find(|c| c.session_id == session_id) {
-                    self.confirms.push(
-                        Confirm::with_grants(
-                            session_id,
-                            card.display_name.clone(),
-                            card.name_is_self_reported,
-                            action,
-                            defaults,
-                        )
-                        .for_admin(card.is_admin),
-                    );
+                    // # A change dialog opens on what is true, not on a default
+                    //
+                    // The approval dialog offers the smallest useful answer,
+                    // because it is deciding something that has not happened.
+                    // This one is editing what a guest is looking at right now,
+                    // and opening it on anything else would misreport the
+                    // session — and, worse, apply that misreport if somebody
+                    // pressed the button without reading it.
+                    let opening = if action == ConfirmAction::Change {
+                        ControlGrants::new(card.mouse_allowed, card.keyboard_allowed)
+                    } else {
+                        defaults
+                    };
+                    let mut confirm = Confirm::with_grants(
+                        session_id,
+                        card.display_name.clone(),
+                        card.name_is_self_reported,
+                        action,
+                        opening,
+                    )
+                    .for_admin(card.is_admin);
+                    if action == ConfirmAction::Change {
+                        confirm.adopt(
+                            self.host_sessions
+                                .as_ref()
+                                .and_then(|s| s.displays_of(session_id)),
+                        );
+                    }
+                    self.confirms.push(confirm);
                 }
             }
         }
@@ -1776,7 +2198,7 @@ impl GuestApp {
             match read_clipboard() {
                 None => {
                     self.paste_state = PasteState::Idle;
-                    self.connect_error = Some("Clipboard is empty".into());
+                    self.connect_error = Some(t!("header.clipboard_empty").into());
                 }
                 Some(text) => match ConnectionCode::parse(&text) {
                     Ok(code) => {
@@ -1848,21 +2270,9 @@ impl GuestApp {
             .unwrap()
             .record(endpoint_hex.clone(), code.encode(), &placeholder);
 
-        // Where this host answered last time, if it ever has. Offered as one
-        // more candidate; see `SavedConnection::last_direct_addr` for why a
-        // stale one costs nothing.
-        let known_addrs: Vec<std::net::SocketAddr> = self
-            .state
-            .previous_connections
-            .lock()
-            .unwrap()
-            .direct_addr(&endpoint_hex)
-            .into_iter()
-            .collect();
-
         let settings = self.state.settings();
         let repaint_ctx = ctx.clone();
-        let session = GuestSession::start(code, known_addrs, &settings, loopback, move || {
+        let session = GuestSession::start(code, &settings, loopback, move || {
             repaint_ctx.request_repaint()
         });
 
@@ -1898,17 +2308,12 @@ impl GuestApp {
         let Some(session) = self.sessions.get(index) else { return };
         let endpoint = session.endpoint_hex.clone();
 
-        // Where it answered, so the next connection can skip finding out. Kept
-        // even when there is no picture — a session that drew every frame on
-        // the GPU has no preview and still had a route worth remembering.
-        if let Some(addr) = session.direct_addr() {
-            self.state
-                .previous_connections
-                .lock()
-                .unwrap()
-                .set_direct_addr(&endpoint, &addr);
-        }
-
+        // The address this session ended on used to be recorded here for the
+        // next dial to try. It is not any more — see
+        // `GuestClient::connect_reporting` for why a remembered address turned
+        // out to be worth less than nothing, and note that this was also the
+        // only thing that could ever refresh one: a stale entry was cleared by
+        // a successful connection, which is precisely what it was preventing.
         let Some(pixels) = session.preview() else { return };
         self.state
             .previous_connections
@@ -1955,7 +2360,7 @@ impl GuestApp {
                     GuestStatus::Failed(e) => format!("Session ended — {e}"),
                     // A clean end with nothing said. The host closed the stream,
                     // or the app on the other side quit.
-                    _ => "The host ended the session".to_string(),
+                    _ => t!("session.ended_by_host").to_string(),
                 };
                 ended.push((session.tab_id, reason));
             }
@@ -2128,7 +2533,7 @@ impl GuestApp {
     fn kick(&mut self, session_id: u32) {
         self.send(HostCommand::KickSession {
             session_id,
-            reason: "disconnected by host".into(),
+            reason: tain_core::protocol::end_reason::DISCONNECTED_BY_HOST.into(),
         });
         // Answer any outstanding approval so the server is not left waiting out
         // its whole timeout on a session that is going away.
@@ -2182,58 +2587,27 @@ impl GuestApp {
         }
         let mut understood = false;
 
-        egui::Window::new("This code is the whole machine")
+        egui::Window::new(t!("admin_warning.title"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.set_max_width(400.0);
-                ui.label(
-                    egui::RichText::new(
-                        "The admin passcode gives whoever holds it unrestricted access to \
-                         this computer: every screen, the mouse and the keyboard, with no \
-                         approval asked for anything.",
-                    )
-                    .size(12.0)
-                    .color(TEXT),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(
-                        "With unattended access installed that includes the lock screen \
-                         and administrator prompts — the things a password would normally \
-                         stop.",
-                    )
-                    .size(12.0)
-                    .color(AMBER),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Keep it for your own devices, and send it somewhere private if \
-                         you must send it at all — not a group chat, not a screen share. \
-                         Anything that ends up holding it is you, as far as this machine \
-                         is concerned.",
-                    )
-                    .size(12.0)
-                    .color(TEXT),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Two things soften a mistake. The first connection from each new \
-                         device has to be approved here, so a code that gets out cannot be \
-                         used behind your back. And the reset button beside the code \
-                         revokes it — along with every device it has already let in.",
-                    )
-                    .size(12.0)
-                    .color(TEXT_DIM),
-                );
+                for (key, colour) in [
+                    ("admin_warning.grants", TEXT),
+                    ("admin_warning.unattended", AMBER),
+                    ("admin_warning.sharing", TEXT),
+                    ("admin_warning.mitigations", TEXT_DIM),
+                ] {
+                    ui.label(egui::RichText::new(t!(key)).size(12.0).color(colour));
+                    ui.add_space(8.0);
+                }
 
-                ui.add_space(14.0);
+                ui.add_space(6.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let button = egui::Button::new(
-                        egui::RichText::new("I understand").color(egui::Color32::WHITE),
+                        egui::RichText::new(t!("admin_warning.understood"))
+                            .color(egui::Color32::WHITE),
                     )
                     .fill(ADMIN_FILL);
                     if ui.add(button).clicked() {
@@ -2285,7 +2659,7 @@ impl GuestApp {
             else {
                 continue;
             };
-            if let Some(outcome) = Self::show_confirm(ctx, confirm, card) {
+            if let Some(outcome) = Self::show_confirm(ctx, confirm, card, &self.window_shots) {
                 answered.push((confirm.session_id, outcome));
             }
         }
@@ -2301,18 +2675,25 @@ impl GuestApp {
         ctx: &egui::Context,
         confirm: &mut Confirm,
         card: egui::Rect,
+        shots: &std::cell::RefCell<WindowShots>,
     ) -> Option<Outcome> {
         let (title, body, label) = (confirm.title(), confirm.body(), confirm.confirm_label());
         let caveat = confirm.name_caveat();
         let confirm_guest = confirm.guest.clone();
         let approving = confirm.action == ConfirmAction::Approve;
+        // Changing what a running session shows asks the same questions, so it
+        // gets the same controls — and a different pair of buttons, since there
+        // is nothing to deny and closing it is how you decline.
+        let editing = confirm.action == ConfirmAction::Change;
         // An admin connection has nothing to tick: the code already carries
         // every screen and both input devices, and the server ignores anything
         // this dialog might say to the contrary.
-        let choosable = approving && !confirm.is_admin;
+        let choosable = (approving || editing) && !confirm.is_admin;
         let mut grants = confirm.grants;
         let screens = confirm.screens.clone();
         let mut share = confirm.share.clone();
+        let mut chosen = confirm.chosen.clone();
+        let mut picking = confirm.picking;
         let mut outcome = None;
 
         /// A screen as somebody at this machine would recognise it.
@@ -2323,7 +2704,7 @@ impl GuestApp {
         fn describe(screen: &tain_core::protocol::DisplayInfo) -> String {
             let what = match &screen.monitor {
                 Some(monitor) => monitor.clone(),
-                None if screen.virtual_display => "Virtual display".to_string(),
+                None if screen.virtual_display => t!("display.virtual").to_string(),
                 None => format!("Screen {}", screen.id + 1),
             };
             let mut label =
@@ -2389,29 +2770,25 @@ impl GuestApp {
                 if choosable {
                     ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new("Permissions for connection:")
+                        egui::RichText::new(t!("approval.permissions"))
                             .size(12.5)
                             .strong()
                             .color(TEXT),
                     );
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Remote inputs:").size(12.0).color(TEXT));
+                    ui.label(
+                        egui::RichText::new(t!("approval.remote_inputs")).size(12.0).color(TEXT),
+                    );
                     ui.checkbox(
                         &mut grants.mouse,
-                        egui::RichText::new("Mouse + Touch").color(TEXT),
+                        egui::RichText::new(t!("approval.mouse")).color(TEXT),
                     )
-                    .on_hover_text(
-                        "Pointing at your screen, however they do it — a mouse, a \
-                         trackpad or a touchscreen are the same act.",
-                    );
+                    .on_hover_text(t!("approval.mouse_hint"));
                     ui.checkbox(
                         &mut grants.keyboard,
-                        egui::RichText::new("Keyboard").color(TEXT),
+                        egui::RichText::new(t!("approval.keyboard")).color(TEXT),
                     )
-                    .on_hover_text(
-                        "Typing into whatever has focus on this machine. \
-                         Revocable later from the connection strip.",
-                    );
+                    .on_hover_text(t!("approval.keyboard_hint"));
 
                     // # Screens as a row of monitors
                     //
@@ -2421,7 +2798,7 @@ impl GuestApp {
                     // it was hidden and why the single-screen case then said
                     // nothing at all.
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Displays:").size(12.0).color(TEXT));
+                    ui.label(egui::RichText::new(t!("approval.displays")).size(12.0).color(TEXT));
                     ui.add_space(2.0);
                     // # Wrapped, because a host can have a great many screens
                     //
@@ -2436,6 +2813,14 @@ impl GuestApp {
                     // line up; see `theme::display_button`.
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        // A window share has no screens in it, so the row is
+                        // shown as what it is: greyed, and not what this guest
+                        // is getting. Left visible rather than hidden — the
+                        // popup would jump, and the screens are what going back
+                        // means.
+                        if !chosen.is_empty() {
+                            ui.disable();
+                        }
                         let everything = screens.is_empty() || share.len() == screens.len();
 
                         let resp = theme::display_button(
@@ -2443,12 +2828,10 @@ impl GuestApp {
                             26.0,
                             egui::include_image!("../../assets/multimonitor.svg"),
                             None,
-                            Some("All"),
+                            Some(t!("approval.all_displays")),
                             everything,
                         );
-                        if resp
-                            .on_hover_text("Every screen, including any monitor plugged in later.")
-                            .clicked()
+                        if resp.on_hover_text(t!("approval.all_displays_hint")).clicked()
                         {
                             share = screens.iter().map(|d| d.id).collect();
                         }
@@ -2482,14 +2865,66 @@ impl GuestApp {
                         }
                     });
 
-                    if share.is_empty() {
+                    // # Particular windows instead, and it is a different
+                    // question
+                    //
+                    // Not more cells in the row above: picking windows is not
+                    // picking one more thing to share, it is choosing to share
+                    // *nothing else*. A screen grant answers "which of these may
+                    // they see"; this answers "may they see only these". Two
+                    // questions, so two controls, and the row above greys out
+                    // when this one has an answer.
+                    //
+                    // # Why a button and not a list here
+                    //
+                    // The list this replaces named each window in a line of
+                    // text, in a popup as wide as a card. That is the one thing
+                    // window names are worst at: four Explorer windows are four
+                    // folder names, three browser windows are three page
+                    // titles, and half of everything else says "Untitled". The
+                    // person choosing knows their window by sight, so the
+                    // choosing happens somewhere with room to show them — and
+                    // what stays here is the answer.
+                    ui.add_space(6.0);
+                    let count = chosen.len();
+                    // # The button says what it opens, not what the session
+                    // would show if it were never pressed
+                    //
+                    // It read "Whole screens" while nothing was chosen — true
+                    // about the session, and wrong on this control: a button
+                    // for picking windows that is labelled with a screens
+                    // answer looks like a screens control. What the session
+                    // will show is already visible in the row above, which is
+                    // lit while this is empty.
+                    //
+                    // Once something is chosen the count is the honest label,
+                    // because then the button *is* the answer.
+                    //
+                    // No symbol in front of it. `🗔` (U+1F5D4) has no glyph in
+                    // the bundled fonts and drew an empty box — see
+                    // `theme::tests::every_symbol_the_ui_draws_has_a_glyph`.
+                    let summary = if count == 0 {
+                        t!("approval.pick_individual").to_string()
+                    } else {
+                        tain_core::i18n::plural("approval.windows_chosen", count as u64, &[])
+                    };
+                    let open =
+                        egui::Button::new(egui::RichText::new(summary).size(12.5).color(TEXT))
+                            .min_size(egui::vec2(theme::PILL_W - 24.0, 24.0));
+                    if ui
+                        .add(open)
+                        .on_hover_text(t!("approval.one_window_hint"))
+                        .clicked()
+                    {
+                        picking = !picking;
+                    }
+
+                    if count == 0 && share.is_empty() {
                         ui.add_space(2.0);
                         ui.label(
-                            egui::RichText::new(
-                                "With none chosen they connect and see nothing.",
-                            )
-                            .size(11.0)
-                            .color(AMBER),
+                            egui::RichText::new(t!("approval.nothing_chosen"))
+                                .size(11.0)
+                                .color(AMBER),
                         );
                     }
                 } else if approving {
@@ -2498,13 +2933,20 @@ impl GuestApp {
                     // the part that outlives this connection.
                     ui.add_space(10.0);
                     ui.label(
-                        egui::RichText::new(
-                            "Allowing this makes the device trusted: it will connect \
-                             with the admin passcode from now on without asking, until \
-                             that passcode is reset.",
-                        )
-                        .size(12.0)
-                        .color(AMBER),
+                        egui::RichText::new(t!("approval.admin_is_remembered"))
+                            .size(12.0)
+                            .color(AMBER),
+                    );
+                } else if editing {
+                    // The admin case again, from the other side: this dialog
+                    // opened offering to change what the session sees, and an
+                    // admin session sees everything by the code it presented.
+                    // Saying so beats an empty dialog that looks broken.
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(t!("approval.admin_sees_everything"))
+                            .size(12.0)
+                            .color(AMBER),
                     );
                 }
 
@@ -2525,25 +2967,29 @@ impl GuestApp {
                         // and one of them is irreversible in the way that
                         // matters — anything seen during a session has been
                         // seen. So they do not merely differ in wording.
+                        //
+                        // Applying a change is green like allowing: it keeps
+                        // the session running, and the red one on this dialog
+                        // means "end it", which this button never does.
                         let go = egui::Button::new(
                             egui::RichText::new(format!("✔ {label}"))
                                 .color(egui::Color32::WHITE)
                                 .strong(),
                         )
-                        .fill(if approving { LIVE_GREEN } else { OFFLINE_RED })
+                        .fill(if approving || editing { LIVE_GREEN } else { OFFLINE_RED })
                         .min_size(egui::vec2(84.0, 26.0));
                         if ui.add(go).clicked() {
-                            outcome = Some(if approving {
-                                Outcome::Allow(grants)
-                            } else {
-                                Outcome::Deny
+                            outcome = Some(match confirm.action {
+                                ConfirmAction::Approve => Outcome::Allow(grants),
+                                ConfirmAction::Change => Outcome::Change(grants),
+                                ConfirmAction::Kick => Outcome::Deny,
                             });
                         }
 
                         if approving {
                             ui.add_space(10.0);
                             let no = egui::Button::new(
-                                egui::RichText::new("✖ deny")
+                                egui::RichText::new(format!("✖ {}", t!("approval.deny")))
                                     .color(egui::Color32::WHITE)
                                     .strong(),
                             )
@@ -2551,7 +2997,7 @@ impl GuestApp {
                             .min_size(egui::vec2(84.0, 26.0));
                             if ui
                                 .add(no)
-                                .on_hover_text("Refuse and disconnect this guest")
+                                .on_hover_text(t!("approval.deny_hint"))
                                 .clicked()
                             {
                                 outcome = Some(Outcome::Deny);
@@ -2561,10 +3007,192 @@ impl GuestApp {
                 });
             });
 
+        // # The picker opens *here*, after the dialog it belongs to
+        //
+        // Drawn last so it lands above the popup, and outside it so it is not
+        // clipped to a card's width — the whole point of it is having room the
+        // popup does not have.
+        //
+        // The list is read at the moment it opens rather than when the dialog
+        // did: those can be minutes apart while a guest waits, and a picker is
+        // asking about the desk as it is now.
+        if picking && !confirm.picking {
+            confirm.windows = Self::pickable(&chosen);
+            shots
+                .borrow_mut()
+                .refresh(ctx, confirm.windows.iter().map(|w| w.id).collect());
+        }
+        if picking {
+            picking = Self::show_window_picker(ctx, confirm, &mut chosen, shots);
+        }
+
         // Keep the checkbox state across frames while the popup is open.
         confirm.grants = grants;
         confirm.share = share;
+        confirm.chosen = chosen;
+        confirm.picking = picking;
         outcome
+    }
+
+    /// The windows to offer, with anything already chosen kept on the list.
+    ///
+    /// # Why the chosen ones are added back
+    ///
+    /// [`tain_core::window_capture::shareable`] answers "what could somebody
+    /// point at", which excludes minimised windows — they have no rectangle on
+    /// screen to point at. But a window already chosen and then minimised is
+    /// still a perfectly good choice, and dropping it from the list would
+    /// silently un-choose it: the person would close the picker having lost a
+    /// selection they never touched.
+    ///
+    /// One that has actually *closed* does drop out, because there is nothing
+    /// left to grant.
+    fn pickable(
+        chosen: &std::collections::BTreeSet<u64>,
+    ) -> Vec<tain_core::protocol::WindowInfo> {
+        let mut offered = tain_core::window_capture::shareable();
+        for id in chosen {
+            if offered.iter().any(|window| window.id == *id) {
+                continue;
+            }
+            if let Some(kept) = tain_core::window_capture::info_of(*id) {
+                offered.push(kept);
+            }
+        }
+        offered
+    }
+
+    /// The window picker. Returns whether it is still open.
+    fn show_window_picker(
+        ctx: &egui::Context,
+        confirm: &Confirm,
+        chosen: &mut std::collections::BTreeSet<u64>,
+        shots: &std::cell::RefCell<WindowShots>,
+    ) -> bool {
+        shots.borrow_mut().collect(ctx);
+
+        /// How wide one tile is, picture and caption alike.
+        const TILE: f32 = 172.0;
+        /// How tall the picture in it is. Not the window's aspect: the tiles
+        /// have to line up in a grid, and a portrait window beside a landscape
+        /// one would otherwise make a row of ragged heights. The picture is
+        /// fitted inside this and centred, so the shape is still visible.
+        const SHOT: f32 = 104.0;
+        /// Three tiles across, plus the gaps and the frame's own margins.
+        const WIDE: f32 = TILE * 3.0 + 12.0 * 2.0 + 24.0;
+
+        let mut open = true;
+        let mut still_picking = true;
+
+        egui::Window::new(t!("approval.pick_windows"))
+            .id(egui::Id::new(("window-picker", confirm.session_id)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(WIDE)
+            // Over the dialog that opened it, and over the cards: it is the
+            // thing being looked at while it is up.
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_width(WIDE);
+                ui.label(
+                    egui::RichText::new(t!("approval.pick_windows_hint"))
+                        .size(11.5)
+                        .color(TEXT_DIM),
+                );
+                ui.add_space(8.0);
+
+                if confirm.windows.is_empty() {
+                    ui.label(
+                        egui::RichText::new(t!("approval.no_windows")).size(12.0).color(TEXT_DIM),
+                    );
+                } else {
+                    // Bounded, because a busy desk has more windows than a
+                    // screen has room for — and this opens in the middle of
+                    // one.
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                            for window in &confirm.windows {
+                                let on = chosen.contains(&window.id);
+                                let shots = shots.borrow();
+                                let tile = theme::window_tile(
+                                    ui,
+                                    TILE,
+                                    SHOT,
+                                    shots.of(window.id),
+                                    shots.waiting_for(window.id),
+                                    &window.app,
+                                    &window.title,
+                                    on,
+                                );
+                                drop(shots);
+                                // The full caption, which the tile elides: a
+                                // browser's is a sentence and the tile is not.
+                                if tile.on_hover_text(&window.title).clicked() {
+                                    if on {
+                                        chosen.remove(&window.id);
+                                    } else {
+                                        chosen.insert(window.id);
+                                    }
+                                }
+                            }
+                        });
+                    });
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    // # Going back to screens is a button, not an empty
+                    // selection
+                    //
+                    // Un-ticking the last window does leave the screens on
+                    // offer again, but nothing about a grid of unticked tiles
+                    // says so. This is the sentence that does.
+                    let mut back = egui::Button::new(
+                        egui::RichText::new(t!("approval.whole_screens")).size(12.0),
+                    );
+                    if chosen.is_empty() {
+                        back = back.fill(SELECT_BLUE);
+                    }
+                    if ui.add(back).on_hover_text(t!("approval.whole_screens_hint")).clicked() {
+                        chosen.clear();
+                        still_picking = false;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let done = egui::Button::new(
+                            egui::RichText::new(t!("approval.pick_done"))
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(LIVE_GREEN)
+                        .min_size(egui::vec2(84.0, 26.0));
+                        if ui.add(done).clicked() {
+                            still_picking = false;
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(tain_core::i18n::plural(
+                                "approval.windows_chosen",
+                                chosen.len() as u64,
+                                &[],
+                            ))
+                            .size(11.5)
+                            .color(if chosen.is_empty() { TEXT_DIM } else { TEXT }),
+                        );
+                    });
+                });
+            });
+
+        // Escape closes it, like every other transient thing in this interface.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            still_picking = false;
+        }
+        open && still_picking
     }
 
     /// Act on an answer, and take the popup away.
@@ -2576,21 +3204,24 @@ impl GuestApp {
 
         match outcome {
             Outcome::Allow(grants) => {
-                // Every screen chosen means *all*, not "these ones that happen
-                // to be all of them": a monitor plugged in later should follow
-                // what was meant rather than be silently excluded.
-                let displays = if confirm.screens.is_empty()
-                    || confirm.share.len() == confirm.screens.len()
-                {
-                    tain_core::protocol::DisplayGrant::All
-                } else {
-                    tain_core::protocol::DisplayGrant::Only(
-                        confirm.share.iter().copied().collect(),
-                    )
-                };
+                let displays = confirm.granted();
                 self.resolve_approval(session_id, ApprovalDecision::Allow { grants, displays });
             }
             Outcome::Deny => self.resolve_approval(session_id, ApprovalDecision::Deny),
+            // # Two commands, not one decision
+            //
+            // The session is already running and was already approved, so there
+            // is no oneshot waiting for an answer — these are edits to something
+            // live. Sent separately because they are separate: the input grants
+            // travel as `ControlState` and what may be seen as `SharedChanged`,
+            // and a guest can legitimately receive one without the other.
+            Outcome::Change(grants) => {
+                self.send(HostCommand::SetSessionControl { session_id, grants });
+                self.send(HostCommand::SetSessionDisplays {
+                    session_id,
+                    displays: confirm.granted(),
+                });
+            }
         }
     }
 
@@ -2618,7 +3249,7 @@ impl GuestApp {
             // which an earlier attempt did — floated the Connect row into the
             // gap between the two Host rows and put the titles at different
             // heights from each other.
-            section_label(ui, "Host:", BUTTON_HEIGHT);
+            section_label(ui, t!("header.host"), BUTTON_HEIGHT);
             ui.add_space(4.0);
 
             ui.vertical(|ui| {
@@ -2631,7 +3262,7 @@ impl GuestApp {
             theme::header_separator(ui);
             ui.add_space(12.0);
 
-            section_label(ui, "Connect:", BUTTON_HEIGHT);
+            section_label(ui, t!("header.connect"), BUTTON_HEIGHT);
             ui.add_space(4.0);
 
             ui.vertical(|ui| {
@@ -2651,13 +3282,24 @@ impl GuestApp {
                     if theme::labelled_button(
                         ui,
                         egui::vec2(btn_w, BUTTON_HEIGHT),
-                        if btn_w >= 200.0 { "Paste passcode" } else { "Paste" },
+                        // Measured, not a threshold read off the English text
+                        // — see `render_passcode_row` for the same reasoning.
+                        if theme::text_fits(
+                            ui,
+                            t!("header.paste"),
+                            &egui::FontId::proportional(13.0),
+                            (btn_w - 38.0).max(0.0),
+                        ) {
+                            t!("header.paste")
+                        } else {
+                            t!("header.paste_short")
+                        },
                         egui::include_image!("../../assets/paste_passcode.svg"),
                         GUEST_FILL,
                         stroke,
                         true,
                     )
-                    .on_hover_text("Read a connection code from the clipboard")
+                    .on_hover_text(t!("header.paste_hint"))
                     .clicked()
                     {
                         edits.paste_passcode = true;
@@ -2711,9 +3353,9 @@ impl GuestApp {
 
                     if resp
                         .on_hover_text(match (has_code, checking) {
-                            (false, _) => "Paste a connection code first",
-                            (true, true) => "Checking that this host is reachable...",
-                            (true, false) => "Open a session with this host",
+                            (false, _) => t!("header.paste_first"),
+                            (true, true) => t!("header.checking_host"),
+                            (true, false) => t!("header.open_session"),
                         })
                         .clicked()
                     {
@@ -2730,9 +3372,8 @@ impl GuestApp {
                     (Some(e), _) => (e.clone(), OFFLINE_RED),
                     (None, Some((text, colour))) => (text, colour),
                     (None, None) => match self.sessions.len() {
-                        0 => ("No sessions".to_string(), TEXT_DIM),
-                        1 => ("1 session open".to_string(), LIVE_GREEN),
-                        n => (format!("{n} sessions open"), LIVE_GREEN),
+                        0 => (t!("incoming.no_sessions").to_string(), TEXT_DIM),
+                        n => (t!("incoming.sessions_open", count = n), LIVE_GREEN),
                     },
                 };
                 ui.label(egui::RichText::new(text).size(11.0).color(colour));
@@ -2746,7 +3387,7 @@ impl GuestApp {
                     ui,
                     22.0,
                     egui::include_image!("../../assets/settings.svg"),
-                    "Settings",
+                    t!("header.settings"),
                 )
                 .clicked()
                 {
@@ -2771,19 +3412,39 @@ impl GuestApp {
             t == typ && at.elapsed() < std::time::Duration::from_millis(1200)
         });
 
-        // Drop to the short form rather than letting the label overrun the button.
-        let roomy = width >= 200.0;
-        let (label, fill, stroke) = match (typ, roomy) {
-            (PasscodeType::Master, true) => ("Copy admin passcode", ADMIN_FILL, ADMIN_STROKE),
-            (PasscodeType::Master, false) => ("Copy admin", ADMIN_FILL, ADMIN_STROKE),
-            (PasscodeType::Guest, true) => ("Copy guest passcode", GUEST_FILL, GUEST_STROKE),
-            (PasscodeType::Guest, false) => ("Copy guest", GUEST_FILL, GUEST_STROKE),
+        // # The long form if it fits, measured rather than guessed
+        //
+        // This used to be `width >= 200.0`, a threshold read off the English
+        // strings — which says nothing about a language whose translation of
+        // the same words is half again as long. Asking whether the text fits
+        // is the question the threshold was standing in for, and it is the
+        // same question in every language.
+        let font = egui::FontId::proportional(13.0);
+        // What `labelled_button` leaves for the label: the inset, the icon and
+        // the gap before it.
+        let room = (width - 12.0 - 18.0 - 8.0).max(0.0);
+        let roomy = |long: &str| theme::text_fits(ui, long, &font, room);
+
+        let (long, short, fill, stroke) = match typ {
+            PasscodeType::Master => (
+                t!("header.copy_admin"),
+                t!("header.copy_admin_short"),
+                ADMIN_FILL,
+                ADMIN_STROKE,
+            ),
+            PasscodeType::Guest => (
+                t!("header.copy_guest"),
+                t!("header.copy_guest_short"),
+                GUEST_FILL,
+                GUEST_STROKE,
+            ),
         };
-        let label = if recently_copied {
-            if roomy { "Copied to clipboard" } else { "Copied" }
+        let (long, short) = if recently_copied {
+            (t!("header.copied"), t!("header.copied_short"))
         } else {
-            label
+            (long, short)
         };
+        let label = if roomy(long) { long } else { short };
         let stroke = if recently_copied { LIVE_GREEN } else { stroke };
 
         ui.horizontal(|ui| {
@@ -2798,10 +3459,21 @@ impl GuestApp {
             // So it is not a button that can be hit by accident. See
             // [`theme::slide_to_reveal`] for why a drag and not a dialog.
             if typ == PasscodeType::Master && !self.admin_cover.is_open() {
+                // Measured against the slider's own geometry and its own text
+                // size, not the copy button's. Sharing `roomy` was wrong twice
+                // over — a different string, at a different size — which is how
+                // a Russian instruction came to sit hard against both edges of
+                // a slider the copy label fitted comfortably.
+                let cover = egui::vec2(width, BUTTON_HEIGHT);
+                let long = t!("header.reveal_admin");
                 let outcome = theme::slide_to_reveal(
                     ui,
-                    egui::vec2(width, BUTTON_HEIGHT),
-                    if roomy { "Slide to reveal admin passcode" } else { "Slide to reveal" },
+                    cover,
+                    if theme::slider_label_fits(ui, long, cover) {
+                        long
+                    } else {
+                        t!("header.reveal_admin_short")
+                    },
                     self.admin_cover.progress,
                 );
                 edits.admin_slider = Some(outcome.progress);
@@ -2832,10 +3504,12 @@ impl GuestApp {
             // there is no code to copy.
             let resp = match (&code, self.state.host.error.lock().unwrap().clone()) {
                 (Some(_), _) => {
-                    resp.on_hover_text("Copy this code and send it to the other machine")
+                    resp.on_hover_text(t!("header.copy_hint"))
                 }
-                (None, Some(e)) => resp.on_hover_text(format!("Host server is offline — {e}")),
-                (None, None) => resp.on_hover_text("No code generated yet"),
+                (None, Some(e)) => {
+                    resp.on_hover_text(t!("header.host_offline", reason = e))
+                }
+                (None, None) => resp.on_hover_text(t!("header.no_code")),
             };
 
             if resp.clicked()
@@ -2859,13 +3533,13 @@ impl GuestApp {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
                 ui.label(
-                    egui::RichText::new("No previous connections yet.")
+                    egui::RichText::new(t!("previous.none"))
                         .size(13.0)
                         .color(TEXT_DIM),
                 );
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("Hosts you connect to will be saved here.")
+                    egui::RichText::new(t!("previous.saved_here"))
                         .size(11.0)
                         .color(SEPARATOR),
                 );
@@ -3007,7 +3681,7 @@ impl GuestApp {
             );
             if forget_ui
                 .small_button("×")
-                .on_hover_text("Forget this host, and the code saved with it")
+                .on_hover_text(t!("previous.forget"))
                 .clicked()
             {
                 edits.forget.push(conn.endpoint_id.clone());
@@ -3050,18 +3724,18 @@ impl GuestApp {
             theme::play_triangle(ui, tri, conn.status.accent());
 
             let resp = resp.on_hover_text(match conn.status {
-                ConnectionStatus::Ready => "Connect",
-                ConnectionStatus::Unknown => "Connect — this host has not been checked yet",
-                ConnectionStatus::Failed => "Try again",
-                ConnectionStatus::Online => "Already connected",
-                ConnectionStatus::Connecting | ConnectionStatus::Waiting => "Connecting…",
+                ConnectionStatus::Ready => t!("previous.connect"),
+                ConnectionStatus::Unknown => t!("previous.connect_unchecked"),
+                ConnectionStatus::Failed => t!("previous.try_again"),
+                ConnectionStatus::Online => t!("previous.already_connected"),
+                ConnectionStatus::Connecting | ConnectionStatus::Waiting => {
+                    t!("previous.connecting")
+                }
                 // Both of these still offer the attempt: the check is a snapshot
                 // and the host may have come back since.
-                ConnectionStatus::Stale => "Try anyway — this code looked expired a moment ago",
-                ConnectionStatus::Unreachable => "Try anyway — this host did not answer",
-                ConnectionStatus::NoCode => {
-                    "No saved code for this host — paste a fresh one to connect"
-                }
+                ConnectionStatus::Stale => t!("previous.try_anyway_expired"),
+                ConnectionStatus::Unreachable => t!("previous.try_anyway_unreachable"),
+                ConnectionStatus::NoCode => t!("previous.no_saved_code"),
             });
             if resp.clicked() {
                 edits.reconnect = Some(conn.endpoint_id.clone());
@@ -3083,7 +3757,7 @@ impl GuestApp {
 
         if incoming.is_empty() {
             ui.label(
-                egui::RichText::new("No incoming connections.")
+                egui::RichText::new(t!("incoming.none"))
                     .size(12.0)
                     .color(TEXT_DIM),
             );
@@ -3155,7 +3829,8 @@ impl GuestApp {
             .inner_margin(egui::Margin::symmetric(MARGIN.x, MARGIN.y))
             .begin(ui);
 
-        {
+        let id = ui.make_persistent_id(("incoming-card", conn.session_id));
+        let card_resp = {
             let ui = &mut card.content_ui;
             // # Fixed, not merely a minimum
             //
@@ -3167,6 +3842,19 @@ impl GuestApp {
             let width = theme::PILL_W - MARGIN.x * 2.0;
             ui.set_min_size(egui::vec2(width, PILL_HEIGHT - MARGIN.y * 2.0));
             ui.set_max_width(width);
+
+            // # The card senses clicks *before* the controls on it
+            //
+            // egui resolves overlapping click targets by taking the last one
+            // registered, so a card-sized interaction added after its contents
+            // covers every button on it. That is what happened when the card
+            // became clickable: the kick control stopped responding, because
+            // the card was swallowing its clicks.
+            //
+            // Registered first, it is underneath, and each control added below
+            // takes its own clicks back. What is left for the card is the space
+            // between them, which is what "click the card" ever meant.
+            let card_resp = ui.interact(ui.max_rect(), id, egui::Sense::click());
 
             ui.horizontal(|ui| {
                 // The person icon *is* the accept/remove control. Pending
@@ -3194,9 +3882,9 @@ impl GuestApp {
                 }
                 if icon_resp
                     .on_hover_text(if pending {
-                        "Waiting for you — click to decide"
+                        t!("incoming.waiting_click")
                     } else {
-                        "Disconnect this guest"
+                        t!("incoming.disconnect")
                     })
                     .clicked()
                 {
@@ -3216,7 +3904,7 @@ impl GuestApp {
                     format!("{}\n", conn.display_name)
                 };
                 if pending {
-                    hover.push_str("Waiting for your decision — nothing shared yet");
+                    hover.push_str(t!("incoming.waiting_nothing_shared"));
                 } else {
                     hover.push_str(describe_grants(conn.mouse_allowed, conn.keyboard_allowed));
                     if conn.name_is_self_reported {
@@ -3248,7 +3936,7 @@ impl GuestApp {
                 match conn.status {
                     ApprovalStatus::Pending => {
                         ui.add(egui::Spinner::new().size(14.0).color(TEXT_DIM))
-                            .on_hover_text("Nothing is being shared until you decide");
+                            .on_hover_text(t!("incoming.nothing_until_you_decide"));
                     }
                     ApprovalStatus::Allowed => {
                         theme::icon(
@@ -3269,10 +3957,10 @@ impl GuestApp {
                     22.0,
                     kbd,
                     match (pending, keyboard_on) {
-                        (true, true) => "Offered in the dialog above — not granted until you allow",
-                        (true, false) => "Decide whether to allow this connection",
-                        (false, true) => "Keyboard allowed — click to revoke",
-                        (false, false) => "Keyboard blocked — click to allow",
+                        (true, true) => t!("incoming.offered_not_granted"),
+                        (true, false) => t!("incoming.decide_first"),
+                        (false, true) => t!("incoming.keyboard_allowed"),
+                        (false, false) => t!("incoming.keyboard_blocked"),
                     },
                 )
                 .clicked()
@@ -3300,10 +3988,10 @@ impl GuestApp {
                     22.0,
                     mouse,
                     match (pending, mouse_on) {
-                        (true, true) => "Offered in the dialog above — not granted until you allow",
-                        (true, false) => "Decide whether to allow this connection",
-                        (false, true) => "Mouse allowed — click to revoke",
-                        (false, false) => "Mouse blocked — click to allow",
+                        (true, true) => t!("incoming.offered_not_granted"),
+                        (true, false) => t!("incoming.decide_first"),
+                        (false, true) => t!("incoming.mouse_allowed"),
+                        (false, false) => t!("incoming.mouse_blocked"),
                     },
                 )
                 .clicked()
@@ -3319,7 +4007,8 @@ impl GuestApp {
                 }
                 });
             });
-        }
+            card_resp
+        };
 
         // # The rectangle comes from the frame, not from its contents
         //
@@ -3332,7 +4021,6 @@ impl GuestApp {
         // card. It is only known afterwards, so the hover that decides the fill
         // is remembered from the previous frame: a frame of lag on a background
         // tint is not perceptible, and being right about the shape is.
-        let id = ui.make_persistent_id(("incoming-card", conn.session_id));
         let was_hovered = ui.data(|d| d.get_temp::<bool>(id).unwrap_or(false));
         card.frame = card.frame.fill(if was_hovered { CARD_BG_HOVER } else { CARD_BG });
         if !pending {
@@ -3340,11 +4028,10 @@ impl GuestApp {
         }
         let rect = card.end(ui).rect;
 
-        // The whole card decides, not only the person on it. Someone looking at
-        // a card that says it is waiting for them will click the card.
-        let sense = if pending { egui::Sense::click() } else { egui::Sense::hover() };
-        let card_resp = ui.interact(rect, id, sense);
-        ui.data_mut(|d| d.insert_temp(id, card_resp.hovered()));
+        // Hovering anywhere on the card tints it, including over the controls —
+        // `contains_pointer` is true for everything under the pointer, unlike a
+        // click, which goes to exactly one of them.
+        ui.data_mut(|d| d.insert_temp(id, card_resp.contains_pointer()));
         // On the card rather than on a control, because it describes the whole
         // connection rather than anything that can be clicked. Withheld while
         // empty: an established session that has not reported yet would
@@ -3353,7 +4040,10 @@ impl GuestApp {
             card_resp.clone().on_hover_text(&conn.link);
         }
         if card_resp.clicked() {
-            edits.confirm.push((conn.session_id, ConfirmAction::Approve));
+            edits.confirm.push((
+                conn.session_id,
+                if pending { ConfirmAction::Approve } else { ConfirmAction::Change },
+            ));
         }
 
         if pending {
@@ -3466,12 +4156,12 @@ fn bitrate_label(kbps: u32) -> String {
 
 /// Plain-language summary of a session's input permissions.
 pub fn describe_grants(mouse: bool, keyboard: bool) -> &'static str {
-    match (mouse, keyboard) {
-        (true, true) => "full control",
-        (true, false) => "mouse only",
-        (false, true) => "keyboard only",
-        (false, false) => "view-only",
-    }
+    t!(match (mouse, keyboard) {
+        (true, true) => "grants.full",
+        (true, false) => "grants.mouse_only",
+        (false, true) => "grants.keyboard_only",
+        (false, false) => "grants.view_only",
+    })
 }
 
 impl GuestApp {
@@ -3514,7 +4204,7 @@ impl GuestApp {
 
         info!("Closing — telling {} connected guest(s)", live.len());
         for id in live {
-            sessions.kick(id, "the host closed Tain");
+            sessions.kick(id, tain_core::protocol::end_reason::HOST_CLOSED);
         }
         std::thread::sleep(GRACE);
     }
@@ -3727,6 +4417,12 @@ impl eframe::App for GuestApp {
     /// one it was.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.say_goodbye_to_guests();
+        // Before anything slow, because this is the one that decides whether
+        // the machine is reachable in a moment's time. Closing this window used
+        // to take unattended access down with it: the service went on yielding
+        // to a host that no longer existed, and the only way back was to restart
+        // the service. See `stopped_hosting`.
+        stopped_hosting(&self.state);
         // A virtual display belongs to the application that put it on the
         // desktop, and this is that application closing. Leaving it behind
         // gives somebody a screen they cannot see, cannot use and have nothing
@@ -3811,7 +4507,7 @@ impl eframe::App for GuestApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Previous connections:")
+                        egui::RichText::new(t!("previous.title"))
                             .size(14.0)
                             .strong()
                             .color(TEXT),
@@ -3821,7 +4517,7 @@ impl eframe::App for GuestApp {
                     // promise something narrower than what happens.
                     if ui
                         .add(egui::Button::new(
-                            egui::RichText::new("Check again").size(12.0).color(TEXT_DIM),
+                            egui::RichText::new(t!("previous.check_again")).size(12.0).color(TEXT_DIM),
                         ))
                         .on_hover_text(
                             "Ask every host on this list whether it is reachable, now. \
@@ -3861,6 +4557,19 @@ impl eframe::App for GuestApp {
                 &mut self.settings_panel,
             );
             if changed {
+                // # The language is applied here and not on settle
+                //
+                // Everything else in this window is a *setting* — something the
+                // host does differently from now on — and those wait for the
+                // user to stop fiddling before anything is rebuilt. The
+                // language is not that. It is what this window is written in,
+                // and one that waited even a quarter of a second would read as
+                // a choice that did not take.
+                //
+                // It was worse than that until now: nothing applied it at all
+                // outside `main`, so picking a language did nothing until the
+                // application was restarted.
+                tain_core::i18n::follow(&settings.language);
                 // The edit is visible immediately, but writing it to disk and
                 // rebuilding the capture pipeline wait for the user to settle —
                 // see `settings_settling`.
@@ -4732,6 +5441,160 @@ mod tests {
         );
         assert!(dialog.grants.mouse);
         assert!(!dialog.grants.keyboard);
+    }
+
+    /// A window a person could not point at is not offered — but one they
+    /// already picked stays picked.
+    ///
+    /// # The bug this exists to prevent
+    ///
+    /// The offered list is "what could somebody click on", which excludes
+    /// minimised windows: they have no rectangle on screen. Somebody picking a
+    /// window and then minimising it — putting the spreadsheet away while they
+    /// finish reading the request — would reopen the picker to find it gone,
+    /// and would have granted one window fewer than they thought.
+    #[test]
+    fn a_chosen_window_stays_on_the_list_after_it_is_minimised() {
+        // Whatever is actually open on the machine running this.
+        let live = tain_core::window_capture::shareable();
+        let offered = GuestApp::pickable(&std::collections::BTreeSet::new());
+        assert_eq!(
+            offered.len(),
+            live.len(),
+            "with nothing chosen, the picker offers exactly what can be pointed at"
+        );
+
+        // A handle that is not open and never was. It cannot be described, so
+        // it drops out — a window that has *closed* has nothing left to grant.
+        let gone: std::collections::BTreeSet<u64> = std::iter::once(u64::MAX).collect();
+        let after = GuestApp::pickable(&gone);
+        assert_eq!(
+            after.len(),
+            live.len(),
+            "a window that has closed cannot be kept on the list, chosen or not"
+        );
+
+        // And a window that *is* open is only ever listed once, however it got
+        // there — the two sources must not produce a duplicate tile.
+        if let Some(first) = live.first() {
+            let chosen: std::collections::BTreeSet<u64> = std::iter::once(first.id).collect();
+            let listed = GuestApp::pickable(&chosen);
+            assert_eq!(
+                listed.iter().filter(|window| window.id == first.id).count(),
+                1,
+                "{} was offered twice, so ticking one tile would leave the other unticked",
+                first.title
+            );
+        }
+    }
+
+    /// What the dialog's answers add up to, for each shape of answer.
+    ///
+    /// # Why the order of the windows is asserted
+    ///
+    /// The first window in the grant is the one the session opens on. Collected
+    /// from the chosen set directly it would come out in handle order, which is
+    /// whatever numbers Windows happened to hand out — so the guest would open
+    /// on an apparently random one of the windows, and no arrangement of the
+    /// picker could change that.
+    #[test]
+    fn the_dialog_grants_windows_in_the_order_they_were_offered() {
+        fn window(id: u64, app: &str) -> tain_core::protocol::WindowInfo {
+            tain_core::protocol::WindowInfo {
+                id,
+                app: app.into(),
+                title: format!("{app} — something"),
+                width: 800,
+                height: 600,
+            }
+        }
+
+        let mut dialog = Confirm::new(1, "Guest".into(), false, ConfirmAction::Approve);
+        // Listed alphabetically, as the picker lists them; the handles run the
+        // other way, which is what makes this test say something.
+        dialog.windows = vec![window(900, "Excel"), window(300, "chrome"), window(600, "Notepad")];
+        dialog.chosen = [600, 900].into_iter().collect();
+
+        assert_eq!(
+            dialog.granted(),
+            tain_core::protocol::DisplayGrant::Windows(vec![900, 600]),
+            "the grant has to follow the list somebody read, not the handle numbers"
+        );
+
+        // And the screens are not in it, whatever was ticked above.
+        dialog.share = [0, 1].into_iter().collect();
+        assert_eq!(
+            dialog.granted(),
+            tain_core::protocol::DisplayGrant::Windows(vec![900, 600]),
+            "choosing windows means choosing nothing else — that is the whole point"
+        );
+
+        // Nothing chosen goes back to the screens.
+        dialog.chosen.clear();
+        assert!(matches!(
+            dialog.granted(),
+            tain_core::protocol::DisplayGrant::All | tain_core::protocol::DisplayGrant::Only(_)
+        ));
+    }
+
+    /// The picker draws, and stays the width it asked for.
+    ///
+    /// # Why the width is what is asserted
+    ///
+    /// The tiles are a fixed size and there are three to a row, so the window
+    /// has one correct width and a grid that fits it. A tile that measured
+    /// wider than it draws — a long window title escaping its elision, most
+    /// likely — would push the row out and take the window with it, and the
+    /// symptom on screen is a picker wider than the screen it opens on.
+    ///
+    /// Drawing it at all is the other half: the tiles are painted by hand from
+    /// a texture that may not exist yet, and this is what runs that path.
+    #[test]
+    fn the_window_picker_draws_within_the_width_it_asked_for() {
+        let ctx = egui::Context::default();
+        let mut confirm = Confirm::new(4, "Guest".into(), false, ConfirmAction::Approve);
+        // Whatever is open on the machine running this, plus one with a caption
+        // long enough to overflow any tile — which is an ordinary browser tab,
+        // not a contrivance.
+        confirm.windows = GuestApp::pickable(&std::collections::BTreeSet::new());
+        confirm.windows.push(tain_core::protocol::WindowInfo {
+            id: 1,
+            app: "a-program-with-a-very-long-name-indeed".into(),
+            title: "A window caption of the sort a browser puts on a tab, which runs on and \
+                    on and has no reason ever to stop"
+                .into(),
+            width: 1920,
+            height: 1080,
+        });
+
+        let shots = std::cell::RefCell::new(WindowShots::default());
+        let mut chosen: std::collections::BTreeSet<u64> =
+            confirm.windows.last().map(|w| w.id).into_iter().collect();
+
+        // Twice: egui sizes a window from what it measured on the frame before.
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                GuestApp::show_window_picker(ctx, &confirm, &mut chosen, &shots);
+            });
+        }
+
+        let rect = ctx
+            .memory(|m| m.area_rect(egui::Id::new(("window-picker", confirm.session_id))))
+            .expect("the picker should have been laid out");
+        // Three tiles, their gaps and the frame's margins, plus room for the
+        // frame's own decoration.
+        assert!(
+            rect.width() <= 600.0,
+            "the picker widened to {:.0} points — a tile is measuring wider than it draws",
+            rect.width()
+        );
+        // And it does not run off the bottom of an ordinary screen either: the
+        // grid scrolls inside a bounded area rather than growing.
+        assert!(
+            rect.height() <= 700.0,
+            "the picker grew to {:.0} points tall, so the grid is not scrolling",
+            rect.height()
+        );
     }
 
     #[test]

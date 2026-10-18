@@ -1006,6 +1006,12 @@ true whichever way the bytes arrive.
 
 ## Tain Writes Its Own Graphics Preference Rather Than Explaining One
 
+> **Reversed.** The write is gone — see *Capture Where the Desktop Is, Encode on
+> the Best Chip* below, which explains what it cost. The reasoning here is kept
+> because the failure it describes is real and the diagnosis was right; only the
+> remedy was wrong.
+
+
 **Problem**: on a laptop with two graphics chips, hosting failed outright and no
 amount of care inside the capture code could fix it. The report that finally
 explained it:
@@ -1237,3 +1243,1480 @@ was being shared.
 card's mouse mark immediately, with a tooltip saying it is offered rather than
 granted — the two used to disagree while a decision was open, the card showing
 the grants the session actually had and the popup showing what was proposed.
+
+
+## The One String That Crosses the Wire Is a Code, Not a Sentence
+
+Every other piece of text in Tain is written on the machine that shows it, so
+translating it is a local matter. `SessionEnd.reason` was the exception: the
+host composed a sentence and the guest printed it. That is invisible while both
+ends speak English and wrong the moment they do not — a Russian host telling an
+English guest, in Russian, that it would not allow the connection. No amount of
+catalogue work fixes it, because the words are chosen on the wrong machine.
+
+**Decision**: `reason` carries one of the codes in `protocol::end_reason`, and
+each end renders it through its own catalogue as `end.<code>`.
+
+**There was never anything dynamic to preserve.** The reasons are fixed
+sentences with, at most, a value or two to name: a display, an adapter setting,
+the operating system's own account of a failure. So the code travels with
+`args`, a list of named values for the placeholders in whichever catalogue ends
+up rendering it — and a value nobody can translate, like an OS error, is a value
+rather than part of the words.
+
+**`invalid_passcode` was already a code**, and had been since the first version
+of the protocol. It was the one reason the guest already rewrote into a sentence
+of its own, in `explain_session_end`, because "Failed: invalid_passcode" sent
+people hunting for a bug that wasn't there. That function now does for every
+code what it used to do for one.
+
+**A code with no entry still reads as an ending.** An older build talking to a
+newer one will meet reasons it has never heard of, so an unmatched code falls
+through to `end.unknown`, which says a session ended and quotes what it was
+told. The alternative — printing the bare code — is precisely the failure this
+replaced.
+
+**The wire format changed.** `args` is a new field, and bincode is not
+self-describing, so old and new builds cannot talk to each other. That is
+acceptable exactly once, before there are versions in the wild, and it is the
+reason to do it now rather than after.
+
+### The Wrong-GPU Remedy Is the Case That Proves It
+
+The failure worth the most words is a laptop with two graphics chips where the
+desktop belongs to one and Tain was started on the other. `gpu_preference`
+explains it at length; what matters here is who reads the explanation. It is
+four paragraphs about the *host's* Windows settings, and the only screen it ever
+reaches is the *guest's* — the host writes it to a log and hands it to the
+session, which sends it on. Written as prose it was therefore prose in the wrong
+language by construction, and no catalogue could have fixed it.
+
+**Decision**: `screen_capture::Remedy` carries the code and its arguments, and
+travels up the error chain as a typed link.
+
+**A link, not a context.** Session start wraps this error in more context before
+anything looks at it, and anyhow's chain yields the wrappers rather than what
+they wrap. `Remedy::in_chain` finds it by type at any depth, which
+`downcast_ref` on the outermost context would not — the same reason
+`DesktopOnAnotherGpu` is a real error type rather than a recognisable sentence.
+
+**Five endings, not one with a value substituted.** They differ in what is left
+to do: Tain has already asked for the other chip and needs a restart; it just
+asked; it wanted to and the registry refused; it is already on the chip that
+usually fixes this, so the fault is elsewhere; or somebody deliberately put it
+on the discrete one, which is not this program's to undo. Two of those were one
+sentence with `{current}` substituted into it, and the substituted value was
+itself a phrase needing translation — a placeholder holding a translatable
+string is a rendering problem with no clean end, and two codes have none.
+
+**`Display` renders English, and only the log reads it.** A sentence shown
+translated and also logged is looked up twice, once each way — `i18n::in_english`
+exists for exactly this. A log in a language the maintainer cannot read is
+materially harder to help with, and every diagnosis of this particular fault so
+far has begun with a log file.
+
+
+## Text Nothing Displays and Keys Nothing Defines Are Both Bugs
+
+Translating the application twice still left English on a Russian settings
+panel. A missing key is not a compile error and not a panic: `i18n::text` falls
+back to English, and English falls back to the key itself, so the failure is a
+string that looks right to the person who wrote it and wrong only on the screen
+where it appears — in the language nobody testing it reads.
+
+**Decision**: `tests/i18n_keys.rs` reads the workspace's sources, extracts every
+key named as a literal — including the `i18n::text(match self { … })` shape that
+most of them use — and fails if the English catalogue does not have it.
+
+**English, not every language.** An unfinished translation is usable and
+welcome; `every_language_reports_what_it_is_missing` prints what each one still
+lacks without failing. A key *no* catalogue has is a different thing: it is a
+key that will show on screen as itself, and it can only have come from this
+repository.
+
+**The reverse direction prints rather than asserts.** An entry nothing names may
+be perfectly alive — built at run time, or held in a table of keys the scan
+cannot follow. Reporting them found one that was genuinely stale, a duplicate of
+a warning already in the file; asserting on them would have been noise.
+
+
+## An Encoder Held Its Own Event Generator While Shutting Itself Down
+
+Roughly one run in ten of `cargo test -p tain-core` never finished. The process
+sat at no CPU with 141 threads until something killed it — twice for over an
+hour, holding the build lock the whole time, with nothing anywhere saying why.
+
+**What it is.** Measured rather than guessed, over about three hundred runs:
+
+| what was run | hung |
+| --- | --- |
+| the whole suite | 5 / 30 |
+| the whole suite without `codec_mf` | 0 / 25 |
+| `codec_mf` on its own | 0 / 50 |
+| the whole suite, one thread | 2 / 30 |
+| the whole suite, one encoder test left in it | 3 / 30 |
+
+So `codec_mf` is necessary and not sufficient: it stalls only alongside the rest
+of the suite, and no single other module is required — dropping `local_input`,
+dropping every other GPU module, or running strictly serially all still stall.
+The stuck test is always one that activates a Media Foundation transform, and
+almost always `a_size_the_gpu_cannot_take_degrades_to_the_cpu_instead_of_failing`.
+
+**Where it is not.** The encode loop was the obvious suspect and is not it:
+`encode_frame` polls with `MF_EVENT_FLAG_NO_WAIT` and gives up after
+`ENCODER_STALL_TIMEOUT`, so it cannot block indefinitely. That left
+`ActivateObject` and `ShutdownObject`, and no way to tell which — a thread
+blocked inside a driver is not unwinding, has no symbols, and cannot be asked
+where it is without a debugger attached to a process that is already wedged.
+
+**So the watchdog was given breadcrumbs.** `Guard::at` records what is about to
+be attempted; the abort quotes it. Two reproductions, both the same:
+
+    watchdog: a_size_the_gpu_cannot_take_degrades_to_the_cpu has been stuck for 60s
+    It got as far as: dropping the encoder — ShutdownObject
+
+**What it was.** Teardown, and two things wrong with it, both about what the
+transform was still holding when it was asked to shut down.
+
+*Nothing flushed.* `encode_frame` takes only the output already queued and
+leaves the rest for the next frame, so an encoder dropped mid-stream leaves the
+transform holding samples it has finished with, signalled, and that nobody will
+ever collect. `MFT_MESSAGE_COMMAND_FLUSH` is what abandons those, and it is the
+counterpart to the flush the encoder already sends when it *starts* streaming.
+Only the two end-of-stream messages were being sent.
+
+*The event generator outlived the transform.* Rust drops fields in declaration
+order, and `activated` is declared before `events`. So `ShutdownObject` ran
+while the struct still held a live `IMFMediaEventGenerator` reference into the
+object being shut down — a reference count the driver waits on, held by the
+thread doing the waiting. Nothing in the type said the order mattered, and
+nothing would have: it is a deadlock made out of two field declarations.
+
+**Decision**: flush, end the stream, release the event generator, and only then
+let `activated` hand the session back. The release is an explicit
+`self.events = None` rather than a reordering of the fields, because relying on
+declaration order is what went wrong.
+
+**Verified by counting.** 100 consecutive clean runs of the suite, against a
+rate that had been 5/30, 3/30, 2/40 and 2/30 across the preceding measurements.
+At the old rate, a hundred clean runs in a row is a one-in-fifty-thousand event.
+
+**This was never only a test problem.** The same `Drop` runs at the end of every
+real session. A host whose encoder was torn down at the wrong moment would have
+hung a thread inside the driver with no log line and no way out — which is
+exactly the class of fault that gets reported as "it froze" and never
+reproduced.
+
+**The watchdog stays.** It found this, and the next driver stall will not
+announce itself any more clearly than this one did. A bound of sixty seconds
+costs a passing run nothing and turns the next mystery into a name.
+
+**It aborts, and it says so first.** A thread blocked inside a driver cannot be
+unwound, so there is nothing to fail gracefully — `abort` is the only way out.
+The first version called it straight after `eprintln!` and lost the message
+every time, because `abort` runs no at-exit handlers and does not flush; the
+run ended with no explanation, which is precisely the thing being fixed. The
+write is now explicit and flushed before the call.
+
+**The firing is tested, on its own.** A watchdog nobody has watched work is not
+one to trust, but a test that fires it ends the suite. So `after` takes the
+deadline as an argument and the demonstration is `#[ignore]`d, to be run
+deliberately — see the doc comment on it for the command.
+
+**It is a test-only module**, `#[cfg(test)]` in `lib.rs`. Bounding somebody
+else's blocking call by killing the process is a reasonable thing to do to a
+test run and not a thing to do to a running application.
+
+**Worth knowing about production.** The same `ActivateObject` and
+`ShutdownObject` run on every session start and teardown, with no timeout there
+either. This has never been seen outside the test suite, and the trigger is not
+understood well enough to say it cannot happen — but a session that freezes
+while starting its encoder would look exactly like this.
+
+
+## Sharing a Window Is Not Sharing a Smaller Screen
+
+Sharing a display answers "let them see this monitor". Sharing a window answers
+something narrower and much more useful on a machine that is somebody's own: let
+them see *this one program*, and nothing else that happens to be on the same
+desk. Mail stays private while the spreadsheet is being looked at, and a second
+monitor is not a workaround for that.
+
+**It cannot be done by cropping.** A window that is partly behind another one,
+or scrolled off the edge of the screen, is not present in the desktop image at
+all — cropping would share whatever is on top of it. Only the compositor holds a
+window's own pixels, which is why `DisplayTarget::Window` routes to
+Windows.Graphics.Capture with no Desktop Duplication fallback and none wanted: a
+window share that quietly became a screen share would be a promise broken
+silently.
+
+**Decision**: it is a *grant*, not a choice the guest makes.
+`DisplayGrant::Window` sits beside `All` and `Only`, and the guest is offered no
+menu at all when it is in force.
+
+**Why the guest does not get to pick.** The other two variants bound what the
+guest may choose between; this one removes the choice, because the choice is the
+whole point. "Let them see the spreadsheet" is only true if they cannot then
+switch to a screen with the mail on it — a window share where the guest can
+change the subject is a display share with an extra step. `allows()` returns
+false for every screen id, `WatchDisplay` is answered with the window whatever
+was asked for, and the toolbar shows the window's name where the display picker
+would have been.
+
+**Minimising is not a failure, and that is the hard part.** A monitor being
+unplugged is rare enough that a session can simply fall back; a window being
+minimised is ordinary, reversible, and happens by accident several times an
+hour. The compositor produces nothing for a window in that state, so a session
+that did nothing about it would show a frozen picture — indistinguishable from a
+dead link, which is the thing people reconnect over.
+
+So the host follows it. `SharedWindowWatch` polls four times a second, and every
+change goes to the guest as `Message::SharedWindow`. While the window is away
+the capturer is dropped and replaced with a stub — keeping it would hold a
+compositor session against a window the compositor has stopped drawing — and it
+is rebuilt when the window comes back. The guest dims the last frame and says,
+in words, that the host minimised it.
+
+**The state travels in `SessionStart` too, not only as a change.** A window that
+is *already* minimised when the guest arrives has no transition to announce, and
+would otherwise be a blank picture with nothing saying why.
+
+**A retitle is a change and not a restore.** Browsers rename their window on
+every navigation, so it is the common case — and treating it as a restore would
+tear the capture down and rebuild it on every page load. `came_back` is the
+distinction, and it is a function rather than an expression inside the loop
+because it is the one transition with a cost attached.
+
+**The handle is the id, and it is not a promise.** Windows reuses handles once a
+window has gone. The host re-reads the window's title and state every poll and
+reports `Closed` for a handle that no longer resolves, rather than trusting the
+number — but a handle reused between two polls by an unrelated window is a hole
+this design does not close. It is bounded by the grant being per-session and the
+poll being fast, and it is the reason the id is opaque to the guest.
+
+
+## Capture Where the Desktop Is, Encode on the Best Chip
+
+**Problem**: on a laptop with two graphics chips, Tain ended up encoding on the
+processor with a powerful discrete card sitting idle — because Tain had asked
+Windows not to use it.
+
+**How it got there.** Desktop Duplication requires the process and the desktop
+to be on the same chip, and on these machines they are not. The fix at the time
+was to write a per-executable graphics preference pinning Tain to the
+*integrated* chip and ask for a restart. It worked, in the narrow sense that
+duplication then succeeded.
+
+It also moved the whole process. The encoder went with it. So a machine with a
+real GPU in it captured happily on the weak chip and encoded on the CPU, for the
+life of the installation, and nothing said why — the registry value outlived the
+run that wrote it, and nothing ever took it back.
+
+**And it was already unnecessary.** Windows.Graphics.Capture had been added
+precisely because it has no adapter rule, and `capture_shared::start_capturing`
+already falls back to it when duplication refuses. The preference was written on
+the way past — a side effect of the duplication attempt failing, before the
+compositor had even been tried. On these machines the compositor then worked,
+so the write bought nothing at all and cost the encoder.
+
+**Decision**: nothing in the capture path changes this machine's graphics
+settings. The desktop is captured wherever it lives, by whichever of the two
+backends can do it, and the encoder runs on whatever encoder is best. They do
+not have to be the same chip — `codec_mf` feeds its transform from system memory
+exactly so that they need not be.
+
+**The five endings became one.** `end_reason::wrong_gpu` had a code per branch
+of the automatic fix. With no fix to report there is one case left worth
+sending, and it is the one that is actually a fault: neither way of capturing
+worked. A desktop on the other chip is ordinary and now silent.
+
+**What was written is taken back.** Not writing it any more fixes nothing on a
+machine that already has the value — it lives in `HKCU` and outlives the build
+that put it there. `gpu_preference::undo_our_old_preference` removes it once, on
+startup, and only `PowerSaving`, which is the only thing the old code ever
+wrote. A deliberate *high performance* choice is somebody's own and is left
+alone; so is a power-saving choice made after the cleanup has run, which is what
+the recorded flag is for.
+
+**Guarded by a grep, deliberately.** `the_capture_path_does_not_change_this_
+machines_graphics_settings` asserts no `gpu_preference::set` appears in the
+capture sources. A crude test, and the right shape for this fault: the problem
+was never that the write did the wrong thing, it was that a registry write
+existed on a path nobody was looking at.
+
+
+## One Machine, One Identity, In Both Directions
+
+**Problem**: approving an admin device did nothing. The owner was asked to
+approve their own laptop on every single connection, for ever.
+
+**Why.** The host remembers the endpoint ids it has approved and checks the next
+connection against that list. The list could never match: the guest side bound
+its endpoint with no key at all, and iroh mints a fresh keypair for an endpoint
+that is not given one. Every dial arrived as a different machine. Nothing was
+wrong with the remembering — there was simply nothing stable to remember, and no
+amount of testing the approval logic would have found it, because the approval
+logic was correct.
+
+**Decision**: `network::adopt_identity` gives the process a stable key for the
+connections it *makes*, taken from the same stored identity the host side is
+known by. A machine is one identity in both directions, which is what "trust
+this device" has to mean for the sentence to be true.
+
+**One endpoint, not one per dial.** This is the part that does not follow from
+the fix and had to be found. Binding per dial was fine while every dial carried
+a throwaway key; under a stable identity, two endpoints live at once are two
+machines claiming one name, and a person with two session tabs open has exactly
+that. `OUTGOING_ENDPOINT` binds once and every session shares it — so
+`GuestClient::shutdown` now closes its *connection* and leaves the endpoint
+alone, where before it closed the endpoint and would have taken down the other
+tabs.
+
+**The test that caught it** was `several_guests_arriving_together_are_all_
+answered`, which had been passing for a year and started failing the moment an
+identity was adopted anywhere in the same test binary. It now adopts one
+explicitly: a test that only covers the interesting case when it happens to run
+second covers nothing.
+
+
+## A Remembered Address Was Last in the Code and First in Practice
+
+**Problem**: the address a host answered on last time was being tried before
+discovery had a chance, and one failed dial with it ended the whole attempt. The
+mainline DHT — the lookup that still answers where the others are blocked — was
+never once observed being used.
+
+**How a last resort became first.** The intent was already right and the comment
+already said so: everything that can say where the host is *now* goes first, and
+the saved address only if all of it comes back with nothing. The gate was
+`nothing_found` — no address from any lookup.
+
+That gate is decided by whichever lookup answers first, and on a filtered link
+the two that answer first are the two that *fail* first. mDNS and DNS do not
+hang there; they complete, with nothing, in a second or two. So `connect`
+returned `NoAddress` almost immediately, the saved address went in at about two
+seconds, and the DHT — which needs eight, and often a second ask — never got a
+turn. A condition written to mean "after everything else" was in practice
+"after the fastest two".
+
+**Decision**: the gate is a clock. `DISCOVERY_GRACE` is fifteen seconds, and
+nothing about how quickly a lookup gives up can shorten it.
+
+**And the saved address is no longer latched.** It used to be inserted once and
+left in the address set for every remaining attempt, so a stale address that
+swallows packets took each retry with it. Whether it is in play is now decided
+per attempt, from the clock — so a dial that fails with it is followed by one
+built again from whatever discovery has since found.
+
+**Every failure is retried while there is time.** The loop used to retry only
+`NoAddress`, on the reasoning that anything else was a definite refusal and
+retrying would turn a clear failure into a slow one. True on a good link. On a
+filtered one a relay handshake that fails is not a refusal — it is a route that
+did not work this second — and a dial that spent its whole budget was treated as
+fatal, which on the network this software is written for is the *ordinary*
+outcome of the first ask. One try, then a failure, with the budget unspent.
+
+The bound is the deadline, not the first discouraging answer: `DIAL_TIMEOUT`
+drops to twelve seconds so more asks fit, and `FIND_WAIT` rises to forty-five.
+Waiting costs nothing that matters — how fast a session runs is a property of
+the path it found, not of how long finding it took.
+
+**Two guards.** A compile-time assertion that the budget leaves room for at
+least one whole attempt after the grace, so the fallback cannot be tuned out of
+existence. And `a_stale_saved_address_does_not_take_the_attempt_with_it`, which
+hands a guest two dead addresses — one that refuses at once, one that swallows
+packets — for a host mDNS can find, and requires it to connect anyway.
+
+**What the existing direct-path test does not prove**, now stated in it: both
+ends are on this machine, so mDNS finds the very same loopback address that is
+passed as the saved one. Arriving quickly there says nothing about which of the
+two got there first. An attempt to assert a timing floor on it failed for
+exactly that reason, which is why the ordering is pinned by the stale-address
+test instead — where the two disagree and only one of them works.
+
+
+## The Remembered Address Is Gone
+
+**Reverses** *A Remembered Address Was Last in the Code and First in Practice*,
+and the two entries above it. Three attempts were made to make caching the
+address a host answered on safe:
+
+1. Added alongside the relay, on the reasoning that iroh races candidates and a
+   stale one simply loses.
+2. Added only once no lookup had answered.
+3. Added only once a fifteen-second discovery grace had elapsed.
+
+Each was reported as still breaking connections that worked the moment the
+saved address was deleted. The third failed on two PCs on one LAN.
+
+**Decision**: there is no saved address. `connect_reporting` takes no address
+list, `Prober::probe` takes none, and `SavedConnection` has no field for one.
+The parameter is gone rather than defaulted, so re-adding it is a deliberate
+change to a signature and not a quiet extra argument.
+
+**Why the idea was wrong, not just the gating.**
+
+*It was never evidence about the present.* A host that changed network, or was
+given a different port by its NAT, leaves an address that still routes — to a
+NAT that now maps it to somebody else, or to nothing. Those do not lose a race
+quickly.
+
+*It could only be refreshed by the thing it prevented.* The cache was written
+from a **successful** session's direct path. So a stale entry was cleared by a
+successful connection, which is exactly what it was blocking. There was no path
+out of a bad entry except deleting the file by hand, which is what kept being
+reported.
+
+*It duplicated work already done better.* iroh keeps its own path state per
+endpoint. mDNS places a peer on a local network with no relay, no DNS and no
+internet. And the DHT record carries dialable addresses rather than only a
+relay — `discovery::publishable` exists for exactly the censored-link case a
+remembered address was supposed to cover. Where the host *is* had three live
+answers and a fourth stale one helping none of them.
+
+*And it was in two places, not one.* Every fix went into the dial loop. The
+prober — which decides what a card says — inserted the saved address
+unconditionally and first, with no lookup given a chance ahead of it, so a
+sweep clinging to a stale address reported a reachable host as offline. That is
+the one thing a card exists to answer.
+
+**What replaced the test.** `a_stale_saved_address_does_not_take_the_attempt_
+with_it` became `discovery_alone_reaches_a_host_on_this_network`: two ends on
+one machine, mDNS the only thing that can place the host, and a session that has
+to start. If discovery alone were not enough, removing the cache would not be
+safe — so that is the assertion.
+
+
+## A Failure Has to Say What Was Tried
+
+Several rounds of "it cannot find my other PC" were diagnosed by reading code,
+because nothing anywhere said which ways of finding a host the machine even
+had. Two PCs on one LAN that cannot see each other is mDNS not running. The
+same pair on a filtered link is the DHT not running. The log said neither.
+
+**mDNS failing to start was logged at `debug`**, on the reasoning that a network
+without multicast is normal and not a fault. True of the network and wrong for
+the log: a machine that cannot start mDNS cannot find a peer on its own LAN at
+all, and on Windows the usual causes — the firewall blocking UDP 5353, another
+program holding the port — are faults, and fixable ones. It is a warning now,
+and so is the DHT failing to start, which on a filtered link is the lookup that
+still answers.
+
+**And a dial that gives up now says what it had**: how long it tried, over how
+many attempts, which of mDNS / DNS / DHT are running on this machine, and
+whether the code carried a relay. One line, at the end, naming the thing that
+would otherwise take another round of guessing.
+
+
+## A Remembered Frame Has to Remember Its Size
+
+**Problem**: `Nv12 buffer too small: 1709568 < 3981312`, and the session ended.
+Reproduced by resizing a shared window on the host and then pressing 1:1 on the
+guest.
+
+**What happened.** The compositor path re-sends its last picture when nothing
+has changed, so a guest joining a still window has something to draw. It sent
+the stored bytes labelled with whatever the emitted size had become — and the
+emitted size moves for three reasons that do not produce a new frame: the guest
+capping it, the controller shedding pixels, and the captured window being
+resized. A window that has just been resized and then left alone produces
+nothing to correct it with, so a stale buffer went out under the new dimensions
+and the encoder refused it.
+
+The dimension check upstream passed, which is what made it look like a capture
+bug rather than a sizing one: the frame's *declared* size was right. Only its
+length disagreed.
+
+**The duplication path does not have this**, because it clears its copy at every
+site that changes the size. That is the same discipline, and it is why the
+compositor path did not get it: remembering to clear a second field at three
+call sites is what gets forgotten at the fourth. It is the encoder `Drop` bug
+again, one field apart.
+
+**Decision**: the size travels with the bytes. `last_frame` holds
+`(width, height, Bytes)`, and the idle refresh compares before re-sending. The
+two cannot disagree, and a mismatch now means "nothing worth re-sending" rather
+than something that will be refused downstream.
+
+**And a still source is asked for a frame.** Withholding the stale picture is
+correct and, on its own, leaves a guest who pressed 1:1 watching nothing happen
+until something moved inside the window — the compositor delivers when the
+*source* changes, and none of these change the source. So the setters recreate
+the frame pool at the size it already has, which provokes a delivery. Only the
+setters: `resize_to` has already recreated it at the new source size and would
+otherwise do it twice.
+
+
+## Reaching a Host Is Retried, Not Attempted Once
+
+**Problem**: a LAN connection that worked about half the time, with pressing
+Connect again as the fix.
+
+Every way of reaching a host fails intermittently. Discovery can answer a moment
+late. Hole punching can fail and succeed on the same pair of machines minutes
+apart. A relay can have a bad second. None of those are properties of the two
+machines; they are properties of the moment, and the remedy for all of them is
+another go.
+
+**Decision**: `run_guest_session` retries for `REACH_FOR` — two and a half
+minutes, about three whole attempts, each of which is itself several dials.
+
+**Why the retry is there and not in the dial.** The dial is not the only part
+worth repeating. `connect_with_code_reporting` also fails *after* a successful
+dial, when no direct path opens inside `DIRECT_PATH_WAIT` and the session is
+refused rather than run over a relay. That is the failure most worth another go,
+and raising the dial's own budget would not have touched it.
+
+**The boundary is "room for another attempt", not "budget spent."** Checking the
+latter starts an attempt it cannot finish, and the session then runs past the
+point it promised to stop. Pinned by a test, along with the budget being large
+enough to cover more than one real attempt — a smaller one would be pressing
+Connect by hand with extra steps.
+
+
+## A Window Share Is a Set, and the Picker Shows Pictures
+
+**Problem**: sharing one window was chosen from a dropdown of text, and the
+grant could hold exactly one window.
+
+**The dropdown was the wrong control for the question.** It named each window in
+a line of text, in a popup as wide as a card. That is the one thing window names
+are worst at: four Explorer windows are four folder names, three browser windows
+are three page titles, and anything with an unsaved document says "Untitled".
+The person choosing knows their window by sight — they were looking at it a
+moment ago — so the picker is now a grid of tiles with a picture of each window
+in it, in a window with room to show them.
+
+**Decision**: `DisplayGrant::Window(u64)` became `Windows(Vec<u64>)`, and the
+guest may switch between the windows in it.
+
+**Why widening it does not weaken it.** The old doc comment argued that a window
+share removes the guest's choice, "because the choice is the whole point". That
+was the wrong reading of its own property. What makes a window share safe is not
+that there is one window; it is that **nothing outside the list is ever
+streamed** — the same property `Only` has for screens. Somebody walking a
+colleague through a spreadsheet usually has the spreadsheet *and* the mail it
+arrived in open, and being unable to grant both is what pushes them to grant the
+whole screen instead. `a_grant_of_several_windows_permits_those_and_no_others`
+pins the boundary: every id in the list allowed, every id outside it refused, and
+no screen reachable by either.
+
+**The grant is ordered as the picker listed it, not by handle.** The first
+window is what the session opens on, and handles sort by whatever number Windows
+happened to hand out — so collecting the chosen set directly would open on an
+apparently arbitrary one of them, and no arrangement of the picker could change
+that.
+
+**Windows open on the first; screens can open on all.** Two monitors sit beside
+each other on a desk, the host knows where, and composing them reproduces that
+arrangement. Windows overlap, in a stack whose order changes as somebody works —
+a composition of them would be a layout this end invented.
+
+## `PrintWindow`, Not the Capture Backend, for Thumbnails
+
+**Decision**: the picker's pictures come from `PrintWindow` with
+`PW_RENDERFULLCONTENT`, on a worker thread, into a GDI DIB section.
+
+**Why not Windows.Graphics.Capture**, which is what the streaming path uses and
+gives a better picture: it costs a graphics device, a frame pool and an
+asynchronous wait *per window*, and on the Windows builds without
+`IsBorderRequired` it draws a yellow border around whatever it captures — so
+opening the picker would flash a ring around every window on the screen. The two
+answer different questions and the cheap answer is the right one for a picker.
+
+The trade is that some windows come back blank; a program drawing through its own
+swapchain need not honour the request. Measured on the development machine, nine
+of ten. So the caller gets an `Option` rather than a grey rectangle, and a tile
+with no picture shows the program's initial — a picker cannot tell "no picture"
+from "a genuinely blank window" if it is handed an empty image.
+
+**It has to be off the interface thread.** `PrintWindow` is a `SendMessage` into
+the target's message loop and does not return until that program answers. A
+program that is busy — or wedged, which is often exactly the one somebody wants
+help with — would freeze the interface for as long as it stayed that way, on the
+machine of the person being asked to allow a connection. Results are sent one at
+a time rather than as a batch, so a slow program delays only its own tile.
+
+**Gotcha, and it produced ten black rectangles**: a device context is not the
+picture. The picture is whatever bitmap is *currently selected into* it, and a
+fresh DC comes with a 1×1 monochrome placeholder in that slot. Restoring the
+previous bitmap after `PrintWindow` — which reads better as "borrow, use,
+return" — means the shrinking blit reads that placeholder instead. It succeeds,
+and every window comes out one flat colour. The restore has to happen after the
+last read. Caught by `every_thumbnail_taken_is_the_size_it_says_it_is`, which
+reported 0 of 10 windows drawing themselves; without that test this would have
+shipped as a picker full of blank tiles.
+
+**Gotcha**: the alpha channel is thrown away. `PrintWindow` leaves whatever the
+window's own drawing put in that byte, which for most of them is zero — carried
+through, the tile is invisible.
+
+**Gotcha**: a window that declined to draw leaves the buffer exactly as
+allocated, which is one flat colour. That is the check that turns "it worked and
+produced nothing" into "there is no picture", and it is what made the bug above
+visible rather than merely wrong.
+
+## The Window Watch Follows the Switch
+
+**Decision**: `SharedWindowWatch` is rebuilt when the session changes window,
+and it knows whether the guest has been told what it holds.
+
+**Two bugs, both from a watch that outlived its window.** It is pointed at one
+handle, and a session granted several windows can be told to show a different one
+at any moment. Left where it was, it reports the state of a window nobody is
+watching — pausing the stream because the window the guest *left* was minimised,
+and saying nothing when the one on screen is.
+
+**And a switch is news even when the state is not.** The watch reports *changes*,
+measured against the last thing it read. Point a fresh one at a second window
+that happens to be doing the same thing as the first — both showing, the ordinary
+case — and nothing has changed, so nothing was sent: the guest went on naming the
+window it had left. Hence `owed`, which is false at session start (where
+`SessionStart` carried the state) and true after a switch (where nothing has).
+`switching_to_another_window_is_announced_even_when_nothing_changed` pins both
+halves.
+
+**A switch to a window that is not on screen is taken, not refused.** A guest can
+pick a window that has since been minimised, and there is nothing to build a
+capture from while it is away — so `create_capturer` fails, the switch is
+reverted, and the guest is left with its switcher pointing at a window it is not
+being shown. Instead the target is adopted, the capture parks on a stub, and the
+guest is told the window is minimised: the same path a window minimised *during*
+a session already takes.
+
+**Gotcha**: the guest's `watching` used to be assigned twice on `SessionStart` —
+once for the window case and then unconditionally from the display list, which is
+empty for a window session. The second overwrote the first with `None`. Harmless
+while a window session had nothing to switch between; not harmless now.
+
+**Gotcha**: the picker re-reads the window list when it *opens*, not when the
+dialog does — those can be minutes apart while a guest waits. But a window
+already chosen and then minimised is kept on the list explicitly, because
+`shareable()` answers "what could somebody point at" and excludes it: dropping it
+would silently un-choose something nobody touched.
+
+## In a Window Session the Pointer Maps Through the Window
+
+**Problem, found while wiring the switcher and older than it**: nothing ever
+told the injector where a shared window is.
+
+A guest sends pointer positions across the picture it was sent, and the injector
+turns them back into desktop pixels through the rectangle being shown
+(`Shown`). Every display path sets that — on session start, on a display switch,
+on the desk being rearranged. The window path set it nowhere, so the rectangle
+stayed at its fallback: the whole primary screen. A click in the middle of a
+shared window landed in the middle of the *screen*.
+
+**Decision**: the capture loop keeps `Shown` pointed at the shared window's own
+rectangle.
+
+**Checked every tick, not on the switch.** A window is not a monitor. It is
+dragged and resized while somebody is using it, so a rectangle fixed at session
+start is wrong the first time the window moves. The DWM read is cheap and the
+injector is only told when the answer changes.
+
+**And the rectangle is `DWMWA_EXTENDED_FRAME_BOUNDS`, not `GetWindowRect`.**
+Since Windows 10 a window's outer rectangle includes several pixels of invisible
+resize border on three sides, while what the compositor hands over as the
+window's picture is its visible extent. Mapping through the larger rectangle puts
+every click a few pixels off, consistently — which reads as a calibration
+problem and is really a border nobody can see. It is also the measurement WGC
+itself sizes the capture item by, so the two agree by construction rather than by
+coincidence.
+
+## This Machine Hosts on One Key and Dials With Another
+
+**Problem**: pasting this machine's own guest code into it sat "looking for the
+host" for two and a half minutes. The log said what the interface did not:
+
+```text
+gave up after 24 attempt(s) over 46.16s:
+Connecting to ourself is not supported
+```
+
+**One key, two endpoints.** The host binds an endpoint with the machine's
+identity, and — since *Every Dial Carries This Machine's Identity* — so did the
+client. Two endpoints, one endpoint id. So a loopback dial was literally asking
+iroh to connect to itself, which it refuses outright.
+
+**And that was the smaller half.** The relays allow one connection per endpoint
+id and boot the other:
+
+```text
+Relay server reports problem: Another endpoint connected with the same
+endpoint id. No more messages will be received.
+```
+
+Sixty-two of those in one log, on an ordinary run. Whichever of the two
+connected last held the slot — so **making an outgoing connection knocked this
+machine's own host off the relay**, and being on the relay is how a distant guest
+finds it and how hole punching is arranged. A host that works or does not
+depending on whether anybody has dialled out from it recently is exactly the
+intermittency that was being chased under *Reaching a Host Is Retried*.
+
+**Decision**: the dialling key is `blake3::derive_key` over the hosting key, with
+a domain-separated context string.
+
+**Why derived rather than stored.** Recognition needs the id to be *stable*, not
+to be the host's — a host trusting a returning admin device remembers whichever
+id dialled it. Deriving gives stability with nothing new to store, nothing to
+migrate, and no second secret to keep safe; the derivation is one-way, so the
+dialling key never discloses the hosting one.
+
+**Upgrading asks once more.** A device trusted under the old id now arrives under
+the new one. One approval per trusted device, once.
+
+**And a loopback connection now works**, which is worth having: it is the
+cheapest possible end-to-end test of capture, encode, discovery, approval and
+display, and it needs one machine.
+
+## A Dial That Cannot Succeed Is Not Retried
+
+**Decision**: the dial refuses a target equal to our own endpoint id before the
+loop, rather than inside it.
+
+Every other failure is retried while the budget lasts, deliberately — on a
+filtered link a route that failed this second is not a refusal. That reasoning
+does not cover dialling ourselves: iroh refuses instantly and will go on
+refusing. Left to the loop it spent the whole 45-second find budget over 24
+identical refusals, and then the outer retry ran it twice more.
+
+**The general shape is worth remembering**: a retry loop written for transient
+failures will happily spend its entire budget on a permanent one, and the
+symptom is indistinguishable from the network being slow. If a failure is
+knowable before the first attempt, answer it before the first attempt.
+
+## Windows Compose Into a Grid, Screens Into Their Arrangement
+
+**Decision**: `DisplayTarget::Windows` tiles the granted windows into a grid;
+`DisplayTarget::All` keeps composing screens where the host has them.
+
+**This reverses an earlier entry.** *A Window Share Is a Set* argued there was no
+honest way to compose windows, because "windows overlap in a stack whose order
+changes, so a composition would be a layout this end invented." The layout is
+invented — that part was right — and it is the wrong thing to object to.
+Reproducing the desktop arrangement would be the *dishonest* option here: two
+maximised windows sit exactly on top of each other, so a faithful composite of
+them is a picture of one window, and seeing all of them is the entire reason for
+asking. A grid says what it is.
+
+**Cells are the size of the largest window**, so nothing is enlarged. The
+alternative — a cell per window, sized to it — makes ragged rows; the
+alternative to *that* upscales a 400-pixel utility window to sit beside a 4K
+editor, spending the picture's resolution on whatever needed it least.
+
+**What it costs is the pointer**, and that is the substantive change. Every other
+picture this streams is a uniform scale of one rectangle of desktop — a screen, a
+window, even a wall of screens, because screens tile the desktop by construction.
+A grid of windows is not: the sources are scattered, possibly on different
+monitors, possibly overlapping. So `Shown` became `Mapping`, which is either one
+rectangle or a list of tiles, and a click is mapped by finding its tile first.
+
+**A click between the tiles lands nowhere**, deliberately. That space is not part
+of the host, and the nearest alternative — clamping to some window — puts the
+pointer somewhere nobody aimed.
+
+**Gotcha, and it is the usual off-by-one**: the position must stay a fraction
+until the last division. A guest points with more precision than the picture has
+— a 1000-wide window shown in a 100-wide tile means one picture pixel is ten host
+pixels — so rounding to the picture pixel first and scaling up afterwards
+multiplies that rounding by ten. Measured at exactly that before it was fixed.
+The other half is the edge: positions are continuous over `0..span` and the
+result is clamped to `onto - 1`, because mixing that convention with the
+`0..=span-1` one puts a click a pixel past the tile's own right-hand edge.
+
+**Staleness is different for the two.** A wall of screens is stale when the desk
+is rearranged. A grid of windows is *not* stale when a window moves — rebuilding
+on every frame of a drag would be unusable, and the grid is not where they are
+anyway. It is stale when the set of granted windows that can currently be
+captured changes, which is what lets a minimised one come back: comparing
+against the wanted list rather than the present one is what makes that work, and
+comparing against the original request alone would make it permanently stale.
+
+## What Is Shared Can Be Changed Without Reconnecting
+
+**Decision**: clicking an established connection card opens the sharing dialog
+again, and applying changes what that session sees immediately.
+
+**Why it was not enough to decide at the door.** Approval answers "may this
+start, showing what", and then the session runs for an hour while what is on the
+screen changes. Somebody who shared a screen to demonstrate one thing should be
+able to narrow it to a window without disconnecting the person they are helping;
+somebody who shared one window should be able to add a second.
+
+**The permission and the picture move together.** Narrowing a grant so that it
+excludes what is on screen would otherwise leave the session streaming something
+it is no longer allowed to stream — the permission right and the picture wrong,
+which is the worse half to get wrong. A target still inside the new grant is left
+alone, because the opposite mistake is nearly as bad: adding a second window must
+not yank the guest away from the one they were reading.
+
+**The offer is replaced wholesale, not edited.** `SharedChanged` carries the
+whole list for the same reason `SessionStart` does — a guest that missed one
+message would otherwise hold a menu assembled from edits it half received.
+
+**The dialog opens on what is true**, not on the defaults the approval dialog
+uses. That dialog offers the smallest useful answer because it is deciding
+something that has not happened; this one is editing what somebody is looking at
+right now, and opening it anywhere else would misreport the session and then
+apply that misreport to anyone who pressed the button without reading it.
+
+**There is no Deny on it.** Declining to change is closing it, and ending the
+session is the kick button, which has not moved.
+
+## A Window Icon Carries a Letter, a Screen a Number
+
+**Decision**: the guest's window switcher marks each entry with the first letter
+of the program's name; the screen switcher keeps its digits.
+
+A screen's number is what a person would count — the monitors are in a row, and
+the second one is the second one. Windows have no such order: the second entry in
+a list is the second entry in a list, and a "2" says nothing about which program
+it is. The initial does. With a mail client, a browser and a spreadsheet shared,
+M, C and E are three things somebody can aim at without reading the tooltip.
+
+It is not unique — two Chrome windows are two Cs — which is why the caption stays
+on the hover. Ambiguous beats meaningless.
+
+**The frame it is drawn on is `empty_button.svg`, not `app_window.svg`.** The
+window art has a title bar across the middle, which is exactly where the letter
+goes, and the two collided. Shrinking the letter to fit between them makes it
+unreadable at the sixteen points this row is drawn at. A mark drawn by the
+caller wants art that leaves the middle alone.
+
+## A Composite Follows Its Windows Without Being Rebuilt
+
+**Problem, reported from use**: an odd-shaped window came out squashed in the
+composite, and switching to that window and back corrected it.
+
+A panel kept the slot it was given when the composite was built. A window's size
+is not a fact for the life of the wall the way a display's is — somebody drags an
+edge and it is a different shape — so a frame of the new shape was being fitted
+into the old slot. Rebuilding is what corrected it, which is precisely the
+signature of a layout that only refreshes on rebuild.
+
+**Decision**: the placement is re-read each tick and the grid recomputed, without
+touching the captures.
+
+**Why not simply mark it stale.** Tearing down N capture sessions and building N
+more would be a second of black picture to fix some arithmetic — and it would
+happen on every frame of a drag. Nothing about the capture goes stale: the
+compositor follows the window and does not care what shape it is. Only the
+arithmetic does.
+
+**And the arithmetic now has one home.** The build and the relayout each computed
+the grid, and two implementations of a layout eventually disagree — the symptom
+being the picture jumping the first time anybody resized a window. `grid` is the
+one definition, and it is what the tests exercise.
+
+**Note the whole grid moves, not one panel.** The cell is the largest window, so
+growing any window regrows every cell and moves every other window. A per-panel
+fix-up would have looked right in the common case and drifted in that one.
+
+## The Composite Was Built One Window at a Time
+
+**Measured, after "switching back to the composite takes a while"**: about 200 ms
+per window — roughly a third creating a graphics device, the rest setting up the
+frame pool and capture session — done one after another. Nine windows took **3.7
+seconds**.
+
+Nothing about the setups is shared, so the only reason it was serial is that it
+was written as a loop. Built at once: **0.64 seconds** for the same nine.
+
+**The order is the order they were asked for, not the order they finished.** The
+grid is positional, and a composite whose cells shuffled according to which
+window's driver answered first would be a different picture every time it was
+opened.
+
+**What is left is still mostly per-window setup.** Sharing one graphics device
+across the panels would save another ~70 ms each, and is not done: it puts nine
+capture sessions on one device's lifetime, on the hot path, for a fraction of
+what parallelising already recovered. The measurement is in
+`report_how_long_a_composite_takes_to_build`, which is why it is kept rather than
+deleted after the fix — "a while" is not a number, and the next person to wonder
+should be able to get one.
+
+## Parking Is Not Allowed to Swallow a Request
+
+**Problem, reported from use**: close one of several shared windows, open the tab
+that says so, ask for the composite again — the stream freezes and stops
+answering every further switch.
+
+A shared window that is minimised or closed has nothing to give, so the capture
+loop parks on a stub and sleeps rather than spinning. It did that by skipping
+straight back to the top of the loop, and **the display switch is below that
+point**. So a watch on a window that had gone held the session there for good:
+the picture froze, and nothing the guest asked for was ever read.
+
+**Decision**: parking is conditional on nobody waiting for anything else, and the
+condition is a named function with a test on it rather than two lines inside a
+loop.
+
+The rule it encodes: *parking is an optimisation for having nothing to do, and
+"somebody asked for a different picture" is something to do.* The same mistake
+was about to be made a second time in the same loop — the composite's
+nothing-left-to-compose path was also written as a sleep and a `continue` — and
+naming the rule is what caught it.
+
+**And a window composite goes stale for its own reason.** `layout_changed` is
+answered by both kinds of wall, and the recovery was written entirely for
+screens: it names the primary display as what is being shown and remaps the
+pointer to the whole desk. For a window session the first is a lie the rest of
+the loop then acts on, and the second silently sends every click to a desktop
+coordinate instead of into a window. A window composite now rebuilds in place,
+keeping its target, and leaves the pointer to the tiles that are maintained a few
+lines above.
+
+Closing *every* shared window left the guest looking at the last frame with
+nothing saying why. Fixed next.
+
+## The Offer Follows the Windows, and Says When There Are None
+
+**Decision**: the host keeps the guest's list of shared windows current, and the
+guest is told explicitly that a session shares windows rather than inferring it.
+
+**A closed window loses its button.** It used to keep one, which reported it
+closed on every click, for the rest of the session. The list the guest builds its
+switcher from is now the windows still *open*, resent whenever that set changes —
+so the button goes with the window, and when the last one goes so does the
+composite button, because there is nothing left to compose.
+
+**Why the capture loop owns this.** It is the only part of a session that already
+asks, every tick, what the shared windows are doing: the composite is rebuilt
+from that answer and the pointer is remapped from it. Anywhere else would be a
+second poller of the same handles, and the two would disagree about when a
+window went.
+
+**Announced on change, not on a timer.** It is asked sixty times a second and the
+answer changes twice an hour. A message per tick would be a message per frame,
+carrying a fact nobody asked about, on the same connection as the video.
+
+**And `sharing_windows` is a field, not an inference.** Both lists empty happens
+two ways and they are not the same thing: a window session whose every window has
+closed has nothing to show and should say so, while a host that cannot enumerate
+its displays *also* sends no displays and is streaming its screen perfectly well.
+Guessing from the lists would put "every shared window has been closed" over a
+working screen share. Pinned by
+`a_host_that_cannot_enumerate_its_displays_still_starts_a_session`.
+
+**The notice is checked before any one window's state**, because there is no
+longer a window to be in a state — a composite watches none of them individually
+and all of them have gone. It is the same failure the per-window notice exists to
+prevent, one level up: a picture that stopped, with nothing saying why.
+
+## A Card Senses Clicks Underneath Its Own Controls
+
+**Problem**: making the incoming card clickable took the kick button with it.
+
+egui resolves overlapping click targets by taking the **last one registered** —
+`hit_click` is `hits.filter(sense.click).last()`. The card's interaction was
+added after its contents, so a card-sized target sat on top of every button on
+it and swallowed their clicks.
+
+**Decision**: the card registers its own click *before* its contents, over the
+frame's content rect. Each control added afterwards is above it and takes its own
+clicks back; what is left for the card is the space between them, which is what
+"click the card" ever meant.
+
+**Hover is not the same question.** `contains_pointer` is true for everything
+under the pointer, unlike a click, which goes to exactly one — so the card still
+tints when the pointer is over a button on it, which is what it should do.
+
+## The Symbol Check Reads the Source, Not a List
+
+**Problem**: `🗔` went on the window picker's button and drew an empty box.
+
+The check for this existed and did not fire. It held a hand-written list of
+symbols with a note saying that picking a new one meant adding it — and **a list
+you have to remember to update cannot catch the case where you forget**, which is
+the only case there is.
+
+**Decision**: the symbols are read out of the sources and the catalogues, the way
+`i18n_keys` reads the keys the code names. Putting one in a label is now enough
+to have it checked.
+
+**It found two more the moment it ran.** The connection graph drew `✓` (U+2713)
+for a completed step and `✗` (U+2717) for a failed one, and neither has a glyph
+in the bundled fonts — so every finished step had been showing a box.
+`report_which_marks_have_glyphs` is kept beside it: choosing `✔` and `×` as the
+replacements was a measurement rather than a guess, and the next person choosing
+a mark should not have to guess either.
+
+**Only what could be drawn counts.** The first version scanned whole files and
+failed on box-drawing art in a module header and on the doc comment explaining
+which symbol had been *replaced* — noise that would have had the next person
+deleting the test rather than reading it. Rust files contribute their string and
+character literals; `.lang` files contribute everything but their own comments.
+
+**And the probe's data is written as code points.** Half of what it tests is
+there *because* it has no glyph, and spelling those out would make the report
+test fail the scanning one.
+
+## A Picker Button Says What It Opens
+
+The window picker's button read "Whole screens" while nothing was chosen. True
+about the session, and wrong on that control: a button for choosing windows,
+labelled with a screens answer, reads as a screens control — reported as looking
+like a mistranslation, which is a fair thing to conclude from it.
+
+It says "Individual windows…" until something is chosen and the count afterwards,
+because then the button *is* the answer. What the session will show while it is
+empty is already visible in the row above, which is lit.
+
+## The Offer Carries What Each Window Is Doing
+
+**Problem, reported from use**: minimising the last shared window left the
+composite showing its last frame, frozen, with nothing saying why.
+
+The same failure as closing them all, which had already been fixed — and not
+covered by that fix, because **a minimised window does not leave the offer**. It
+is still granted, still listed, and can come back. Only its state moved, and the
+offer did not carry one.
+
+**Decision**: the offer is `Vec<SharedWindow>`, not `Vec<WindowInfo>` — the same
+identity fields plus the state. The guest could not work that out for itself, and
+the sizes it replaced were never read at that end.
+
+**Two states, not one flag.** "Every shared window is closed" and "every shared
+window is minimised" want different sentences and offer different hope: nothing
+at the host brings a closed window back, while a minimised one is one gesture
+away. `WindowsAway` is that distinction, and it is what `source_is_live` now
+answers to as well.
+
+**And the offer is resent when a state changes**, not only when the set does. An
+offer compared by id alone does not move when a window is minimised, which is
+exactly the case that went unreported. The *title* is still not compared: a
+browser retitles on every navigation, this is asked sixty times a second, and the
+window being watched already carries its live title on its own message.
+
+## A View Being Fetched Says So
+
+**Problem**: switching views left the old picture up, unchanged, for as long as
+the switch took.
+
+Which is up to two thirds of a second for a composite of several windows,
+because the host's capture thread is inside `create_capturer` for that whole time
+and produces nothing. The view just asked for looked exactly like the view
+already there, frozen.
+
+**Decision**: a dimmed overlay with a spinner and one line, from the request
+until the first frame after the host's answer.
+
+**Two steps, not one.** Clearing it on the next frame alone would clear it on a
+frame of the view being *left* — the host answers the request straight away and
+its capture thread switches afterwards. So the answer arms it and the frame that
+follows clears it.
+
+**And it gives up.** A request the host never answers should leave the picture it
+has rather than a spinner that never stops; `SWITCH_PATIENCE` is generous because
+the wait is real work, and expiring also *forgets*, so the decision is made once
+rather than re-made every frame.
+
+**The old picture stays underneath, dimmed.** Same reasoning as the window
+notices: what was there a moment ago is context, and a black panel with a
+sentence on it throws that away to say what the sentence already says. What
+separates this from those is the ring — they describe a state that lasts until
+somebody at the host acts, and this is work in progress, which only a moving
+thing says honestly.
+
+## `DisplayChanged` Is Sent When It Becomes True
+
+**Problem**: the loading indicator cleared while a stale frame of the old view
+was still on screen.
+
+`DisplayChanged` was sent by the reader, the moment a request was accepted — and
+the capture thread acts on it afterwards, taking as long as building the new
+capture takes. So the message announced a view whose *previous* pictures were
+still being produced, and a guest waiting for the new one stopped waiting at the
+first frame after it, which was a frame of what it had just left.
+
+**Decision**: a refusal is sent from the reader, because it is final the moment
+it is decided. An acceptance is sent by the capture thread, when it has actually
+switched. The message then means what its own documentation says it means: what
+is *actually* being streamed.
+
+**A failed switch is announced too.** The reader now says nothing for an accepted
+request precisely so this can be the one answer, whichever way it goes —
+otherwise a switch that could not be built would leave the guest waiting for a
+picture nobody was going to send.
+
+**And "no picture is coming" is an answer as well.** A switch to a minimised
+window produces no frame at all, so the guest also stops waiting when it is told
+the window is away — otherwise it would watch a spinner until it gave up, over
+the very message explaining why there was nothing.
+
+## A Pump Loop Written for a Source That Blocks
+
+**Reported**: "slow capture" and occasional "slow decoding", with both machines'
+GPUs idle, and a blurry picture. Measured from the host's own log: **six to ten
+frames a second**.
+
+The wall gives each source a thread that pumps it into a slot, because a display
+subscriber *blocks* for about twenty-five milliseconds waiting for its screen to
+change — so an empty answer had already cost a wait, and going straight round
+again was free.
+
+A window does not work that way. `TryGetNextFrame` is in its name: the compositor
+answers "not yet" immediately. The loop became a spin at whatever rate the CPU
+allows, holding and releasing the panel's lock throughout — **one core per shared
+window**, plus the contention with the thread trying to compose. Nothing was
+struggling, exactly as reported; the capture thread simply could not get
+scheduled.
+
+**Decision**: a pump that got nothing waits `IDLE_POLL` before asking again.
+Short enough to be invisible against a sixteen-millisecond budget, and a source
+that blocks on its own pays it only on top of a wait it already did.
+
+## A Composite Fits Each Panel Once, Not Once a Frame
+
+The other half of the same report. A panel whose frame is not its slot's size is
+resampled to fit — and a panel is usually the wrong size for a *while*: it is
+showing a still window whose last frame was captured before the slot was worked
+out, and nothing new arrives until that window changes. So the same picture was
+being resampled on every composition.
+
+Measured before: **3.2 seconds per composed frame** across seven windows, in a
+debug build — a third of a frame per second. After keeping the fitted copy beside
+the frame it came from, and clearing it when the pump stores a new one:
+**62 composed/s at 1.0 ms each**, release.
+
+The measurement is kept as `report_what_a_live_composite_costs`, for the same
+reason as the build timer beside it: the next person to be told "it feels slow"
+should be able to get a number.
+
+**On the blurriness.** The composite is capped to the guest's viewport, and a
+grid of windows has an aspect nothing like a guest's window — so fitting it costs
+a great deal of detail. `ScalingMode::Actual` reports *no* ceiling at all, so 1:1
+is the lever, exactly as it is for a wall of screens. The window hint now says so;
+it was the one place that had been left out.
+
+## The Resize Was the Frame Rate
+
+**Reported**: a shared window streaming at sixteen frames a second, with nothing
+on either machine busy. "Is there really no way to improve this?"
+
+There was. `box_downscale` is the resize used by every capture that cannot hand
+the job to the GPU — a window captured as BGRA, and every panel of a composite —
+and it ran on one thread. Measured in release:
+
+| | one thread | threaded |
+|---|---|---|
+| 2446x1516 → 1200x750 | **22.0 ms** | 5.9 ms |
+| 2560x1440 → 1280x720 | 14.4 ms | 4.2 ms |
+| 3840x2160 → 1920x1080 | **33.0 ms** | 6.4 ms |
+
+Against a 16.7 ms budget at 60 fps, a single window was over it on the resize
+*alone*, before the readback — so the frame rate could not reach its target
+however idle the machines were, and the adaptive controller settled where the
+budget finally fit. Sixteen frames a second is a 62 ms budget, which is what 22
+ms of resize plus a readback plus encoding adds up to.
+
+**Decision**: the resize is threaded, a band of output rows per worker. The rows
+are independent, so there is nothing to synchronise beyond the join — the same
+shape as the NV12 conversion in `codec_mf`, and for the same reason.
+
+**Each worker addresses its rows twice** — once as a position in the source and
+once as an offset into its own slice — and getting that pair wrong produces a
+subtly striped picture rather than a crash. The existing tests all used frames
+small enough to stay on one thread, so
+`resizing_in_bands_matches_resizing_in_one_pass` compares against a plain
+implementation at sizes that do not divide evenly.
+
+**Still on the table**: giving the BGRA path the GPU as well. The video processor
+already scales for NV12, and a BGRA output format would remove this cost rather
+than divide it — which would matter for a composite of many large windows, where
+several panels resize at once. Not done here, because threading brought it inside
+the budget and the structural change is a larger one.
+
+**And the log now says which path a session took.** `negotiate_format` logged the
+GPU case at `debug` and the CPU case at `info`, so a host that was fine left no
+trace and a host that was not looked like the only possibility. Both are `info`
+now: it is the first question to ask about a session that will not reach its
+frame rate.
+
+## A Captured Pointer Is Sent as Movement
+
+**Reported**: in a 3D game the camera was uncontrollable from the guest — but
+that same game's menus, and every other cursor-driven interface, worked
+perfectly.
+
+That difference is the whole diagnosis. A program that *follows* a cursor wants a
+position, which is what every pointer event here carried. A program that
+**captures** it does not: it hides the cursor, reads movement, and warps the
+cursor back to the middle after every frame so it can keep reading movement
+forever. Inject an absolute position into that and the game centres the cursor,
+the next position arrives from wherever the guest's pointer happens to be, and
+the game reads the jump between them as an enormous flick — sixty times a
+second.
+
+**Decision**: `InputEvent::MouseMotion` carries a delta, and the injector sends
+it as `MOUSEEVENTF_MOVE` without `ABSOLUTE` — which is what reaches a program
+through raw input, so movement arrives as movement.
+
+**It switches itself, on a fact the session already had.** A guest cannot tell
+from its own side which kind of program is on the far end; the host can, because
+a program that captured the pointer hides it — and that is already reported so
+the remote cursor is not drawn as a ghost. So the same fact decides both, nobody
+has to know what their game is doing, and a game's own menus go straight back to
+positions mid-session.
+
+**The guest holds its pointer in the middle of the picture** while this is on.
+Movement is only movement while there is somewhere to move from, and a pointer
+left where the user pushed it stops producing anything at the window's edge —
+which, in a game, is the moment you try to keep turning.
+
+**The delta is read from the system, not from egui.** The warp is itself a
+movement, and egui would report it as one — so the delta would include the
+correction, doubling every input and cancelling it on alternate frames. Reading
+the position, subtracting the centre and putting it back is one exchange with
+nothing to get wrong.
+
+**Buttons and the wheel are not part of the switch.** A game being looked around
+in is still being shot in, so this replaces the movement and falls through to
+the rest.
+
+**Escaping is focus.** Nothing is warped while the session window is not focused,
+so alt-tab frees the pointer, and the `Ctrl+Shift` session shortcuts keep
+working throughout.
+
+**Gotcha**: the agent pipe's record kinds are shared between input and
+non-input, and 7 was already the touch release. `each_record_kind_decodes_as_itself`
+caught the collision — which is exactly what a test that enumerates a wire
+format's tags is for.
+
+## Workers in Proportion to the Work
+
+**Reported**: on a sixteen-thread host, a composite pinned every core — with no
+loss of performance, and no such behaviour on a smaller machine.
+
+Threading the resize asked for `available_parallelism` workers *per call*, and a
+composite resizes every panel at once on a thread each. Sixteen cores times six
+panels is ninety-six threads spawned per composed frame, for work that could not
+go any faster.
+
+**Decision**: workers scale with the source pixels, capped at eight. A panel in a
+grid asks for one or two; a 4K window on its own asks for eight and gets its
+resize back inside the frame budget. The whole machine is never handed to one
+caller, and no caller is capped for the sake of a neighbour it does not have.
+
+**What is left is real work**, and worth being clear about: resizing several
+large windows on the CPU costs what it costs, and a six-window composite genuinely
+needs several cores of it. Dividing it differently cannot change that — only
+moving it to the GPU can, which is the change deferred under *The Resize Was the
+Frame Rate*.
+
+## One Video Processor, Two Answers
+
+**Decision**: `Nv12Converter` became `VideoScaler`, with an [`Output`] of `Nv12`
+or `Bgra`. The deferred change, taken.
+
+It was built to convert BGRA to NV12 because that is what the encoder wants, and
+the *resize* came along for free — the processor rescales in the same pass. That
+made the resize the valuable half for everything the encoder does not take NV12
+from: a window composite is assembled in BGRA, so its panels could not use it and
+were resized on the CPU instead.
+
+Converting BGRA to BGRA is a scaling blit as far as the driver is concerned. The
+only thing that has to be right is the colour space — telling it the output is in
+the space the input already was, rather than asking for a conversion to a space
+it is already in. Get that wrong and every window in a composite is tinted,
+consistently, in a way that reads as a display setting rather than a bug;
+`scaling_bgra_on_the_gpu_keeps_the_colours_the_cpu_would` compares against the
+CPU resize it replaces, on real hardware.
+
+**Asked for only when the size changes.** At 1:1 there is nothing to do and the
+readback is the whole job.
+
+**A refusal is fatal for NV12 and survivable for BGRA.** The encoder was promised
+NV12 and cannot be told otherwise mid-stream, so that failure reaches the caller.
+A resize has a CPU path that is correct and only slower.
+
+**Gotcha, and it panicked immediately**: the CPU resize that followed the
+readback was not gated. With the GPU now producing the emitted size, that block
+ran *again* on an already-shrunk buffer while still treating it as full size, and
+read off the end of it. Caught by the composite panicking exactly one index past
+its own frame.
+
+## Movement Is Sent As It Was Made
+
+**Decision**: relative pointer movement is no longer scaled by the ratio between
+the picture and the host's screen. It is multiplied by a sensitivity the user can
+see, defaulting to one.
+
+The ratio was inherited from the absolute path, where it is right: a *position*
+should land where it was aimed, so it is measured against the picture. Movement
+has no such anchor — a program that captured the pointer is reading movement, and
+what it does with the number is its own sensitivity setting. Multiplying by a
+window-size ratio put a second, invisible sensitivity in front of it, so a guest
+window half the host's size doubled every input. Reported as ordinary movements
+producing extreme rotations.
+
+**Why it needs a setting at all, when nothing else about the pointer does.** A
+position lands where it was aimed whatever anybody prefers. Movement depends on
+the game's own sensitivity, the mouse, and the window — so two people on
+identical hardware want different values, and the same person wants different
+ones per game.
+
+**It lives behind the control it belongs to**: right-click the pointer button on
+the session toolbar. A permanent slider would be a toolbar item for a mode most
+sessions never enter; in the settings only, it could not be adjusted against the
+game it is being adjusted *for*. The setting seeds new sessions; the session
+holds the live value.
+
+**Clamped on the way out as well as on the way in.** It multiplies every delta in
+the one mode with no cursor on screen to show what went wrong, and a NaN rounds
+to zero — a pointer that has simply stopped, in a game, with nothing saying why.
+
+## The Unattended Host Runs Where the Desktop Is
+
+**Decision**: the service no longer hosts. It starts a separate process — this
+executable with `--unattended-host` — on the ordinary desktop of the console
+session, as Local System, the same way it starts the agents, and that process
+runs the application's own hosting path.
+
+Hosting from inside the service meant hosting from session zero, which has no
+desktop. Every frame therefore came from an agent: raw pixels over a named pipe,
+at native resolution, in BGRA, sent whether or not anyone wanted them. The
+controls that make the application's picture cheap — the quality scale, the
+guest's viewport ceiling, the GPU format conversion — all talk to a local
+capturer, and in agent-only mode there was none, so all three answered "not
+honoured" and changed nothing. At 4K that is about 33 MB a frame through a pipe
+before encoding. The low-level hook that lets somebody at the machine take the
+mouse back sat in a session with no input. The pointer was painted into the
+frames instead of being sent separately.
+
+**Why not forward those controls down the agent pipe.** It was the plan, and it
+fixes three of the symptoms while keeping the architecture that produced all of
+them: frames would still cross a process boundary uncompressed, the pointer and
+the local-input hook would still be missing, and every future capture feature
+would need a second implementation for the pipe. The only thing the application
+has that the service lacked is a desktop, and a process on one is something the
+service already knows how to start.
+
+**"Does this desktop have the input" is now asked by name.** It used to be
+"can `OpenInputDesktop` open it", which is the same question for the application
+— the signed-in user is refused the secure desktop — and the wrong one for Local
+System, which is refused nothing. The host would have believed the input was
+still on its desktop through every consent prompt and every lock. The agents
+already compared names; that code now lives in one place and both use it.
+
+**A capturer can start before its desktop is in front.** Desktop Duplication
+opens an output only for the input desktop, so a session that began while the
+machine was locked failed before its first frame. The application met this only
+when a guest connected during a consent prompt; the unattended host meets it
+whenever the machine is locked, which is most of the time nobody is at it. The
+wrapper now shows the secure desktop's agent, builds its local capturer when its
+own desktop comes back, and replays the scale, ceiling, granularity and format
+the session asked for in the meantime — without the replay, a session that began
+locked would have run at native size in BGRA for its whole life.
+
+**Stopped by a named event, bound to the service by a job.** A pipe on the host's
+standard input would have been one mechanism for both, but `CreateProcessAsUser`
+documents that handles cannot be inherited across sessions. A `Global\` event
+crosses sessions by design and cannot be pre-created by anyone without
+`SeCreateGlobalPrivilege`. Set, the host tells its guests and closes its endpoint
+properly, which is what keeps the application's endpoint — same identity — from
+being refused by the relay as a duplicate. The job has `KILL_ON_JOB_CLOSE`, so a
+host cannot outlive a service that crashed and go on answering as the machine.
+
+**Gotcha, found before it shipped**: the host runs from the same copy of the
+executable a reinstall replaces, and stopping it gracefully can take longer than
+the two seconds `uninstall` waited for the service to stop. That is the race that
+left a week-old service running after a "successful" reinstall. The wait is now
+ten seconds, agents are waited for after they are terminated, and the copy is
+retried across the moment a just-ended process still holds the file.
+
+**Removed**: agent-only capture, and with it the rotation between desktops that
+was added to make it show the right one. Nothing hosts from session zero any
+more.
+
+## A Link to the Agent Has to Close When It Is Let Go
+
+**Decision**: a process holds at most one connection to the secure desktop's
+agent, shared by every session that needs it, and closing it cancels the pending
+read. The host's end of the pipe is opened for overlapped I/O. An agent treats a
+failed peek as its host having gone.
+
+Reported as: lock the machine from the guest, click the lock screen, and the
+picture freezes — and no new connection shows anything until somebody unlocks
+it at the machine. The first lock of the session had worked.
+
+**Three faults, each enough on its own.** The agent's pipe has one instance.
+The host's frame reader held that pipe from a thread blocked in `ReadFile`, so
+when the input came back and the session let go of its reader, the pipe stayed
+open behind it. The agent, which by then was sending nothing because its desktop
+no longer had the input, never found out: `take_input` read a failed
+`PeekNamedPipe` as "nothing waiting". So the pipe stayed busy until the agent
+exited, and every later connection — the next lock, and every reconnect — was
+told `All pipe instances are busy`. Separately, each session opened a connection
+of its own, so a second session could not have had the secure desktop even with
+the first two fixed.
+
+**Why overlapped, found by the test for the fix.** The first version of the
+close path sent "frames no longer wanted" before cancelling the read, and hung.
+Windows performs the I/O on a handle opened without `FILE_FLAG_OVERLAPPED` one
+operation at a time, per handle: the write waited behind a read waiting for a
+frame that was never coming. The same rule had been delaying every click and
+key sent to the agent until the next frame arrived, which on a still consent
+prompt is whenever the caret next blinks. Overlapped, each operation stands
+alone, and `CancelIoEx` abandons a wait from any thread.
+
+**The agents capture with `create_desktop_capturer`.** Once desktops were told
+apart by name, an agent's own capturer — wrapped, like every capturer, to follow
+the input — noticed the input leave and opened its own pipe to ask for frames.
+Refused only because a host already held it; between hosts it would have taken
+the pipe from itself.
+
+**Verified against a real named pipe**, served the way the agents serve theirs.
+Removing either the host's cancel or the agent's disconnect check reproduces the
+reported error exactly; the tests run inside a time limit so that a
+regression fails with a name instead of hanging the run, which is how the
+deadlock above first showed itself.
+
+**Also**: the app hands its settings over again at the moment it hands over
+hosting, because a service installed while the app was running had never been
+sent them; the second of two control messages sent back to back is retried
+briefly across the moment the service's single pipe instance is rebuilt, which
+is what had delayed the handover by one heartbeat; and a session logs the first
+input it cannot inject rather than every one — one report held 450 identical
+warnings in three seconds.
+
+
+## The Pointer Can Be Taken Without Being Asked For
+
+**Decision**: capturing the pointer is no longer decided only by whether the
+host was seen to hide its own. There is a toggle and a shortcut, and the
+compositor paths now answer the question they used to ignore.
+
+Reported as a game whose camera stopped turning at the edge of the window: the
+local cursor reached the border, and the host stopped moving with it.
+
+**The switch existed and could never fire.** `wants_relative_pointer` was
+`sends_mouse() && host_cursor_hidden()`, and `host_cursor_hidden` reads a
+visibility flag that arrives with the pointer — which only Desktop Duplication
+sends. `WgcCapturer::take_cursor` returned `None` by design, because the
+compositor bakes the pointer into the frame and reports nothing separate, and
+`Wall` never implemented it at all. So on every shared window, every composite
+and every display captured through the compositor, the host looked exactly like
+one whose cursor was showing. Positions were sent, and a position has nowhere
+left to go at the edge of the picture.
+
+**`GetCursorInfo` is the same fact from the other side.** It costs a syscall,
+it is true whichever backend is running, and both compositor paths now report
+it — on change only, and with no shape. No shape matters: the guest draws a
+remote pointer only when it has a position *and* an image, so the fact travels
+without a second pointer appearing over the one already painted into the frame.
+
+**And a way in that depends on seeing nothing.** Automatic capture is still the
+default and still right — a game that hides its cursor should not need anybody
+to know that is what it did. But a heuristic reached through one backend is not
+a feature, so there is now a checkbox beside the sensitivity it governs, and a
+bindable shortcut, defaulting to Ctrl+Shift+C alongside the other four. The
+shortcut matters more than the checkbox: capture hides the cursor and pins it to
+the middle of the video, so the button that turned it on cannot be clicked to
+turn it off.
+
+**Everything that frees the keyboard frees the pointer.** The hook's escape
+shortcut and the window losing the foreground both end immersive mode, and both
+now drop capture as well — ending the mode while leaving the cursor hidden and
+pinned is indistinguishable from the escape having failed.

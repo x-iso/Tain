@@ -37,8 +37,10 @@ use windows::Win32::Graphics::Dxgi::{
 };
 
 use super::capture_hdr::{ColourLog, DisplayColour, HdrToSdr};
-use super::capture_nv12::Nv12Converter;
-use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, ScreenFrame};
+use super::capture_nv12::VideoScaler;
+use super::screen_capture::{
+    PixelFormat, QualityScale, Remedy, ScreenCaptureBackend, ScreenFrame,
+};
 
 /// How long to block waiting for the desktop to change, per capture call.
 ///
@@ -72,7 +74,7 @@ struct Duplication {
     /// through the video processor instead and this stays untouched.
     staging: ID3D11Texture2D,
     /// GPU colour conversion, when it was asked for and the driver has it.
-    converter: Option<Nv12Converter>,
+    converter: Option<VideoScaler>,
     /// Brings a floating-point HDR desktop back to BGRA. `None` on an ordinary
     /// SDR display, which is the usual case and needs nothing.
     hdr: Option<HdrToSdr>,
@@ -152,26 +154,40 @@ impl Duplication {
         if failures.is_empty() {
             anyhow::bail!("this machine reports no display adapters at all");
         }
-        // # The one failure with something to be done about it
+        // # Two chips, and the one holding the display will not duplicate it
         //
-        // Two graphics chips, and the one holding the display refuses to
-        // duplicate it. Trying more adapters cannot help — that was the last
-        // two attempts at this fault, and the log they produced is quoted in
-        // `gpu_preference`, which is where the actual remedy lives.
+        // Not a remedy any more, and not something to act on here. Duplication
+        // is one of two ways to capture and it is the one with an adapter rule;
+        // the compositor has none, and `capture_shared::start_capturing` tries
+        // it next. On these machines it works.
+        //
+        // What used to happen instead was worse than not helping. This wrote a
+        // per-executable graphics preference pinning Tain to the *integrated*
+        // chip and asked for a restart — which did fix duplication, and moved
+        // the whole process, encoder included, onto the weaker of the two
+        // chips. The result on a laptop with a real GPU in it was a session
+        // encoding on the processor with the discrete card sitting idle,
+        // because this code had asked Windows not to use it. Capture is not
+        // worth buying at the price of everything downstream of capture: the
+        // desktop is captured wherever it lives, the encoder runs on whatever
+        // encoder is best, and the two do not have to be the same chip. See
+        // `codec_mf`, which feeds the transform from system memory precisely so
+        // that they need not be.
+        //
+        // So this is a diagnosis, carried as a typed link so that
+        // `capture_shared` can say something useful if the compositor fails
+        // too — and nothing at all if it does not.
         if wrong_gpu && chips > 1 {
-            // Layered rather than concatenated. The guest is sent `{e}` and the
-            // log gets `{e:#}`, so the remedy is what reaches the person and the
-            // list of adapters is what reaches whoever reads the log — which is
-            // the split that made the last two rounds of this so slow, when the
-            // only thing anybody could see was a sentence about DXGI.
-            let remedy = move_to_the_desktops_gpu(want);
-            warn!("{remedy}");
-            return Err(anyhow::anyhow!(
+            warn!(
+                "{} is drawn by a graphics chip this process cannot duplicate from. \
+                 Trying the compositor, which has no such rule.",
+                want.unwrap_or("The primary display")
+            );
+            return Err(anyhow::Error::new(DesktopOnAnotherGpu).context(format!(
                 "tried {} adapter(s): {}",
                 failures.len(),
                 failures.join("; ")
-            ))
-            .context(remedy);
+            )));
         }
         anyhow::bail!(
             "no adapter could capture {}. Tried {}: {}",
@@ -453,13 +469,14 @@ impl Duplication {
     /// Returns whether it took. Failure is not an error the caller has to
     /// handle — the BGRA path is still there and still correct.
     fn enable_nv12(&mut self, out_width: u16, out_height: u16) -> bool {
-        match Nv12Converter::scaling(
+        match VideoScaler::scaling(
             &self.device,
             &self.context,
             self.width,
             self.height,
             out_width,
             out_height,
+            super::capture_nv12::Output::Nv12,
         ) {
             Ok(converter) => {
                 self.converter = Some(converter);
@@ -809,63 +826,41 @@ fn choose_output(
     Ok((output, where_))
 }
 
-/// Put this executable on the chip that draws the desktop, and say so.
+/// What to tell a guest when neither way of capturing worked on a machine with
+/// two graphics chips.
 ///
-/// # This writes a Windows setting, and does it on purpose
+/// # Why there is no automatic fix here any more
 ///
-/// Which chip a process runs on is fixed before `main`, so nothing can repair
-/// the run that failed — only the next one. The previous version of this told
-/// the person at the keyboard to go and change it themselves, in
-/// *Settings > System > Display > Graphics*, and that is a fair description of
-/// a page almost nobody will find, on a machine that is usually being helped
-/// with from somewhere else. Twice now, that message has come back with the
-/// fault unfixed.
+/// There was one, and it was the wrong trade. Which chip a process runs on is
+/// fixed before `main`, so nothing can repair the run that failed — and this
+/// wrote a per-executable graphics preference pinning Tain to the *integrated*
+/// chip so the next run would duplicate correctly.
 ///
-/// So Tain writes its own per-application preference — its own executable, its
-/// own key under `HKCU`, reversible from the same Settings page — and asks for
-/// a restart. See [`crate::gpu_preference`] for the shape of the failure and
-/// why the integrated chip is the answer rather than a coin toss.
+/// It did fix duplication. It also moved the whole process onto the weaker of
+/// the two chips, encoder included, which on a laptop with a real GPU in it
+/// meant a session encoding on the processor while the discrete card sat idle —
+/// because this code had asked Windows not to use it. Nothing in the fix said
+/// so, and nothing undid it afterwards.
 ///
-/// Never against a preference somebody chose. Already on the integrated chip
-/// and still failing means this is not the wrong-chip problem, and an
-/// executable somebody deliberately put on the discrete chip is not this
-/// function's to move back.
-fn move_to_the_desktops_gpu(want: Option<&str>) -> String {
-    use crate::gpu_preference::{self, Preference};
-
-    let screen = want.unwrap_or("the primary display");
-    let preamble = format!(
-        "{screen} is drawn by a graphics chip this process cannot capture from — \
-         Desktop Duplication needs them to be the same one, and which chip a \
-         process gets is decided before it starts"
-    );
-
-    // Asked before the preference is read, because writing it does not move
-    // *this* process: every later failure in this run has to keep saying
-    // "restart", not "already set and still failing".
-    if gpu_preference::switched_this_run() {
-        return format!("{preamble}. Tain has asked Windows for the other chip — restart Tain");
-    }
-
-    let current = gpu_preference::current();
-    if !gpu_preference::worth_switching(current) {
-        return format!(
-            "{preamble}. Tain is already set to {}, so this is not simply the wrong chip; \
-             Settings > System > Display > Graphics is where that is changed",
-            current.name()
-        );
-    }
-
-    match gpu_preference::set(Preference::PowerSaving) {
-        Ok(()) => format!(
-            "{preamble}. Tain has asked Windows to run it on the chip that draws the \
-             desktop — restart Tain and this display will capture"
-        ),
-        Err(e) => format!(
-            "{preamble}, and Tain could not set that itself ({e:#}). In Settings > System > \
-             Display > Graphics, add Tain and set it to Power saving"
-        ),
-    }
+/// Capture is not worth buying at the price of everything downstream of it. The
+/// compositor captures the desktop wherever it lives with no adapter rule at
+/// all, and the encoder runs on whatever encoder is best; they do not have to
+/// be the same chip, and `codec_mf` feeds its transform from system memory
+/// precisely so that they need not be.
+///
+/// So this is reached only when the compositor has failed too, which is not the
+/// wrong-chip problem at all — and it says where the setting lives rather than
+/// reaching for it.
+pub(crate) fn both_ways_failed(want: Option<&str>) -> Remedy {
+    // A display name is an identifier, so it travels as itself. Its absence is
+    // not: "the primary display" is a phrase, and gets a key of its own.
+    let screen = want
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::i18n::text("display.primary").to_string());
+    Remedy::new(
+        crate::protocol::end_reason::wrong_gpu::NEITHER_WAY,
+        &[("screen", &screen)],
+    )
 }
 
 /// This adapter enumerates the display and cannot duplicate it.

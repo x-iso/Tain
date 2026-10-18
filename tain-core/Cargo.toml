@@ -29,6 +29,11 @@ tokio = { version = "1", features = ["full"] }
 # Random number generation for passcodes
 rand = "0.9"
 
+# Deriving this machine's dialling key from the key it hosts on, so the two are
+# never the same endpoint id. Already in the tree under iroh, so this adds a
+# name rather than a dependency. See `network::outgoing_key`.
+blake3 = "1"
+
 # Compact encoding for connection codes. The "check" feature adds the checksum
 # that makes a truncated or mangled paste fail loudly instead of parsing.
 bs58 = { version = "0.5", features = ["check"] }
@@ -71,6 +76,10 @@ windows = { version = "0.58", features = [
     # DisplayConfigGetDeviceInfo, for where Windows has put SDR white.
     "Win32_Devices_Display",
     # EnumDisplaySettings, for the display's real pixel count.
+    # `DWMWA_CLOAKED`, which is how a window that is "visible" and not on screen
+    # is told apart from one a person could actually point at. See
+    # `window_capture::shareable`.
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     # Decoding the desktop wallpaper for a card picture.
     "Win32_Graphics_Imaging",
@@ -95,6 +104,11 @@ windows = { version = "0.58", features = [
     # The per-application graphics preference, which is the only way to put this
     # process on the chip that draws the desktop. See `gpu_preference`.
     "Win32_System_Registry",
+    # GetUserPreferredUILanguages, for following the system language. See `i18n`.
+    "Win32_Globalization",
+    # `PrintWindow`, which is filed under printing and is how a window is asked
+    # to draw a picture of itself for the share picker. See `window_capture`.
+    "Win32_Storage_Xps",
     # Windows.Graphics.Capture: frames from the compositor rather than by
     # duplicating an output this process has to own. See `capture_wgc`.
     "Graphics_Capture",

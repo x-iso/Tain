@@ -85,17 +85,17 @@ pub fn watch(ctx: &egui::Context) {
 /// Win32 half below has nothing to check that a test could reach.
 pub fn wording(name: &str, needs_approval: bool) -> (String, String) {
     let title = if needs_approval {
-        "Someone wants to connect".to_string()
+        tain_core::i18n::text("notify.wants_to_connect").to_string()
     } else {
-        "Someone has connected".to_string()
+        tain_core::i18n::text("notify.has_connected").to_string()
     };
     let body = if needs_approval {
-        format!("{name} is waiting for you to allow it.")
+        tain_core::i18n::format("notify.waiting_body", &[("name", name)])
     } else {
         // Said plainly. An administrator connection needs no permission and
         // gets none asked for, so the only protection the owner of the machine
         // has is knowing it happened.
-        format!("{name} connected with an admin passcode and is not waiting for approval.")
+        tain_core::i18n::format("notify.admin_body", &[("name", name)])
     };
     (title, body)
 }

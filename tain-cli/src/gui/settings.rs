@@ -38,17 +38,17 @@ impl ScalingMode {
     pub const ALL: [Self; 2] = [Self::Fit, Self::Actual];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Fit => "Fit",
-            Self::Actual => "1:1",
-        }
+        tain_core::i18n::text(match self {
+            Self::Fit => "choice.scaling.fit",
+            Self::Actual => "choice.scaling.actual",
+        })
     }
 
     pub fn description(self) -> &'static str {
-        match self {
-            Self::Fit => "Preserve aspect ratio, letterbox the rest",
-            Self::Actual => "One remote pixel per screen pixel, panning at the edges",
-        }
+        tain_core::i18n::text(match self {
+            Self::Fit => "choice.scaling.fit_detail",
+            Self::Actual => "choice.scaling.actual_detail",
+        })
     }
 }
 
@@ -85,21 +85,21 @@ impl DeviceNameMode {
         [Self::Anonymous, Self::SystemUser, Self::NetworkName, Self::Custom];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Anonymous => "Anonymous",
-            Self::SystemUser => "System user name",
-            Self::NetworkName => "Network PC name",
-            Self::Custom => "Custom",
-        }
+        tain_core::i18n::text(match self {
+            Self::Anonymous => "choice.name.anonymous",
+            Self::SystemUser => "choice.name.system_user",
+            Self::NetworkName => "choice.name.network",
+            Self::Custom => "choice.name.custom",
+        })
     }
 
     pub fn description(self) -> &'static str {
-        match self {
-            Self::Anonymous => "Publish no name — the other machine shows \"Guest #1\" or similar",
-            Self::SystemUser => "The account you are signed in as",
-            Self::NetworkName => "This machine's network name",
-            Self::Custom => "A name you choose",
-        }
+        tain_core::i18n::text(match self {
+            Self::Anonymous => "choice.name.anonymous_detail",
+            Self::SystemUser => "choice.name.system_user_detail",
+            Self::NetworkName => "choice.name.network_detail",
+            Self::Custom => "choice.name.custom_detail",
+        })
     }
 }
 
@@ -302,6 +302,15 @@ pub struct Settings {
     /// one has something to say.
     #[serde(default)]
     pub admin_copy_warning_read: bool,
+    /// Whether the graphics preference an older Tain wrote for itself has been
+    /// taken back.
+    ///
+    /// Recorded so it happens once and never again: somebody who chooses power
+    /// saving for Tain *after* the cleanup has run has chosen it, and a program
+    /// that undid that on every launch would be a program arguing with its
+    /// user. See [`tain_core::gpu_preference::undo_our_old_preference`].
+    #[serde(default)]
+    pub gpu_preference_undone: bool,
     /// How long remote input gives way after somebody uses this machine, in
     /// milliseconds. Zero turns it off.
     ///
@@ -309,6 +318,13 @@ pub struct Settings {
     /// what deliberately does not.
     #[serde(default = "default_local_input_wins_ms")]
     pub local_input_wins_ms: u64,
+    /// Interface language, as a BCP 47 tag. Empty follows the computer.
+    ///
+    /// Empty by default and not "en": an application that opens in a language
+    /// its user does not read is one they have to guess their way through to
+    /// the setting that fixes it.
+    #[serde(default, deserialize_with = "lenient")]
+    pub language: String,
     /// How large this application's own interface is, relative to the DPI
     /// scale the monitor asks for. `1.0` follows the monitor exactly.
     ///
@@ -405,6 +421,21 @@ pub struct Settings {
     pub default_allow_mouse: bool,
     /// Whether the approval dialog's keyboard checkbox starts ticked.
     pub default_allow_keyboard: bool,
+    /// How far the pointer moves on the host per unit of movement here, while
+    /// the host has captured its pointer.
+    ///
+    /// # Why this needs a setting at all
+    ///
+    /// The rest of the pointer needs none: a position is a position, and it
+    /// lands where it was aimed whatever anybody prefers. Movement has no such
+    /// anchor. What reaches a game is a number of mickeys, and what that turns
+    /// into depends on the game's own sensitivity, on the mouse, and on how big
+    /// this window is — so two people on identical hardware can want different
+    /// values, and the same person wants different ones per game.
+    ///
+    /// One is the honest default: the movement made here is the movement sent.
+    /// See `session_window::forward_relative_pointer`.
+    pub pointer_sensitivity: f32,
 
     // Session
     #[serde(deserialize_with = "lenient")]
@@ -428,7 +459,12 @@ impl Default for Settings {
             // Nobody, until somebody at this machine says so.
             trusted_admin_endpoints: Vec::new(),
             admin_copy_warning_read: false,
+            // A fresh install has nothing to undo, and no older Tain ever wrote
+            // anything for it. Saying "already done" here would be a lie on a
+            // machine that does have the old value and no settings file yet.
+            gpu_preference_undone: false,
             local_input_wins_ms: default_local_input_wins_ms(),
+            language: String::new(),
             ui_scale: 1.0,
             rate_control: RateControlSetting::default(),
             latency_priority: LatencyPriority::default().value(),
@@ -453,6 +489,7 @@ impl Default for Settings {
             guest_autoreset: true,
             default_allow_mouse: false,
             default_allow_keyboard: false,
+            pointer_sensitivity: 1.0,
             scaling_mode: ScalingMode::default(),
             fullscreen_on_connect: false,
             shortcuts: ShortcutBindings::default(),
@@ -472,6 +509,14 @@ fn one() -> f32 {
 /// outside it is a config file that has been edited by hand or corrupted, and
 /// either way an interface nobody can use to put it right.
 pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.5;
+
+/// How far [`Settings::pointer_sensitivity`] may be pushed either way.
+///
+/// Wide, because what it has to cancel out is wide: a game whose own
+/// sensitivity is already high wants a fraction, and one that reads movement in
+/// small steps wants several times. Bounded so a hand-edited file cannot
+/// produce a pointer that crosses a screen per pixel.
+pub const POINTER_SENSITIVITY_RANGE: std::ops::RangeInclusive<f32> = 0.1..=5.0;
 
 impl Settings {
     /// Clamp everything into a sane range.
@@ -515,6 +560,16 @@ impl Settings {
             self.ui_scale = 1.0;
         }
         self.ui_scale = self.ui_scale.clamp(*UI_SCALE_RANGE.start(), *UI_SCALE_RANGE.end());
+
+        // The same reasoning, and a worse failure: a NaN here multiplies every
+        // delta into a NaN, which rounds to zero — a pointer that has stopped,
+        // in the one mode where there is nothing on screen to show why.
+        if !self.pointer_sensitivity.is_finite() {
+            self.pointer_sensitivity = 1.0;
+        }
+        self.pointer_sensitivity = self
+            .pointer_sensitivity
+            .clamp(*POINTER_SENSITIVITY_RANGE.start(), *POINTER_SENSITIVITY_RANGE.end());
 
         self.target_fps = self.target_fps.clamp(1, 240);
         self.approval_timeout_secs = self.approval_timeout_secs.clamp(5, 600);
@@ -1279,5 +1334,57 @@ mod tests {
             assert!(!mode.description().is_empty());
         }
         assert_eq!(ScalingMode::default(), ScalingMode::Fit);
+    }
+
+    /// What the service is handed has to arrive as what was sent.
+    ///
+    /// The service configures an unattended host by taking this JSON off the
+    /// control pipe, parsing it back into `Settings`, and calling
+    /// `to_session_config` exactly as the application does — see
+    /// `ControlMessage::AdoptIdentity`. So the round trip *is* the handover,
+    /// and anything that does not survive it is a setting the owner chose and
+    /// an unattended session silently ignores. That was the whole bug: audio
+    /// exclusions, frame rate and codec were never sent at all, and a session
+    /// with nobody at the machine ran on library defaults.
+    #[test]
+    fn settings_survive_the_trip_to_the_service() {
+        let chosen = Settings {
+            target_fps: 24,
+            max_bitrate_kbps: 9001,
+            audio_bitrate_kbps: 96,
+            exclude_audio_processes: vec!["teams.exe".into(), "spotify.exe".into()],
+            codec: CodecSetting::H264,
+            local_input_wins_ms: 1234,
+            approval_timeout_secs: 42,
+            device_name_mode: DeviceNameMode::Custom,
+            custom_device_name: "the study machine".into(),
+            trusted_admin_endpoints: vec!["ab".repeat(32)],
+            ..Settings::default()
+        };
+
+        let json = serde_json::to_string(&chosen).expect("our own settings");
+        let arrived: Settings = serde_json::from_str(&json).expect("our own json");
+
+        let sent = chosen.to_session_config();
+        let got = arrived.to_session_config();
+
+        // Field by field before the whole thing, so a failure names what was
+        // lost rather than printing two large structures side by side.
+        assert_eq!(got.exclude_audio_processes, sent.exclude_audio_processes);
+        assert_eq!(got.encode.fps, sent.encode.fps);
+        assert_eq!(got.encode.target_bitrate_kbps, sent.encode.target_bitrate_kbps);
+        assert_eq!(got.audio_bitrate_kbps, sent.audio_bitrate_kbps);
+        assert_eq!(got.host_name, sent.host_name);
+        assert_eq!(got.local_input_wins_for, sent.local_input_wins_for);
+        assert_eq!(got.approval_timeout, sent.approval_timeout);
+        assert_eq!(got.trusted_admins, sent.trusted_admins);
+        assert_eq!(got, sent, "something in the settings does not survive the pipe");
+
+        // And the values are the chosen ones, not defaults that happen to match
+        // on both sides — which is how this test could pass while sending
+        // nothing at all.
+        let defaults = Settings::default().to_session_config();
+        assert_ne!(got.encode.fps, defaults.encode.fps);
+        assert!(!got.exclude_audio_processes.is_empty());
     }
 }

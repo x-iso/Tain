@@ -39,11 +39,11 @@ pub enum Waiting {
 
 impl Waiting {
     fn label(self) -> &'static str {
-        match self {
-            Self::Session => "Connected — waiting for the host to open the session…",
-            Self::FirstFrame => "Session open — waiting for the first frame…",
-            Self::Decoding => "Video is arriving, but none of it is decoding on this machine",
-        }
+        tain_core::i18n::text(match self {
+            Self::Session => "guest.waiting_session",
+            Self::FirstFrame => "guest.waiting_first_frame",
+            Self::Decoding => "guest.waiting_decode",
+        })
     }
 }
 
@@ -71,12 +71,12 @@ impl GuestStatus {
     /// Short text for the header's status line.
     pub fn label(&self) -> String {
         match self {
-            Self::Disconnected => "Disconnected".into(),
+            Self::Disconnected => tain_core::i18n::text("guest.disconnected").into(),
             Self::Connecting(step) => step.label().into(),
             Self::Authenticated(waiting) => waiting.label().into(),
-            Self::AwaitingApproval => "Waiting for the host to allow this connection…".into(),
-            Self::Streaming => "Connected".into(),
-            Self::Failed(e) => format!("Failed: {e}"),
+            Self::AwaitingApproval => tain_core::i18n::text("guest.awaiting_approval").into(),
+            Self::Streaming => tain_core::i18n::text("guest.connected").into(),
+            Self::Failed(e) => tain_core::i18n::format("guest.failed", &[("reason", e)]),
         }
     }
 
@@ -462,6 +462,31 @@ impl StreamHealth {
     }
 }
 
+/// A view asked for, and how far the answer has got.
+///
+/// # Why two steps and not one
+///
+/// Clearing this on the next frame alone would clear it on a frame of the view
+/// being left: the host answers the request straight away and its capture
+/// thread switches afterwards. `answered` is that reply, and the frame that
+/// follows it is the first one produced since — which is the one worth waiting
+/// for.
+#[derive(Debug, Clone, Copy)]
+pub struct Switching {
+    /// When it was asked for, so a switch that never lands gives up rather than
+    /// spinning for the rest of the session.
+    pub since: std::time::Instant,
+    /// Whether the host has said what it is now showing.
+    pub answered: bool,
+}
+
+/// How long to keep saying a picture is coming before admitting it is not.
+///
+/// Generous, because the wait is real work: rebuilding a composite of several
+/// windows was measured at about two thirds of a second, and a host on a slow
+/// link can take longer to get the first keyframe out.
+pub const SWITCH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// State shared between the session task and the egui render pass.
 #[derive(Clone)]
 pub struct GuestSessionState {
@@ -483,6 +508,40 @@ pub struct GuestSessionState {
     /// What is being streamed, once the host has said. `None` before the first
     /// answer, which the UI shows as the primary.
     pub watching: Arc<Mutex<Option<tain_core::protocol::DisplayChoice>>>,
+    /// The window this session is watching, when it is watching one rather than
+    /// a screen.
+    ///
+    /// `None` for an ordinary screen session, and that is the whole of how the
+    /// two are told apart on this side. Carries the window's state as well as
+    /// its name, because a minimised window sends no frames and the picture
+    /// stopping needs an explanation rather than a guess.
+    pub shared_window: Arc<Mutex<Option<tain_core::protocol::SharedWindow>>>,
+    /// Every window this session is allowed to see, in the host's order.
+    ///
+    /// The window counterpart of [`Self::displays`], and empty for a screen
+    /// session. What the switcher is built from: with one window there is
+    /// nothing to switch between and the toolbar simply names it, and with
+    /// several it offers them.
+    pub shared_windows: Arc<Mutex<Vec<tain_core::protocol::SharedWindow>>>,
+    /// Whether this session shares windows rather than screens.
+    ///
+    /// Stays true when every one of them has closed, which is the whole reason
+    /// it exists: [`Self::shared_windows`] going empty then means "they have
+    /// all gone" rather than "this is a screen session". A host that cannot
+    /// enumerate its displays also sends nothing, and is streaming a screen
+    /// perfectly well.
+    pub sharing_windows: Arc<std::sync::atomic::AtomicBool>,
+    /// A view the guest has asked for and not yet been shown.
+    ///
+    /// # Why the picture goes away and nothing said so
+    ///
+    /// Switching rebuilds the host's capture, and building a composite of
+    /// several windows takes the better part of a second — during which the
+    /// capture thread is inside `create_capturer` and produces nothing at all.
+    /// The guest kept drawing its last frame, so the view it had just asked for
+    /// looked like the view it already had, frozen. Something has to say that a
+    /// picture is on the way.
+    pub switching: Arc<Mutex<Option<Switching>>>,
     /// Sends a control message to the host, while a session is live.
     ///
     /// The UI needs a way to *ask* for something rather than only to report,
@@ -580,6 +639,10 @@ impl GuestSessionState {
             remote_size: Arc::new(Mutex::new((640, 360))),
             displays: Arc::new(Mutex::new(Vec::new())),
             watching: Arc::new(Mutex::new(None)),
+            shared_window: Arc::new(Mutex::new(None)),
+            shared_windows: Arc::new(Mutex::new(Vec::new())),
+            sharing_windows: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            switching: Arc::new(Mutex::new(None)),
             control: Arc::new(Mutex::new(None)),
             cursor: Arc::new(Mutex::new(CursorState::default())),
             host_preview: Arc::new(Mutex::new(None)),
@@ -656,6 +719,15 @@ const TELEMETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// waiting on it would make every failed session hang on the way out.
 const GOODBYE_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// How long to let the reader finish saying why, once the writer has stopped.
+///
+/// The reason is already on the wire when this is reached — the host sent it
+/// and closed, and that close is what stopped the writer. So this is waiting on
+/// bytes that have arrived, not on a round trip, and it can be short. Long
+/// enough for a decode and a channel hop; too short to be noticed as a session
+/// closing slowly.
+const REASON_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How long the host may say nothing before the guest gives up on it.
 ///
 /// The host sends frames, control state and pong replies, so silence this long
@@ -679,13 +751,34 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// How long to keep trying to reach a host before giving up on the session.
+///
+/// Two and a half minutes. Long, on purpose: every one of the ways reaching a
+/// host fails intermittently — a lookup answering late, a punch that does not
+/// take, a relay having a bad moment — is fixed by trying again, and somebody
+/// waiting for a machine they expect to reach would rather wait than press a
+/// button. It covers about three whole attempts, each of which is itself
+/// several dials.
+///
+/// It is a ceiling and not a cost: a host that answers answers in seconds.
+const REACH_FOR: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// How long to leave between attempts to reach a host.
+///
+/// Short. The attempt that just failed took tens of seconds on its own, so this
+/// is only there to stop a fast failure — a host that is genuinely switched
+/// off — becoming a spin.
+const REACH_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Connect to the host a code addresses and run the session to completion.
+///
+/// Reaching the host is retried until [`REACH_FOR`] is spent — see the loop
+/// itself for what that covers and why one attempt was not enough.
 ///
 /// Returns when the host closes the stream or an error occurs. Cancel by
 /// aborting the task — dropping the connection is a clean disconnect.
 pub async fn run_guest_session(
     code: ConnectionCode,
-    known_addrs: Vec<std::net::SocketAddr>,
     client_name: Option<String>,
     shared: GuestSessionState,
     mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
@@ -707,11 +800,57 @@ pub async fn run_guest_session(
                 shared.set_status(GuestStatus::Connecting(step));
             }
         };
-        let mut client = GuestClient::connect_with_code_reporting(&code, &known_addrs, &announce)
-            .await
-            .with_context(|| {
-                format!("Could not reach that host — {}", reached.lock().unwrap().stalled_at())
-            })?;
+        // # Reaching a host is retried, not attempted once
+        //
+        // A connection has several ways to fail that another try would simply
+        // not hit. Discovery can answer a moment too late; hole punching can
+        // fail and succeed on the same pair of machines minutes apart; a relay
+        // can be slow once. Reported as "works half the time" between two PCs
+        // on one LAN, with the fix being to press Connect again — which is a
+        // thing the application can do for somebody.
+        //
+        // The retry is *here* rather than inside the dial because the dial is
+        // not the only part worth repeating. `connect_with_code_reporting`
+        // fails after a successful dial when no direct path opens, and that is
+        // the failure most worth another go: a relay-only connection is refused
+        // deliberately, and whether the punch works is not a property of the
+        // machines so much as of the moment.
+        //
+        // Bounded, and the bound is generous: nobody minds waiting two minutes
+        // for a machine they expect to reach, and the progress graph restarts
+        // visibly on each attempt so it does not look stuck.
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        let mut client = loop {
+            attempt += 1;
+            let outcome = GuestClient::connect_with_code_reporting(&code, &announce).await;
+            let why = match outcome {
+                Ok(client) => {
+                    if attempt > 1 {
+                        info!("Reached the host on attempt {attempt}");
+                    }
+                    break client;
+                }
+                Err(why) => why,
+            };
+
+            let spent = started.elapsed();
+            if spent + REACH_RETRY_GAP >= REACH_FOR {
+                return Err(why).with_context(|| {
+                    tain_core::i18n::format(
+                        "connect.unreachable",
+                        &[("reason", reached.lock().unwrap().stalled_at())],
+                    )
+                });
+            }
+            warn!(
+                "Attempt {attempt} to reach the host did not work after {spent:?} \
+                 ({why:#}) — trying again"
+            );
+            shared.set_status(GuestStatus::Connecting(DialStep::Starting));
+            repaint();
+            tokio::time::sleep(REACH_RETRY_GAP).await;
+        };
 
         announce(DialStep::Authenticating);
         // The host authenticates on the secret inside the code, so send it whole.
@@ -898,12 +1037,22 @@ pub async fn run_guest_session(
         // a keyframe request, which cannot go down the ack channel because that
         // one carries a sequence number rather than a message.
         let reader_state = shared.clone();
-        let reader = tokio::spawn(async move {
-            if let Err(e) =
-                receive_loop(&mut recv, &reader_state, ack_tx, control_tx, move || repaint()).await
-            {
-                debug!("Guest receive loop ended: {e}");
-            }
+        // # The reason comes back out
+        //
+        // This used to log the error and return `()`. Everything the host says
+        // about why a session ended arrives here — `SessionEnd` is turned into
+        // a sentence by `explain_session_end`, in this machine's language,
+        // which is the entire reason the host sends a code and not prose — and
+        // then it went into a `debug!` line and the status became a bare
+        // "Disconnected". An invalid passcode, a refused connection, a host
+        // that could not capture: all of them looked identical, and the only
+        // way to find out which was to read the *host's* log, on a machine you
+        // by definition could not reach.
+        //
+        // `GuestStatus::Failed` has carried a message the whole time. Nothing
+        // could reach it.
+        let mut reader = tokio::spawn(async move {
+            receive_loop(&mut recv, &reader_state, ack_tx, control_tx, move || repaint()).await
         });
 
         // Forward input, and report on our own health, until the channel closes
@@ -1072,7 +1221,35 @@ pub async fn run_guest_session(
                     }
                 }
             } => Ok(()),
-            r = reader => r.context("Receive task panicked"),
+            // `&mut`, so the handle survives a writer that finishes first and
+            // can still be asked what the host said. See below.
+            r = &mut reader => match r {
+                Ok(result) => result,
+                Err(e) => Err(anyhow::Error::new(e).context("the receive task panicked")),
+            },
+        };
+
+        // # Let a reason that is already on the wire arrive
+        //
+        // The two arms race, and the writer wins more often than it looks: the
+        // host writes `SessionEnd` and closes the stream in the same breath, so
+        // the very packet carrying the reason is what makes the next send fail.
+        // The writer breaks out with `Ok(())`, the session is reported as an
+        // ordinary disconnection, and the explanation is sitting unread in the
+        // reader.
+        //
+        // So when the writer ends a session cleanly, the reader gets a moment
+        // to say whether it was actually clean. Bounded and short — this is on
+        // the teardown path, and a reader with nothing to say must not hold it
+        // up.
+        let outcome = match outcome {
+            Ok(()) => match tokio::time::timeout(REASON_GRACE, &mut reader).await {
+                Ok(Ok(result)) => result,
+                // Panicked, or said nothing in time. Neither is a reason to
+                // report, and the session did end.
+                Ok(Err(_)) | Err(_) => Ok(()),
+            },
+            other => other,
         };
 
         // # Say goodbye before hanging up
@@ -1089,7 +1266,8 @@ pub async fn run_guest_session(
         // dropped connection still ends it the slow way if this does not land.
         let farewell = Message::SessionEnd(tain_core::protocol::SessionEnd {
             session_id: 0,
-            reason: "the guest closed the session".into(),
+            reason: tain_core::protocol::end_reason::GUEST_CLOSED.into(),
+            args: Vec::new(),
         });
         let _ = tokio::time::timeout(
             GOODBYE_GRACE,
@@ -1201,9 +1379,9 @@ impl FrameDecoder {
                 let decoder =
                     tain_core::decode_ffmpeg::FfmpegDecoder::for_codec(codec).with_context(
                         || {
-                            format!(
-                                "this machine cannot decode {} — ask the host for H.264",
-                                codec.label()
+                            tain_core::i18n::format(
+                                "decoder.cannot_decode",
+                                &[("codec", codec.label())],
                             )
                         },
                     )?;
@@ -1274,19 +1452,21 @@ impl FrameDecoder {
     /// thing for the one line whose job is explaining a freeze.
     fn label(&self) -> String {
         match self {
-            Self::Pending => "no codec agreed yet".to_string(),
+            Self::Pending => tain_core::i18n::text("guest.no_codec").to_string(),
             Self::Raw => "raw".to_string(),
             Self::Delta(_) => "delta-zstd".to_string(),
-            Self::H264(_) => "H.264 on the CPU".to_string(),
+            Self::H264(_) => tain_core::i18n::text("decoder.h264_cpu").to_string(),
             #[cfg(target_os = "windows")]
             #[cfg(all(target_os = "windows", db_ffmpeg))]
             Self::H264Ffmpeg(decoder) => {
-                format!("libavcodec {} on the GPU (D3D11VA)", decoder.name)
+                tain_core::i18n::format("decoder.gpu", &[("name", &decoder.name)])
             }
-            Self::H264Hardware(_) => "H.264 via Media Foundation (CPU)".to_string(),
+            Self::H264Hardware(_) => {
+                tain_core::i18n::text("decoder.h264_media_foundation").to_string()
+            }
             #[cfg(all(target_os = "windows", db_ffmpeg))]
             Self::Hevc(decoder) => {
-                format!("libavcodec {} on the GPU (D3D11VA)", decoder.name)
+                tain_core::i18n::format("decoder.gpu", &[("name", &decoder.name)])
             }
         }
     }
@@ -1487,9 +1667,9 @@ where
                     ss.host_name.as_deref().unwrap_or("anonymous")
                 );
                 let codec = VideoCodec::from_wire_name(&ss.encoder_type).with_context(|| {
-                    format!(
-                        "host is streaming '{}', which this build cannot decode",
-                        ss.encoder_type
+                    tain_core::i18n::format(
+                        "decoder.unknown_stream",
+                        &[("name", &ss.encoder_type)],
                     )
                 })?;
                 *shared.codec.lock().unwrap() = Some(codec);
@@ -1498,6 +1678,22 @@ where
                 // Published so the render thread can try to open it for sharing.
                 shared.gpu_device.store(decoder.gpu_device(), Ordering::Relaxed);
                 *shared.remote_size.lock().unwrap() = (ss.screen_info.width, ss.screen_info.height);
+                // A window session, if this is one. Recorded before the first
+                // frame so the toolbar names what is being watched from the
+                // start, and so a window that is already minimised explains
+                // itself rather than showing as a blank picture.
+                if let Some(ref window) = ss.window {
+                    info!(
+                        "This session is watching a window: {} — {} ({:?}), {} on offer",
+                        window.app,
+                        window.title,
+                        window.state,
+                        ss.windows.len()
+                    );
+                }
+                *shared.shared_window.lock().unwrap() = ss.window.clone();
+                *shared.shared_windows.lock().unwrap() = ss.windows.clone();
+                shared.sharing_windows.store(ss.sharing_windows, Ordering::Relaxed);
                 // What this host has, which is not the same question as what it
                 // is currently sending. A host that cannot enumerate its
                 // displays sends none, and an empty list means "unknown" — the
@@ -1523,13 +1719,26 @@ where
                             .join(", ")
                     );
                 }
-                // Whatever the host is streaming to begin with, which is the
-                // primary unless something has already asked otherwise.
-                *shared.watching.lock().unwrap() = ss
-                    .displays
-                    .iter()
-                    .find(|d| d.primary)
-                    .map(|d| tain_core::protocol::DisplayChoice::One(d.id));
+                // Whatever the host is streaming to begin with: the window it
+                // opened on, or — for a screen session — the primary, unless
+                // something has already asked otherwise.
+                //
+                // The two are one assignment rather than two, because they used
+                // to be two and the second overwrote the first: a window session
+                // has no displays to search, so what the window branch had just
+                // recorded became `None` a few lines later. Harmless while a
+                // window session had nothing to switch between; not harmless
+                // now that it does.
+                *shared.watching.lock().unwrap() = match ss.window {
+                    Some(ref window) => {
+                        Some(tain_core::protocol::DisplayChoice::Window(window.id))
+                    }
+                    None => ss
+                        .displays
+                        .iter()
+                        .find(|d| d.primary)
+                        .map(|d| tain_core::protocol::DisplayChoice::One(d.id)),
+                };
                 *shared.displays.lock().unwrap() = ss.displays.clone();
                 // Sanitized on arrival: the host chose this string, we did not.
                 *shared.host_name.lock().unwrap() =
@@ -1733,6 +1942,16 @@ where
                         }
                     };
 
+                // A picture, which is what a pending switch was waiting for —
+                // but only once the host has said what it is now showing, or
+                // this would clear on a frame of the view being left.
+                {
+                    let mut switching = shared.switching.lock().unwrap();
+                    if switching.is_some_and(|s| s.answered) {
+                        *switching = None;
+                    }
+                }
+
                 // The decoder is the authority on size: a lossy codec pads to
                 // whole macroblocks, and the header is only the host's claim.
                 *shared.remote_size.lock().unwrap() =
@@ -1784,6 +2003,73 @@ where
                         change.encoder_type),
                 }
             }
+            Message::SharedWindow(window) => {
+                // Two kinds of news in one message: what the window is doing —
+                // which is what the picture stopping needs explaining by — and,
+                // when the host has switched, *which* window this now is.
+                info!(
+                    "The shared window is now {:?}: {} — {}",
+                    window.state, window.app, window.title
+                );
+                // Recorded so the switcher marks the window that is actually on
+                // screen. `DisplayChanged` says so too, and this is the message
+                // that arrives when the host changed windows without being
+                // asked — a shared window that closed, say.
+                *shared.watching.lock().unwrap() =
+                    Some(tain_core::protocol::DisplayChoice::Window(window.id));
+                // # "No picture is coming" is also an answer
+                //
+                // A switch clears when a frame of the new view arrives, and a
+                // window that is minimised produces none — so a guest that
+                // switched to one would have watched a spinner until it gave
+                // up, over the very message explaining why there was nothing.
+                // This is that message: the wait is over, and what it arrived
+                // at is a window that is away.
+                if window.state != tain_core::protocol::SharedWindowState::Showing {
+                    *shared.switching.lock().unwrap() = None;
+                }
+                *shared.shared_window.lock().unwrap() = Some(window);
+                repaint();
+            }
+            Message::SharedChanged(offer) => {
+                // The person at the host changed their mind about what this
+                // session may see, while it was running.
+                info!(
+                    "The host now shares {} display(s) and {} window(s)",
+                    offer.displays.len(),
+                    offer.windows.len()
+                );
+                // Replaced wholesale rather than merged: the message carries the
+                // whole offer for exactly this reason — a menu assembled from
+                // edits would be wrong for anybody who missed one.
+                *shared.displays.lock().unwrap() = offer.displays.clone();
+                *shared.shared_windows.lock().unwrap() = offer.windows.clone();
+                shared.sharing_windows.store(offer.sharing_windows, Ordering::Relaxed);
+                // The same as a single window going away: an offer with nothing
+                // showing in it is an answer, and waiting for a picture from it
+                // would be waiting for one nobody is going to send.
+                let nothing_showing = offer.sharing_windows
+                    && offer
+                        .windows
+                        .iter()
+                        .all(|w| w.state != tain_core::protocol::SharedWindowState::Showing);
+                if nothing_showing {
+                    *shared.switching.lock().unwrap() = None;
+                }
+                // A window that is no longer shared must stop being named as
+                // the one being watched; `DisplayChanged` follows this and says
+                // what took its place.
+                let still_shared = shared
+                    .shared_window
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|w| offer.windows.iter().any(|on| on.id == w.id));
+                if !still_shared {
+                    *shared.shared_window.lock().unwrap() = None;
+                }
+                repaint();
+            }
             Message::DisplayChanged(change) => {
                 // The host's answer, sent whether or not the request worked.
                 // Recording it either way is the point: a menu showing a
@@ -1795,6 +2081,21 @@ where
                     None => info!("Host switched to {:?}", change.showing),
                 }
                 *shared.watching.lock().unwrap() = Some(change.showing);
+                // The host has said what it is showing; the picture of it comes
+                // when its capture has been rebuilt. See `Switching`.
+                if let Some(switching) = shared.switching.lock().unwrap().as_mut() {
+                    switching.answered = true;
+                }
+                // # The composite is not watching any one window
+                //
+                // `shared_window` is what puts "Excel is minimised on the host"
+                // over the picture and what pauses the session as not-live.
+                // Left set after a switch to the composite, a window that
+                // happened to be minimised would put that message over a
+                // picture cheerfully showing three other windows.
+                if change.showing == tain_core::protocol::DisplayChoice::All {
+                    *shared.shared_window.lock().unwrap() = None;
+                }
                 // A different display is a different picture of a different
                 // size, and the decoder holds reference frames for the old one.
                 //
@@ -1820,8 +2121,10 @@ where
                 repaint();
             }
             Message::SessionEnd(se) => {
-                info!("Host ended the session: {}", se.reason);
-                anyhow::bail!("{}", explain_session_end(&se.reason));
+                // The code and its arguments, not the sentence: the log stays
+                // English whatever language this guest is showing.
+                info!("Host ended the session: {} {:?}", se.reason, se.args);
+                anyhow::bail!("{}", explain_session_end(&se));
             }
             _ => {}
         }
@@ -1829,19 +2132,26 @@ where
     Ok(())
 }
 
-/// Turn the host's machine-readable reason into something worth reading.
+/// Turn the host's code into a sentence, in *this* machine's language.
+///
+/// The host sends a code precisely so that this can happen here — see
+/// [`tain_core::protocol::end_reason`]. A code with no entry is one from a
+/// newer version of Tain, and gets a sentence that at least says what happened
+/// and quotes what it was told.
 ///
 /// `invalid_passcode` is the common one and the least self-explanatory: it is
 /// what a saved connection hits once the host has regenerated its code, which
 /// happens on every host restart (codes are in-memory) and on disconnect if
 /// guest autoreset is on. "Failed: invalid_passcode" sends people hunting for a
 /// bug that isn't there.
-fn explain_session_end(reason: &str) -> String {
-    match reason {
-        "invalid_passcode" => {
-            "that code is no longer valid — the host has generated a new one".to_string()
-        }
-        other => other.to_string(),
+fn explain_session_end(end: &tain_core::protocol::SessionEnd) -> String {
+    let args: Vec<(&str, &str)> =
+        end.args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let key = format!("end.{}", end.reason);
+    if tain_core::i18n::has(&key) {
+        tain_core::i18n::format(&key, &args)
+    } else {
+        tain_core::i18n::format("end.unknown", &[("code", &end.reason)])
     }
 }
 
@@ -2091,15 +2401,160 @@ mod tests {
         assert!(decoder.decode(&[], 64, 64, false).unwrap().is_none());
     }
 
+    /// Build the message a host would send with this code.
+    fn ended(reason: &str, args: &[(&str, &str)]) -> tain_core::protocol::SessionEnd {
+        tain_core::protocol::SessionEnd {
+            session_id: 1,
+            reason: reason.into(),
+            args: args.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    /// Reaching a host is tried more than once, and stops.
+    ///
+    /// # What the boundary has to get right
+    ///
+    /// The loop gives up when there is no room left for *another* attempt, not
+    /// when the budget is already spent — otherwise it starts an attempt it
+    /// cannot finish and the session hangs past the point it promised to stop.
+    /// Both ends of that are worth pinning: a budget that allows no retry at
+    /// all is a regression to pressing Connect by hand, and one that never
+    /// stops is a session nobody can get rid of.
+    #[test]
+    fn reaching_a_host_is_retried_within_a_bounded_budget() {
+        /// The loop's own decision, with the network taken out.
+        fn keeps_trying(spent: std::time::Duration) -> bool {
+            spent + REACH_RETRY_GAP < REACH_FOR
+        }
+
+        assert!(keeps_trying(std::time::Duration::ZERO), "the first failure must be retried");
+        assert!(
+            keeps_trying(REACH_FOR / 2),
+            "half the budget spent is still worth another attempt"
+        );
+        assert!(!keeps_trying(REACH_FOR), "a spent budget must stop");
+        assert!(
+            !keeps_trying(REACH_FOR - REACH_RETRY_GAP),
+            "there has to be room for the gap as well as the attempt"
+        );
+
+        // And the budget is big enough to be worth having. A dial is 45s of its
+        // own, so anything under two of those would be one attempt with extra
+        // steps.
+        assert!(
+            REACH_FOR >= std::time::Duration::from_secs(120),
+            "the budget does not cover more than one real attempt"
+        );
+        assert!(REACH_RETRY_GAP < REACH_FOR, "the gap alone would use the whole budget");
+    }
+
     #[test]
     fn a_stale_saved_code_says_so_instead_of_showing_a_wire_constant() {
-        let explained = explain_session_end("invalid_passcode");
+        use tain_core::protocol::end_reason;
+
+        let explained = explain_session_end(&ended(end_reason::INVALID_PASSCODE, &[]));
         assert!(!explained.contains('_'), "still reads like a wire constant: {explained}");
         assert!(explained.contains("no longer valid"));
+    }
 
-        // Reasons written for humans pass straight through.
-        let human = "the host did not allow this connection";
-        assert_eq!(explain_session_end(human), human);
+    /// What the host actually sends with each code.
+    ///
+    /// A second copy of the producers' knowledge, deliberately: it is what lets
+    /// the test below notice a placeholder renamed on one side only.
+    fn args_for(code: &str) -> Vec<(&'static str, &'static str)> {
+        use tain_core::protocol::end_reason::CAPTURE_FAILED;
+        match code {
+            CAPTURE_FAILED => vec![("detail", "DXGI_ERROR_UNSUPPORTED")],
+            other if other.starts_with("capture_wrong_gpu") => {
+                vec![("screen", r"\\.\DISPLAY1")]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Every code the host can send has words to go with it, and every
+    /// placeholder in those words has something to put there.
+    ///
+    /// The point of sending a code rather than a sentence is that the sentence
+    /// is written here — so a code with no entry would leave the guest reading
+    /// `not_allowed` off the wire, which is exactly what this replaced. A
+    /// placeholder with nothing to fill it is the same failure one layer down:
+    /// the guest reads `{detail}`.
+    #[test]
+    fn every_reason_a_host_can_send_has_words_on_this_side() {
+        use tain_core::protocol::end_reason::{wrong_gpu::*, *};
+
+        for code in [
+            INVALID_PASSCODE,
+            NOT_ALLOWED,
+            NOT_APPROVED,
+            CAPTURE_FAILED,
+            DISCONNECTED_BY_HOST,
+            HOST_CLOSED,
+            GUEST_CLOSED,
+            NEITHER_WAY,
+        ] {
+            let explained = explain_session_end(&ended(code, &args_for(code)));
+            assert!(
+                !explained.contains(code),
+                "{code} was shown as the code itself: {explained}"
+            );
+            assert!(explained.split_whitespace().count() > 2, "{code} says too little");
+            assert!(
+                !explained.contains('{'),
+                "{code} left a placeholder unfilled: {explained}"
+            );
+        }
+    }
+
+    /// A newer host may end a session for a reason this build has never heard
+    /// of. That has to read as an ending, not as a blank or a bare identifier.
+    #[test]
+    fn a_reason_from_a_newer_host_still_reads_as_a_sentence() {
+        let explained = explain_session_end(&ended("moved_to_another_screen", &[]));
+        assert!(explained.contains("moved_to_another_screen"), "{explained}");
+        assert!(explained.split_whitespace().count() > 3, "{explained}");
+    }
+
+    /// The specifics a reason carries reach the screen.
+    ///
+    /// A capture failure with nothing to be done about it is the operating
+    /// system's own words, which no catalogue can hold; the wrong-GPU failures
+    /// name the display they are about. Both arrive as arguments, and both have
+    /// to land in the sentence rather than being dropped on the way.
+    #[test]
+    fn the_specifics_a_reason_carries_reach_the_screen() {
+        use tain_core::protocol::end_reason;
+
+        let os = explain_session_end(&ended(
+            end_reason::CAPTURE_FAILED,
+            &[("detail", "DXGI_ERROR_UNSUPPORTED")],
+        ));
+        assert!(os.contains("DXGI_ERROR_UNSUPPORTED"), "{os}");
+        assert!(os.contains("capture"), "lost the sentence: {os}");
+
+        let gpu = explain_session_end(&ended(
+            end_reason::wrong_gpu::NEITHER_WAY,
+            &[("screen", "\\\\.\\DISPLAY2")],
+        ));
+        assert!(gpu.contains("DISPLAY2"), "the display was dropped: {gpu}");
+    }
+
+    /// The wrong-GPU remedy is chosen on the host and read on the guest, so
+    /// what crosses is a code and its arguments — never the host's words.
+    #[test]
+    fn a_remedy_survives_the_layers_of_context_put_on_top_of_it() {
+        use tain_core::protocol::end_reason::wrong_gpu;
+        use tain_core::screen_capture::Remedy;
+
+        let remedy = Remedy::new(wrong_gpu::NEITHER_WAY, &[("screen", "\\\\.\\DISPLAY1")]);
+        let buried = anyhow::Error::new(remedy)
+            .context("tried 3 adapter(s)")
+            .context("could not start capturing for the host");
+
+        let found = Remedy::in_chain(&buried).expect("the remedy is still in the chain");
+        assert_eq!(found.code, wrong_gpu::NEITHER_WAY);
+        assert_eq!(found.args, vec![("screen".to_string(), "\\\\.\\DISPLAY1".to_string())]);
     }
 
     #[test]
@@ -2152,9 +2607,6 @@ mod tests {
         let (_input_tx, input_rx) = mpsc::unbounded_channel();
         let session = tokio::spawn(run_guest_session(
             code,
-            // Nothing remembered in a test: the harness connects to a host it
-            // just started, so there is no previous address to reuse.
-            Vec::new(),
             Some("Test Guest".into()),
             state.clone(),
             input_rx,

@@ -485,7 +485,7 @@ fn what_the_colour_conversion_costs() {
 #[ignore = "requires a D3D11 device with video support"]
 #[cfg(target_os = "windows")]
 fn gpu_conversion_against_cpu_readback() {
-    use tain_core::capture_nv12::Nv12Converter;
+    use tain_core::capture_nv12::VideoScaler;
     use windows::core::Interface;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::*;
@@ -582,7 +582,7 @@ fn gpu_conversion_against_cpu_readback() {
     });
 
     // Path B: convert on the GPU, read back the smaller result.
-    let mut converter = Nv12Converter::new(&device, &context, w, h).expect("converter");
+    let mut converter = VideoScaler::new(&device, &context, w, h).expect("converter");
     converter.convert(&source).expect("warm up");
     let gpu_ms = median_ms(20, || {
         converter.convert(&source).expect("convert");

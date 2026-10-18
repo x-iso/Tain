@@ -42,6 +42,15 @@
 //! this process cannot see, and closed as soon as it comes back — so the normal
 //! path is untouched, and the agent captures nothing until somebody is actually
 //! looking at a consent prompt.
+//!
+//! # Two processes use this, as two different users
+//!
+//! The application, as the signed-in user, and the unattended host, as Local
+//! System — both on the ordinary desktop. That difference is why "does this
+//! desktop have the input" is asked by name rather than by whether the input
+//! desktop can be opened: see [`this_desktop_has_input`]. And the host starts
+//! on a machine that is often locked, which is why the local backend can be
+//! built after the fact: see `DesktopFollowing::deferred`.
 
 use anyhow::Result;
 
@@ -54,17 +63,17 @@ use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, Scr
 /// them.
 pub const SECURE_DESKTOP: &str = "Winlogon";
 
+/// The desktop a signed-in user's session lives on.
+///
+/// Where the application runs, where the unattended host is started, and the
+/// agent that carries input to elevated windows.
+pub const ORDINARY_DESKTOP: &str = "Default";
+
 #[cfg(target_os = "windows")]
 pub use platform::{
-    capture_through_agent_only, release_agent_touches, send_input_to_agent, touch_route_changed,
-    use_agent_only, DesktopFollowing,
+    input_desktop_name, own_desktop_name, release_agent_touches, send_input_to_agent,
+    this_desktop_has_input, touch_route_changed, DesktopFollowing, LocalFactory,
 };
-
-/// Whether this process has no desktop of its own to capture.
-#[cfg(not(target_os = "windows"))]
-pub fn capture_through_agent_only() -> bool {
-    false
-}
 
 /// Whether input should be going to an agent rather than injected locally.
 #[cfg(not(target_os = "windows"))]
@@ -88,36 +97,82 @@ mod platform {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// Whether this process must get every frame from an agent.
+    /// The name of the desktop currently receiving input, if it can be opened.
     ///
-    /// # Why a process-wide mode rather than a parameter
-    ///
-    /// The service has no desktop. It runs in session zero, where Desktop
-    /// Duplication has nothing to duplicate, so the local capturer it would
-    /// normally wrap does not merely return black — it refuses to start, and
-    /// the session fails before a frame is asked for.
-    ///
-    /// This is not a property of one session or one configuration. It is a fact
-    /// about the process: the service is *always* in that position and the
-    /// application never is. Threading it through every constructor between
-    /// here and where a session is built would be plumbing a constant, so the
-    /// service states it once at startup and nothing below has to carry it.
-    static AGENT_ONLY: AtomicBool = AtomicBool::new(false);
+    /// `None` is an answer, not a failure: a process running as the signed-in
+    /// user cannot open the secure desktop, so being refused is how it learns
+    /// that a consent prompt or the lock screen is up.
+    pub fn input_desktop_name() -> Option<String> {
+        use windows::Win32::System::StationsAndDesktops::{
+            CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
+        };
 
-    /// Say that this process cannot capture anything itself.
-    ///
-    /// Called by the service before it hosts, and by nothing else.
-    pub fn use_agent_only() {
-        AGENT_ONLY.store(true, Ordering::Relaxed);
-        tracing::info!(
-            "This process has no desktop of its own — every frame will come from the \
-             {SECURE_DESKTOP} agent"
-        );
+        // SAFETY: documented; the handle is closed before returning.
+        unsafe {
+            let handle =
+                OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS).ok()?;
+            let name = desktop_name(handle);
+            let _ = CloseDesktop(handle);
+            name
+        }
     }
 
-    /// Whether [`use_agent_only`] was called.
-    pub fn capture_through_agent_only() -> bool {
-        AGENT_ONLY.load(Ordering::Relaxed)
+    /// The name of the desktop this process was started on.
+    ///
+    /// Asked once and kept. A process cannot move to another desktop, and no
+    /// thread in this one ever calls `SetThreadDesktop`, so the first answer is
+    /// the answer for its whole life.
+    pub fn own_desktop_name() -> Option<String> {
+        use windows::Win32::System::StationsAndDesktops::GetThreadDesktop;
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+
+        static OWN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        OWN.get_or_init(|| {
+            // SAFETY: the handle belongs to the thread and must not be closed.
+            let handle = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok()?;
+            desktop_name(handle)
+        })
+        .clone()
+    }
+
+    fn desktop_name(handle: windows::Win32::System::StationsAndDesktops::HDESK) -> Option<String> {
+        use windows::Win32::System::StationsAndDesktops::{GetUserObjectInformationW, UOI_NAME};
+
+        let mut buffer = [0u16; 128];
+        let mut needed = 0u32;
+        // SAFETY: a documented read into a buffer this function owns, sized in
+        // bytes as the call expects.
+        unsafe {
+            GetUserObjectInformationW(
+                windows::Win32::Foundation::HANDLE(handle.0),
+                UOI_NAME,
+                Some(buffer.as_mut_ptr().cast()),
+                std::mem::size_of_val(&buffer) as u32,
+                Some(&mut needed),
+            )
+            .ok()?;
+        }
+        let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        Some(String::from_utf16_lossy(&buffer[..len]))
+    }
+
+    /// Whether the desktop receiving input is the one this process is on.
+    ///
+    /// # By name, because being able to open it proves nothing
+    ///
+    /// This used to ask only whether `OpenInputDesktop` succeeded. For the
+    /// application that is the same question: running as the signed-in user it
+    /// is refused the secure desktop, so success meant the input was here.
+    ///
+    /// The unattended host runs on the same desktop as Local System, and Local
+    /// System is not refused anything. It opens the secure desktop as easily as
+    /// its own — so it would have gone on believing the input was here through
+    /// every consent prompt and every lock, duplicating a desktop Windows was
+    /// not showing. Comparing the name is the question that was always meant,
+    /// and it gives the same answer for the application as the old test did.
+    pub fn this_desktop_has_input() -> bool {
+        let Some(input) = input_desktop_name() else { return false };
+        own_desktop_name().is_some_and(|own| own.eq_ignore_ascii_case(&input))
     }
 
     /// The link to the secure desktop's agent, while there is one.
@@ -217,7 +272,7 @@ mod platform {
         let Ok(mut link) = INPUT_LINK.lock() else { return false };
 
         if link.is_none() {
-            match super::super::agent_pipe::connect("Default") {
+            match super::super::agent_pipe::connect(ORDINARY_DESKTOP) {
                 Ok(agent) => {
                     let agent = Arc::new(agent);
                     // Explicitly no frames: this link exists to carry input.
@@ -374,12 +429,25 @@ mod platform {
         }
     }
 
+    /// Builds the capturer for this process's own desktop, for a wrapper that
+    /// could not have one when it was made. See [`DesktopFollowing::deferred`].
+    pub type LocalFactory = Box<dyn Fn() -> Result<Box<dyn ScreenCaptureBackend>> + Send + Sync>;
+
     /// Wraps a local capturer and falls back to an agent's frames.
     pub struct DesktopFollowing {
-        /// `None` in the service, which has no desktop to capture.
+        /// The capturer for this desktop. `None` until it can be built — see
+        /// [`Self::deferred`].
         local: Option<Box<dyn ScreenCaptureBackend>>,
+        /// How to build `local`, while there is not one yet.
+        build_local: Option<LocalFactory>,
+        /// When building `local` last failed, so a desktop that has just come
+        /// back and is not ready to be duplicated is not asked on every frame.
+        build_failed_at: Option<std::time::Instant>,
+        /// What the session has asked of the capturer, so one built later is
+        /// told as well.
+        asked: Asked,
         /// Running only while the input is somewhere this process cannot see.
-        agent: Option<AgentReader>,
+        agent: Option<AgentSubscription>,
         /// Whether the last look found the input on a desktop we can capture.
         had_local_input: bool,
         /// Frames taken from the agent since it was last connected.
@@ -389,55 +457,140 @@ mod platform {
         /// side alone, and the first time this failed it took both logs to see
         /// that nothing had failed at all — the picture simply stopped.
         from_agent: u64,
+        /// Whether this desktop has the input. A function rather than a call so
+        /// a test can answer it; see [`this_desktop_has_input`] for the real one.
+        has_input: fn() -> bool,
     }
+
+    /// The session's requests of a capturer that does not exist yet.
+    ///
+    /// # Why they are remembered rather than refused
+    ///
+    /// The session asks for a scale, a size ceiling, a granularity and a format
+    /// once, when it starts, and does not ask again unless something changes. A
+    /// capturer built afterwards would never hear them — so a session that
+    /// began while the machine was locked would, on unlock, duplicate at full
+    /// native resolution in BGRA for the rest of its life, ignoring the quality
+    /// setting and the guest's window. Replaying them onto the capturer when it
+    /// is built makes a late start the same as an early one.
+    #[derive(Default)]
+    struct Asked {
+        scale: Option<QualityScale>,
+        ceiling: Option<Option<(u16, u16)>>,
+        granularity: Option<(u16, u16)>,
+        format: Option<PixelFormat>,
+    }
+
+    impl Asked {
+        fn replay(&self, capturer: &mut dyn ScreenCaptureBackend) {
+            if let Some(scale) = self.scale {
+                capturer.set_scale(scale);
+            }
+            if let Some(ceiling) = self.ceiling {
+                capturer.set_size_ceiling(ceiling);
+            }
+            if let Some(granularity) = self.granularity {
+                capturer.set_size_granularity(granularity);
+            }
+            if let Some(format) = self.format {
+                capturer.request_format(format);
+            }
+        }
+    }
+
+    /// How long to wait before trying again to build a local capturer.
+    ///
+    /// The input returning to a desktop and Desktop Duplication agreeing to
+    /// open it are not the same instant. Half a second is a retry nobody sees
+    /// and an attempt nobody pays for sixty times a second.
+    const RETRY_BUILDING_LOCAL: std::time::Duration = std::time::Duration::from_millis(500);
 
     impl DesktopFollowing {
         pub fn new(local: Box<dyn ScreenCaptureBackend>) -> Self {
-            Self { local: Some(local), agent: None, had_local_input: true, from_agent: 0 }
-        }
-
-        /// A capturer with no desktop of its own, for the service.
-        ///
-        /// Every frame comes from the agent. There is no local backend to fall
-        /// back to and no question about which desktop to ask: with nobody
-        /// signed in, the sign-in screen *is* the secure desktop, and it is the
-        /// only thing there is to show.
-        pub fn agent_only() -> Self {
-            Self { local: None, agent: None, had_local_input: false, from_agent: 0 }
-        }
-
-        /// Whether this process can still see the desktop receiving input.
-        ///
-        /// `OpenInputDesktop` refusing is the signal, not an error: a process on
-        /// the ordinary desktop is not permitted to open the secure one, so
-        /// being turned away is precisely how it learns the secure desktop is
-        /// up. There is no positive notification of this anywhere in Windows.
-        fn local_has_input() -> bool {
-            // A process with no desktop never has the input, whatever Windows
-            // would say about session zero's own.
-            if capture_through_agent_only() {
-                return false;
+            Self {
+                local: Some(local),
+                build_local: None,
+                build_failed_at: None,
+                asked: Asked::default(),
+                agent: None,
+                had_local_input: true,
+                from_agent: 0,
+                has_input: this_desktop_has_input,
             }
-            use windows::Win32::System::StationsAndDesktops::{
-                CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
-            };
+        }
 
-            // SAFETY: documented; the handle is closed immediately.
-            unsafe {
-                match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) {
-                    Ok(handle) => {
-                        let _ = CloseDesktop(handle);
-                        true
+        /// A capturer whose own desktop could not be duplicated when it was
+        /// made, because another desktop had the input.
+        ///
+        /// It shows the secure desktop's agent until its own desktop is back in
+        /// front, then builds its local capturer with `build` and carries on as
+        /// though it had had one all along. See `create_capturer` for when this
+        /// happens, which for the unattended host is every time the machine is
+        /// locked.
+        pub fn deferred(build: LocalFactory) -> Self {
+            Self {
+                local: None,
+                build_local: Some(build),
+                build_failed_at: None,
+                asked: Asked::default(),
+                agent: None,
+                had_local_input: false,
+                from_agent: 0,
+                has_input: this_desktop_has_input,
+            }
+        }
+
+        /// Try to build the local capturer, if there is not one and it is time.
+        fn build_local_if_due(&mut self) {
+            if self.local.is_some() {
+                return;
+            }
+            let Some(build) = self.build_local.as_ref() else { return };
+            if self.build_failed_at.is_some_and(|at| at.elapsed() < RETRY_BUILDING_LOCAL) {
+                return;
+            }
+            match build() {
+                Ok(mut capturer) => {
+                    self.asked.replay(&mut *capturer);
+                    tracing::info!("This desktop has the input again — capturing it directly");
+                    self.local = Some(capturer);
+                    self.build_local = None;
+                    self.build_failed_at = None;
+                }
+                Err(e) => {
+                    // Once per run of failures, not twice a second.
+                    if self.build_failed_at.is_none() {
+                        tracing::info!("This desktop cannot be captured yet: {e:#}");
                     }
-                    Err(_) => false,
+                    self.build_failed_at = Some(std::time::Instant::now());
                 }
             }
+        }
+
+        /// The same wrapper, deciding whether its desktop has the input with
+        /// `has_input` instead of asking Windows. Tests only.
+        #[cfg(test)]
+        pub fn answering_input_with(mut self, has_input: fn() -> bool) -> Self {
+            self.has_input = has_input;
+            self
+        }
+
+        /// Whether a request made now will reach a capturer.
+        ///
+        /// A wrapper that is waiting to build one says yes, because it will be
+        /// honoured the moment there is something to honour it — and until
+        /// then the frames come from the agent, which is the same exception a
+        /// consent prompt has always been. Saying no instead would have the
+        /// session wrap this in a CPU resampler for its whole life, long after
+        /// the GPU was available to do the same work for nothing.
+        fn will_be_honoured(&self) -> bool {
+            self.build_local.is_some()
         }
     }
 
     impl ScreenCaptureBackend for DesktopFollowing {
         fn capture_next(&mut self) -> Result<Option<ScreenFrame>> {
-            let local = Self::local_has_input();
+            let local = (self.has_input)();
 
             if local != self.had_local_input {
                 self.had_local_input = local;
@@ -447,12 +600,10 @@ mod platform {
                         self.from_agent,
                     );
                     self.from_agent = 0;
-                    // Dropping it closes the pipe, which is what tells the
-                    // agent to stop capturing. The link goes first, so no
-                    // click can be sent down a pipe that is about to close.
-                    if let Ok(mut link) = LINK.lock() {
-                        *link = None;
-                    }
+                    // Letting go. When this was the last session holding the
+                    // link, the link closes — withdrawing itself as the route
+                    // for input first, then really closing the pipe, which is
+                    // what frees it for the next time. See `AgentLink`.
                     self.agent = None;
                 } else {
                     tracing::info!(
@@ -462,16 +613,28 @@ mod platform {
                 }
             }
 
-            if local && let Some(local) = self.local.as_mut() {
-                return local.capture_next();
+            if local {
+                self.build_local_if_due();
+                return match self.local.as_mut() {
+                    Some(capturer) => capturer.capture_next(),
+                    // The input is here and the capturer is not up yet. There
+                    // is nothing to show from anywhere: the agent serves the
+                    // other desktop, which no longer has anything on it.
+                    None => Ok(None),
+                };
             }
 
             // Connecting is retried on each call rather than once, because the
             // agent may not have its pipe up at the instant the desktop
             // switches, and the alternative is giving up for the whole prompt.
             if self.agent.is_none() {
-                match AgentReader::start(SECURE_DESKTOP) {
-                    Ok(reader) => self.agent = Some(reader),
+                match AgentLink::attach(&SECURE_AGENT, SECURE_DESKTOP) {
+                    // From generation zero, so a session joining a link that
+                    // is already open is handed the picture that is already
+                    // there. Desktop Duplication sends only changes, and a lock
+                    // screen does not change — waiting for the next frame would
+                    // mean waiting for somebody to move the mouse.
+                    Ok(link) => self.agent = Some(AgentSubscription { link, seen: 0 }),
                     Err(e) => {
                         tracing::debug!("No frames from the {SECURE_DESKTOP} agent yet: {e:#}");
                         // Not an error to the caller. The session carries on
@@ -482,29 +645,28 @@ mod platform {
                 }
             }
 
-            let Some(reader) = self.agent.as_mut() else { return Ok(None) };
-            match reader.take() {
-                Some(frame) => {
-                    self.from_agent += 1;
-                    if self.from_agent == 1 {
-                        tracing::info!(
-                            "First frame from the {SECURE_DESKTOP} agent: {}x{}",
-                            frame.width,
-                            frame.height,
-                        );
-                    }
-                    Ok(Some(frame))
+            let Some(subscription) = self.agent.as_mut() else { return Ok(None) };
+            // A frame that arrived before the agent went is still a frame, so
+            // it is taken before asking whether the agent has gone.
+            if let Some((generation, frame)) = subscription.link.newer_than(subscription.seen) {
+                subscription.seen = generation;
+                self.from_agent += 1;
+                if self.from_agent == 1 {
+                    tracing::info!(
+                        "First frame from the {SECURE_DESKTOP} agent: {}x{}",
+                        frame.width,
+                        frame.height,
+                    );
                 }
-                None if reader.finished() => {
-                    tracing::info!("The {SECURE_DESKTOP} agent stopped sending");
-                    if let Ok(mut link) = LINK.lock() {
-                        *link = None;
-                    }
-                    self.agent = None;
-                    Ok(None)
-                }
-                None => Ok(None),
+                return Ok(Some(frame));
             }
+            if subscription.link.finished() {
+                tracing::info!("The {SECURE_DESKTOP} agent stopped sending");
+                // Letting go of a finished link is what allows the next call to
+                // open a new one rather than rejoin the dead one.
+                self.agent = None;
+            }
+            Ok(None)
         }
 
         fn take_cursor(&mut self) -> Option<super::super::cursor::CursorUpdate> {
@@ -518,9 +680,9 @@ mod platform {
         }
 
         fn frame_size(&self) -> (u16, u16) {
-            // Without a local backend the size is whatever the agent sends, and
-            // nothing has arrived yet. The primary display's size is the right
-            // guess: the agent is capturing the same screen.
+            // Without a local backend yet, the size is whatever the agent
+            // sends, and nothing may have arrived. The primary display's size
+            // is the right guess: the agent is capturing the same screen.
             self.local.as_ref().map_or_else(
                 super::super::screen_capture::primary_display_size,
                 |local| local.frame_size(),
@@ -528,7 +690,11 @@ mod platform {
         }
 
         fn set_scale(&mut self, scale: QualityScale) -> bool {
-            self.local.as_mut().is_some_and(|local| local.set_scale(scale))
+            self.asked.scale = Some(scale);
+            match self.local.as_mut() {
+                Some(local) => local.set_scale(scale),
+                None => self.will_be_honoured(),
+            }
         }
 
         /// # This was missing, and every Windows host paid for it
@@ -548,22 +714,36 @@ mod platform {
         /// was not, which reads as the wall being fast rather than the rest
         /// being slow.
         ///
-        /// Nothing to forward to when the agent is doing the capturing. It
-        /// sends what it sends, and the size follows the desktop back.
+        /// The agent's own frames are not affected: it sends what it sends, and
+        /// the size follows the desktop back when the input does.
         fn set_size_ceiling(&mut self, ceiling: Option<(u16, u16)>) -> bool {
-            self.local.as_mut().is_some_and(|local| local.set_size_ceiling(ceiling))
+            self.asked.ceiling = Some(ceiling);
+            match self.local.as_mut() {
+                Some(local) => local.set_size_ceiling(ceiling),
+                None => self.will_be_honoured(),
+            }
         }
 
-        /// Same delegation, and the same nothing to delegate to when the agent
-        /// is capturing — an agent frame is whatever size the desktop is.
+        /// Same delegation, and the same exception for the agent's frames.
         fn set_size_granularity(&mut self, granularity: (u16, u16)) -> bool {
-            self.local.as_mut().is_some_and(|local| local.set_size_granularity(granularity))
+            self.asked.granularity = Some(granularity);
+            match self.local.as_mut() {
+                Some(local) => local.set_size_granularity(granularity),
+                None => self.will_be_honoured(),
+            }
         }
 
         /// Forwarded, or this wrapper hides a wall's staleness from the session
         /// that has to act on it — which is how `set_size_ceiling` went missing.
         fn layout_changed(&self) -> bool {
             self.local.as_ref().is_some_and(|local| local.layout_changed())
+        }
+
+        /// Forwarded for the same reason, and it matters more: a composite of
+        /// windows that lost its tiles here would have every click mapped
+        /// through the primary screen instead.
+        fn input_tiles(&self) -> Option<Vec<crate::input_inject::Tile>> {
+            self.local.as_ref().and_then(|local| local.input_tiles())
         }
 
         fn request_format(&mut self, format: PixelFormat) -> bool {
@@ -588,18 +768,41 @@ mod platform {
             //
             // The agent's own frames still cost the conversion. They are rare,
             // brief, and mostly a still dialog.
-            self.local.as_mut().is_some_and(|local| local.request_format(format))
+            self.asked.format = Some(format);
+            match self.local.as_mut() {
+                Some(local) => local.request_format(format),
+                None => self.will_be_honoured(),
+            }
         }
 
         fn is_real(&self) -> bool {
-            // Agent frames are a real screen even though this process cannot
-            // see one. Reporting otherwise would have the session treat them
-            // as a test pattern.
+            // Agent frames are a real screen even while this process has no
+            // capturer of its own. Reporting otherwise would have the session
+            // treat them as a test pattern.
             self.local.as_ref().is_none_or(|local| local.is_real())
         }
     }
 
-    /// Reads an agent's frames on its own thread, keeping only the newest.
+    /// The link to the secure desktop's agent that sessions in this process
+    /// share, while any of them wants it.
+    static SECURE_AGENT: Mutex<std::sync::Weak<AgentLink>> = Mutex::new(std::sync::Weak::new());
+
+    /// One session's hold on the shared link, and the last frame it was given.
+    struct AgentSubscription {
+        link: Arc<AgentLink>,
+        seen: u64,
+    }
+
+    /// How long a closing link waits for its reader to let go of the pipe.
+    ///
+    /// Cancelling the read takes effect in microseconds. This is the ceiling
+    /// for a reader that is somewhere a cancel cannot reach, not a wait anybody
+    /// pays.
+    const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// A connection to an agent, reading its frames on a thread of its own.
+    ///
+    /// # Why reading has a thread
     ///
     /// The pipe read blocks until a frame arrives, and a consent prompt is
     /// mostly still, so a blocking read on the capture thread would stall the
@@ -607,18 +810,65 @@ mod platform {
     /// handing over the latest keeps the frame loop's own timing intact — and
     /// dropping older frames is what the loop does with its own capturer
     /// anyway.
-    struct AgentReader {
-        latest: Arc<Mutex<Option<ScreenFrame>>>,
+    ///
+    /// # Why there is one per process, shared
+    ///
+    /// The agent's pipe has a single instance, because an agent serves one
+    /// host. A host can have several sessions, though — two guests at once, or
+    /// a guest that reconnected while its old session was still winding down —
+    /// and each used to open a connection of its own. Whichever got there first
+    /// had the secure desktop, and every other session was told the pipe was
+    /// busy and showed a frozen picture until the input came back.
+    ///
+    /// # Why closing it is work
+    ///
+    /// The reading thread holds the pipe, and is almost always blocked in that
+    /// read — the agent sends nothing once the input leaves its desktop, which
+    /// is precisely when a session lets go. Dropping every other reference
+    /// therefore closed nothing. The thread waited on, the agent went on
+    /// holding the connection, and the next attempt to connect found the pipe
+    /// busy: the first lock worked and every later one froze, until the input
+    /// came back to a desktop the host could capture itself. So the last holder
+    /// to leave cancels the read, and the pipe closes when the thread returns.
+    pub(super) struct AgentLink {
+        frames: Arc<super::super::agent_pipe::AgentFrames>,
+        /// The newest frame, numbered, so each session can tell whether it has
+        /// already had it without taking it away from the others.
+        latest: Arc<Mutex<(u64, Option<ScreenFrame>)>>,
+        /// Asks the reader to stop.
+        stop: Arc<AtomicBool>,
+        /// Set by the reader once it has stopped, for whatever reason.
         done: Arc<AtomicBool>,
+        reader: Option<std::thread::JoinHandle<()>>,
     }
 
-    impl AgentReader {
-        fn start(desktop: &str) -> Result<Self> {
+    impl AgentLink {
+        /// The link in `slot`, opening one to the agent on `desktop` if there
+        /// is no live one to join.
+        pub(super) fn attach(
+            slot: &Mutex<std::sync::Weak<AgentLink>>,
+            desktop: &str,
+        ) -> Result<Arc<AgentLink>> {
+            let mut shared =
+                slot.lock().map_err(|_| anyhow::anyhow!("the shared agent link was poisoned"))?;
+            if let Some(link) = shared.upgrade()
+                && !link.finished()
+            {
+                return Ok(link);
+            }
+            let link = Arc::new(Self::open(desktop)?);
+            *shared = Arc::downgrade(&link);
+            Ok(link)
+        }
+
+        fn open(desktop: &str) -> Result<Self> {
             let frames = Arc::new(super::super::agent_pipe::connect(desktop)?);
-            // Frames are opt-in now, because the same pipe carries input-only
-            // links that must not start a duplication. See `PipeRequest`.
+            // Frames are opt-in, because the same pipe carries input-only links
+            // that must not start a duplication. See `PipeRequest`.
             frames.send_frames_wanted(true)?;
-            let latest = Arc::new(Mutex::new(None));
+
+            let latest = Arc::new(Mutex::new((0u64, None)));
+            let stop = Arc::new(AtomicBool::new(false));
             let done = Arc::new(AtomicBool::new(false));
 
             // Published before the reader starts, so the first click cannot
@@ -627,45 +877,127 @@ mod platform {
                 *link = Some(frames.clone());
             }
 
-            let into = latest.clone();
-            let finished = done.clone();
-            let reading = frames.clone();
-            std::thread::Builder::new()
-                .name("tain-agent-frames".into())
-                .spawn(move || {
-                    loop {
+            let (reading, into, stopping, finished) =
+                (frames.clone(), latest.clone(), stop.clone(), done.clone());
+            let spawned = std::thread::Builder::new().name("tain-agent-frames".into()).spawn(
+                move || {
+                    while !stopping.load(Ordering::Relaxed) {
                         match reading.next_frame() {
                             Ok(frame) => {
+                                // The format the agent says it sent. This was
+                                // `Bgra` whatever the byte said, which would
+                                // have turned the first NV12 frame an agent
+                                // produced into a picture of noise.
+                                let Some(format) = PixelFormat::from_wire(frame.format) else {
+                                    tracing::debug!(
+                                        "Skipping an agent frame in unknown format {}",
+                                        frame.format
+                                    );
+                                    continue;
+                                };
                                 let screen = ScreenFrame::with_format(
                                     frame.width,
                                     frame.height,
                                     frame.data.into(),
-                                    PixelFormat::Bgra,
+                                    format,
                                     std::time::Duration::ZERO,
                                 );
                                 if let Ok(mut slot) = into.lock() {
-                                    *slot = Some(screen);
+                                    *slot = (slot.0 + 1, Some(screen));
                                 }
                             }
                             Err(e) => {
-                                tracing::debug!("Agent frames ended: {e:#}");
-                                finished.store(true, Ordering::Relaxed);
-                                return;
+                                // A cancelled read is how a closing link stops
+                                // this, and is not worth a line.
+                                if !stopping.load(Ordering::Relaxed) {
+                                    tracing::debug!("Agent frames ended: {e:#}");
+                                }
+                                break;
                             }
                         }
                     }
-                })?;
+                    finished.store(true, Ordering::Relaxed);
+                },
+            );
 
-            Ok(Self { latest, done })
+            match spawned {
+                Ok(reader) => Ok(Self { frames, latest, stop, done, reader: Some(reader) }),
+                Err(e) => {
+                    // Withdrawn again: a route for input with nothing behind it
+                    // would send every click to a link that is about to close.
+                    if let Ok(mut link) = LINK.lock() {
+                        *link = None;
+                    }
+                    Err(anyhow::Error::new(e).context("could not start reading the agent's frames"))
+                }
+            }
         }
 
-        /// The newest frame, if one has arrived since the last call.
-        fn take(&mut self) -> Option<ScreenFrame> {
-            self.latest.lock().ok().and_then(|mut slot| slot.take())
+        /// The newest frame, if it is newer than `seen`, with its number.
+        ///
+        /// Cloned rather than taken, because other sessions may want it too.
+        /// A frame's pixels are shared, so the clone is a reference count.
+        pub(super) fn newer_than(&self, seen: u64) -> Option<(u64, ScreenFrame)> {
+            let slot = self.latest.lock().ok()?;
+            let (generation, frame) = &*slot;
+            if *generation <= seen {
+                return None;
+            }
+            frame.clone().map(|frame| (*generation, frame))
         }
 
-        fn finished(&self) -> bool {
+        /// Whether the reader has stopped — the agent went, or the pipe broke.
+        pub(super) fn finished(&self) -> bool {
             self.done.load(Ordering::Relaxed)
+        }
+
+        /// The connection itself. Tests only.
+        #[cfg(test)]
+        pub(super) fn frames(&self) -> &super::super::agent_pipe::AgentFrames {
+            &self.frames
+        }
+    }
+
+    impl Drop for AgentLink {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+
+            // Withdrawn as the route for input before the pipe goes, so no
+            // click is sent down a link that is closing. Only if it is this
+            // link: a newer one may already have taken its place.
+            if let Ok(mut link) = LINK.lock()
+                && link.as_ref().is_some_and(|held| Arc::ptr_eq(held, &self.frames))
+            {
+                *link = None;
+            }
+
+            // Said first, so the agent lets go of its duplication even in the
+            // moment before it notices the connection has gone. It cannot wait
+            // behind the reader's pending read: the link is overlapped for
+            // exactly this. See `AgentFrames`.
+            let _ = self.frames.send_frames_wanted(false);
+
+            let Some(reader) = self.reader.take() else { return };
+            // Repeated, because a cancel can land in the moment between two
+            // reads and the next read would wait again. A cancel with nothing
+            // to cancel is harmless.
+            let started = std::time::Instant::now();
+            while !reader.is_finished() && started.elapsed() < CLOSE_WAIT {
+                self.frames.cancel_pending();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            } else {
+                // Left to finish on its own. It holds the pipe until the agent
+                // closes its end, which the agent now does when it notices this
+                // side has stopped listening.
+                tracing::warn!(
+                    "The agent frame reader did not stop within {CLOSE_WAIT:?} — its connection \
+                     will close when the agent notices"
+                );
+            }
+            // `frames` closes as this returns, if the reader has let go of it.
         }
     }
 }
@@ -762,6 +1094,310 @@ mod tests {
         assert!(following.set_size_ceiling(Some((1856, 1020))));
         assert!(following.set_size_ceiling(None), "and removing it has to arrive too");
         assert_eq!(*asked.lock().unwrap(), vec![Some((1856, 1020)), None]);
+    }
+
+    /// A capturer that could not start is built once its desktop has the input,
+    /// and not hammered while it still cannot be.
+    ///
+    /// This is the locked machine: the unattended host's session starts while
+    /// the lock screen has the input, so Desktop Duplication refuses, and the
+    /// picture has to begin the moment somebody unlocks rather than never.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_capturer_that_could_not_start_is_built_when_its_desktop_is_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Local;
+        impl ScreenCaptureBackend for Local {
+            fn capture_next(&mut self) -> anyhow::Result<Option<ScreenFrame>> {
+                Ok(Some(ScreenFrame::with_format(
+                    2,
+                    2,
+                    vec![0u8; 16].into(),
+                    PixelFormat::Bgra,
+                    std::time::Duration::ZERO,
+                )))
+            }
+            fn frame_size(&self) -> (u16, u16) {
+                (2, 2)
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let mut following = DesktopFollowing::deferred(Box::new(move || {
+            // The desktop has just come back and is not ready the first time,
+            // which is the ordinary shape of an unlock.
+            match counted.fetch_add(1, Ordering::Relaxed) {
+                0 => anyhow::bail!("DXGI_ERROR_ACCESS_DENIED"),
+                _ => Ok(Box::new(Local) as Box<dyn ScreenCaptureBackend>),
+            }
+        }))
+        .answering_input_with(|| true);
+
+        assert!(following.capture_next().unwrap().is_none(), "nothing yet: the build failed");
+        assert!(following.capture_next().unwrap().is_none());
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "a failed build is not retried on the very next frame"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let frame = following.capture_next().unwrap();
+        assert!(frame.is_some(), "once it can be built, this desktop's own frames arrive");
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        following.capture_next().unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2, "and it is built once, not per frame");
+    }
+
+    /// What the session asked for before there was a capturer reaches the one
+    /// built later.
+    ///
+    /// The session sets its scale, its size ceiling and its format once, at
+    /// the start. Without the replay, a session that began while the machine
+    /// was locked would duplicate at native size in BGRA for the rest of its
+    /// life — which is exactly what the unattended host used to do on every
+    /// session, for a different reason.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn requests_made_before_the_capturer_exists_reach_it() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Seen {
+            ceiling: Vec<Option<(u16, u16)>>,
+            format: Vec<PixelFormat>,
+        }
+
+        struct Local(Arc<Mutex<Seen>>);
+        impl ScreenCaptureBackend for Local {
+            fn capture_next(&mut self) -> anyhow::Result<Option<ScreenFrame>> {
+                Ok(None)
+            }
+            fn frame_size(&self) -> (u16, u16) {
+                (64, 64)
+            }
+            fn set_size_ceiling(&mut self, ceiling: Option<(u16, u16)>) -> bool {
+                self.0.lock().unwrap().ceiling.push(ceiling);
+                true
+            }
+            fn request_format(&mut self, format: PixelFormat) -> bool {
+                self.0.lock().unwrap().format.push(format);
+                true
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let given = Arc::clone(&seen);
+        let mut following = DesktopFollowing::deferred(Box::new(move || {
+            Ok(Box::new(Local(Arc::clone(&given))) as Box<dyn ScreenCaptureBackend>)
+        }))
+        .answering_input_with(|| true);
+
+        // Said yes to, because they will be honoured — see `will_be_honoured`.
+        assert!(following.set_size_ceiling(Some((1856, 1020))));
+        assert!(following.request_format(PixelFormat::Nv12));
+        assert!(seen.lock().unwrap().ceiling.is_empty(), "nothing to tell yet");
+
+        following.capture_next().unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.ceiling, vec![Some((1856, 1020))], "the guest's window reached it");
+        assert_eq!(seen.format, vec![PixelFormat::Nv12], "and so did the GPU format");
+    }
+
+    /// A link every session has let go of really closes, and the agent's one
+    /// pipe is free for the next — the second lock that froze.
+    ///
+    /// Run against a real named pipe served the way the agents serve theirs:
+    /// one instance, a frame when frames are asked for and nothing after, and
+    /// no way to learn that the host has left except through its input. That
+    /// is an agent whose desktop has just lost the input, which is exactly when
+    /// a host lets go. Before the fix, the host's reader kept the pipe open, the
+    /// agent never noticed, and the attach at the end was refused forever.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn a_link_that_is_let_go_frees_the_agent_for_the_next_one() {
+        use pipes::*;
+
+        within("letting go of an agent link and connecting again", || {
+            let desktop = format!("TainTest-{}-free", std::process::id());
+            let agent = FakeAgent::serve(&desktop, true);
+            let slot = Mutex::new(Weak::new());
+
+            let first = attach_within(&slot, &desktop);
+            let second = AgentLink::attach(&slot, &desktop).expect("a live link to join");
+            assert!(Arc::ptr_eq(&first, &second), "two sessions share one connection");
+
+            let started = Instant::now();
+            let (generation, frame) = loop {
+                if let Some(arrived) = first.newer_than(0) {
+                    break arrived;
+                }
+                assert!(started.elapsed() < Duration::from_secs(3), "the agent's frame never arrived");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!((frame.width, frame.height), (2, 2));
+            assert!(
+                second.newer_than(0).is_some(),
+                "one session seeing a frame does not take it from another"
+            );
+            assert!(first.newer_than(generation).is_none(), "nobody is handed the same frame twice");
+            assert_eq!(agent.connections(), 1);
+
+            drop(first);
+            drop(second);
+
+            let third = attach_within(&slot, &desktop);
+            assert_eq!(
+                agent.connections(),
+                2,
+                "letting go closed the connection, and the agent served the next one"
+            );
+            drop(third);
+        });
+    }
+
+    /// Input reaches the agent while the link is waiting for a frame.
+    ///
+    /// Which is most of the time: an agent sends only when its desktop
+    /// changes. On a handle that is not overlapped Windows runs one operation
+    /// at a time, so this click would have waited behind that read until the
+    /// picture moved — and the message a closing link sends would have waited
+    /// forever, which is how this was found.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn input_reaches_the_agent_while_a_frame_is_awaited() {
+        use crate::protocol::{InputEvent, MouseEvent};
+        use pipes::*;
+
+        within("sending input while waiting for a frame", || {
+            let desktop = format!("TainTest-{}-input", std::process::id());
+            // An agent that never sends a frame, so the read never finishes.
+            let agent = FakeAgent::serve(&desktop, false);
+            let slot = Mutex::new(Weak::new());
+
+            let link = attach_within(&slot, &desktop);
+            // Long enough that the reader is certainly inside its read.
+            std::thread::sleep(Duration::from_millis(100));
+
+            link.frames()
+                .send_input(&InputEvent::MouseMove(MouseEvent { x: 1, y: 2 }))
+                .expect("a live link accepts input");
+
+            let started = Instant::now();
+            while agent.inputs() == 0 {
+                assert!(started.elapsed() < Duration::from_secs(3), "the click never reached the agent");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(link);
+        });
+    }
+
+    /// A stand-in agent on a real named pipe, and the helpers the tests share.
+    #[cfg(target_os = "windows")]
+    mod pipes {
+        pub(super) use super::platform::AgentLink;
+        use crate::agent_pipe::{serve_forever, PipeFrame, PipeRequest};
+        use crate::screen_capture::PixelFormat;
+        pub use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        pub use std::sync::{Arc, Mutex, Weak};
+        pub use std::time::{Duration, Instant};
+
+        /// Never cleared: the fake agents live until the test process ends.
+        static RUNNING: AtomicBool = AtomicBool::new(true);
+
+        /// Serves a pipe the way the agents serve theirs — one instance, and no
+        /// way to learn that a host has left except through its input.
+        pub struct FakeAgent {
+            connections: Arc<AtomicUsize>,
+            inputs: Arc<AtomicUsize>,
+        }
+
+        impl FakeAgent {
+            /// `one_frame`: send a single frame when frames are wanted, then
+            /// nothing — an agent whose desktop has just lost the input.
+            pub fn serve(desktop: &str, one_frame: bool) -> Self {
+                let connections = Arc::new(AtomicUsize::new(0));
+                let inputs = Arc::new(AtomicUsize::new(0));
+                let (desktop, counted, heard) =
+                    (desktop.to_string(), Arc::clone(&connections), Arc::clone(&inputs));
+                std::thread::spawn(move || {
+                    let _ = serve_forever(&desktop, &RUNNING, |writer| {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        let mut sent = false;
+                        loop {
+                            for request in writer.take_input()? {
+                                match request {
+                                    PipeRequest::FramesWanted(true) if one_frame && !sent => {
+                                        writer.send(&PipeFrame {
+                                            width: 2,
+                                            height: 2,
+                                            format: PixelFormat::Bgra.to_wire(),
+                                            data: vec![0; 16],
+                                        })?;
+                                        sent = true;
+                                    }
+                                    PipeRequest::Input(_) => {
+                                        heard.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    });
+                });
+                Self { connections, inputs }
+            }
+
+            pub fn connections(&self) -> usize {
+                self.connections.load(Ordering::Relaxed)
+            }
+
+            pub fn inputs(&self) -> usize {
+                self.inputs.load(Ordering::Relaxed)
+            }
+        }
+
+        /// Attach, retrying while the pipe is not there yet or still busy.
+        pub fn attach_within(slot: &Mutex<Weak<AgentLink>>, desktop: &str) -> Arc<AgentLink> {
+            let started = Instant::now();
+            loop {
+                match AgentLink::attach(slot, desktop) {
+                    Ok(link) => return link,
+                    Err(_) if started.elapsed() < Duration::from_secs(3) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("the agent's pipe never came free: {e:#}"),
+                }
+            }
+        }
+
+        /// Run `body` on a thread and fail if it has not finished in time.
+        ///
+        /// These tests exist because something waited forever. One that waited
+        /// forever itself would say nothing about why, and would hold the run
+        /// up until somebody noticed — so a stall is a failure with a name.
+        pub fn within(what: &str, body: impl FnOnce() + Send + 'static) {
+            let (done, finished) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                body();
+                let _ = done.send(());
+            });
+            match finished.recv_timeout(Duration::from_secs(20)) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("{what} did not finish within 20 seconds — something is waiting forever")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("{what} failed — see the panic above")
+                }
+            }
+        }
     }
 
     /// Only a *change* of route may release contacts.

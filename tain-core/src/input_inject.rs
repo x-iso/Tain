@@ -26,6 +26,99 @@ pub struct Shown {
     pub height: u16,
 }
 
+/// One part of a picture, and the part of this machine it came from.
+///
+/// # Why a picture can need several
+///
+/// Everything else this maps through is one rectangle of desktop: a screen, a
+/// window, even a wall of screens — because screens tile the desktop, so the
+/// wall is a uniform scale of their bounding box and one rectangle describes it.
+///
+/// Windows tiled into a grid are not. The picture is an arrangement this end
+/// invented, the sources are scattered across the desk and may overlap, and
+/// there is no rectangle that maps the whole thing. So the mapping is per tile:
+/// find which one the guest clicked in, then map within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tile {
+    /// Where this sits in the composed picture, in picture pixels:
+    /// `(x, y, width, height)`.
+    pub picture: (u16, u16, u16, u16),
+    /// Where it came from on the virtual desktop.
+    pub desktop: super::window_capture::OnScreen,
+}
+
+/// What a guest's coordinates are measured against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mapping {
+    /// One rectangle of the virtual desktop. A screen, a window, or a wall of
+    /// screens — all of which are a uniform scale of some region of the desk.
+    Whole(Shown),
+    /// A picture assembled from pieces. See [`Tile`].
+    Tiled {
+        /// The composed picture's own size, which is what a guest's coordinates
+        /// are normalized against before any tile can be looked for.
+        size: (u16, u16),
+        tiles: Vec<Tile>,
+    },
+}
+
+/// Where a point in a tiled picture lands on this machine, if anywhere.
+///
+/// `None` for a point in none of the tiles — the space between them. That is a
+/// real answer rather than a failure: a guest clicking the black gap beside a
+/// window has clicked something that is not being shared, and the nearest
+/// alternative would be putting their pointer somewhere they did not aim.
+fn through_tiles(size: (u16, u16), tiles: &[Tile], x: u16, y: u16) -> Option<(i32, i32)> {
+    /// The denominator every position below is carried over.
+    ///
+    /// # Why the picture pixel is never rounded to
+    ///
+    /// A guest points with more precision than the picture has: it sends a
+    /// position normalized across `0..=65535`, and one pixel of a composite may
+    /// stand for ten pixels of the window inside it — a 1000-wide window shown
+    /// in a 100-wide tile. Rounding to the picture pixel first and scaling up
+    /// afterwards multiplies that rounding by the same ten, so a click landed
+    /// up to ten host pixels from where it was aimed. Measured at exactly that
+    /// before this was fixed.
+    ///
+    /// So the position stays a fraction until the last division.
+    const OVER: i64 = crate::protocol::ABSOLUTE_MAX as i64;
+
+    // Where in the picture, as a numerator over `OVER`. Positions are treated
+    // as continuous across `0..span` rather than as landing on `0..=span-1`:
+    // mixing the two conventions is what put a click a pixel past a tile's own
+    // right-hand edge, and the pixel it belongs on is decided once, at the end.
+    //
+    // Clamped inside the picture so the last tile catches the far corner, which
+    // otherwise falls exactly on its exclusive upper bound and matches nothing.
+    let along = |value: u16, span: u16| {
+        (i64::from(value) * i64::from(span)).min(i64::from(span) * OVER - 1)
+    };
+    let (px, py) = (along(x, size.0), along(y, size.1));
+
+    let within = |at: i64, start: u16, span: u16| {
+        at >= i64::from(start) * OVER && at < (i64::from(start) + i64::from(span)) * OVER
+    };
+    let tile = tiles.iter().find(|tile| {
+        let (tx, ty, tw, th) = tile.picture;
+        within(px, tx, tw) && within(py, ty, th)
+    })?;
+
+    // Within the tile, as a fraction of it, onto the rectangle it came from.
+    let (tx, ty, tw, th) = tile.picture;
+    let across = |at: i64, start: u16, span: u16, onto: u16| -> i32 {
+        let into = (at - i64::from(start) * OVER) * i64::from(onto);
+        // The far edge of a tile is the *last* pixel of its window, not the one
+        // after it — the same off-by-one every mapping in this file has to
+        // answer, and the reason `into_pixels` counts to `size - 1`.
+        (into / (i64::from(span.max(1)) * OVER)).min(i64::from(onto.max(1)) - 1) as i32
+    };
+    Some((
+        tile.desktop.x + across(px, tx, tw, tile.desktop.width),
+        tile.desktop.y + across(py, ty, th, tile.desktop.height),
+    ))
+}
+
 /// Absolute pointer position, normalized to `0..=65535` across the whole screen.
 #[derive(Debug, Clone, Copy)]
 pub struct MousePosition {
@@ -90,10 +183,36 @@ pub trait InputInjector: Send + Sync {
     ///
     /// Defaults to doing nothing, because a backend that cannot inject at all
     /// has nothing to be right or wrong about.
-    fn set_shown(&self, _shown: Shown) {}
+    fn set_shown(&self, shown: Shown) {
+        self.set_mapping(Mapping::Whole(shown));
+    }
+
+    /// The same, for a picture that is not one rectangle of desktop.
+    ///
+    /// Kept separate from [`Self::set_shown`] so the ordinary case stays a
+    /// four-field value: nearly every session is one screen or one window, and
+    /// making all of them carry a list to describe a rectangle would be paying
+    /// for the exception everywhere.
+    fn set_mapping(&self, _mapping: Mapping) {}
 
     /// Move the pointer to an absolute position on the host display.
     fn move_mouse(&self, pos: MousePosition) -> Result<()>;
+
+    /// Move the pointer *by* this much, in host pixels.
+    ///
+    /// # Why this does not go through the mapping
+    ///
+    /// Everything else here is a position on a picture, turned back into a
+    /// place on this machine. A delta has no place: it is the movement itself,
+    /// and it is what a program that captured the pointer is reading. Putting it
+    /// through the mapping would be scaling a movement by a rectangle it is not
+    /// measured against.
+    ///
+    /// Defaults to doing nothing, because a backend that cannot inject at all
+    /// has nothing to move.
+    fn move_mouse_by(&self, _dx: i32, _dy: i32) -> Result<()> {
+        Ok(())
+    }
 
     /// Press or release a mouse button.
     fn mouse_button(&self, input: MouseButtonInput) -> Result<()>;
@@ -168,10 +287,10 @@ mod windows_impl {
     ];
 
     pub struct WindowsInjector {
-        /// Which part of the desktop the guest is looking at, once a session has
-        /// said. `None` until then, which means the primary display — the only
-        /// honest default, and the right one for every single-monitor host.
-        shown: Mutex<Option<Shown>>,
+        /// What the guest is looking at, once a session has said. `None` until
+        /// then, which means the primary display — the only honest default, and
+        /// the right one for every single-monitor host.
+        mapping: Mutex<Option<Mapping>>,
         /// The contacts Windows currently believes are down.
         ///
         /// Behind a mutex because the trait is `Sync` and this is the one piece
@@ -288,7 +407,7 @@ mod windows_impl {
 
     impl WindowsInjector {
         pub fn new() -> Result<Self> {
-            Ok(Self { shown: Mutex::new(None), touch: Mutex::new(TouchState::default()) })
+            Ok(Self { mapping: Mutex::new(None), touch: Mutex::new(TouchState::default()) })
         }
 
         /// The rectangle of the virtual desktop the guest is looking at.
@@ -309,8 +428,12 @@ mod windows_impl {
                 GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
             };
 
-            // What the session said it is streaming, when it has said.
-            if let Some(shown) = *self.shown.lock().unwrap_or_else(|e| e.into_inner()) {
+            // What the session said it is streaming, when it has said. A tiled
+            // picture has no single rectangle and never reaches here — see
+            // `to_desktop_pixels`, which answers it before asking this.
+            if let Some(Mapping::Whole(shown)) =
+                self.mapping.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            {
                 return RECT {
                     left: shown.x,
                     top: shown.y,
@@ -368,8 +491,22 @@ mod windows_impl {
         /// buys; a process that ended up merely system aware would be handed a
         /// scaled virtual desktop here and put every touch in the wrong place
         /// on the secondary monitors. See `declare_dpi_awareness` in `tain-cli`.
-        fn to_desktop_pixels(&self, x: u16, y: u16) -> POINT {
-            into_pixels(self.shown(), x, y)
+        ///
+        /// `None` only for a tiled picture where the point is in none of the
+        /// tiles — the space between windows, which is not part of this machine
+        /// and has nowhere to land.
+        fn to_desktop_pixels(&self, x: u16, y: u16) -> Option<POINT> {
+            // Taken and released before anything else: `shown()` wants the same
+            // lock, and holding it across that call would deadlock.
+            let tiled = match self.mapping.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                Some(Mapping::Tiled { size, tiles }) => Some((*size, tiles.clone())),
+                _ => None,
+            };
+            if let Some((size, tiles)) = tiled {
+                let (x, y) = through_tiles(size, &tiles, x, y)?;
+                return Some(POINT { x, y });
+            }
+            Some(into_pixels(self.shown(), x, y))
         }
 
         /// Desktop pixels back to what `SendInput` wants: normalized across
@@ -430,8 +567,8 @@ mod windows_impl {
     }
 
     impl InputInjector for WindowsInjector {
-        fn set_shown(&self, shown: Shown) {
-            *self.shown.lock().unwrap_or_else(|e| e.into_inner()) = Some(shown);
+        fn set_mapping(&self, mapping: Mapping) {
+            *self.mapping.lock().unwrap_or_else(|e| e.into_inner()) = Some(mapping);
         }
 
         fn move_mouse(&self, pos: MousePosition) -> Result<()> {
@@ -447,7 +584,12 @@ mod windows_impl {
             // So: into desktop pixels through the rectangle actually being
             // shown, then back out across the whole desktop, which is what the
             // flag promises.
-            let point = self.to_desktop_pixels(pos.x, pos.y);
+            // Nowhere to put it: the guest's pointer is over part of a tiled
+            // picture that is not any of the windows. Left where it was, which
+            // is what "that space is not shared with you" looks like.
+            let Some(point) = self.to_desktop_pixels(pos.x, pos.y) else {
+                return Ok(());
+            };
             let (x, y) = Self::to_virtual_desktop(point);
             Self::send(Self::mouse(
                 MOUSEEVENTF_MOVE.0 | MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0,
@@ -455,6 +597,21 @@ mod windows_impl {
                 y,
                 0,
             ))
+        }
+
+        /// # Why this is the same call without one flag
+        ///
+        /// `MOUSEEVENTF_MOVE` on its own is what Windows calls relative
+        /// movement: the numbers are added to wherever the pointer is rather
+        /// than being read as a place. That is also what reaches a program
+        /// through raw input, which is what a game reading mouse-look is
+        /// listening to — so the movement arrives as movement rather than as
+        /// the difference between two positions it did not ask for.
+        fn move_mouse_by(&self, dx: i32, dy: i32) -> Result<()> {
+            if (dx, dy) == (0, 0) {
+                return Ok(());
+            }
+            Self::send(Self::mouse(MOUSEEVENTF_MOVE.0, dx, dy, 0))
         }
 
         fn mouse_button(&self, input: MouseButtonInput) -> Result<()> {
@@ -584,7 +741,18 @@ mod windows_impl {
                 POINTER_FLAG_UPDATE.0 | POINTER_FLAG_INRANGE.0 | POINTER_FLAG_INCONTACT.0,
             );
 
-            let point = self.to_desktop_pixels(input.x, input.y);
+            // A touch in the space between tiles has nowhere on this machine to
+            // land. Dropped rather than placed somewhere arbitrary — see
+            // `to_desktop_pixels`. A lift still has to run, though: the contact
+            // it ends was placed somewhere real, and leaving it down would
+            // strand a finger on the host.
+            let point = match self.to_desktop_pixels(input.x, input.y) {
+                Some(point) => point,
+                None if matches!(input.phase, TouchPhase::End | TouchPhase::Cancel) => {
+                    POINT { x: 0, y: 0 }
+                }
+                None => return Ok(()),
+            };
             let existing = state.contacts.iter().position(|c| c.id == input.id);
 
             match (input.phase, existing) {
@@ -832,8 +1000,11 @@ mod windows_impl {
                 return; // No display; nothing to be right about.
             }
 
-            let start = injector.to_desktop_pixels(0, 0);
-            let end = injector.to_desktop_pixels(u16::MAX, u16::MAX);
+            // Never `None` here: that answer belongs to a tiled picture, and
+            // nothing has given this injector one.
+            let start = injector.to_desktop_pixels(0, 0).expect("a whole-rectangle mapping");
+            let end =
+                injector.to_desktop_pixels(u16::MAX, u16::MAX).expect("a whole-rectangle mapping");
             assert_eq!(start.x, shown.left, "zero should be the shown display's left edge");
             assert_eq!(
                 end.x,
@@ -984,6 +1155,13 @@ impl InputInjector for Deferring {
         self.inner.move_mouse(pos)
     }
 
+    fn move_mouse_by(&self, dx: i32, dy: i32) -> Result<()> {
+        if self.giving_way() {
+            return Ok(());
+        }
+        self.inner.move_mouse_by(dx, dy)
+    }
+
     fn mouse_button(&self, input: MouseButtonInput) -> Result<()> {
         if input.pressed && self.giving_way() {
             return Ok(());
@@ -1057,6 +1235,129 @@ pub fn create_injector() -> Box<dyn InputInjector> {
          logged but not delivered."
     );
     Box::new(StubInjector)
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::*;
+
+    const MAX: u16 = crate::protocol::ABSOLUTE_MAX;
+
+    fn tile(picture: (u16, u16, u16, u16), desktop: (i32, i32, u16, u16)) -> Tile {
+        Tile {
+            picture,
+            desktop: crate::window_capture::OnScreen {
+                x: desktop.0,
+                y: desktop.1,
+                width: desktop.2,
+                height: desktop.3,
+            },
+        }
+    }
+
+    /// Two windows side by side, each somewhere else entirely on the host.
+    ///
+    /// # Why this cannot be one rectangle
+    ///
+    /// Everything else the pointer maps through is a uniform scale of one
+    /// region of the desktop. A composite is not: the picture is a grid this
+    /// end invented, and the sources are wherever the person at the host left
+    /// them — possibly on different monitors, possibly overlapping. Mapping
+    /// the whole picture through one rectangle would put every click in the
+    /// right *proportion* of the wrong place.
+    fn desk() -> ((u16, u16), Vec<Tile>) {
+        (
+            (200, 100),
+            vec![
+                // Left half of the picture; a window at the desktop origin.
+                tile((0, 0, 100, 100), (0, 0, 1000, 1000)),
+                // Right half; a window on a second monitor, off to the left of
+                // the primary, so its coordinates are negative.
+                tile((100, 0, 100, 100), (-1920, 40, 500, 500)),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_click_lands_in_the_window_it_was_over() {
+        let (size, tiles) = desk();
+
+        // The far left of the picture is the far left of the first window.
+        assert_eq!(through_tiles(size, &tiles, 0, 0), Some((0, 0)));
+
+        // A quarter across the picture is halfway across the *first* window,
+        // because that window occupies the left half.
+        // Within three parts in a thousand, which is the picture's own
+        // resolution and not this arithmetic's: the tolerance is tight
+        // deliberately, because rounding to the picture pixel instead of
+        // carrying the fraction lands ten pixels out here and would pass a
+        // looser one.
+        let (x, y) = through_tiles(size, &tiles, MAX / 4, MAX / 2).expect("inside the first");
+        assert!((499..=501).contains(&x), "{x} is not the middle of the first window");
+        assert!((499..=501).contains(&y), "{y} is not the middle of the first window");
+
+        // Three quarters across is the middle of the *second* window, which is
+        // on another monitor at a negative offset. This is the case a single
+        // rectangle gets wrong: proportionally right, 1920 pixels away.
+        let (x, y) = through_tiles(size, &tiles, MAX / 4 * 3, MAX / 2).expect("inside the second");
+        assert!((-1672..=-1669).contains(&x), "{x} is not the middle of the second window");
+        assert!((289..=291).contains(&y), "{y} is not the middle of the second window");
+
+        // # The far corner is the far corner, not one past it
+        //
+        // The tolerances above would not notice a mapping that ran a pixel over
+        // at each edge — the failure is invisible in the middle and shows up
+        // only as a click that misses the last row of a window.
+        let (x, y) = through_tiles(size, &tiles, MAX, MAX).expect("the bottom-right corner");
+        assert_eq!(
+            (x, y),
+            (-1920 + 499, 40 + 499),
+            "the corner of the picture is the corner of the last window"
+        );
+    }
+
+    /// The space between windows belongs to nobody.
+    ///
+    /// A grid of three windows has a fourth cell with nothing in it, and a
+    /// window smaller than its cell has space around it. Clicking there has no
+    /// answer on the host — and inventing one would put the pointer somewhere
+    /// the guest did not aim, which is worse than nothing happening.
+    #[test]
+    fn a_click_between_the_windows_lands_nowhere() {
+        // One window occupying the left quarter, and nothing beside it.
+        let tiles = vec![tile((0, 0, 50, 100), (0, 0, 500, 500))];
+        let size = (200, 100);
+
+        assert!(through_tiles(size, &tiles, 0, 0).is_some(), "the window itself still maps");
+        assert_eq!(
+            through_tiles(size, &tiles, MAX / 2, MAX / 2),
+            None,
+            "the empty half of the picture is not part of this machine"
+        );
+    }
+
+    /// Every point of a tile maps inside the window it came from.
+    ///
+    /// The property that matters, swept rather than sampled: a click anywhere
+    /// in a window's part of the picture has to land in that window and not one
+    /// pixel outside it.
+    #[test]
+    fn no_point_in_a_tile_maps_outside_its_window() {
+        let (size, tiles) = desk();
+        for step in 0..=64u32 {
+            let across = (step * u32::from(MAX) / 64) as u16;
+            let Some((x, y)) = through_tiles(size, &tiles, across, across) else {
+                continue;
+            };
+            let inside = tiles.iter().any(|tile| {
+                x >= tile.desktop.x
+                    && y >= tile.desktop.y
+                    && x < tile.desktop.x + i32::from(tile.desktop.width)
+                    && y < tile.desktop.y + i32::from(tile.desktop.height)
+            });
+            assert!(inside, "({x}, {y}) is not inside any shared window");
+        }
+    }
 }
 
 #[cfg(test)]

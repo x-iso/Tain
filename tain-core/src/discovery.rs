@@ -95,29 +95,20 @@ pub enum Branch {
 impl Branch {
     /// Short enough to sit in a status row.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Lan => "LAN",
-            Self::Dns => "DNS",
-            Self::Dht => "DHT",
-        }
+        crate::i18n::text(match self {
+            Self::Lan => "found.lan",
+            Self::Dns => "found.dns",
+            Self::Dht => "found.dht",
+        })
     }
 
     /// What finding a host this way actually meant.
     pub fn describe(self) -> &'static str {
-        match self {
-            Self::Lan => {
-                "Found on this local network by multicast — no relay, no DNS and no internet \
-                 were involved in locating this host."
-            }
-            Self::Dns => {
-                "Found through the public lookup service, either as a DNS record or the same \
-                 data fetched over HTTPS."
-            }
-            Self::Dht => {
-                "Found through the mainline DHT — the distributed table BitTorrent uses, which \
-                 has no operator and keeps working where DNS is blocked."
-            }
-        }
+        crate::i18n::text(match self {
+            Self::Lan => "found.lan_detail",
+            Self::Dns => "found.dns_detail",
+            Self::Dht => "found.dht_detail",
+        })
     }
 }
 
@@ -337,9 +328,22 @@ pub fn attach(endpoint: &Endpoint) -> Attached {
             up.mdns = true;
             info!("Local network discovery on (mDNS) — peers on this LAN need no relay");
         }
-        // Reported at debug because the usual cause is a network that does not
-        // carry multicast, which is normal and not a fault.
-        Err(e) => debug!("No local network discovery ({e}) — a LAN peer will need a relay"),
+        // # Loud, because this is the one that explains a LAN failure
+        //
+        // Reported at debug once, on the reasoning that a network which does
+        // not carry multicast is normal and not a fault. True of the network
+        // and wrong for the log: a machine that cannot start mDNS cannot find a
+        // peer on its own network at all, which is exactly the symptom people
+        // report — two PCs on one LAN, neither able to place the other — and
+        // the one line that would have explained it was invisible at the level
+        // anybody runs.
+        //
+        // On Windows this fails for reasons that *are* faults and are fixable:
+        // the firewall blocking UDP 5353, or another program holding the port.
+        Err(e) => warn!(
+            "No local network discovery ({e}) — this machine cannot find a peer on its own \
+             LAN and will need a relay or the DHT for every connection"
+        ),
     }
 
     // # Mainline DHT
@@ -362,7 +366,10 @@ pub fn attach(endpoint: &Endpoint) -> Attached {
             up.dht = true;
             info!("Distributed discovery on (mainline DHT) — a peer can be found without DNS");
         }
-        Err(e) => debug!("No distributed discovery ({e}) — falling back to DNS lookups"),
+        // Also loud, and for the same reason: on a link where the relays are
+        // filtered this is the lookup that still answers, so losing it is the
+        // difference between connecting and not.
+        Err(e) => warn!("No distributed discovery ({e}) — falling back to DNS lookups"),
     }
 
     up

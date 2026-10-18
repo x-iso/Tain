@@ -13,6 +13,9 @@ use super::settings::{
 };
 use super::shortcuts::{Shortcut, ShortcutAction};
 use super::theme::*;
+// Every section in this window draws text, so the catalogue is reached for
+// here rather than in each of them.
+use tain_core::i18n;
 use tain_core::{EncoderBackend, H264Profile, QualityScale, RateControl, VideoCodec};
 
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x9B, 0x2E);
@@ -78,7 +81,11 @@ pub fn show(
     let available = ctx.screen_rect().height() - CHROME;
     let body_height = available.clamp(MIN_BODY, 620.0);
 
-    egui::Window::new("Settings")
+    // A fixed id, because the title is translated and egui keys a window's
+    // remembered position and size by it — changing language would otherwise
+    // hand the window a fresh identity and lose where it was.
+    egui::Window::new(i18n::text("header.settings"))
+        .id(egui::Id::new("settings-window"))
         .open(open)
         .collapsible(false)
         .resizable(false)
@@ -93,6 +100,8 @@ pub fn show(
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     identity_section(ui, settings);
+                    ui.add_space(10.0);
+                    language_section(ui, settings);
                     ui.add_space(10.0);
                     interface_section(ui, settings, panel);
                     ui.add_space(10.0);
@@ -117,12 +126,12 @@ pub fn show(
 
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("Hosting settings apply to new connections.")
+                    RichText::new(tain_core::i18n::text("settings.applies_to_new"))
                         .size(11.0)
                         .color(TEXT_DIM),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Reset to defaults").clicked() {
+                    if ui.button(tain_core::i18n::text("settings.reset_defaults")).clicked() {
                         *settings = Settings::default();
                         panel.capturing = None;
                     }
@@ -155,10 +164,10 @@ fn heading(ui: &mut egui::Ui, text: &str) {
 /// One setting used in both directions: as a guest it names you in the host's
 /// approval prompt, and as a host it names you in the guest's saved list.
 fn identity_section(ui: &mut egui::Ui, settings: &mut Settings) {
-    heading(ui, "This PC");
+    heading(ui, i18n::text("settings.identity"));
 
     egui::Grid::new("identity").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-        ui.label("Name");
+        ui.label(i18n::text("settings.identity.name"));
         egui::ComboBox::from_id_salt("device_name_mode")
             .width(220.0)
             .selected_text(settings.device_name_mode.label())
@@ -178,7 +187,7 @@ fn identity_section(ui: &mut egui::Ui, settings: &mut Settings) {
                 egui::TextEdit::singleline(&mut settings.custom_device_name)
                     .desired_width(220.0)
                     .char_limit(tain_core::MAX_DEVICE_NAME)
-                    .hint_text("e.g. Studio desktop"),
+                    .hint_text(i18n::text("settings.identity.custom_hint")),
             );
             ui.end_row();
         }
@@ -189,8 +198,8 @@ fn identity_section(ui: &mut egui::Ui, settings: &mut Settings) {
     // cleaning the receiving end applies. "Anonymous" is not a name being sent —
     // it means no name is sent at all.
     let preview = match settings.device_name() {
-        Some(name) => format!("Shown to the other machine as \"{name}\""),
-        None => "No name is sent — the other machine shows a generated label".to_string(),
+        Some(name) => i18n::format("settings.identity.shown_as", &[("name", &name)]),
+        None => i18n::text("settings.identity.no_name").to_string(),
     };
     ui.label(RichText::new(preview).size(11.0).color(TEXT_DIM));
 }
@@ -237,12 +246,12 @@ fn gpu_choices() -> Vec<(String, String)> {
 /// session any given control was about. Sessions this machine receives are
 /// configured in [`viewing_section`].
 fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
-    heading(ui, "Hosting — what this PC sends");
+    heading(ui, i18n::text("settings.video"));
 
     let codec = settings.codec.to_core();
 
     egui::Grid::new("video").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-        ui.label("Codec");
+        ui.label(i18n::text("settings.video.codec"));
         egui::ComboBox::from_id_salt("codec")
             .width(220.0)
             .selected_text(codec_text(settings.codec))
@@ -261,7 +270,7 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
             .on_hover_text(codec.description());
         ui.end_row();
 
-        ui.label("Encoder");
+        ui.label(i18n::text("settings.video.encoder"));
         ui.add_enabled_ui(codec.is_lossy(), |ui| {
             egui::ComboBox::from_id_salt("backend")
                 .width(220.0)
@@ -285,26 +294,31 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
         let uses_gpu = settings.encoder_backend.to_core() != EncoderBackend::Software;
         let choices = gpu_choices();
         if uses_gpu && choices.len() > 1 {
-            ui.label("Graphics card").on_hover_text(
-                "Which GPU encodes the stream. A laptop with two will otherwise \
-                 use whichever Windows lists first — often the integrated one.",
-            );
+            ui.label(i18n::text("settings.video.gpu"))
+                .on_hover_text(i18n::text("settings.video.gpu_hint"));
             let selected = if settings.preferred_encoder.is_empty() {
-                "Automatic".to_string()
+                i18n::text("settings.video.automatic").to_string()
             } else if choices.iter().any(|(key, _)| *key == settings.preferred_encoder) {
                 settings.preferred_encoder.clone()
             } else {
                 // A preference carried over from another machine. Said plainly
                 // rather than silently reset, so it is clear why the stream is
                 // not on the card the settings claim.
-                format!("{} (not on this machine)", settings.preferred_encoder)
+                i18n::format(
+                    "settings.video.not_on_this_machine",
+                    &[("name", &settings.preferred_encoder)],
+                )
             };
             egui::ComboBox::from_id_salt("preferred_encoder")
                 .width(220.0)
                 .selected_text(selected)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut settings.preferred_encoder, String::new(), "Automatic")
-                        .on_hover_text("Let Windows choose, which is what happened before.");
+                    ui.selectable_value(
+                        &mut settings.preferred_encoder,
+                        String::new(),
+                        i18n::text("settings.video.automatic"),
+                    )
+                    .on_hover_text(i18n::text("settings.video.automatic_hint"));
                     for (key, full) in choices.iter() {
                         ui.selectable_value(&mut settings.preferred_encoder, key.clone(), key)
                             .on_hover_text(full.as_str());
@@ -326,10 +340,8 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
         // pipeline captures and converts NV12, which is eight-bit, so Main is
         // the only one it can feed. A picker with one entry is furniture.
         if codec.is_lossy() && codec == VideoCodec::H264 {
-            ui.label("H.264 profile").on_hover_text(
-                "How much the picture is compressed. Anything above Baseline \
-                 needs the guest to be decoding on its GPU.",
-            );
+            ui.label(i18n::text("settings.video.profile"))
+                .on_hover_text(i18n::text("settings.video.profile_hint"));
             egui::ComboBox::from_id_salt("h264_profile")
                 .width(220.0)
                 .selected_text(settings.h264_profile.to_core().label())
@@ -354,19 +366,16 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
             if settings.h264_profile.to_core() != H264Profile::default() {
                 ui.label("");
                 ui.label(
-                    RichText::new(
-                        "⚠ A guest without GPU decoding will not be able to read this. \
-                         Use it when an Intel encoder stalls on Baseline.",
-                    )
-                    .size(11.0)
-                    .color(AMBER),
+                    RichText::new(i18n::text("settings.video.high_profile_warning"))
+                        .size(11.0)
+                        .color(AMBER),
                 );
                 ui.end_row();
             }
         }
 
-        ui.label("Resolution")
-            .on_hover_text("The most this will ever stream. It is not reduced unless something cannot keep up.");
+        ui.label(i18n::text("settings.video.resolution"))
+            .on_hover_text(i18n::text("settings.video.resolution_hint"));
         egui::ComboBox::from_id_salt("max_resolution")
             .width(220.0)
             .selected_text(settings.max_resolution.to_core().label())
@@ -381,12 +390,12 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
             });
         ui.end_row();
 
-        ui.label("Frame rate")
-            .on_hover_text("What the host aims for. Dropped only while something is behind.");
+        ui.label(i18n::text("settings.video.frame_rate"))
+            .on_hover_text(i18n::text("settings.video.frame_rate_hint"));
         ui.add(egui::Slider::new(&mut settings.target_fps, 5..=144).suffix(" fps"));
         ui.end_row();
 
-        ui.label("If it can't keep up");
+        ui.label(i18n::text("settings.video.if_behind"));
         ui.vertical(|ui| {
             // No numeric readout: the number is meaningless on its own, and the
             // summary below says what the position actually does.
@@ -397,22 +406,30 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
                     .custom_formatter(|_, _| String::new()),
             );
             ui.horizontal(|ui| {
-                ui.label(RichText::new("keep detail").size(10.0).color(TEXT_DIM));
+                ui.label(
+                    RichText::new(i18n::text("settings.video.keep_detail"))
+                        .size(10.0)
+                        .color(TEXT_DIM),
+                );
                 ui.add_space(104.0);
-                ui.label(RichText::new("keep motion").size(10.0).color(TEXT_DIM));
+                ui.label(
+                    RichText::new(i18n::text("settings.video.keep_motion"))
+                        .size(10.0)
+                        .color(TEXT_DIM),
+                );
             });
         });
         ui.end_row();
 
         ui.label("");
-        ui.checkbox(&mut settings.follow_priority, "Let the slider set the encoder details")
-            .on_hover_text(
-                "Quality target and keyframe interval follow the slider. \
-                 Turn off to set them yourself.",
-            );
+        ui.checkbox(
+            &mut settings.follow_priority,
+            i18n::text("settings.video.follow_priority"),
+        )
+            .on_hover_text(i18n::text("settings.video.auto_quality_hint"));
         ui.end_row();
 
-        ui.label("Rate control");
+        ui.label(i18n::text("settings.video.rate_control"));
         ui.add_enabled_ui(codec.is_lossy(), |ui| {
             egui::ComboBox::from_id_salt("rate_control")
                 .width(220.0)
@@ -435,11 +452,14 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
         // and a metered connection does not become less metered because you
         // dragged towards quality.
         if settings.rate_control.to_core().uses_bitrate() {
-            ui.label("Bitrate limit");
+            ui.label(i18n::text("settings.video.bitrate_limit"));
             ui.add_enabled_ui(codec.is_lossy(), |ui| {
                 ui.horizontal(|ui| {
                     let mut unlimited = settings.max_bitrate_kbps == 0;
-                    if ui.checkbox(&mut unlimited, "Unlimited").changed() {
+                    if ui
+                        .checkbox(&mut unlimited, i18n::text("settings.video.unlimited"))
+                        .changed()
+                    {
                         settings.max_bitrate_kbps = if unlimited { 0 } else { 8_000 };
                     }
                     if !unlimited {
@@ -457,27 +477,31 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
 
         if !settings.follow_priority {
             if !settings.rate_control.to_core().uses_bitrate() {
-                ui.label("Quality target");
+                ui.label(i18n::text("settings.video.quality_target"));
                 ui.add(egui::Slider::new(&mut settings.encode_quality, 0..=100));
                 ui.end_row();
             }
 
-            ui.label("Keyframe interval");
+            ui.label(i18n::text("settings.video.keyframe_interval"));
             ui.add_enabled_ui(codec.is_lossy(), |ui| {
                 ui.add(
                     egui::Slider::new(&mut settings.keyframe_interval, 0..=600)
                         .suffix(" frames")
                         .custom_formatter(|n, _| {
-                            if n == 0.0 { "on request".into() } else { format!("{n:.0}") }
+                            if n == 0.0 {
+                                i18n::text("settings.video.keyframe_on_request").into()
+                            } else {
+                                format!("{n:.0}")
+                            }
                         }),
                 )
-                .on_hover_text("How often a frame that stands alone is sent");
+                .on_hover_text(i18n::text("settings.video.keyframe_hint"));
             });
             ui.end_row();
         }
 
-        ui.label("Capture cursor");
-        ui.checkbox(&mut settings.show_cursor, "Include the pointer in frames");
+        ui.label(i18n::text("settings.video.capture_cursor"));
+        ui.checkbox(&mut settings.show_cursor, i18n::text("settings.video.include_pointer"));
         ui.end_row();
     });
 
@@ -493,13 +517,18 @@ fn bandwidth_note(ui: &mut egui::Ui, settings: &Settings) {
 
     // No U+2192 arrow: egui's default font has no glyph for it and renders a
     // missing-character box. The multiplication sign is fine.
-    let note = if (nw, nh) == (sw, sh) {
-        format!(
-            "Host display {nw}×{nh} — up to full resolution at {} fps",
-            capture.fps
+    let fps = capture.fps.to_string();
+    let (nw, nh, sw, sh) = (nw.to_string(), nh.to_string(), sw.to_string(), sh.to_string());
+    let note = if (&nw, &nh) == (&sw, &sh) {
+        i18n::format(
+            "settings.video.summary_full",
+            &[("w", &nw), ("h", &nh), ("fps", &fps)],
         )
     } else {
-        format!("Host display {nw}×{nh} — up to {sw}×{sh} at {} fps", capture.fps)
+        i18n::format(
+            "settings.video.summary_scaled",
+            &[("w", &nw), ("h", &nh), ("sw", &sw), ("sh", &sh), ("fps", &fps)],
+        )
     };
     ui.label(RichText::new(note).size(11.0).color(TEXT_DIM));
     // Say what the slider position means in words, not just where the handle is.
@@ -513,29 +542,23 @@ fn bandwidth_note(ui: &mut egui::Ui, settings: &Settings) {
     match tain_core::encoder::hardware_encoder_name_for(&settings.preferred_encoder) {
         Some(name) if settings.encoder_backend.to_core() != EncoderBackend::Software => {
             ui.label(
-                RichText::new(format!("Encoding on the GPU via {name}"))
+                RichText::new(i18n::format("settings.video.encoding_via", &[("name", &name)]))
                     .size(11.0)
                     .color(TEXT_DIM),
             );
         }
         Some(_) => {
             ui.label(
-                RichText::new(
-                    "⚠ This machine has a GPU encoder, but the backend is set to Software. \
-                     Full resolution at a high frame rate is unlikely to keep up.",
-                )
-                .size(11.0)
-                .color(AMBER),
+                RichText::new(i18n::text("settings.video.gpu_but_software"))
+                    .size(11.0)
+                    .color(AMBER),
             );
         }
         None => {
             ui.label(
-                RichText::new(
-                    "No GPU encoder found — encoding on the CPU. Large displays may not \
-                     hold a high frame rate at full resolution.",
-                )
-                .size(11.0)
-                .color(TEXT_DIM),
+                RichText::new(i18n::text("settings.video.no_gpu_encoder"))
+                    .size(11.0)
+                    .color(TEXT_DIM),
             );
         }
     }
@@ -543,10 +566,12 @@ fn bandwidth_note(ui: &mut egui::Ui, settings: &Settings) {
     let encode = settings.to_session_config().encode;
     if encode.is_falling_back() {
         ui.label(
-            RichText::new(format!(
-                "⚠ {} is not implemented yet — sessions will use {} instead.",
-                encode.codec.label(),
-                encode.effective_codec().label()
+            RichText::new(i18n::format(
+                "settings.video.not_implemented",
+                &[
+                    ("wanted", encode.codec.label()),
+                    ("instead", encode.effective_codec().label()),
+                ],
             ))
             .size(11.0)
             .color(AMBER),
@@ -561,12 +586,9 @@ fn bandwidth_note(ui: &mut egui::Ui, settings: &Settings) {
         && tain_core::encoder::hardware_encoder_name().is_none()
     {
         ui.label(
-            RichText::new(
-                "⚠ This machine has no GPU encoder, so sessions will refuse to start. \
-                 Use Automatic to allow the software encoder.",
-            )
-            .size(11.0)
-            .color(AMBER),
+            RichText::new(i18n::text("settings.video.hardware_only_no_gpu"))
+                .size(11.0)
+                .color(AMBER),
         );
     }
 
@@ -574,12 +596,9 @@ fn bandwidth_note(ui: &mut egui::Ui, settings: &Settings) {
     // which is the opposite of what "lossless" suggests to most people.
     if encode.effective_codec() == VideoCodec::DeltaZstd {
         ui.label(
-            RichText::new(
-                "Pixel-exact, but bandwidth scales with how much of the screen changes — \
-                 video and scrolling get expensive fast.",
-            )
-            .size(11.0)
-            .color(TEXT_DIM),
+            RichText::new(i18n::text("settings.video.lossless_cost"))
+                .size(11.0)
+                .color(TEXT_DIM),
         );
     }
 
@@ -595,8 +614,9 @@ fn bandwidth_note(ui: &mut egui::Ui, settings: &Settings) {
             TEXT_DIM
         };
         ui.label(
-            RichText::new(format!(
-                "≈{mb:.0} MB/s uncompressed — no bitrate limit can throttle raw video."
+            RichText::new(i18n::format(
+                "settings.video.raw_bandwidth",
+                &[("mb", &format!("{mb:.0}"))],
             ))
             .size(11.0)
             .color(colour),
@@ -607,49 +627,47 @@ fn bandwidth_note(ui: &mut egui::Ui, settings: &Settings) {
 fn codec_text(choice: CodecSetting) -> String {
     let core = choice.to_core();
     if !core.is_available() {
-        return format!("{} (planned)", core.label());
+        return i18n::format("settings.video.planned", &[("name", core.label())]);
     }
     // Implemented, but this machine may still not be able to encode it. Said on
     // the entry itself rather than discovered when a session quietly streams
     // something else — see `VideoCodec::is_encodable_here`.
     if !core.is_encodable_here() {
-        return format!("{} (no encoder on this PC)", core.label());
+        return i18n::format("settings.video.no_encoder", &[("name", core.label())]);
     }
     core.label().to_string()
 }
 
 /// What sound is sent, and what is kept out of it.
 fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelState) {
-    heading(ui, "Audio");
+    heading(ui, i18n::text("settings.audio"));
 
     egui::Grid::new("audio").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-        ui.label("Quality").on_hover_text(
-            "Opus. 160 kbit/s is transparent for nearly all content; above 256 there is nothing left to gain.",
-        );
+        ui.label(i18n::text("settings.audio.quality"))
+            .on_hover_text(i18n::text("settings.audio.quality_hint"));
         ui.horizontal(|ui| {
             for kbps in tain_core::AUDIO_BITRATES_KBPS {
                 let selected = settings.audio_bitrate_kbps == kbps;
                 if ui
                     .selectable_label(selected, format!("{kbps}"))
-                    .on_hover_text(match kbps {
-                        96 => "Noticeably compressed on music, fine for speech and game audio",
-                        160 => "Transparent for nearly all content",
-                        _ => "Beyond what most people can tell from the source",
-                    })
+                    .on_hover_text(i18n::text(match kbps {
+                        96 => "settings.audio.q96",
+                        160 => "settings.audio.q160",
+                        _ => "settings.audio.q_high",
+                    }))
                     .clicked()
                 {
                     settings.audio_bitrate_kbps = kbps;
                 }
             }
-            ui.label(RichText::new("kbit/s").size(11.0).color(TEXT_DIM));
+            ui.label(
+                RichText::new(i18n::text("settings.audio.kbits")).size(11.0).color(TEXT_DIM),
+            );
         });
         ui.end_row();
 
-        ui.label("Exclude apps").on_hover_text(
-            "Keep applications out of the streamed sound — a voice chat, say.
-
-             One app is removed by Windows itself, inside the audio engine. Choosing more than one switches to mixing the apps that are left, which is exact but only sees what was already playing when the session started.",
-        );
+        ui.label(i18n::text("settings.audio.exclude"))
+            .on_hover_text(i18n::text("settings.audio.exclude_hint"));
         ui.vertical(|ui| {
             if panel.audio_apps.is_empty() {
                 panel.audio_apps = tain_core::playing_audio();
@@ -683,27 +701,28 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
                 .collect();
             for name in absent {
                 let mut on = true;
-                if ui.checkbox(&mut on, format!("{name} (not playing)")).changed() && !on {
+                let shown = i18n::format("settings.audio.not_playing", &[("name", &name)]);
+                if ui.checkbox(&mut on, shown).changed() && !on {
                     settings.exclude_audio_processes.retain(|n| !n.eq_ignore_ascii_case(&name));
                 }
             }
 
             ui.horizontal(|ui| {
-                if ui.button("Refresh list").clicked() {
+                if ui.button(i18n::text("settings.audio.refresh")).clicked() {
                     panel.audio_apps = tain_core::playing_audio();
                 }
                 if !settings.exclude_audio_processes.is_empty()
-                    && ui.button("Clear").clicked()
+                    && ui.button(i18n::text("settings.audio.clear")).clicked()
                 {
                     settings.exclude_audio_processes.clear();
                 }
             });
 
-            let note = if settings.exclude_audio_processes.len() > 1 {
-                "Several excluded — the stream is mixed from the remaining apps, so anything that starts playing later will be missing until you reconnect."
+            let note = i18n::text(if settings.exclude_audio_processes.len() > 1 {
+                "settings.audio.several_excluded"
             } else {
-                "Only applications currently playing sound are listed."
-            };
+                "settings.audio.only_playing_listed"
+            });
             ui.label(RichText::new(note).size(11.0).color(TEXT_DIM));
         });
         ui.end_row();
@@ -730,19 +749,12 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
 fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
     use crate::display_driver::{self, DriverState};
 
-    heading(ui, "Virtual display");
+    heading(ui, i18n::text("settings.vdisplay"));
 
     let state = display_driver::state();
 
     ui.label(
-        RichText::new(
-            "A display that exists only in software. Lets a machine with no monitor be \
-             streamed at all, gives a guest a screen at its own resolution instead of a \
-             scaled copy of this one, and turns a spare tablet or laptop into a second \
-             screen.",
-        )
-        .size(11.0)
-        .color(TEXT_DIM),
+        RichText::new(i18n::text("settings.vdisplay.blurb")).size(11.0).color(TEXT_DIM),
     );
     ui.add_space(6.0);
 
@@ -760,15 +772,9 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
         if ui
             .add_enabled(
                 state == DriverState::NotInstalled,
-                egui::Button::new("Install driver"),
+                egui::Button::new(i18n::text("settings.vdisplay.install")),
             )
-            .on_hover_text(
-                "Windows will ask twice — once for administrator rights, and once about \
-                 trusting the publisher. The second prompt is Windows' own and cannot be \
-                 skipped, which is rather the point of it. The name it shows is the \
-                 driver's author, not Tain: the package is installed exactly as they \
-                 signed it, because changing a byte of it would void the signature.",
-            )
+            .on_hover_text(i18n::text("settings.vdisplay.install_hint"))
             .clicked()
             && let Err(e) = display_driver::request_install()
         {
@@ -776,11 +782,11 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
         }
 
         if ui
-            .add_enabled(state.is_installed(), egui::Button::new("Remove driver"))
-            .on_hover_text(
-                "Removes the driver and any display it was presenting. Everything else \
-                 keeps working. Windows will ask for permission.",
+            .add_enabled(
+                state.is_installed(),
+                egui::Button::new(i18n::text("settings.vdisplay.remove_driver")),
             )
+            .on_hover_text(i18n::text("settings.vdisplay.remove_driver_hint"))
             .clicked()
             && let Err(e) = display_driver::request_uninstall()
         {
@@ -794,7 +800,7 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
     if state == DriverState::NotBundled {
         ui.add_space(6.0);
         ui.label(
-            RichText::new("This build was made without a driver package to install.")
+            RichText::new(i18n::text("settings.vdisplay.not_bundled"))
                 .size(11.0)
                 .color(TEXT_DIM),
         );
@@ -818,9 +824,8 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
     let count = display_driver::monitor_count();
     ui.label(
         RichText::new(match count {
-            0 => "No virtual display.".to_string(),
-            1 => "One virtual display.".to_string(),
-            n => format!("{n} virtual displays."),
+            0 => i18n::text("settings.vdisplay.count.zero").to_string(),
+            n => i18n::plural("settings.vdisplay.count", n as u64, &[]),
         })
         .size(11.0)
         .color(if count > 0 { TEXT } else { TEXT_DIM }),
@@ -835,18 +840,16 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
     // is sharp at 1:1, where a scaled copy of a 2560x1600 desktop never is.
     ui.checkbox(
         &mut settings.virtual_display_follows_guest,
-        "Match the resolution of whoever connects",
+        i18n::text("settings.vdisplay.follow_guest"),
     )
-    .on_hover_text(
-        "A virtual display takes the size of the guest watching it, so their window \
-         is drawn 1:1 instead of scaled. Each display follows the first guest to \
-         watch it, so a second guest gets a second display at their own size.",
-    );
+    .on_hover_text(i18n::text("settings.vdisplay.follow_guest_hint"));
 
     ui.add_space(4.0);
     ui.add_enabled_ui(!settings.virtual_display_follows_guest, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Size").size(11.0).color(TEXT_DIM));
+            ui.label(
+                RichText::new(i18n::text("settings.vdisplay.size")).size(11.0).color(TEXT_DIM),
+            );
 
             // Offered from what a display actually reports, so the list cannot
             // contain a mode the driver will refuse. Falls back to the primary
@@ -859,7 +862,10 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
 
             let chosen = settings.virtual_display_size;
             let label = if chosen == (0, 0) {
-                format!("Same as this screen ({}x{})", primary.0, primary.1)
+                i18n::format(
+                    "settings.vdisplay.same_as_screen",
+                    &[("w", &primary.0.to_string()), ("h", &primary.1.to_string())],
+                )
             } else {
                 format!("{}x{}", chosen.0, chosen.1)
             };
@@ -870,7 +876,10 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
                     ui.selectable_value(
                         &mut settings.virtual_display_size,
                         (0, 0),
-                        format!("Same as this screen ({}x{})", primary.0, primary.1),
+                        i18n::format(
+                    "settings.vdisplay.same_as_screen",
+                    &[("w", &primary.0.to_string()), ("h", &primary.1.to_string())],
+                ),
                     );
                     for size in sizes {
                         ui.selectable_value(
@@ -890,12 +899,8 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
         // couple of seconds and a button that cannot be pressed twice is
         // simpler than a state machine for something this short.
         if ui
-            .button("Add a display")
-            .on_hover_text(
-                "Creates a virtual monitor and puts it on the desktop, to the right of \
-                 everything else. The display driver restarts to do it, so this takes a \
-                 moment.",
-            )
+            .button(i18n::text("settings.vdisplay.add"))
+            .on_hover_text(i18n::text("settings.vdisplay.add_hint"))
             .clicked()
         {
             // What the settings above say. Zero means "the same as this
@@ -912,8 +917,8 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
         }
 
         if ui
-            .add_enabled(count > 0, egui::Button::new("Remove"))
-            .on_hover_text("Takes the most recently added virtual display away again.")
+            .add_enabled(count > 0, egui::Button::new(i18n::text("settings.vdisplay.remove")))
+            .on_hover_text(i18n::text("settings.vdisplay.remove_hint"))
             .clicked()
             && let Err(e) = display_driver::remove_display()
         {
@@ -936,7 +941,7 @@ fn virtual_display_section(ui: &mut egui::Ui, settings: &mut Settings) {
 fn unattended_section(ui: &mut egui::Ui, settings: &mut Settings) {
     use crate::service::{self, ServiceState};
 
-    heading(ui, "Unattended access");
+    heading(ui, i18n::text("settings.unattended"));
 
     let state = service::state();
     let installed = matches!(
@@ -945,12 +950,7 @@ fn unattended_section(ui: &mut egui::Ui, settings: &mut Settings) {
     );
 
     ui.label(
-        RichText::new(
-            "Reaching a UAC prompt, a lock screen, or a machine with nobody logged in \
-             needs a Windows service. Everything else works without it.",
-        )
-        .size(11.0)
-        .color(TEXT_DIM),
+        RichText::new(i18n::text("settings.unattended.blurb")).size(11.0).color(TEXT_DIM),
     );
     ui.add_space(6.0);
 
@@ -976,15 +976,12 @@ fn unattended_section(ui: &mut egui::Ui, settings: &mut Settings) {
             .add_enabled(
                 !installed || state == ServiceState::Mismatched,
                 egui::Button::new(if state == ServiceState::Mismatched {
-                    "Reinstall service"
+                    i18n::text("settings.unattended.reinstall")
                 } else {
-                    "Install service"
+                    i18n::text("settings.unattended.install")
                 }),
             )
-            .on_hover_text(
-                "Windows will ask for permission — registering a service needs \
-                 administrator rights, and Tain does not run with them.",
-            )
+            .on_hover_text(i18n::text("settings.unattended.install_hint"))
             .clicked()
             && let Err(e) = service::request_install()
         {
@@ -992,11 +989,11 @@ fn unattended_section(ui: &mut egui::Ui, settings: &mut Settings) {
         }
 
         if ui
-            .add_enabled(installed, egui::Button::new("Uninstall service"))
-            .on_hover_text(
-                "Removes the service and everything it allowed. Tain keeps working \
-                 for ordinary sessions. Windows will ask for permission.",
+            .add_enabled(
+                installed,
+                egui::Button::new(i18n::text("settings.unattended.uninstall")),
             )
+            .on_hover_text(i18n::text("settings.unattended.uninstall_hint"))
             .clicked()
             && let Err(e) = service::request_uninstall()
         {
@@ -1012,61 +1009,90 @@ fn unattended_section(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.add_enabled_ui(installed, |ui| {
         ui.checkbox(
             &mut settings.unattended_access,
-            "Answer when nobody is signed in",
+            i18n::text("settings.unattended.answer_signed_out"),
         )
-        .on_hover_text(
-            "Hands this machine's identity to the service, so the same connection \
-             code reaches it at the sign-in screen. Off, the service still covers \
-             consent prompts and the lock screen while somebody is signed in.",
-        );
+        .on_hover_text(i18n::text("settings.unattended.answer_hint"));
     });
     if !installed {
         ui.label(
-            RichText::new("Needs the service installed.").size(11.0).color(TEXT_DIM),
+            RichText::new(i18n::text("settings.unattended.needs_service"))
+                .size(11.0)
+                .color(TEXT_DIM),
         );
     }
 
     ui.add_space(8.0);
     ui.label(
-        RichText::new(
-            "The service runs as LocalSystem so it can reach screens an ordinary \
-             program cannot. That is a real amount of trust to place in this machine \
-             and in whoever holds a code for it — install it only where you want \
-             unattended access.",
-        )
-        .size(10.5)
-        .color(TEXT_DIM),
+        RichText::new(i18n::text("settings.unattended.trust_note")).size(10.5).color(TEXT_DIM),
+    );
+}
+
+/// What language the interface speaks.
+///
+/// # Why "Automatic" names the language it would pick
+///
+/// A picker whose first entry says only "Automatic" tells somebody nothing
+/// about what they are choosing between — and the people most likely to open
+/// this are the ones for whom automatic guessed wrong. Naming the answer makes
+/// the entry a statement rather than a question.
+///
+/// Every language names itself in its own language, because nobody looks for
+/// their own under an English name.
+fn language_section(ui: &mut egui::Ui, settings: &mut Settings) {
+    heading(ui, i18n::text("settings.language"));
+
+    ui.label(RichText::new(i18n::text("settings.language.blurb")).size(11.0).color(TEXT_DIM));
+    ui.add_space(6.0);
+
+    let automatic = match i18n::automatic() {
+        Some(language) => i18n::format("settings.language.automatic", &[("name", &language.name)]),
+        None => i18n::text("settings.language.automatic_unknown").to_string(),
+    };
+    let selected = i18n::languages()
+        .iter()
+        .find(|l| l.tag.eq_ignore_ascii_case(&settings.language))
+        .map(|l| l.name.clone())
+        .unwrap_or_else(|| automatic.clone());
+
+    egui::ComboBox::from_id_salt("language")
+        .width(220.0)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut settings.language, String::new(), automatic);
+            for language in i18n::languages() {
+                ui.selectable_value(
+                    &mut settings.language,
+                    language.tag.clone(),
+                    &language.name,
+                );
+            }
+        });
+
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(i18n::text("settings.language.contribute")).size(11.0).color(TEXT_DIM),
     );
 }
 
 fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
-    heading(ui, "Security");
+    heading(ui, i18n::text("settings.security"));
 
-    ui.label(
-        RichText::new(
-            "Guests are streamed nothing until you allow them, every time they connect.",
-        )
-        .size(11.0)
-        .color(TEXT_DIM),
-    );
+    ui.label(RichText::new(i18n::text("settings.security.blurb")).size(11.0).color(TEXT_DIM));
     ui.add_space(6.0);
 
     egui::Grid::new("security").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-        ui.label("Approval timeout");
+        ui.label(i18n::text("settings.security.approval_timeout"));
         ui.add(egui::Slider::new(&mut settings.approval_timeout_secs, 5..=300).suffix(" s"))
-            .on_hover_text(
-                "How long a guest waits for an answer before being refused. \
-                 Timing out denies — an unattended machine should not share its screen.",
-            );
+            .on_hover_text(i18n::text("settings.security.approval_timeout_hint"));
         ui.end_row();
 
-        ui.label("Admin code");
-        ui.checkbox(&mut settings.admin_autoreset, "Reset automatically")
-            .on_hover_text("Admin codes grant full control immediately — resetting often is safer");
+        ui.label(i18n::text("settings.security.admin_code"));
+        ui.checkbox(&mut settings.admin_autoreset, i18n::text("settings.security.admin_autoreset"))
+            .on_hover_text(i18n::text("settings.security.admin_autoreset_hint"));
         ui.end_row();
 
-        ui.label("Guest code");
-        ui.checkbox(&mut settings.guest_autoreset, "Reset when the last guest leaves");
+        ui.label(i18n::text("settings.security.guest_code"));
+        ui.checkbox(&mut settings.guest_autoreset, i18n::text("settings.security.guest_autoreset"));
         ui.end_row();
 
         // # Who wins when both people reach for the mouse
@@ -1075,32 +1101,40 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
         // and two hands on one cursor is not a shared session — it is neither
         // person being able to do anything, with the one actually in the room
         // losing, because a guest's events arrive faster than a hand moves.
-        ui.label("Give way to me for");
+        ui.label(i18n::text("settings.security.give_way"));
         ui.add(
             egui::Slider::new(&mut settings.local_input_wins_ms, 0..=10_000)
                 .suffix(" ms")
                 .step_by(100.0),
         )
-        .on_hover_text(
-            "After you use this machine's own mouse or keyboard, a guest's input is \
-             ignored for this long. It resumes on its own once you stop.\n\n\
-             Anything a guest is already holding is still released, so nothing can be \
-             left stuck down.\n\n\
-             Zero turns this off and lets a guest type over you.",
-        );
+        .on_hover_text(i18n::text("settings.security.give_way_hint"));
         ui.end_row();
 
-        ui.label("Offer by default");
+        ui.label(i18n::text("settings.security.offer_by_default"));
         ui.vertical(|ui| {
-            ui.checkbox(&mut settings.default_allow_mouse, "Mouse");
-            ui.checkbox(&mut settings.default_allow_keyboard, "Keyboard");
+            ui.checkbox(&mut settings.default_allow_mouse, i18n::text("approval.mouse"));
+            ui.checkbox(&mut settings.default_allow_keyboard, i18n::text("approval.keyboard"));
         })
         .response
-        .on_hover_text(
-            "Which boxes start ticked in the approval dialog. \
-             You still have to allow each connection. \
-             Mouse also covers touch.",
-        );
+        .on_hover_text(i18n::text("settings.security.offer_hint"));
+        ui.end_row();
+
+        // # A default, not the value in use
+        //
+        // What it seeds is per session and adjustable there — the right number
+        // depends on the game at the other end, and there is no way to know it
+        // from here. This is where somebody who always wants the same starting
+        // point puts it. See `Settings::pointer_sensitivity`.
+        ui.label(i18n::text("session.pointer_sensitivity"));
+        ui.add(
+            egui::Slider::new(
+                &mut settings.pointer_sensitivity,
+                super::settings::POINTER_SENSITIVITY_RANGE,
+            )
+            .logarithmic(true)
+            .fixed_decimals(2),
+        )
+        .on_hover_text(i18n::text("settings.security.sensitivity_hint"));
         ui.end_row();
 
         // # Who has already been let in with the admin code
@@ -1113,26 +1147,24 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
         //
         // A count rather than a list of endpoint ids: sixty-four hex characters
         // identifies a device to the protocol and to nobody at all.
-        ui.label("Trusted devices");
+        ui.label(i18n::text("settings.security.trusted_devices"));
         ui.horizontal(|ui| {
             let trusted = settings.trusted_admin_endpoints.len();
             ui.label(
-                RichText::new(match trusted {
-                    0 => "None yet".to_string(),
-                    1 => "1 device".to_string(),
-                    n => format!("{n} devices"),
+                RichText::new(if trusted == 0 {
+                    i18n::text("settings.security.trusted_none").to_string()
+                } else {
+                    i18n::plural("settings.security.trusted_count", trusted as u64, &[])
                 })
                 .size(11.0)
                 .color(if trusted > 0 { TEXT } else { TEXT_DIM }),
             );
             if ui
-                .add_enabled(trusted > 0, egui::Button::new("Forget all"))
-                .on_hover_text(
-                    "Devices that have connected with the admin passcode and been \
-                     allowed. Forgetting them means the next connection from each one \
-                     has to be approved again. Resetting the admin passcode does this \
-                     too, along with revoking the code itself.",
+                .add_enabled(
+                    trusted > 0,
+                    egui::Button::new(i18n::text("settings.security.forget_all")),
                 )
+                .on_hover_text(i18n::text("settings.security.forget_all_hint"))
                 .clicked()
             {
                 settings.trusted_admin_endpoints.clear();
@@ -1144,11 +1176,9 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
     if settings.default_allow_mouse || settings.default_allow_keyboard {
         ui.add_space(4.0);
         ui.label(
-            RichText::new(
-                "⚠ Input will be pre-ticked — check the dialog before allowing a guest.",
-            )
-            .size(11.0)
-            .color(AMBER),
+            RichText::new(i18n::text("settings.security.pre_ticked_warning"))
+                .size(11.0)
+                .color(AMBER),
         );
     }
 }
@@ -1158,7 +1188,7 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
 fn interface_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelState) {
     use super::app::SCALE_EPSILON as EPSILON;
 
-    heading(ui, "Interface — this application's own window");
+    heading(ui, i18n::text("settings.interface"));
 
     // Held rather than applied as it moves — see `PanelState::pending_ui_scale`
     // for what happens when a slider resizes itself.
@@ -1171,10 +1201,8 @@ fn interface_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pan
     }
 
     egui::Grid::new("interface").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-        ui.label("Scale").on_hover_text(
-            "Relative to what the monitor asks for, so it still follows a screen \
-             with a different DPI. Ctrl+plus and Ctrl+minus move it too.",
-        );
+        ui.label(i18n::text("settings.interface.scale"))
+            .on_hover_text(i18n::text("settings.interface.scale_hint"));
         ui.horizontal(|ui| {
             ui.add(
                 egui::Slider::new(pending, super::settings::UI_SCALE_RANGE)
@@ -1185,8 +1213,11 @@ fn interface_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pan
             // window under the pointer would move the next thing to be clicked.
             let off_default = (*pending - 1.0).abs() > EPSILON;
             if ui
-                .add_enabled(off_default, egui::Button::new("100%"))
-                .on_hover_text("Follow the monitor exactly")
+                .add_enabled(
+                    off_default,
+                    egui::Button::new(i18n::text("settings.interface.hundred")),
+                )
+                .on_hover_text(i18n::text("settings.interface.follow_monitor"))
                 .clicked()
             {
                 *pending = 1.0;
@@ -1194,8 +1225,11 @@ fn interface_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pan
 
             let differs = (*pending - settings.ui_scale).abs() > EPSILON;
             if ui
-                .add_enabled(differs, egui::Button::new("Apply"))
-                .on_hover_text("Resize the interface to the chosen scale")
+                .add_enabled(
+                    differs,
+                    egui::Button::new(i18n::text("settings.interface.apply")),
+                )
+                .on_hover_text(i18n::text("settings.interface.apply_hint"))
                 .clicked()
             {
                 settings.ui_scale = *pending;
@@ -1207,11 +1241,12 @@ fn interface_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pan
 
     ui.add_space(2.0);
     let note = if (*pending - settings.ui_scale).abs() > EPSILON {
-        format!("Currently {:.0}%. Apply to resize the interface.", settings.ui_scale * 100.0)
+        i18n::format(
+            "settings.interface.currently",
+            &[("percent", &format!("{:.0}%", settings.ui_scale * 100.0))],
+        )
     } else {
-        "Applied on the button rather than as the slider moves, because this \
-         setting resizes the slider. Ctrl+plus and Ctrl+minus apply at once."
-            .to_string()
+        i18n::text("settings.interface.apply_note").to_string()
     };
     ui.label(RichText::new(note).size(11.0).color(TEXT_DIM));
 }
@@ -1222,11 +1257,11 @@ fn interface_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pan
 /// reaches the host: it is all about how the picture arriving is decoded and
 /// drawn on this screen.
 fn viewing_section(ui: &mut egui::Ui, settings: &mut Settings) {
-    heading(ui, "Viewing — what this PC receives");
+    heading(ui, i18n::text("settings.viewing"));
 
     egui::Grid::new("viewing").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-        ui.label("Scaling")
-            .on_hover_text("How a remote screen that does not match this window is shown.");
+        ui.label(i18n::text("settings.viewing.scaling"))
+            .on_hover_text(i18n::text("settings.viewing.scaling_hint"));
         ui.horizontal(|ui| {
             for mode in ScalingMode::ALL {
                 ui.selectable_value(&mut settings.scaling_mode, mode, mode.label())
@@ -1249,28 +1284,25 @@ fn viewing_section(ui: &mut egui::Ui, settings: &mut Settings) {
         // own renderer. A host has no more say in it than in which monitor the
         // window is on.
         if cfg!(target_os = "windows") {
-            ui.label("Draw frames on the GPU").on_hover_text(
-                "For sessions this machine receives. Skips copying each decoded \
-                 frame off the GPU and back, which is most of the decode cost. \
-                 It depends on a driver extension, and turns itself off for the \
-                 session if the extension is missing or the decoder will not hand \
-                 its textures over — but it cannot tell that the picture has \
-                 stopped updating, so turn it off if that happens.",
-            );
-            ui.checkbox(&mut settings.gpu_present, "Skip the readback (experimental)");
+            ui.label(i18n::text("settings.viewing.gpu_present"))
+                .on_hover_text(i18n::text("settings.viewing.gpu_present_hint"));
+            ui.checkbox(&mut settings.gpu_present, i18n::text("settings.viewing.skip_readback"));
             ui.end_row();
         }
 
         ui.label("");
-        ui.checkbox(&mut settings.fullscreen_on_connect, "Enter fullscreen on connect");
+        ui.checkbox(
+            &mut settings.fullscreen_on_connect,
+            i18n::text("settings.viewing.fullscreen_on_connect"),
+        );
         ui.end_row();
     });
 }
 
 fn shortcut_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelState) {
-    heading(ui, "Shortcuts");
+    heading(ui, i18n::text("settings.shortcuts"));
     ui.label(
-        RichText::new("Handled locally during a session — never sent to the host.")
+        RichText::new(i18n::text("settings.shortcuts.blurb"))
             .size(11.0)
             .color(TEXT_DIM),
     );
@@ -1293,14 +1325,18 @@ fn shortcut_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pane
 
             let capturing = panel.capturing == Some(action);
             let shortcut = settings.shortcuts.get(action);
-            let text = if capturing { "press a key…".to_string() } else { shortcut.to_string() };
+            let text = if capturing {
+                i18n::text("settings.shortcuts.press_a_key").to_string()
+            } else {
+                shortcut.to_string()
+            };
 
             if ui
                 .add_sized(
                     [140.0, 22.0],
                     egui::SelectableLabel::new(capturing, text),
                 )
-                .on_hover_text("Click, then press the combination you want")
+                .on_hover_text(i18n::text("settings.shortcuts.rebind_hint"))
                 .clicked()
             {
                 panel.capturing = if capturing { None } else { Some(action) };
@@ -1309,13 +1345,18 @@ fn shortcut_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pane
             // Warn rather than block: refusing the first half of a swap is more
             // annoying than flagging the overlap.
             if conflicts.contains(&action) {
-                ui.label(RichText::new("⚠ duplicate").size(11.0).color(AMBER));
+                ui.label(
+                    RichText::new(i18n::text("settings.shortcuts.duplicate"))
+                        .size(11.0)
+                        .color(AMBER),
+                );
             } else if !shortcut.is_safe() {
-                ui.label(RichText::new("⚠ may block typing").size(11.0).color(AMBER))
-                    .on_hover_text(
-                        "Without a modifier this key is indistinguishable from typing, \
-                         so the host will never receive it",
-                    );
+                ui.label(
+                    RichText::new(i18n::text("settings.shortcuts.may_block"))
+                        .size(11.0)
+                        .color(AMBER),
+                )
+                .on_hover_text(i18n::text("settings.shortcuts.may_block_hint"));
             } else {
                 ui.label("");
             }
@@ -1500,8 +1541,11 @@ mod tests {
             });
         }
 
+        // By the window's own id rather than one derived from its title: the
+        // title is translated now, and a test that looked it up by its English
+        // words would pass in English and fail in every other language.
         let rect = ctx
-            .memory(|m| m.area_rect(egui::Id::new("Settings")))
+            .memory(|m| m.area_rect(egui::Id::new("settings-window")))
             .expect("the settings window should have been laid out");
         // 470 is the requested width; the margin is for the frame around it.
         assert!(

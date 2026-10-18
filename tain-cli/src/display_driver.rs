@@ -283,12 +283,12 @@ impl DriverState {
 
     /// One line for the settings panel.
     pub fn summary(self) -> &'static str {
-        match self {
-            Self::Ready => "Installed. A virtual display can be created.",
-            Self::Idle => "Installed, but no virtual monitor is present yet.",
-            Self::NotInstalled => "Not installed. Virtual displays need it.",
-            Self::NotBundled => "This copy of Tain ships no driver to install.",
-        }
+        tain_core::i18n::text(match self {
+            Self::Ready => "driver.ready",
+            Self::Idle => "driver.idle",
+            Self::NotInstalled => "driver.not_installed",
+            Self::NotBundled => "driver.not_bundled",
+        })
     }
 }
 

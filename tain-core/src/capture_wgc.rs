@@ -143,7 +143,7 @@ pub struct WgcCapturer {
     /// video processor the duplication path uses — it rescales in the same pass
     /// it converts, which is why the emitted size is its business and not a
     /// separate resample here.
-    converter: Option<super::capture_nv12::Nv12Converter>,
+    converter: Option<super::capture_nv12::VideoScaler>,
 
     /// What the compositor is producing.
     width: u16,
@@ -156,7 +156,34 @@ pub struct WgcCapturer {
     granularity: (u16, u16),
     format: PixelFormat,
 
-    last_frame: Option<Bytes>,
+    /// Whether the pointer was showing the last time anybody asked.
+    ///
+    /// `None` until the first look. Kept so [`Self::take_cursor`] can report a
+    /// change rather than the same answer on every frame.
+    cursor_visible: Option<bool>,
+
+    /// The last picture produced, **with the size it was produced at**.
+    ///
+    /// # Why the size travels with the bytes
+    ///
+    /// The idle refresh re-sends this when nothing has changed, labelled with
+    /// whatever the emitted size is *now*. Those are not the same thing: the
+    /// output size moves when the guest caps it, when the controller sheds
+    /// pixels, and when the captured window is resized — and a window that has
+    /// just been resized and then left alone produces no new frame to correct
+    /// it with.
+    ///
+    /// So a stale buffer went out under a new, larger size and the encoder
+    /// refused it — `Nv12 buffer too small: 1709568 < 3981312`, and the session
+    /// ended. The duplication path avoids this by clearing its copy at every
+    /// site that changes the size; this one did not, because remembering to do
+    /// that at three call sites is exactly the kind of thing that gets
+    /// forgotten at the fourth.
+    ///
+    /// Keeping the size beside the bytes makes them impossible to disagree:
+    /// `idle_refresh` compares, and a mismatch means there is nothing worth
+    /// re-sending rather than something that will be refused downstream.
+    last_frame: Option<(u16, u16, Bytes)>,
     last_emitted: Option<std::time::Instant>,
     /// The display this is for, for the log line and for rebuilding.
     label: String,
@@ -170,10 +197,50 @@ pub struct WgcCapturer {
 unsafe impl Send for WgcCapturer {}
 unsafe impl Sync for WgcCapturer {}
 
+/// What a compositor capture is pointed at.
+///
+/// The two are the same capture in every respect after the item exists — same
+/// pool, same readback, same conversion — so they differ only in which interop
+/// call produces the item.
+enum Source {
+    /// A display by device name, or the primary one.
+    Monitor(Option<String>),
+    /// One window by handle. See [`super::window_capture`].
+    Window(u64),
+}
+
+/// [`Source`] once it has been resolved to something the interop factory takes.
+enum Target {
+    Monitor(windows::Win32::Graphics::Gdi::HMONITOR),
+    Window(u64),
+}
+
 impl WgcCapturer {
     /// `want` is a device name as [`super::screen_capture::displays`] reports
     /// it; `None` means the primary display.
     pub fn new(want: Option<String>) -> Result<Self> {
+        Self::of(Source::Monitor(want))
+    }
+
+    /// Capture one application window and nothing around it.
+    ///
+    /// Refuses a window that is not on screen. The compositor will not create
+    /// an item for a minimised window, and a session that is *already* watching
+    /// one keeps its capture alive across minimising — so the only case this
+    /// has to refuse is starting on one, which the caller retries when the
+    /// window comes back. See `window_capture::State`.
+    pub fn for_window(id: u64) -> Result<Self> {
+        use super::window_capture::State;
+        match super::window_capture::state_of(id) {
+            State::Showing => Self::of(Source::Window(id)),
+            State::Minimised => {
+                anyhow::bail!("that window is minimised, so there is nothing to capture yet")
+            }
+            State::Closed => anyhow::bail!("that window has closed"),
+        }
+    }
+
+    fn of(source: Source) -> Result<Self> {
         anyhow::ensure!(
             is_available(),
             "this version of Windows has no compositor capture (it needs 1903 or later)"
@@ -188,7 +255,19 @@ impl WgcCapturer {
         // SAFETY: documented; the returned cookie is only for decrementing.
         let _ = unsafe { windows::Win32::System::Com::CoIncrementMTAUsage() };
 
-        let (monitor, label) = monitor_for(want.as_deref())?;
+        // Resolved before the device, because a target that does not exist is
+        // worth failing on before a D3D11 device has been built for it.
+        let (target, label) = match &source {
+            Source::Monitor(want) => {
+                let (monitor, label) = monitor_for(want.as_deref())?;
+                (Target::Monitor(monitor), label)
+            }
+            Source::Window(id) => {
+                let title = super::window_capture::title_of(*id)
+                    .context("that window has gone")?;
+                (Target::Window(*id), title)
+            }
+        };
         let (device, context) = create_device()?;
 
         // SAFETY: the device is live and implements IDXGIDevice.
@@ -200,14 +279,22 @@ impl WgcCapturer {
         .cast::<windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>()
         .context("the WinRT device is not an IDirect3DDevice")?;
 
-        // The interop factory is how a Win32 HMONITOR becomes something the
-        // WinRT API will capture. There is no other way in from desktop code.
+        // The interop factory is how a Win32 handle becomes something the WinRT
+        // API will capture. There is no other way in from desktop code.
         let interop: IGraphicsCaptureItemInterop =
             windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
                 .context("no capture item factory — this Windows cannot capture a monitor")?;
-        // SAFETY: a live monitor handle from the enumeration above.
-        let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor) }
-            .with_context(|| format!("{label} cannot be captured by the compositor"))?;
+        // SAFETY: a live handle, checked immediately above — a monitor from the
+        // enumeration, or a window `for_window` has just found on screen.
+        let item: GraphicsCaptureItem = unsafe {
+            match target {
+                Target::Monitor(monitor) => interop.CreateForMonitor(monitor),
+                Target::Window(id) => interop.CreateForWindow(
+                    windows::Win32::Foundation::HWND(id as isize as *mut std::ffi::c_void),
+                ),
+            }
+        }
+        .with_context(|| format!("{label} cannot be captured by the compositor"))?;
 
         let size = item.Size().context("the capture item has no size")?;
         let (width, height) = clamp_size(size);
@@ -262,6 +349,7 @@ impl WgcCapturer {
             ceiling: None,
             granularity: (2, 2),
             format: PixelFormat::Bgra,
+            cursor_visible: None,
             last_frame: None,
             last_emitted: None,
             label,
@@ -297,6 +385,42 @@ impl WgcCapturer {
         self.converter = None;
     }
 
+    /// Recompute the emitted size, and make sure a frame arrives at it.
+    ///
+    /// # Why asking is necessary
+    ///
+    /// The compositor delivers a frame when the *source* changes. Everything
+    /// that reaches this — the guest capping the size, the controller shedding
+    /// pixels, the encoder's granularity — changes what is emitted and not what
+    /// is captured, so on a still source nothing would arrive to carry the new
+    /// size. A desktop changes soon enough for that not to matter; a single
+    /// window, resized and then left alone, does not. Without this the guest
+    /// presses 1:1 and watches nothing happen.
+    ///
+    /// Recreating the pool at the size it already has is what provokes a
+    /// delivery. Safe here because no frame is outstanding: these are the
+    /// trait's setters, called from the capture loop between frames and never
+    /// from inside `capture_next` while one is held — which is the thing
+    /// `Recreate` must not race.
+    ///
+    /// Not used by [`Self::resize_to`], which has already recreated the pool at
+    /// the new source size and would only be doing it twice.
+    fn recompute_and_ask(&mut self) {
+        let before = (self.out_width, self.out_height);
+        self.recompute_output();
+        if before == (self.out_width, self.out_height) {
+            return;
+        }
+        if let Err(e) = self.pool.Recreate(
+            &self.winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            BUFFERS,
+            SizeInt32 { Width: i32::from(self.width), Height: i32::from(self.height) },
+        ) {
+            debug!("Could not ask {} for a fresh frame after a resize: {e}", self.label);
+        }
+    }
+
     /// Follow a resolution change on the captured display.
     ///
     /// The compositor keeps delivering the old size until the pool is told, and
@@ -321,16 +445,47 @@ impl WgcCapturer {
 
     /// Turn one captured texture into the bytes a frame carries.
     fn read(&mut self, texture: &ID3D11Texture2D) -> Result<Vec<u8>> {
-        if self.format == PixelFormat::Nv12 {
+        // # BGRA that has to shrink goes through the same processor
+        //
+        // The converter was built for the encoder's NV12, and the *resize* it
+        // does on the way is the valuable part for everything else: a window
+        // composite is assembled in BGRA, so its panels could not use it and
+        // were resized on the CPU instead — measured at twenty to thirty
+        // milliseconds a frame each, which is a whole frame budget for one
+        // window and several for a grid of them.
+        //
+        // Converting BGRA to BGRA is a scaling blit as far as the driver is
+        // concerned. Asked for only when the size actually changes: at 1:1
+        // there is nothing to do and the readback is the whole job.
+        let shrinking = (self.out_width, self.out_height) != (self.width, self.height);
+        if self.format == PixelFormat::Nv12 || shrinking {
+            let output = if self.format == PixelFormat::Nv12 {
+                super::capture_nv12::Output::Nv12
+            } else {
+                super::capture_nv12::Output::Bgra
+            };
             if self.converter.is_none() {
-                self.converter = Some(super::capture_nv12::Nv12Converter::scaling(
+                match super::capture_nv12::VideoScaler::scaling(
                     &self.device,
                     &self.context,
                     self.width,
                     self.height,
                     self.out_width,
                     self.out_height,
-                )?);
+                    output,
+                ) {
+                    Ok(built) => self.converter = Some(built),
+                    // # A refusal is fatal for NV12 and survivable for BGRA
+                    //
+                    // The encoder was promised NV12 and cannot be told
+                    // otherwise mid-stream, so that failure has to reach the
+                    // caller. A resize has a CPU path that is correct and only
+                    // slower, and taking it beats ending the session.
+                    Err(e) if output == super::capture_nv12::Output::Nv12 => return Err(e),
+                    Err(e) => {
+                        info!("{}: resizing on the CPU instead: {e:#}", self.label);
+                    }
+                }
             }
             if let Some(converter) = self.converter.as_mut() {
                 return converter.convert(texture);
@@ -362,15 +517,23 @@ impl WgcCapturer {
 
     /// Re-send the last picture when nothing has changed for a while.
     fn idle_refresh(&mut self) -> Option<ScreenFrame> {
-        let last = self.last_frame.clone()?;
+        let (width, height, last) = self.last_frame.clone()?;
+        // Captured at a size this session has since stopped emitting. Sending
+        // it would be sending the wrong number of bytes under the right
+        // dimensions, which the encoder refuses and which ends the session —
+        // see the field's own note. Nothing is the correct answer: the next
+        // real frame arrives at the current size.
+        if (width, height) != (self.out_width, self.out_height) {
+            return None;
+        }
         let due = self.last_emitted.is_none_or(|at| at.elapsed() >= REFRESH_IDLE);
         if !due {
             return None;
         }
         self.last_emitted = Some(std::time::Instant::now());
         Some(ScreenFrame::with_format(
-            self.out_width,
-            self.out_height,
+            width,
+            height,
             last,
             self.format,
             std::time::Duration::ZERO,
@@ -424,10 +587,16 @@ impl ScreenCaptureBackend for WgcCapturer {
         let pixels = self.read(&texture)?;
         let cost = started.elapsed();
 
-        // On the NV12 path the video processor already produced the emitted
-        // size; on the BGRA path the frame is still full size and has to be
-        // brought down here.
-        let (pixels, cost) = if self.format == PixelFormat::Bgra
+        // # Only when the GPU did not already do it
+        //
+        // The video processor now produces the emitted size for BGRA as well as
+        // for NV12, so this is the fallback for a driver that refused — see
+        // `read`. Left ungated it ran *after* the GPU scale, treating an
+        // already-shrunk buffer as if it were still full size, and read off the
+        // end of it. Caught by the composite panicking one index past its own
+        // frame.
+        let (pixels, cost) = if self.converter.is_none()
+            && self.format == PixelFormat::Bgra
             && (self.out_width, self.out_height) != (self.width, self.height)
         {
             let scaling = std::time::Instant::now();
@@ -440,7 +609,7 @@ impl ScreenCaptureBackend for WgcCapturer {
         };
 
         let data = Bytes::from(pixels);
-        self.last_frame = Some(data.clone());
+        self.last_frame = Some((self.out_width, self.out_height, data.clone()));
         self.last_emitted = Some(std::time::Instant::now());
         Ok(Some(ScreenFrame::with_format(
             self.out_width,
@@ -451,10 +620,46 @@ impl ScreenCaptureBackend for WgcCapturer {
         )))
     }
 
-    /// Nothing. The pointer is drawn into the frame instead — see the note in
+    /// Whether the pointer is showing, and nothing else.
+    ///
+    /// # No shape, deliberately
+    ///
+    /// The pointer is already drawn into the frame — see the note in
     /// [`WgcCapturer::new`], where that is decided and why there is no choice.
+    /// Sending an image as well would put a second pointer on top of the first.
+    /// The guest only draws when it has both a position *and* a shape, so an
+    /// update with no shape carries the fact without the ghost.
+    ///
+    /// # Why the fact is worth carrying on its own
+    ///
+    /// Because the guest decides whether to send the pointer as a movement or
+    /// as a place by exactly this, and until now this path answered nothing at
+    /// all. A host captured through the compositor therefore looked, from the
+    /// guest, like one whose cursor was showing — so positions were sent, and a
+    /// position runs out at the edge of the window. In a game that is a camera
+    /// that stops turning while the mouse keeps moving. See
+    /// `GuestSession::wants_relative_pointer`.
+    ///
+    /// Reported only when it changes. `x` and `y` are the pointer's place on
+    /// the desktop rather than within whatever is being captured, which is of
+    /// no use to anybody here and is why nothing reads them: a window share's
+    /// frame does not start at the desktop's origin. Only `visible` is meant.
     fn take_cursor(&mut self) -> Option<super::cursor::CursorUpdate> {
-        None
+        let (showing, at) = pointer_showing()?;
+        if self.cursor_visible == Some(showing) {
+            return None;
+        }
+        self.cursor_visible = Some(showing);
+        Some(super::cursor::CursorUpdate {
+            position: super::cursor::CursorPosition {
+                x: at.0,
+                y: at.1,
+                desktop_width: self.width,
+                desktop_height: self.height,
+                visible: showing,
+            },
+            shape: None,
+        })
     }
 
     fn frame_size(&self) -> (u16, u16) {
@@ -463,19 +668,19 @@ impl ScreenCaptureBackend for WgcCapturer {
 
     fn set_scale(&mut self, scale: QualityScale) -> bool {
         self.scale = scale;
-        self.recompute_output();
+        self.recompute_and_ask();
         true
     }
 
     fn set_size_ceiling(&mut self, ceiling: Option<(u16, u16)>) -> bool {
         self.ceiling = ceiling;
-        self.recompute_output();
+        self.recompute_and_ask();
         true
     }
 
     fn set_size_granularity(&mut self, granularity: (u16, u16)) -> bool {
         self.granularity = (granularity.0.max(1), granularity.1.max(1));
-        self.recompute_output();
+        self.recompute_and_ask();
         true
     }
 
@@ -489,7 +694,7 @@ impl ScreenCaptureBackend for WgcCapturer {
         // for the duplication path has the same one here.
         self.format = PixelFormat::Nv12;
         self.converter = None;
-        self.recompute_output();
+        self.recompute_and_ask();
         true
     }
 
@@ -506,6 +711,36 @@ impl Drop for WgcCapturer {
         let _ = self.pool.Close();
         let _ = &self.item;
     }
+}
+
+/// Whether the pointer is being drawn anywhere, and where it is.
+///
+/// # Why this is asked of Windows rather than of the capture
+///
+/// Because the capture has no answer. Desktop Duplication reports the pointer
+/// as a thing apart — shape, place, whether it is showing — and the compositor
+/// does not: it either paints the pointer into the frame or leaves it out, and
+/// says nothing either way. `GetCursorInfo` is the same fact from the other
+/// direction, it costs a syscall, and it is true regardless of which backend
+/// is running. See [`WgcCapturer::take_cursor`] for what it is used for.
+///
+/// `None` when the call fails, which leaves the previous answer standing
+/// rather than reporting a change that was never observed.
+///
+/// Shared with [`super::capture_wall`], which bakes the pointer into its
+/// panels for exactly the same reason and so needs exactly the same answer.
+pub(crate) fn pointer_showing() -> Option<(bool, (i32, i32))> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
+
+    let mut info =
+        CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    // SAFETY: `cbSize` is filled in as the call documents, and `info` outlives
+    // it. Nothing is retained.
+    unsafe { GetCursorInfo(&mut info) }.ok()?;
+    Some((
+        info.flags.0 & CURSOR_SHOWING.0 != 0,
+        (info.ptScreenPos.x, info.ptScreenPos.y),
+    ))
 }
 
 /// A size the rest of the pipeline can carry, and never zero.
@@ -708,6 +943,165 @@ unsafe fn read_mapped(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u16, height: u16
 mod tests {
     use super::*;
 
+    /// What one window costs per frame, on each of the two paths.
+    ///
+    /// # Why this exists
+    ///
+    /// A single shared window was reported streaming at sixteen frames a second
+    /// with both machines idle, and the adaptive controller settles exactly
+    /// there when capture is spending forty to sixty milliseconds a frame. The
+    /// two candidates are the colour conversion and the resize, and they run in
+    /// different places depending on what the encoder negotiated — so the
+    /// number that matters is per path, not overall.
+    ///
+    /// Frames are provoked rather than waited for: a still window delivers
+    /// nothing, and `set_size_ceiling` recreates the pool, which makes the
+    /// compositor hand one over. That costs a pool recreation per sample, which
+    /// is why the *conversion* is timed from the frame's own reported cost
+    /// rather than from the wall clock around it.
+    #[test]
+    #[ignore = "captures a real window — run explicitly"]
+    fn report_what_one_window_costs_on_each_path() {
+        let Some(window) = crate::window_capture::shareable().into_iter().max_by_key(|w| {
+            u32::from(w.width) * u32::from(w.height)
+        }) else {
+            println!("nothing open to capture");
+            return;
+        };
+        println!("{} — {}x{}", window.app, window.width, window.height);
+
+        for nv12 in [false, true] {
+            let Ok(mut capturer) = WgcCapturer::for_window(window.id) else {
+                println!("  could not capture it");
+                return;
+            };
+            let asked = nv12 && capturer.request_format(PixelFormat::Nv12);
+            if nv12 && !asked {
+                println!("  NV12: refused");
+                continue;
+            }
+
+            let mut costs = Vec::new();
+            for round in 0..24 {
+                // A ceiling that alternates by two pixels, so each round is a
+                // real reconfiguration and a frame actually arrives.
+                capturer.set_size_ceiling(Some((1200 + (round % 2) * 2, 750)));
+                for _ in 0..50 {
+                    if let Ok(Some(frame)) = capturer.capture_next() {
+                        costs.push(frame.cost.as_secs_f64() * 1000.0);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            costs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let middle = costs.get(costs.len() / 2).copied().unwrap_or(0.0);
+            let (out_w, out_h) = capturer.frame_size();
+            println!(
+                "  {} -> {out_w}x{out_h}: {} frames, median {middle:.1} ms",
+                if asked { "NV12" } else { "BGRA" },
+                costs.len(),
+            );
+        }
+    }
+
+    /// What a window costs to capture, at full size and shrunk.
+    ///
+    /// Reported rather than asserted. It exists because a composite was
+    /// measured running at six to ten frames a second with both machines' GPUs
+    /// idle, and the question that answers is where the time goes: the readback,
+    /// or the resample that follows it.
+    #[test]
+    #[ignore = "captures a real window — run explicitly"]
+    fn report_what_a_window_costs_per_frame() {
+        let Some(window) = crate::window_capture::shareable().into_iter().max_by_key(|w| {
+            u32::from(w.width) * u32::from(w.height)
+        }) else {
+            println!("nothing open to capture");
+            return;
+        };
+        println!("{} — {}x{}", window.app, window.width, window.height);
+
+        for ceiling in [None, Some((960u16, 600u16))] {
+            let Ok(mut capturer) = WgcCapturer::for_window(window.id) else {
+                println!("  could not capture it");
+                return;
+            };
+            capturer.set_size_ceiling(ceiling);
+            let (out_w, out_h) = capturer.frame_size();
+
+            // The first frames carry setup; what matters is the steady state.
+            let mut costs = Vec::new();
+            for _ in 0..40 {
+                if let Ok(Some(frame)) = capturer.capture_next() {
+                    costs.push(frame.cost.as_secs_f64() * 1000.0);
+                }
+            }
+            costs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let middle = costs.get(costs.len() / 2).copied().unwrap_or(0.0);
+            println!(
+                "  ceiling {ceiling:?} -> {out_w}x{out_h}: {} frames, median {middle:.1} ms",
+                costs.len()
+            );
+        }
+    }
+
+    /// Where the time goes when a composite is built.
+    ///
+    /// Reported rather than asserted — it is a property of the graphics driver.
+    /// It exists because "the composite takes a while to appear" needed
+    /// attributing to something, and the two candidates are the graphics device
+    /// and the capture session, which want completely different fixes.
+    #[test]
+    #[ignore = "creates real graphics devices — run explicitly"]
+    fn report_what_a_capture_costs_to_set_up() {
+        for round in 0..4 {
+            let started = std::time::Instant::now();
+            let made = create_device();
+            println!(
+                "  device {round}: {:.1} ms ({})",
+                started.elapsed().as_secs_f64() * 1000.0,
+                if made.is_ok() { "ok" } else { "failed" }
+            );
+        }
+    }
+
+    /// A frame is only ever re-sent at the size it was captured at.
+    ///
+    /// # The crash this is for
+    ///
+    /// `Nv12 buffer too small: 1709568 < 3981312`, and the session ended. The
+    /// idle refresh re-sent the last picture labelled with whatever the emitted
+    /// size had become — and the emitted size moves when the guest caps it,
+    /// when the controller sheds pixels, or when the captured window is
+    /// resized. Resize a window, then press 1:1 on the guest: the size changed,
+    /// nothing moved, so the stale buffer went out under the new dimensions and
+    /// the encoder refused it.
+    ///
+    /// The size now travels with the bytes, so the two cannot disagree. This
+    /// checks the decision that rests on it, without needing a compositor: the
+    /// bytes are re-sent when the size matches and withheld when it does not.
+    #[test]
+    fn a_stale_picture_is_not_re_sent_under_a_new_size() {
+        /// What `idle_refresh` decides, with the timing taken out.
+        fn would_resend(stored: (u16, u16), emitting: (u16, u16)) -> bool {
+            stored == emitting
+        }
+
+        assert!(would_resend((1920, 1080), (1920, 1080)), "an unchanged size is re-sendable");
+
+        // Every way the emitted size moves without a new frame arriving.
+        for grown in [(2560, 1600), (1920, 1081), (1921, 1080)] {
+            assert!(
+                !would_resend((1920, 1080), grown),
+                "a 1920x1080 buffer was offered as {grown:?} — this is the crash"
+            );
+        }
+        // Shrinking is just as wrong: the encoder checks the length against the
+        // dimensions, and too many bytes is a different picture, not a safe one.
+        assert!(!would_resend((1920, 1080), (1280, 720)));
+    }
+
     /// A size from the compositor must never reach the pipeline as zero.
     #[test]
     fn a_size_is_clamped_into_something_capturable() {
@@ -776,6 +1170,76 @@ mod tests {
         // looks like, and it is the failure this test exists to catch.
         let distinct: std::collections::BTreeSet<&[u8]> =
             frame.data.chunks_exact(4).step_by(997).take(500).collect();
+        println!("  {} bytes, {} distinct sampled pixels", frame.data.len(), distinct.len());
+        assert!(distinct.len() > 1, "every sampled pixel was identical — the frame is blank");
+    }
+
+    /// One window, and only that window.
+    ///
+    /// # What this proves that the monitor test does not
+    ///
+    /// Capturing a display and capturing a window are two different interop
+    /// calls into the same machinery, and only one of them can fail on a
+    /// machine where the other works — `CreateForWindow` is refused for a
+    /// window that is minimised, on another desktop, or protected from capture,
+    /// none of which has an equivalent for a monitor. And the frame that comes
+    /// back must be the *window's* size rather than the screen's, which is the
+    /// difference between sharing a window and cropping one.
+    ///
+    /// Run with
+    /// `cargo test -p tain-core --lib -- --ignored --nocapture a_single_window_captures`.
+    #[test]
+    #[ignore = "captures a window on this machine — run explicitly"]
+    fn a_single_window_captures_at_its_own_size() {
+        if !is_available() {
+            println!("No compositor capture on this Windows — nothing to test.");
+            return;
+        }
+        let offered = super::super::window_capture::shareable();
+        let Some(window) = offered.first() else {
+            println!("Nothing shareable is open — open a window and run this again.");
+            return;
+        };
+        println!("Capturing {} — {} ({}x{})", window.app, window.title, window.width, window.height);
+
+        let mut capturer =
+            WgcCapturer::for_window(window.id).expect("could not capture that window");
+        let (width, height) = capturer.frame_size();
+
+        // The window's own size, not the screen's. Compared loosely because the
+        // two disagree by the invisible resize border a window carries and the
+        // capture does not — a few pixels, never a screen's worth.
+        let screen = super::super::screen_capture::primary_display_size();
+        println!("  captured {width}x{height}, this screen is {screen:?}");
+        assert!(
+            i32::from(width) - i32::from(window.width) < 40
+                && i32::from(window.width) - i32::from(width) < 40,
+            "{width} is not the window's own width of {}",
+            window.width
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let frame = loop {
+            match capturer.capture_next().expect("capture failed") {
+                Some(frame) => break frame,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                None => panic!("no frame arrived within 5s"),
+            }
+        };
+        assert_eq!(
+            frame.data.len(),
+            frame.width as usize * frame.height as usize * 4,
+            "a BGRA frame is four bytes a pixel"
+        );
+        // Spread over the whole picture, not the first few rows: a window's top
+        // edge is its title bar, and five hundred samples of one flat colour
+        // would pass this while the rest of the frame was empty.
+        let pixels = frame.data.len() / 4;
+        let stride = (pixels / 500).max(1);
+        let distinct: std::collections::BTreeSet<&[u8]> =
+            frame.data.chunks_exact(4).step_by(stride).collect();
         println!("  {} bytes, {} distinct sampled pixels", frame.data.len(), distinct.len());
         assert!(distinct.len() > 1, "every sampled pixel was identical — the frame is blank");
     }

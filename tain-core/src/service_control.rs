@@ -47,7 +47,8 @@ pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 /// What the application asks of the service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMessage {
-    /// Take over hosting when nobody is signed in, using this identity.
+    /// Host on this machine's behalf while the application is not, as this
+    /// identity and with these settings.
     ///
     /// Sent when unattended access is on, and re-sent whenever the identity or
     /// the codes change — a regenerated passcode that the service did not hear
@@ -62,8 +63,38 @@ pub enum ControlMessage {
         /// credential fails to parse instead of being adopted as thirty-two
         /// bytes of nonsense that looks like a working passcode.
         codes: Vec<String>,
+        /// The application's settings, verbatim, as the JSON it saves.
+        ///
+        /// # Why the whole thing and not the fields it needs
+        ///
+        /// Because naming the fields is how this went wrong four times. The
+        /// service hosts on the same identity and runs the same session
+        /// pipeline, so it needs the same configuration — and it was given the
+        /// identity, then the codes, then the approved devices, each as a
+        /// separate errand, each added only after somebody noticed it missing.
+        /// What was still missing after all three: the frame rate, the bitrate,
+        /// the codec, the resolution ceiling, the host name, the audio
+        /// exclusions and the local-input window, because an unattended session
+        /// ran on `SessionConfig::default()` and quietly ignored every one of
+        /// them.
+        ///
+        /// A blob has none of that failure mode. The service builds its
+        /// configuration the same way the application does — one call to
+        /// `to_session_config` — so a setting added later reaches it without
+        /// anybody remembering to forward it.
+        ///
+        /// # Why JSON rather than the config itself
+        ///
+        /// `SessionConfig` is not serialisable and should not become so: it
+        /// holds resolved things like a window handle to capture, which mean
+        /// nothing in another process. The settings are already a serde type,
+        /// already `#[serde(default)]` — so a service that predates a field
+        /// reads the file without it rather than failing to parse — and the
+        /// translation to a session configuration already exists on the far
+        /// side of it.
+        settings: String,
     },
-    /// Stop hosting when nobody is signed in, and forget what was adopted.
+    /// Stop hosting on this machine's behalf, and forget what was adopted.
     ///
     /// Sent when the setting is turned off. Forgetting is the point: leaving
     /// the key in Local System's store after somebody has said they do not want
@@ -74,8 +105,40 @@ pub enum ControlMessage {
     /// Two hosts on one identity would be worse than none: guests would reach
     /// whichever answered first, and which one that was would change between
     /// attempts. So the service only binds while this says nobody else is.
+    ///
+    /// # Why `true` is a lease and not a latch
+    ///
+    /// This was once sent exactly once, when the application began hosting, and
+    /// the service treated it as true from then on. That made unattended access
+    /// fail in the one case it exists for: close the application and the
+    /// machine went unreachable, because the service was still yielding to a
+    /// host that no longer existed. Nothing sent `false`, and nothing could —
+    /// [`send`] hangs up after each message, so there is no broken connection
+    /// for the service to notice either.
+    ///
+    /// So `true` expires. The application re-sends it every
+    /// [`HOSTING_HEARTBEAT`] and the service forgets the claim after
+    /// [`HOSTING_LEASE`] of silence. `false` on the way out is the courtesy
+    /// that makes handover immediate rather than a lease long — it is not the
+    /// mechanism, because a process that is killed, panics or loses power sends
+    /// nothing, and "the machine I am not sitting at" is the entire premise of
+    /// the feature.
     ApplicationHosting(bool),
 }
+
+/// How often the application repeats its hosting claim.
+///
+/// Short enough that [`HOSTING_LEASE`] can be short, long enough that this is a
+/// named pipe opened twelve times a minute rather than continuously.
+pub const HOSTING_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the service honours a hosting claim it has stopped hearing.
+///
+/// Three heartbeats. One missed beat is a busy machine; three is a host that is
+/// gone. The cost of being wrong is asymmetric and this errs the right way: too
+/// short and both ends bind briefly, which the next beat resolves; too long and
+/// the machine stays unreachable for exactly as long as the excess.
+pub const HOSTING_LEASE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Frame one message for the pipe: four bytes of length, then the body.
 ///
@@ -220,7 +283,22 @@ mod platform {
         if !read_exact(pipe, &mut body)? {
             return Ok(None);
         }
-        Ok(Some(decode(&body)?))
+        // # Why this one error gets a sentence
+        //
+        // A body that arrives whole and will not decode is, in practice,
+        // always the same thing: the application and the service are different
+        // builds, and the message changed shape between them. The raw error
+        // says something about an invalid tag, which sends people to look at
+        // the pipe. The consequence is invisible and specific — the service
+        // keeps whatever it stored last and silently stops learning about new
+        // codes, new settings and newly approved devices — so it is worth
+        // naming rather than leaving to be worked out from a machine that
+        // refuses connections for no stated reason.
+        decode(&body).map(Some).context(
+            "the application sent a control message this service cannot read — they are \
+             almost certainly different builds of Tain. Reinstall the service from the \
+             application you are running, then restart the application.",
+        )
     }
 
     /// Fill `into`, or report that the far end closed first.
@@ -288,6 +366,16 @@ mod tests {
             ControlMessage::AdoptIdentity {
                 secret_key: [7u8; 32],
                 codes: vec!["MASTER-abc".to_string(), "GUEST-def".to_string()],
+                settings: r#"{"target_fps":30,"exclude_audio_processes":["teams.exe"]}"#
+                    .to_string(),
+            },
+            // Both routinely empty — no codes issued yet, no settings file
+            // written yet — and each has to survive the trip as empty rather
+            // than as an absence the far side could read as "unchanged".
+            ControlMessage::AdoptIdentity {
+                secret_key: [7u8; 32],
+                codes: Vec::new(),
+                settings: String::new(),
             },
             ControlMessage::ForgetIdentity,
             ControlMessage::ApplicationHosting(true),
@@ -316,5 +404,29 @@ mod tests {
     #[test]
     fn a_damaged_body_is_refused_rather_than_guessed_at() {
         assert!(decode(&[0xFF; 16]).is_err());
+    }
+
+    /// The lease has to outlast a missed beat, or the two ends fight.
+    ///
+    /// Both sides of this matter and they pull opposite ways. Too short and a
+    /// busy machine drops one heartbeat, the service binds alongside a host
+    /// that never stopped, and a guest reaches whichever answered first — the
+    /// exact failure the claim exists to prevent. Too long and the machine
+    /// stays unreachable after the application closes for however much the
+    /// excess is, which is the failure the lease exists to prevent.
+    ///
+    /// Room for two missed beats is the judgement; this test is here so that
+    /// changing either constant alone cannot quietly undo it.
+    #[test]
+    fn the_hosting_lease_survives_a_missed_heartbeat() {
+        assert!(
+            HOSTING_HEARTBEAT < HOSTING_LEASE,
+            "a lease no longer than the beat that renews it expires between beats",
+        );
+        assert!(
+            HOSTING_HEARTBEAT * 3 <= HOSTING_LEASE,
+            "the lease must survive two missed beats: {HOSTING_HEARTBEAT:?} against \
+             {HOSTING_LEASE:?}",
+        );
     }
 }

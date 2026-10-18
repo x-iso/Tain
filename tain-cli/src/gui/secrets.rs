@@ -200,6 +200,17 @@ pub fn saved_endpoints() -> Vec<String> {
 const IDENTITY_ID: &str = "tain-host-identity";
 const MASTER_ID: &str = "tain-host-master-code";
 const GUEST_ID: &str = "tain-host-guest-code";
+/// The service's copy of which devices may use the admin code.
+///
+/// Endpoint ids are public keys, not secrets, and the application keeps its
+/// copy in a settings file for exactly that reason. This copy is in the
+/// credential store all the same, because of what it is *used* for here: it is
+/// the list that decides who gets in with the admin passcode on a machine with
+/// nobody signed in to ask. A file anybody could append a line to would be a
+/// way to grant yourself admin access with a stolen code, and the credential
+/// store is writable only by Local System and administrators — who could grant
+/// themselves that access anyway.
+const TRUSTED_ADMINS_ID: &str = "tain-host-trusted-admins";
 
 /// Suffix that gives a second instance on one machine its own identity.
 ///
@@ -282,6 +293,59 @@ impl HostSecrets {
     /// Save the network identity for the next run. Returns whether it stuck.
     pub fn set_identity(&self, key: &[u8; 32]) -> bool {
         self.store.store(&profiled(IDENTITY_ID), &encode_key(key))
+    }
+
+    /// Destroy the saved network identity.
+    ///
+    /// For the service, when unattended access is switched off. The message
+    /// that asks for it is called `ForgetIdentity` and says forgetting is the
+    /// point — that a host key left in Local System's store after somebody
+    /// declined the feature is a cost they did not agree to. It forgot the
+    /// codes and kept the key, which is the one part that matters most.
+    pub fn forget_identity(&self) {
+        self.store.forget(&profiled(IDENTITY_ID));
+    }
+
+    /// Which devices the application has approved for the admin passcode.
+    ///
+    /// # Why the service needs its own copy
+    ///
+    /// The check that gates the admin passcode is a set of endpoint ids, and
+    /// the application keeps that set in its settings file, under the signed-in
+    /// user's profile. Local System cannot read another account's profile — the
+    /// same wall that made the identity have to be handed over. So a service
+    /// hosting on this machine's behalf started with an empty set and refused
+    /// every admin connection, including from devices the owner had already
+    /// approved at this very machine. The code was right, the endpoint was
+    /// approved, and the answer was still no.
+    ///
+    /// Anything unreadable is dropped rather than refused, matching the
+    /// application: a malformed entry means one device gets asked about again,
+    /// which is the safe direction.
+    pub fn trusted_admins(&self) -> std::collections::BTreeSet<[u8; 32]> {
+        let Some(stored) = self.store.load(&profiled(TRUSTED_ADMINS_ID)) else {
+            return std::collections::BTreeSet::new();
+        };
+        stored.split(',').filter_map(|hex| decode_key(hex.trim())).collect()
+    }
+
+    /// Replace the approved set. Returns whether it stuck.
+    ///
+    /// Replace rather than add, because the application's list is the whole
+    /// truth and revocation has to travel: resetting the admin passcode empties
+    /// it there, and a service that only ever learned additions would go on
+    /// trusting a device the owner had just revoked.
+    pub fn set_trusted_admins(&self, endpoints: &std::collections::BTreeSet<[u8; 32]>) -> bool {
+        let joined =
+            endpoints.iter().map(encode_key).collect::<Vec<_>>().join(",");
+        // An empty set is stored as an empty string rather than forgotten, so
+        // "approved nobody" and "never told" stay distinguishable.
+        self.store.store(&profiled(TRUSTED_ADMINS_ID), &joined)
+    }
+
+    /// Destroy the approved set, when unattended access is switched off.
+    pub fn forget_trusted_admins(&self) {
+        self.store.forget(&profiled(TRUSTED_ADMINS_ID));
     }
 
     /// The saved code of this type, verbatim as it was handed out.

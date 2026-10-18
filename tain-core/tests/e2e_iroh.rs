@@ -108,31 +108,6 @@ async fn start_host() -> Result<(Arc<HostServer>, String, [u8; 32])> {
     Ok((server, passcode, id))
 }
 
-/// Where this host can actually be dialled from this machine.
-///
-/// `bound_sockets` reports what the endpoint bound, which is a wildcard —
-/// `0.0.0.0:60617` and `[::]:60619`. Handing those to a guest as an address to
-/// try is meaningless, and the first version of this test did exactly that: it
-/// passed anyway, over the relay, while claiming to need no relay. It only
-/// failed once the relay stopped answering, which is the condition it was
-/// supposed to be testing under.
-///
-/// Substituting loopback for the unspecified address gives the guest something
-/// it can really dial, and takes the relay out of the path for good.
-fn loopback_addrs(server: &HostServer) -> Vec<std::net::SocketAddr> {
-    server
-        .local_addrs()
-        .into_iter()
-        .filter(|addr| addr.is_ipv4())
-        .map(|mut addr| {
-            if addr.ip().is_unspecified() {
-                addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
-            }
-            addr
-        })
-        .collect()
-}
-
 /// Several guests arriving at once must all be answered.
 ///
 /// # The failure this is for
@@ -147,24 +122,41 @@ fn loopback_addrs(server: &HostServer) -> Vec<std::net::SocketAddr> {
 ///
 /// # Why this one needs no relay
 ///
-/// It dials the host's own socket, which is the path a guest takes once it has
-/// connected before. That makes it the only test in this file that runs on a
-/// machine which cannot reach the n0 relay — which is the machine this software
-/// is written for, and increasingly the one it is developed on.
+/// Both ends are on this machine, so mDNS places the host with no relay, no
+/// DNS and no internet at all. That makes it one of the few tests in this file
+/// that runs on a machine which cannot reach the n0 relay — which is the
+/// machine this software is written for, and increasingly the one it is
+/// developed on.
+///
+/// It used to dial the host's own socket, handed over as a remembered address.
+/// There is no such thing any more, and losing it costs this test nothing: the
+/// address mDNS answers with is the same one.
 #[tokio::test(flavor = "multi_thread")]
 async fn several_guests_arriving_together_are_all_answered() -> Result<()> {
-    let (server, passcode, host_id) = start_host().await?;
-    let addrs = loopback_addrs(&server);
-    assert!(!addrs.is_empty(), "the host bound no dialable socket");
+    // # Under one identity, which is the interesting part
+    //
+    // Every dial used to bind its own endpoint with its own throwaway key, so
+    // four at once were four strangers and could not collide. They share a
+    // stable identity now — that is what lets a host recognise a returning
+    // device — and two endpoints live at once under one node id are two
+    // machines claiming the same name. A person with four session tabs open has
+    // exactly that, and it failed here before the endpoint became shared.
+    //
+    // Adopted explicitly rather than relied on from another test in this
+    // binary: the state is process-global, and a test that only covers this
+    // when it happens to run second covers nothing.
+    tain_core::network::adopt_identity([0x11u8; 32]);
+
+    let (_server, passcode, host_id) = start_host().await?;
     let key = iroh::PublicKey::from_bytes(&host_id).context("host id")?;
 
     // Enough to notice serialisation, few enough to stay quick.
     const GUESTS: usize = 4;
     let mut dials = Vec::new();
     for _ in 0..GUESTS {
-        let (key, addrs, passcode) = (key, addrs.clone(), passcode.clone());
+        let (key, passcode) = (key, passcode.clone());
         dials.push(tokio::spawn(async move {
-            let mut guest = GuestClient::connect_via(&key, None, &addrs).await?;
+            let mut guest = GuestClient::connect_via(&key, None).await?;
             let (_send, mut recv) = guest.authenticate(&passcode, Some("Crowd")).await?;
             // # Reaching SessionStart is the proof
             //
@@ -244,7 +236,7 @@ async fn a_host_that_appears_late_is_still_found() -> Result<()> {
     let dialing = tokio::spawn(async move {
         // No relay url and no remembered address: every way of placing this
         // host has to come from discovery, and none of them can answer yet.
-        GuestClient::connect_via(&key, None, &[]).await
+        GuestClient::connect_via(&key, None).await
     });
 
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -538,34 +530,21 @@ async fn two_endpoints_on_one_network_find_each_other_without_any_server() -> Re
 /// candidate iroh has not selected as one — it would pass while proving
 /// nothing, so the path is asserted on afterwards as well.
 ///
-/// Loopback for the same reason the test above uses it: it takes the relay out
-/// of the picture entirely, so this runs on a machine that cannot reach one.
+/// Both ends on this machine for the same reason the test above uses it: mDNS
+/// places the host with no relay in the picture, so this runs on a machine that
+/// cannot reach one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_host_that_can_be_reached_directly_is_carried_directly() -> Result<()> {
-    let (server, _passcode, host_id) = start_host().await?;
-    let addrs = loopback_addrs(&server);
-    assert!(!addrs.is_empty(), "the host bound no dialable socket");
+    let (_server, _passcode, host_id) = start_host().await?;
     let key = iroh::PublicKey::from_bytes(&host_id).context("host id")?;
 
     // # Why this budget is not tight
     //
-    // A loopback address is passed as `known_addrs`, and those are no longer
-    // raced against discovery — they are the last resort, tried only once
-    // everything that could say where the host is *now* has come back with
-    // nothing. So this test takes the slow path by construction: it waits for
-    // the lookups to give up before the address it was handed is used at all.
-    //
-    // That is the point rather than an accident. A remembered address is not
-    // evidence about the present, and preferring one was reported as breaking
-    // connections that worked the moment it was deleted.
-    //
-    // What is still being timed is the punch, which is immediate to ourselves.
-    // The budget covers discovery declining first — and declining can mean
-    // hanging until the dial timeout rather than answering "nothing", which on
-    // a network where lookups are blocked is the usual shape. So the budget has
-    // to cover a full dial that found nothing *plus* the one that then uses the
-    // address, which is two dial timeouts and not one.
-    let guest = tokio::time::timeout(Duration::from_secs(60), GuestClient::connect_via(&key, None, &addrs))
+    // What is being timed is the punch, which is immediate to ourselves. The
+    // budget also has to cover getting there: mDNS answers in well under a
+    // second, but the endpoint's own online wait comes first and a dial that
+    // has to be asked twice comes after.
+    let guest = tokio::time::timeout(Duration::from_secs(60), GuestClient::connect_via(&key, None))
         .await
         .context("connecting to a host on this machine took longer than the punch should")??;
 
@@ -575,6 +554,53 @@ async fn a_host_that_can_be_reached_directly_is_carried_directly() -> Result<()>
         "a host on this machine was carried over {} — the direct-path gate let a relay past",
         path.remote(),
     );
+    Ok(())
+}
+
+/// A host on this network is reached by discovery alone.
+///
+/// # What replaced what
+///
+/// Tain used to keep the address a host answered on and hand it to the next
+/// dial. Three attempts were made to make that safe and each was reported as
+/// still breaking connections that worked the moment the saved address was
+/// deleted — so it is gone, and there is no parameter left to pass one through.
+///
+/// What is left is this: everything that can say where a host is *now*. Both
+/// ends are on this machine, so mDNS is the one that answers, with no relay, no
+/// DNS and no internet involved. If discovery alone were not enough, this could
+/// not connect at all — which is exactly the claim removing the cache rests on.
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_alone_reaches_a_host_on_this_network() -> Result<()> {
+    let (server, passcode, host_id) = start_host().await?;
+    let key = iroh::PublicKey::from_bytes(&host_id).context("host id")?;
+
+    let mut guest = tokio::time::timeout(
+        Duration::from_secs(60),
+        GuestClient::connect_via(&key, None),
+    )
+    .await
+    .context("a dial with nothing but discovery never finished")?
+    .context("discovery could not place a host on this very machine")?;
+
+    // Reaching it is most of the claim; being able to use it is the rest.
+    let (_send, mut recv) = guest.authenticate(&passcode, Some("Discovery only")).await?;
+    let mut started = false;
+    for _ in 0..2 {
+        match next_message(&mut recv).await {
+            Some(Message::SessionStart(_)) => {
+                started = true;
+                break;
+            }
+            Some(Message::GuestApprovalRequest(_)) => continue,
+            Some(other) => anyhow::bail!("unexpected first message: {other:?}"),
+            None => break,
+        }
+    }
+    assert!(started, "the session never started");
+
+    guest.shutdown().await?;
+    server.shutdown().await?;
     Ok(())
 }
 
@@ -688,7 +714,7 @@ async fn a_connection_code_alone_is_enough_to_reach_the_host() -> Result<()> {
         "code must address the host that issued it"
     );
 
-    let mut guest = GuestClient::connect_with_code(&code, &[]).await?;
+    let mut guest = GuestClient::connect_with_code(&code).await?;
     let (_send, mut recv) = guest.authenticate(&code_string, None).await?;
 
     let bytes = tokio::time::timeout(Duration::from_secs(30), read_stream_message(&mut recv))
@@ -727,7 +753,7 @@ async fn a_code_for_a_different_host_is_rejected() -> Result<()> {
         .context("timed out waiting for rejection")??
         .context("stream closed without a reason")?;
     match bincode::deserialize::<Message>(&bytes)? {
-        Message::SessionEnd(se) => assert_eq!(se.reason, "invalid_passcode"),
+        Message::SessionEnd(se) => assert_eq!(se.reason, tain_core::protocol::end_reason::INVALID_PASSCODE),
         other => panic!("expected rejection, got {other:?}"),
     }
     assert_eq!(server.sessions().count(), 0);
@@ -751,7 +777,7 @@ async fn invalid_passcode_is_rejected_with_session_end() -> Result<()> {
         .context("stream closed without a reason")?;
 
     match bincode::deserialize::<Message>(&bytes)? {
-        Message::SessionEnd(se) => assert_eq!(se.reason, "invalid_passcode"),
+        Message::SessionEnd(se) => assert_eq!(se.reason, tain_core::protocol::end_reason::INVALID_PASSCODE),
         other => panic!("expected SessionEnd, got {other:?}"),
     }
 
@@ -790,7 +816,7 @@ async fn a_probe_answers_without_disturbing_the_host() -> Result<()> {
 
     // A valid guest code: reachable, current, and it says approval is needed.
     let code = ConnectionCode::parse(&guest_code)?;
-    match prober.probe(&code, &[], timeout).await {
+    match prober.probe(&code, timeout).await {
         ProbeOutcome::Valid { host_name, needs_approval } => {
             assert_eq!(host_name.as_deref(), Some("Test Host"));
             assert!(needs_approval, "a guest code must report that it will ask");
@@ -800,7 +826,7 @@ async fn a_probe_answers_without_disturbing_the_host() -> Result<()> {
 
     // A master code is equally valid but would not wait for anyone.
     let master = ConnectionCode::parse(&master_code)?;
-    match prober.probe(&master, &[], timeout).await {
+    match prober.probe(&master, timeout).await {
         ProbeOutcome::Valid { needs_approval, .. } => {
             assert!(!needs_approval, "a master code connects without asking");
         }
@@ -811,7 +837,7 @@ async fn a_probe_answers_without_disturbing_the_host() -> Result<()> {
     // exactly the "the host regenerated while you were away" case, and it must
     // be distinguishable from the host being off.
     server.regenerate_passcode(tain_core::PasscodeType::Guest).await?;
-    assert_eq!(prober.probe(&code, &[], timeout).await, ProbeOutcome::Stale);
+    assert_eq!(prober.probe(&code, timeout).await, ProbeOutcome::Stale);
 
     // And through all of it, nobody was asked anything.
     assert!(
@@ -1173,5 +1199,146 @@ async fn a_fresh_identity_produces_a_different_endpoint() -> Result<()> {
     a.shutdown().await?;
     b.shutdown().await?;
     reused.shutdown().await?;
+    Ok(())
+}
+
+/// An admin device is asked about once, not once per connection.
+///
+/// # The bug this exists for
+///
+/// Trusting an admin endpoint remembers the id a connection arrived under, and
+/// checks the next one against it. That could never match, because the guest
+/// side bound its endpoint with no key at all — iroh minted a fresh keypair per
+/// dial, so every connection from the same machine arrived as a different
+/// endpoint. The owner was asked to approve their own laptop every single time,
+/// and no amount of remembering could have helped: there was nothing stable to
+/// remember. See `network::adopt_identity`.
+///
+/// So this connects twice and asserts the second one is *not* asked about,
+/// which is the whole of the feature and was the whole of the failure.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network access to the n0 relay"]
+async fn an_approved_admin_device_is_not_asked_about_again() -> Result<()> {
+    use tain_core::network::{adopt_identity, ApprovalDecision, ApprovalRequest, GuestClient};
+
+    // The identity this process dials under. Adopted before the first dial,
+    // exactly as the application does at startup.
+    adopt_identity([0x5Au8; 32]);
+
+    let (approval_tx, mut approvals) = tokio::sync::mpsc::unbounded_channel::<ApprovalRequest>();
+    let server = Arc::new(
+        HostServer::bind()
+            .await?
+            .with_config(test_config())
+            .with_approval_channel(approval_tx),
+    );
+    let passcode = server.generate_master_passcode().await?;
+    let host_id = decode_endpoint_id(&server.endpoint_id())?;
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { server.run().await }
+    });
+
+    // ── first connection: asked about, and approved ──
+    let mut first = GuestClient::connect_from_bytes(&host_id).await?;
+    let (_send, _recv) = first.authenticate(&passcode, Some("This laptop")).await?;
+
+    let asked = tokio::time::timeout(Duration::from_secs(30), approvals.recv())
+        .await
+        .context("an unknown admin device should be asked about")?
+        .context("approval channel closed")?;
+    assert!(asked.is_admin, "a master passcode is an admin connection");
+    let device = asked.endpoint_id;
+    asked
+        .approve_tx
+        .send(ApprovalDecision::Allow {
+            grants: tain_core::protocol::ControlGrants::ALL,
+            displays: tain_core::protocol::DisplayGrant::All,
+        })
+        .expect("the server dropped the responder");
+
+    // What the application does on approval: remember the device, and push the
+    // new configuration to the running server.
+    let mut config = test_config();
+    config.trusted_admins.insert(device);
+    server.set_session_config(config);
+    first.shutdown().await?;
+
+    // ── second connection: the same machine, and no question ──
+    let mut second = GuestClient::connect_from_bytes(&host_id).await?;
+    let (_send, mut recv) = second.authenticate(&passcode, Some("This laptop")).await?;
+
+    // Waited on rather than polled once: the host would raise the request
+    // before streaming, so a session that starts is a session that was not
+    // asked about. Reaching a frame is the proof.
+    let mut streamed = false;
+    for _ in 0..40 {
+        match next_message(&mut recv).await {
+            Some(Message::Frame(_)) => {
+                streamed = true;
+                break;
+            }
+            Some(Message::GuestApprovalRequest(_)) => {
+                panic!("the owner was asked to approve the same device twice")
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(streamed, "an already-trusted admin device should stream without being asked");
+    assert!(
+        approvals.try_recv().is_err(),
+        "a trusted device must raise no approval request at all"
+    );
+
+    second.shutdown().await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+
+/// Every endpoint this process binds gets its own local discovery.
+///
+/// # The fault this is for
+///
+/// A running Tain binds three endpoints: the host, the prober that refreshes
+/// the cards, and the shared one every outgoing dial uses. Each one starts its
+/// own mDNS responder, and they all want the same multicast port. If the second
+/// and third cannot have it, the guest side of this machine has no local
+/// discovery at all — and two PCs on one LAN silently stop being able to find
+/// each other, which is the thing people report.
+///
+/// It costs nothing to check and it is invisible otherwise: `attach` reports
+/// the failure and carries on, because a network without multicast is a real
+/// and ordinary thing. This distinguishes that from a machine that could have
+/// had it and lost the race to itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_endpoints_in_one_process_all_get_local_discovery() -> Result<()> {
+    let mut bound = Vec::new();
+    for _ in 0..3 {
+        bound.push(
+            tain_core::discovery::bind(tain_core::discovery::endpoint_builder())
+                .await
+                .context("binding an endpoint")?,
+        );
+    }
+
+    let with_mdns = bound.iter().filter(|(_, up)| up.mdns).count();
+    for (n, (_, up)) in bound.iter().enumerate() {
+        println!("endpoint {n}: mdns {} dns {} dht {}", up.mdns, up.dns, up.dht);
+    }
+
+    // All or none. None is a machine with no multicast, which is legitimate;
+    // some is this process taking the port from itself, which is not.
+    assert!(
+        with_mdns == 0 || with_mdns == bound.len(),
+        "{with_mdns} of {} endpoints got local discovery — the rest lost the multicast \
+         port to their own process, so this machine's guest side cannot see its own LAN",
+        bound.len()
+    );
+
+    for (endpoint, _) in bound {
+        endpoint.close().await;
+    }
     Ok(())
 }
