@@ -506,6 +506,9 @@ russian
 [settings.reset_defaults]
 Сбросить настройки
 
+[settings.version]
+Версия {version}
+
 
 # ── Настройки: варианты в выпадающих списках ──────────────────
 

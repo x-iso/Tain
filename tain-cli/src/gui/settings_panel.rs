@@ -135,6 +135,17 @@ pub fn show(
                         *settings = Settings::default();
                         panel.capturing = None;
                     }
+                    // Here rather than only in the log, because "which version
+                    // are you on" is the first question about any report, and
+                    // the person answering it should not need to find a file.
+                    ui.label(
+                        RichText::new(i18n::format(
+                            "settings.version",
+                            &[("version", env!("CARGO_PKG_VERSION"))],
+                        ))
+                        .size(11.0)
+                        .color(TEXT_DIM),
+                    );
                 });
             });
         });

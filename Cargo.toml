@@ -3,7 +3,7 @@ members = ["tain-core", "tain-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "P2P remote desktop application built on iroh networking"

@@ -488,6 +488,9 @@ Hosting settings apply to new connections.
 [settings.reset_defaults]
 Reset to defaults
 
+[settings.version]
+Version {version}
+
 
 # ── Settings: names for choices in dropdowns ──────────────────
 
