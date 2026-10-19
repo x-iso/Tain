@@ -2,16 +2,24 @@
 
 A peer-to-peer remote desktop application built in Rust, using [iroh](https://iroh.computer) for NAT-traversing P2P QUIC connections. Designed for wide hardware compatibility — from low-latency gaming to light desktop tasks.
 
+Tain runs on Windows. The protocol, networking, passcodes and adaptive controller
+build anywhere, but capture, encoding, audio and input injection are Windows-only
+for now.
+
 ## Features
 
 - **P2P via iroh 1.x** — QUIC with hole punching. A session runs on a **direct path or not at all**: a relay carries the handshake and never the video
 - **Found without one server** — mDNS on the local network and the mainline DHT run alongside the public lookup service, so a peer is findable when DNS is blocked and instantly when it is in the same building
-- **Passcode-based auth** — Master passcodes grant immediate control; guest passcodes are streamed **nothing** until the host allows the connection, every time
-- **Multi-user support** — Several guests on one host at once, each independently approved
+- **Two kinds of code** — An admin code is full control, approved once per device and trusted after that. A guest code is streamed **nothing** until the host allows it, every time it connects
+- **Share exactly what you mean to** — Whole screens, a chosen few of them, every screen at once laid out as the host has them, or individual application windows with nothing behind them. The host can change what a guest sees without the guest reconnecting
+- **Multi-user support** — Several guests on one host at once, each approved and limited independently
 - **Hardware video** — H.264, H.265 and AV1 through Media Foundation, decoded on the GPU through libavcodec, with software H.264, lossless and raw paths behind them
 - **Adapts to what it measures** — Frame rate, resolution and bitrate follow the pipeline and the link, and the session says which of them is holding it back
-- **Audio and cursor** — System audio over Opus; the host's pointer sent as data so it moves at the guest's frame rate
+- **Audio and cursor** — System audio over Opus, minus any apps you exclude. The host's pointer is sent as data so it moves at the guest's frame rate, and can be captured as relative movement for games
+- **Virtual displays** — A screen that exists only in software: for a machine with no monitor, or a guest who wants a screen at their own resolution
+- **Unattended access** — An optional Windows service reaches the lock screen, UAC prompts, and a machine with nobody signed in
 - **Saved connections** — Hosts you have connected to are remembered, with their codes in the OS credential store
+- **Localised** — English and Russian. Adding a language is one file — see [i18n/README.md](i18n/README.md)
 
 ## Architecture
 
@@ -19,54 +27,92 @@ A peer-to-peer remote desktop application built in Rust, using [iroh](https://ir
 ┌──────────────────┐   iroh P2P QUIC, ALPN "tain/6"    ┌──────────────────┐
 │       Host       │ ◄════════ direct path only ══════► │       Guest      │
 │                  │                                     │                  │
-│  DXGI capture    │  video stream (unidirectional)      │  GPU decode      │
-│  GPU NV12        │ ─────────────────────────────────►  │  GPU RGBA        │
-│  HW encoder      │                                     │  OpenGL, no      │
-│                  │                                     │  readback        │
+│  DXGI / WGC      │  video stream (unidirectional)      │  GPU decode      │
+│  capture         │ ─────────────────────────────────►  │  GPU RGBA        │
+│  GPU NV12        │                                     │  OpenGL, no      │
+│  HW encoder      │                                     │  readback        │
+│                  │                                     │                  │
+│  WASAPI + Opus   │  audio stream (unidirectional)      │  jitter buffer,  │
+│                  │ ─────────────────────────────────►  │  playback        │
+│                  │                                     │                  │
 │  adaptive ctrl   │  control stream (bidirectional)     │                  │
 │  passcodes       │ ◄═════════════════════════════════► │  input, cursor,  │
-│  sessions        │    input · telemetry · audio        │  audio, session  │
+│  sessions        │    input · telemetry · cursor       │  session         │
 └──────────────────┘                                     └──────────────────┘
 ```
 
-Frames go down a stream of their own so a keyframe cannot queue in front of a
-mouse movement. See [docs/architecture/overview.md](docs/architecture/overview.md).
+Video and audio each go down a stream of their own, so a keyframe cannot queue in
+front of a mouse movement. See [docs/architecture/overview.md](docs/architecture/overview.md).
 
 ### Protocol Messages
 
-All messages are `bincode`-serialized and sent over iroh QUIC bidirectional streams:
+Every message is length-prefixed `bincode` 1.x. Frames and audio travel on
+unidirectional streams of their own, each opened with a byte saying which it is.
+Everything else shares the bidirectional control stream. The full shapes are in
+`tain-core/src/protocol.rs`.
 
 | Direction | Message | Purpose |
 |-----------|---------|---------|
-| Guest → Host | `Auth { passcode, session_id }` | Initial authentication with master or guest code |
-| Host → Guest | `SessionStart { screen_info, encoder_type }` | Session established, share display info |
-| Guest → Host | `Config { fps, bitrate, client_res }` | Client's display capabilities |
-| Guest → Host | `Input { MouseMove / MouseButton / Scroll / Key }` | User input events (only forwarded when approved) |
-| Host → Guest | `Frame { sequence_number, data }` | Encoded screen frame (H.264 NAL units or raw BGRA pixels) |
-| Host → Guest | `GuestApprovalRequest { session_id, label }` | Ask host to approve a guest's input control |
-| Host → Guest | `ControlState { session_id, grants }` | Authoritative input permissions for this session |
-| Bidirectional | `Ping / Pong { timestamp }` | Keepalive and latency measurement |
+| Guest → Host | `Auth` | The whole connection code, plus the name the guest publishes, if any |
+| Guest → Host | `Config` | The guest's window size, frame rate and bitrate ceiling, so the host does not send pixels nobody will see |
+| Guest → Host | `Input` | Pointer, buttons, scroll, keys and touch, dropped by the host unless granted |
+| Guest → Host | `Telemetry` | Decode and render time, frames decoded, round trip. This steers the adaptive controller |
+| Guest → Host | `FrameAck` | A frame was decoded and shown, which bounds how far ahead the host may get |
+| Guest → Host | `RequestKeyframe` | The decoder lost sync and needs a frame that stands alone |
+| Guest → Host | `WatchDisplay` | Show another screen, every screen, or another of the shared windows |
+| Guest → Host | `Probe` | Check a code without connecting: the "is it ready" check after a paste |
+| Host → Guest | `SessionStart` | Session established: codec, host name, the displays and windows this guest may see |
+| Host → Guest | `Frame` | Encoded video |
+| Host → Guest | `CodecChanged`, `DisplayChanged` | Rebuild the decoder, because the stream is about to change shape |
+| Host → Guest | `SharedWindow`, `SharedChanged` | A shared window was minimised or closed, or the host changed what this guest may see |
+| Host → Guest | `GuestApprovalRequest` | Waiting for the host to allow the connection |
+| Host → Guest | `ControlState` | The authoritative mouse and keyboard grants for this session |
+| Host → Guest | `StreamStatus` | What the stream is running at and what is limiting it |
+| Host → Guest | `Audio` | Opus packets of the host's system audio |
+| Host → Guest | `Cursor` | Where the host's pointer is, what it looks like, and whether it is hidden |
+| Host → Guest | `HostPreview` | A small blurred picture of the host, so its saved card is recognisable |
+| Host → Guest | `ProbeResult` | The answer to `Probe` |
+| Either | `SessionEnd` | A reason *code*, worded in their own language by whichever end displays it |
+| Either | `Ping` / `Pong` | Keepalive, round trip, and the clock offset between the two machines |
 
 ### Approval
 
-A guest passcode gets nothing on connecting — no screen, no input — until the host
+A guest code gets nothing on connecting — no screen, no input — until the host
 allows it. The connection handler waits before it captures a single frame, so a
 refused guest never sees a pixel.
 
-Every outcome that is not an explicit allow denies: clicking Deny, letting the prompt
-time out, or running a host with no UI attached. That last one matters most — an
-unattended machine must not share its screen because nobody was there to say no.
-Closing the dialog is the one exception: it leaves the guest waiting rather than
-disconnecting it, so a stray Escape does not end a connection.
+Every outcome that is not an explicit allow denies: clicking deny, letting the
+prompt time out (30 seconds by default), or a host with nobody to ask. That last
+one matters most — an unattended machine must not share its screen because nobody
+was there to say no. Putting the popup away without answering is not an answer
+either: the guest keeps waiting and seeing nothing until someone decides or the
+timeout runs out.
 
-Approval is per *connection*. Reconnecting with the same code asks again.
+Guest approval is per *connection*. Reconnecting with the same code asks again.
 
-Master passcodes skip all of this — they are the "this is my own machine" path.
+**Admin codes are approved once per device.** The admin code is unrestricted
+access to the machine, and codes get out: pasted into the wrong window, read off a
+screen share, left in a clipboard manager. So the first connection from each
+device has to be allowed at the host, and after that the device is trusted and
+connects straight in. A device is identified by its iroh endpoint id, never by a
+name or address, because a caller chooses both of those. Resetting the admin
+passcode revokes the code *and* forgets every device it let in. Settings →
+Security shows how many devices are trusted and can forget them all without a
+reset.
 
-### Input Permissions
+A consequence worth knowing: a host with nobody to ask cannot be reached by a
+device that has never been approved at it, even with the admin code.
 
-Mouse and keyboard are granted **independently** per session, chosen in the same
-dialog that allows the connection, and both **off by default**:
+### Permissions
+
+Each guest's permissions are chosen in the popup that allows it:
+
+- **Mouse + Touch** and **Keyboard**, granted independently. Both start unticked
+  unless Settings → Security → *Offer by default* says otherwise.
+- **Displays**: *All* (which includes monitors plugged in later) or any subset.
+  With none chosen the guest connects and sees nothing.
+- **Or individual windows**: application windows and nothing else. No desktop
+  behind them, and nothing that happens to be on the same screen.
 
 ```
 ControlGrants { mouse: true, keyboard: false }   ← pointer only; keystrokes dropped
@@ -81,18 +127,28 @@ them per event so a change applies mid-session without reconnecting. Whenever gr
 change the host pushes a `ControlState` message, so the guest knows its real
 permissions instead of inferring them from which events silently vanish.
 
+An admin connection has nothing to narrow: it sees every screen and has the mouse
+and keyboard.
+
+**Remote input gives way to the person at the host.** When the host's own mouse or
+keyboard is used, guest input is ignored for two seconds and then resumes on its
+own (Settings → Security → *Interrupt guest input*, where zero turns it off).
+Presses, movement and scrolls give way, but releases always go through, because a
+dropped key-up is how a key gets stuck down on somebody else's machine.
+
 ### Connection Codes
 
 ```
-MASTER-<base58check>   ← Full control, granted immediately
-GUEST-<base58check>    ← View-only until the host approves input
+MASTER-<base58check>   ← Admin: full control, once this device has been approved
+GUEST-<base58check>    ← Nothing until the host allows the connection
 ```
 
-A code is **self-contained**: it encodes a type byte, a 32-byte random secret, and
-the host's 32-byte iroh endpoint ID. That is why the UI needs only a copy button on
-the host and a paste button on the guest — there is no separate ticket to shuttle
-around. The host authenticates on the secret inside the code and rejects codes
-addressed to a different endpoint.
+A code is **self-contained**: a type byte, a 32-byte random secret, the host's
+32-byte iroh endpoint ID, and the relay it can be reached through. That is why the
+UI needs only a copy button on the host and a paste button on the guest. There is
+no separate ticket to shuttle around, and nothing to look up before dialling. The
+host authenticates on the secret inside the code and rejects codes addressed to a
+different endpoint.
 
 Base58**check** is deliberate: codes get pasted through chat clients, and a truncated
 or mangled paste must fail loudly rather than producing a valid-looking code that
@@ -100,12 +156,14 @@ dials the wrong host.
 
 ### Multi-User Support
 
-Each guest connection gets its own iroh QUIC stream and session ID. The `SessionManager` tracks:
-- Per-session input control state (granted/denied)
+Each guest connection gets its own iroh QUIC streams and session ID. The `SessionManager` tracks:
+- Per-session input grants, and which displays or windows the guest may see
 - Display configuration from each guest
-- Approval status for guest passcodes
+- Approval status
+- How each guest is connected: its address, round trip, what the host is sending
+  it, and what it manages to decode. All of this shows when you hover over its card
 
-The host can approve or deny individual guests without affecting others.
+The host can approve, narrow, or disconnect individual guests without affecting others.
 
 ## Project Structure
 
@@ -113,28 +171,38 @@ The host can approve or deny individual guests without affecting others.
 ├── Cargo.toml              # Workspace root
 ├── README.md               # This file
 ├── tain-core/              # Everything that is not a window
+│   ├── ffmpeg/             # The libavcodec shim, compiled when ffmpeg is present
 │   └── src/
 │       ├── network.rs      # HostServer + GuestClient: accept, handshake, streams, adaptive loop
 │       ├── protocol.rs     # Every message that crosses the wire
 │       ├── discovery.rs    # mDNS + mainline DHT, and which branch found a host
-│       ├── dns_cache.rs    # Relay addresses remembered from last time
 │       ├── adaptive.rs     # Measures the pipeline, decides what to give up
-│       ├── capture_*.rs    # DXGI duplication, shared capture, NV12, HDR, agent pipe
+│       ├── capture_*.rs    # DXGI duplication, WGC, shared capture, NV12, HDR, the all-screens wall
+│       ├── window_capture.rs  # Sharing individual application windows
+│       ├── virtual_display.rs # Putting virtual displays on the desktop, sizing them, taking them off
 │       ├── codec_*.rs      # Media Foundation, OpenH264, delta+zstd
 │       ├── decode_*.rs     # libavcodec D3D11VA, NV12→RGBA on the GPU
 │       ├── audio_*.rs      # WASAPI loopback, Opus, jitter buffer, playback
-│       └── …               # passcodes, sessions, connection codes, cursor, input, service
-└── tain-cli/               # The `tain` binary: GUI, service, and per-desktop agent
-    └── src/
-        ├── main.rs         # Entry point; bare args, no subcommands
-        ├── service.rs      # Register, control and run as a Windows service
-        ├── agent.rs        # The per-desktop agent process
-        └── gui/            # app, session, session_window, network_bridge,
-                            # progress, gl_interop, immersive, settings, theme, …
+│       ├── local_input.rs  # Noticing the person at the host, so remote input gives way
+│       ├── i18n.rs         # The compiled-in string catalogues
+│       └── …               # passcodes, sessions, connection codes, cursor, input, service control
+├── tain-cli/               # The `tain` binary: GUI, service, unattended host, and agent
+│   └── src/
+│       ├── main.rs         # Entry point; bare flags, no subcommands
+│       ├── service.rs      # Register, control and run as a Windows service
+│       ├── unattended_host.rs # The host the service starts while the app is closed
+│       ├── agent.rs        # The per-desktop agent, for the lock screen and UAC
+│       ├── display_driver.rs  # Installing the virtual display driver and talking to it
+│       └── gui/            # app, session, session_window, network_bridge,
+│                           # settings, immersive, gl_interop, theme, …
+├── i18n/                   # One .lang file per language
+├── third_party/VirtualDisplayDriver/  # The vendored, signed driver package
+└── docs/                   # Architecture, module map, and the decision log
 ```
 
 The full list, with what each module is for, is in
-[docs/structure.md](docs/structure.md).
+[docs/structure.md](docs/structure.md). Why things are the way they are is in
+[docs/decisions.md](docs/decisions.md).
 
 ## Building
 
@@ -152,25 +220,42 @@ winget install NASM.NASM
 
 (`brew install nasm` on macOS, `apt install nasm` on Debian/Ubuntu.)
 
-The winget package does not add itself to `PATH`, so this repo's
-`.cargo/config.toml` points at the binary directly. If you build elsewhere,
-update that path or put `nasm` on `PATH`. `tain-core/build.rs` warns loudly if it
-cannot find it — **do not ignore that warning**, it is the difference between a
-working app and a broken-feeling one.
+The winget package does not add itself to `PATH`. Either put `nasm` on `PATH`, or
+copy `.cargo/config.toml.example` to `.cargo/config.toml` and point it at your
+`nasm.exe`. That file is gitignored, because the path belongs to one machine.
+`tain-core/build.rs` warns loudly if it cannot find `nasm`. **Do not ignore that
+warning**: it is the difference between a working app and a broken-feeling one.
 
 ```bash
 cargo build
 ```
 
+### ffmpeg is optional
+
+Hardware decode goes through libavcodec. Without it the build still succeeds and
+still decodes, just without the D3D11VA path. Run `scripts/fetch-ffmpeg.ps1` to
+download a shared build into `third_party/ffmpeg`, or set `FFMPEG_DIR` to one you
+already have. The DLLs are carried inside the binary and unpacked on first use.
+
+### Tests
+
 ```bash
 cargo test --workspace
 ```
 
-The end-to-end tests exercise a real iroh connection and are `#[ignore]`d because
-they need network access to the n0 relay:
+Tests that need real hardware or real network traffic are `#[ignore]`d and named,
+so they can be run one at a time. **Do not run `-- --ignored` wholesale** unless
+you mean to exercise encoders, decoders, display drivers and the public DHT all at
+once. The end-to-end tests make a real iroh connection:
 
 ```bash
 cargo test -p tain-core --test e2e_iroh -- --ignored
+```
+
+To check that every string the source asks for exists in the English catalogue:
+
+```bash
+cargo test -p tain-core --test i18n_keys -- --nocapture
 ```
 
 ### When the stream feels slow
@@ -184,9 +269,9 @@ cargo test --release -p tain-core --test pipeline_timing -- --ignored --nocaptur
 ```
 
 It reports milliseconds per frame for capture, encode and decode at every
-resolution the priority slider can pick. Anything at or above 33 ms cannot hold
-30 fps, and the bottleneck is this machine rather than the link. Build it in
-release — a debug build's numbers are dominated by unoptimised pixel loops.
+resolution step. Anything at or above 33 ms cannot hold 30 fps, and the bottleneck
+is this machine rather than the link. Build it in release — a debug build's
+numbers are dominated by unoptimised pixel loops.
 
 ### Dependencies
 
@@ -195,14 +280,16 @@ release — a debug build's numbers are dominated by unoptimised pixel loops.
 | Networking | `iroh` 1.x | P2P QUIC connections, NAT traversal (hole punching + relay) |
 | Discovery | `iroh-mdns-address-lookup`, `iroh-mainline-address-lookup` | Finding a peer on the local network, or through the DHT, without DNS |
 | Serialization | `serde` + `bincode` (v1.x) | Efficient binary protocol messages (NOT v2, which requires serde feature flag) |
-| Screen capture | `windows` (DXGI) | Desktop Duplication on Windows; test pattern elsewhere |
+| Screen capture | `windows` (DXGI, Windows.Graphics.Capture) | Desktop Duplication, with the compositor as the fallback; test pattern off Windows |
 | Hardware video | `windows` (Media Foundation) | H.264, H.265 and AV1 encode on the GPU |
-| Hardware decode | ffmpeg / libavcodec | D3D11VA decode. **Optional** — found or fetched by `build.rs`, which sets the `db_ffmpeg` cfg only when the shim compiles |
+| Hardware decode | ffmpeg / libavcodec | D3D11VA decode. **Optional**: `build.rs` sets the `db_ffmpeg` cfg only when the shim compiles |
 | Software video | `openh264` 0.9 | H.264 encode and decode, built from source — **needs `nasm`** |
 | Audio | `windows` (WASAPI) + Opus | System audio capture and playback |
 | Lossless codec | `zstd` | The delta+zstd path |
 | Passcode encoding | `bs58` (check) | Base58check codes, so a mangled paste fails loudly |
-| Secret storage | `keyring` 4 | Connection codes in the OS credential store, never in a file |
+| Secret storage | `keyring` 4 | Codes and identity in the OS credential store, never in a file |
+| Interface | `egui` / `eframe` 0.29 (glow) | The application window |
+| Virtual display | [Virtual Display Driver](third_party/VirtualDisplayDriver/PROVENANCE.md) (MIT) | Vendored, pinned by hash, and compiled into the binary |
 | Async runtime | `tokio` 1.x | Required by iroh and used throughout |
 
 ## Usage
@@ -212,10 +299,17 @@ cargo run
 ```
 
 That launches the GUI, which is the only entry point you type. There are **no
-subcommands** — `main.rs` reads a couple of bare arguments rather than parsing a
-command surface, and the other modes it compiles (`service`, `agent`, `console`,
-`migrate`) are entered by the service control manager or by a single flag.
+subcommands**. `main.rs` reads a few bare flags rather than parsing a command
+surface, and the other modes it compiles are started for you: the service and
+unattended host by the service control manager, the agent by the service, and
+the installers by the app relaunching itself with administrator rights.
 `tain-cli/src/host.rs` and `guest.rs` still exist and are not compiled in.
+
+Each run logs to `%APPDATA%\Tain\tain.log`. The service, the unattended host and
+the agents log to `%ProgramData%\Tain`. Every log starts with the build that
+wrote it.
+
+### Debugging aids
 
 The middle and footer sections are empty until a real session exists, which makes
 their layout hard to iterate on. Debug builds accept an opt-in flag that fills them
@@ -225,14 +319,15 @@ with sample rows — it is compiled out of release builds entirely:
 TAIN_DEBUG=demo cargo run
 ```
 
-Flags are comma-separated. Most are compiled out of release builds; two are
-deliberately not, because the build whose numbers matter is the release one:
+Flags are comma-separated. The ones that need sample data are compiled out of
+release builds; the rest are deliberately not, because the build whose numbers
+matter is the release one:
 
 | Flag | Effect | Builds |
 |------|--------|--------|
 | `demo` | Fill the connection lists with sample rows | debug |
-| `settings` | Open the settings window immediately | debug |
-| `approval` | Open the approval dialog for the pending demo guest | debug |
+| `settings` | Open the settings window immediately | **all** |
+| `approval` | Open the approval popup for the pending demo guest (with `demo`) | debug |
 | `loopback` | Connect to our own host endpoint on startup, to exercise the video path on one machine | **all** |
 | `frametime` | Report where a frame of UI time went, once a second | **all** |
 
@@ -245,14 +340,39 @@ the real thing has sent an investigation down a wrong turn once already.
 TAIN_DEBUG=loopback,settings cargo run
 ```
 
-Release builds are linked as a GUI app, so no console window appears beside them.
-Output is still available when you want it: run the binary from a terminal and it
-attaches to that terminal, or pass `--console` (or set `TAIN_CONSOLE=1`) to get
-a console of its own.
-
 A loopback session **disables input forwarding**, and says so in the session toolbar.
 Injection is real on Windows, so forwarding the pointer to our own endpoint would
 move the pointer we are reading from.
+
+Other environment variables:
+
+| Variable | Effect |
+|----------|--------|
+| `TAIN_CONSOLE=1` | Give a release build a console of its own, the same as `--console` |
+| `TAIN_LOG_FILE` | Write the log somewhere other than the default |
+| `TAIN_PROFILE` | Give a second instance on one machine its own identity, so two can connect to each other |
+| `TAIN_CAPTURE=wgc` | Capture through the compositor even where Desktop Duplication works, to compare the two |
+
+Release builds are linked as a GUI app, so no console window appears beside them.
+Output is still available when you want it: run the binary from a terminal and it
+attaches to that terminal, or pass `--console` to get a console of its own.
+
+### The main window
+
+The header holds both halves of the app:
+
+- **Host:** *Copy admin passcode*, behind a cover you slide aside rather than
+  click, so a stray click or a key repeat cannot copy it. The first time, a warning
+  explains what the code grants. The cover closes again after the copy, on a reset,
+  and by itself after twenty seconds. *Copy guest passcode* has no cover. Each
+  code has a reset button beside it, and the guest code can reset itself when the
+  last guest leaves.
+- **Connect:** *Paste passcode* reads a code from the clipboard and checks the host
+  before you commit to anything. It reports the host as ready, ready but going to
+  ask, expired, or not answering. The arrow then opens the session.
+
+Below the header are **previous connections** (hosts this machine has dialled)
+and **incoming connections** (guests connected to this one).
 
 ### Sessions
 
@@ -261,41 +381,64 @@ That window owns fullscreen — the main window can never be left stranded by
 disconnecting from it, and there is no app header taking up space over the remote
 screen. Closing the window ends every session in it; closing a tab ends just that one.
 
+The toolbar over the video starts with what you send — the **pointer** and the
+**keyboard**, each of which can be kept local — then what you receive: connection
+**stats**, the **host's pointer**, and its **sound** with a volume control. The
+screen picker, scaling, fullscreen and immersive mode are on the toolbar too.
+Right-click the pointer button for aim sensitivity and pointer capture.
+
+The **screen picker** offers whatever the host allowed. Screens are labelled by
+where they sit (*Main*, *Left*, *Above*, *Virtual*, …), and there is also a view of
+every screen at once, laid out as the host has them. A window share shows one
+window at a time, or all of them tiled side by side so none can hide behind
+another.
+
+The **stats** distinguish `lat`, which runs from capture on the host to display
+here, from `net`, which is the round trip on the link alone. A large gap between
+them puts the delay in encoding or decoding rather than the network. Hovering
+also shows the path (and warns when a private address means a VPN is carrying
+it), what the host is sending, decode and draw time per frame, and the audio
+buffer.
+
 ### Managing guests
 
-A waiting guest shows as a dashed pill with a spinner. Clicking **any** of its three
-icons — person, mouse, or keyboard — opens the approval dialog, which explains what
-allowing actually shares, offers separate mouse and keyboard checkboxes (both off),
-and gives you three answers:
+A guest arriving opens an approval popup attached to its card, as wide as it.
+Several can be open at once. The popup says what allowing will share and offers
+the [permissions](#permissions) above, with two answers:
 
 | Button | Effect |
 |--------|--------|
-| **Allow** | Start streaming, with whichever devices are ticked |
-| **Deny** | Refuse and disconnect — the guest never sees a frame |
-| **Cancel** | Decide later; the guest keeps waiting and is shown nothing |
+| **Allow** | Start streaming what is ticked |
+| **deny** | Refuse and disconnect — the guest never sees a frame |
+
+Clicking the card again puts the popup away unanswered, and the guest keeps
+waiting. An admin connection from a new device gets a different popup, *Allow full
+control of this machine?*, because there is nothing to choose. Allowing it makes
+the device trusted.
 
 On an **established** connection the mouse and keyboard icons toggle directly, because
-revoking should be instant. The person icon swaps to the kick icon on hover, and
-kicking asks for confirmation.
+revoking should be instant. Clicking the card reopens the popup to change which
+screens or windows are shared, which takes effect while the guest is watching. The
+person icon swaps to the kick icon on hover, and kicking asks for confirmation.
 
-If the guest published a name, the dialog says so — the host cannot verify a name the
+If the guest published a name, the popup says so — the host cannot verify a name the
 other machine chose for itself.
 
-A pill disappears as soon as its session ends, however it ended. The UI reconciles
+A card disappears as soon as its session ends, however it ended. The UI reconciles
 against the server's live session list each frame rather than waiting for a
-notification per event.
+notification per event. A guest connecting raises a Windows notification, admin
+connections included.
 
 ### Previous connections
 
-Hosts you connect to are saved to `connections.json` (beside `settings.json`) and
-appear as cards. The play triangle reconnects, the name is editable, and the ✕ that
-appears on hover forgets the host.
+Hosts you connect to appear as cards, with a blurred picture of the host's screen
+so each is recognisable. The play triangle reconnects, the name is editable, and
+the ✕ that appears on hover forgets the host *and* the code saved with it.
 
-The card stores the connection code, which is what makes reconnecting work — and which
-also means **the file holds a shared secret**. Two things limit that: a host with guest
-autoreset enabled invalidates its code the moment you disconnect, and approval is per
-connection, so a stored code still cannot get in without the host allowing it. Forget a
-card to delete its code.
+`connections.json` (beside `settings.json`) holds only which hosts you have
+connected to and what you call them. The codes themselves are kept in the OS
+credential store, and never in that file. An older version did write them there,
+and loading it moves any it finds into the credential store.
 
 If the host you connected to has a name set, the card adopts it. Renaming a card
 yourself sticks — a host's published name never overwrites it.
@@ -310,12 +453,13 @@ Rebindable in Settings → Shortcuts. Defaults:
 | `Ctrl+Shift+W` | Toggle fullscreen / windowed |
 | `Ctrl+Shift+A` | Toggle the session toolbar |
 | `Ctrl+Shift+E` | Toggle immersive mode |
+| `Ctrl+Shift+C` | Capture the pointer, or release it |
 | `Esc` | Leave fullscreen — always available, and never disconnects, because a reflexive press should not end a session |
 
 These keys are consumed locally and never forwarded to the host, which is why the
 settings panel warns when a binding has no modifier: a bare letter would be stolen
 from the host mid-sentence. Keeping the defaults on one modifier pair bounds that
-cost — `Ctrl+Shift` plus four letters is the whole hole in the keymap. Duplicate
+cost — `Ctrl+Shift` plus five letters is the whole hole in the keymap. Duplicate
 bindings are flagged rather than blocked, so swapping two shortcuts doesn't get
 stuck halfway.
 
@@ -323,29 +467,112 @@ stuck halfway.
 
 Makes the session window behave like the host's own machine:
 
-- **The Win key goes to the host.** egui never reports it — Windows routes it
-  straight to the shell — so this installs a low-level keyboard hook that swallows
-  the Win key before the shell sees it. Nothing else is ever swallowed.
+- **Every key goes to the host, Win and Alt included.** egui never reports the Win
+  key — Windows routes it straight to the shell — so this installs a low-level
+  keyboard hook that swallows it before the shell sees it.
 - **The pointer stays inside the window**, so aiming at the far edge of a remote
   screen doesn't drop the cursor onto a local monitor.
 
 It releases both the hook and the pointer when you toggle it off, disconnect, or
 the window loses focus, and Windows tears them down automatically if the process
 dies. `Ctrl+Alt+Del` is unaffected — Windows reserves it from low-level hooks
-regardless. Windows-only for now; elsewhere it logs and does nothing.
+regardless.
 
-**Scaling** handles a remote screen that doesn't match your window: `Fit` preserves
-aspect ratio and letterboxes, `Stretch` fills and distorts, `1:1` shows one remote
-pixel per screen pixel and crops.
+### Pointer capture
 
-On launch the app binds an iroh endpoint, generates a master and a guest passcode, and
-begins accepting connections. The window shows:
+A game looking around wants mouse *movement*, not a position, and a position has
+nowhere left to go once the local cursor reaches the window border. Capture hides
+this machine's cursor and sends movement instead. It switches on by itself when
+the host is seen to hide its own pointer, which works on any capture backend. You
+can also switch it on from the pointer button's right-click menu or with
+`Ctrl+Shift+C`. Use the shortcut to release it: a captured cursor cannot click the
+button that captured it. *Aim sensitivity*, in the same menu, applies only while
+the pointer is captured.
 
-- **Host panel** (left): admin and guest passcodes with copy / regenerate / autoreset controls
-- **Connect panel** (right): passcode and endpoint-ID fields — the Connect button is
-  deliberately disabled until the guest path is wired up
-- **Previous connections**: saved endpoints (nothing persists them yet)
-- **Incoming connections**: pending guest approvals with grant / revoke controls
+### Scaling
+
+**Fit** preserves aspect ratio and letterboxes the remote screen into the window.
+**1:1** shows one remote pixel per screen pixel and auto-pans: move the pointer
+into the outer 20% and the view slides that way, faster the closer you get to the
+edge. The middle 60% is a dead zone so the view does not drift while you work.
+
+### Settings
+
+| Section | What is in it |
+|---------|---------------|
+| This PC | The name shown to the other machine: anonymous, your user name, the network name, or one you choose |
+| Hosting | Codec, encoder backend, which GPU encodes, H.264 profile, resolution and frame-rate ceilings, what to give up when behind, rate control, bitrate limit, whether the pointer is drawn into frames |
+| Audio | Opus bitrate, and applications to leave out of the stream — a voice chat, say |
+| Virtual display | Installing the driver, adding and removing displays, their size, and whether one follows the guest's resolution |
+| Unattended access | Installing the service, and whether it answers when nobody is signed in |
+| Security | Approval timeout, code autoreset, interrupting guest input, trusted devices, which permissions are pre-ticked |
+| Viewing | Scaling, drawing frames straight from the GPU, fullscreen on connect |
+| Interface | Scale of this app's own window (`Ctrl+plus` and `Ctrl+minus` too) |
+| Shortcuts | The session controls above |
+| Language | Follows the system unless you choose |
+
+Settings are saved to `settings.json` in `%APPDATA%\Tain`. Hosting settings apply
+to new connections.
+
+## Sharing Screens and Windows
+
+A host with several monitors can offer all of them, any subset, or none. The guest
+picks between them from the toolbar, or watches every screen at once as one
+picture arranged the way the host has them. That composed picture rebuilds itself
+when someone moves or plugs in a monitor, and pointer input maps through it, so a
+click lands where it was aimed.
+
+**Sharing windows is not sharing a smaller screen.** A window share sends the
+chosen application windows and nothing else. There is no desktop behind them, and
+nothing that happens to sit on the same screen. The host picks them from a list
+with thumbnails. The guest sees one at a time, can switch between them, or can
+see them all tiled. The pointer maps through the window, and the guest is told
+when a window is minimised or closed instead of being left looking at a frozen
+picture.
+
+The host can change what a guest sees in the middle of a session, from the
+guest's card, without the guest reconnecting.
+
+## Virtual Displays
+
+A virtual display is a monitor that exists only in software. It lets a machine
+with no monitor be streamed at all. It gives a guest a screen at its own
+resolution instead of a scaled copy of the host's, and it turns a spare tablet or
+laptop into a second screen.
+
+Settings → Virtual display installs the driver, adds displays and removes them.
+Installing needs administrator rights, and Windows also asks whether to trust
+the publisher. That second prompt names the driver's author rather than Tain,
+because the signed package is installed exactly as shipped. New displays go to
+the right of everything else, with sizes picked from the modes the driver
+actually reports. With *Match the resolution of whoever connects* on, a virtual
+display takes the size of the guest watching it, so their window is drawn 1:1. A
+real monitor is never resized.
+
+A virtual display does not outlive the app that created it: closing Tain removes
+it. If Tain is killed instead, the unattended-access agent notices and removes
+it, where the service is installed. The driver is
+[Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
+by MikeTheTech, MIT licensed, vendored in `third_party/` with its provenance and
+hashes, and compiled into the binary, so the button works offline.
+
+## Unattended Access
+
+Most of Tain needs nothing installed. Reaching a UAC prompt, the lock screen, or a
+machine with nobody signed in needs a Windows service, which Settings → Unattended
+access installs (with administrator rights).
+
+The service runs as LocalSystem. While the app is running, the app hosts. When
+the app is closed, the service starts a host of its own on the console session's
+desktop, using the owner's settings: codec, frame rate, audio exclusions, name and
+trusted devices. A per-desktop agent covers the secure desktop that the lock screen
+and consent prompts run on. *Answer when nobody is signed in* hands this machine's
+identity to the service, so the same connection code reaches the sign-in screen.
+
+Install it only where you want unattended access: a host with nobody to ask
+refuses every guest code and every untrusted device, so only trusted admin devices
+get in. The install also adds an inbound firewall rule for the service's own copy
+of the executable, which can never raise the firewall prompt itself.
 
 ## Video Pipeline
 
@@ -358,58 +585,75 @@ begins accepting connections. The window shows:
 | **Raw BGRA** | Available | Debugging, or a LAN where 400 MB/s is free |
 | VP9 | Planned | — |
 
-H.265 and AV1 are asked of the *machine*, not assumed: a host whose GPU cannot
+H.264 is encoded on the GPU through Media Foundation where there is a hardware
+encoder, and by OpenH264 in software where there is not. H.265 and AV1 are GPU-only
+— a software path for either would be a poor trade for a stream that has to stay
+interactive — and are asked of the *machine*, not assumed. A host whose GPU cannot
 encode one advertises H.264 instead, so the two ends never negotiate something
-neither can run.
+neither can run. Choosing an unavailable codec falls back to H.264 rather than to
+raw, so it never silently costs you hundreds of MB/s.
 
-H.264 is encoded in **software** by OpenH264 — no driver dependency, works anywhere.
-Selecting the `Hardware` backend is currently a preference, not a guarantee: no GPU
-encoder is wired up yet, and both the log and the settings panel say so rather than
-letting you conclude your GPU is broken.
+The **encoder backend** is *Automatic* (GPU when there is one), *Hardware* (GPU
+only — sessions refuse to start without one) or *Software*. A hardware encoder that
+fails mid-stream is restarted, and if it keeps failing the session continues on
+the software encoder rather than ending. *Hardware* chosen by name never falls
+back. On a machine with two GPUs you can choose which one encodes. Baseline
+**H.264 profile** works with every guest. Main and High are smaller, but need the
+guest to be decoding on its GPU.
 
-With no bitrate limit set, the encoder targets ~0.07 bits per pixel per frame — about
-4 Mbit/s at 1080p30. Set an explicit limit to override that.
+The **lossless delta + zstd** path is still worth choosing for text-heavy work on a
+fast link: each frame is XOR-ed against the previous one, which turns a mostly-static
+desktop into runs of zero that zstd collapses to almost nothing. Pixel-exact,
+CPU-only, and an unchanged screen costs a few hundred bytes instead of 16 MB. Its
+weakness is motion — the delta stops being zeroes and the cost tracks whatever the
+screen did, which is why it is not the default.
 
-### Priority: quality ↔ latency
+### Capture
 
-One slider, because the underlying settings are not independent — lower latency means
-fewer pixels *and* less encoder search *and* a shorter queue, together. Measured on a
-2560×1600 display:
+Capture follows the **host's actual display resolution** — a remote desktop shows
+the host's screen, so there is no capture-size setting. Frame sizes are snapped to
+what the encoder will accept (AV1 wants widths in multiples of 64), keeping the
+aspect ratio, and never exceed what the guest's window can show.
 
-| Slider | Streams | Encode cost | Holds 30 fps? |
-|--------|---------|-------------|---------------|
-| Quality (0–33) | Full resolution | ~45 ms/frame | No, ~20 fps |
-| **Balanced (34–66, default)** | 75%, 30 fps | ~26 ms/frame | Yes |
-| (67–85) | 50%, 45 fps | ~11 ms/frame | Yes, easily |
-| Latency (86–100) | 33%, 60 fps | ~5 ms/frame | Yes |
+**DXGI Desktop Duplication** comes first: the compositor hands over the
+already-composed desktop, with no capture border, the pointer reported separately,
+and a frame the moment the desktop changes. Duplication is *lost* rather than
+interrupted by resolution changes, driver restarts, UAC prompts, and the lock
+screen; the capturer rebuilds itself and keeps serving the last good frame
+meanwhile.
 
-The midpoint is 75% rather than full resolution on purpose: at 2560×1600 the software
-encoder cannot hold 30 fps at native, and a default that stutters is a bad default
-however good it looks written down.
+Duplication only works from the GPU that composites the desktop, and on a hybrid
+laptop Windows often runs the process on the other one. Where it fails, Tain falls
+back to **Windows.Graphics.Capture**, which asks the compositor for frames and has
+no adapter rule to break. (An earlier version pinned itself to the integrated chip
+instead, which left the encoder on the weaker GPU. That preference is removed once
+on startup.) HDR desktops are tone-mapped back into range on the GPU.
 
-*Let the slider set the details* is on by default. Turn it off to set frame rate,
-quality target and keyframe interval yourself — resolution still follows the slider,
-since that is the lever the trade is actually about. The **bitrate limit never follows
-it**: that is a property of your link, not of the trade-off.
+### When it can't keep up
+
+**Resolution** (Native, 75%, 50% or 33%) and **frame rate** are ceilings you set
+outright. The stream runs at them whenever nothing is wrong, and the adaptive
+controller only goes below them while something is behind. The *If it can't keep
+up* slider decides what goes first. Towards *keep detail*, frame rate drops before
+resolution and audio is buffered generously. Towards *keep motion*, resolution
+softens first and audio is buffered as little as possible. The stats line names
+whatever is holding the stream back (capture, encoding, the network, decoding,
+drawing, or latency) and says what to do about it.
+
+*Let the slider set the encoder details* is on by default. Turn it off to set the
+quality target and keyframe interval yourself. The **bitrate limit never follows
+it**: that is a property of your link, not of the trade-off. With no limit set, the
+bitrate scales with pixels and frame rate, more generously towards the detail end.
 
 **Patents**: OpenH264's source is BSD licensed, but H.264 is patent-encumbered and
 Cisco's royalty coverage applies only to binaries Cisco distributes — not to a build
 from source, which is what this does. Fine for personal use; a licensing question if
 this is ever shipped commercially.
 
-### Scaling
-
-**Fit** letterboxes the remote screen into the window. **1:1** shows one remote pixel
-per screen pixel and auto-pans: move the pointer into the outer 20% and the view slides
-that way, faster the closer you get to the edge. The middle 60% is a dead zone so the
-view does not drift while you work.
-
 ## Input Injection
 
-Platform-specific implementations:
-- **Windows**: `SendInput` API with virtual key codes
-- **macOS**: `CGEventPost` via CoreGraphics framework
-- **Linux X11**: `XTestFakeKeyEvent` / `XTestFakeButtonEvent` (via libxdo or raw FFI)
+- **Windows**: `SendInput` for mouse and keyboard, and `InjectTouchInput` for touch
+- **macOS and Linux**: log-only stubs
 
 The `input_inject.rs` module provides a trait-based abstraction so the actual injection logic can be swapped per platform without touching protocol code.
 
@@ -418,103 +662,67 @@ The `input_inject.rs` module provides a trait-based abstraction so the actual in
 - All traffic is encrypted via QUIC/TLS 1.3 (built into iroh)
 - Passcodes are cryptographically random 256-bit secrets — brute-force resistant
 - Guest connections are streamed **nothing** until explicitly allowed — not the screen, not input — and every reconnection asks again
-- Timing out, or having no UI attached to answer, **denies**
+- Timing out, or having nobody to answer, **denies**
+- Admin codes are approved once per device, keyed by endpoint id. Resetting the admin passcode revokes it and forgets every device it let in
+- The admin code is behind a slide-to-reveal cover, with a one-time warning about what it grants
+- Codes and this machine's identity key live in the OS credential store, never in a file
 - Device names arriving from a peer are sanitized and length-capped before they are drawn, and are labelled as self-reported
-- The host can revoke any passcode at any time via `revoke <code>`
+- Remote input gives way to whoever is physically at the host
 
-**`connections.json` stores connection codes in plaintext.** That is what makes the
-reconnect button work, and it means the file is as sensitive as a saved password.
-Approval is still required per connection, so a stolen code alone does not grant
-access. Forget a saved connection to delete its code.
+Two things to understand before installing the optional parts:
+
+- **The service runs as LocalSystem**, so it can reach screens an ordinary program
+  cannot. With it installed, the admin code reaches the lock screen and
+  administrator prompts too.
+- **The virtual display driver's control pipe is open to every process** on the
+  machine, so anything running locally can add or remove virtual monitors. That
+  is the driver's decision, not one Tain can tighten.
 
 ## Status
 
-Verified by `cargo test --workspace` plus the `#[ignore]`d end-to-end suite. "Works"
-below means there is a test covering it, not that it compiles.
+Verified by `cargo test --workspace` plus the `#[ignore]`d suites that need the
+network or real hardware. Pure logic is tested without a GPU; capture, encode,
+decode and display-driver paths are tested on the hardware that has them.
 
 | Area | Status | Notes |
 |------|--------|-------|
 | Protocol framing | ✅ Works | Length-prefixed bincode; oversized and truncated messages rejected |
 | Passcode auth over iroh | ✅ Works | Valid codes admitted, invalid rejected with `SessionEnd` |
-| Frame streaming | ✅ Works | Host pushes frames on a timer, independent of guest traffic |
 | Session management | ✅ Works | Host-assigned IDs, per-session approval, cleanup on disconnect |
-| Guest approval flow | ✅ Works | Nothing streamed until allowed; deny, timeout and headless all refuse |
+| Guest approval flow | ✅ Works | Nothing streamed until allowed; deny, timeout and nobody-to-ask all refuse |
+| Admin device approval | ✅ Works | First connection per device approved; trusted after; reset forgets |
 | Per-device control | ✅ Works | Mouse and keyboard granted separately; guest notified via `ControlState` |
-| Connection codes | ✅ Works | One base58check string carries type, secret, and host address |
+| Connection codes | ✅ Works | One base58check string carries type, secret, host address and relay |
 | Device names | ✅ Works | Anonymous / system user / network name / custom, both directions, sanitized |
-| GUI host panel | ✅ Works | Copy, regenerate, autoreset, per-device approval |
-| Guest connect from GUI | ✅ Works | Paste a code, hit connect; validated on paste |
-| Saved connections | ✅ Works | Persisted to JSON, reconnectable, renameable, forgettable |
-| Frame rendering | ✅ Works | BGRA→RGBA, texture reused per upload, aspect-fit |
-| Mouse input (guest) | ✅ Works | Move/buttons/scroll, sent on change only, gated on grants |
-| Keyboard input (guest) | ✅ Works | egui→virtual-key map, synthesized modifiers, repeat suppressed |
-| Input injection (host) | ✅ Windows | Real `SendInput`. macOS/Linux still log-only stubs |
-| Settings | ✅ Works | Codec, encoder, quality, rate control, security, session; persisted to JSON |
-| Configurable shortcuts | ✅ Works | Disconnect / fullscreen / toolbar / immersive, rebindable, conflict-checked |
+| Guest connect from GUI | ✅ Works | Paste a code, the host is checked, then connect |
+| Saved connections | ✅ Works | Names in JSON, codes in the credential store; reconnect, rename, forget |
+| Mouse, keyboard, touch (guest) | ✅ Works | Sent on change only, gated on grants |
+| Input injection (host) | ✅ Windows | `SendInput` and touch injection. macOS/Linux are log-only stubs |
+| Local input priority | ✅ Windows | Guest input yields to the host's own; releases always delivered |
+| Pointer capture | ✅ Works | Relative movement for games; automatic or by shortcut |
 | Immersive mode | ✅ Windows | Win key forwarded via a keyboard hook, pointer confined to the window |
 | Session window | ✅ Works | Separate window, one tab per session, several at once |
-| Approve / kick guests | ✅ Works | Person icon, with confirmation on both |
-| Hardware encode | ✅ Windows | H.264, H.265 and AV1 via Media Foundation, where the GPU has them |
+| Screen choice | ✅ Windows | Host limits which screens; guest switches, or sees all at once |
+| Window sharing | ✅ Windows | Chosen windows only; one at a time or tiled; changeable mid-session |
+| Virtual displays | ✅ Windows | Install, add, remove, follow the guest's size |
+| Unattended access | ✅ Windows | Service, unattended host, and per-desktop agent for lock screen and UAC |
+| Screen capture | ✅ Windows | Desktop Duplication, with Windows.Graphics.Capture as the fallback; test pattern elsewhere |
+| HDR hosts | ✅ Windows | Tone-mapped back into range by shader, with a video-processor fallback |
+| Hardware encode | ✅ Windows | H.264, H.265 and AV1 via Media Foundation, with software fallback |
 | Hardware decode | ✅ Windows | libavcodec D3D11VA; drawn straight from the GPU where interop exists |
 | Adaptive quality | ✅ Works | Frame rate, scale and bitrate follow measurement; the session names the bottleneck |
-| Audio | ✅ Windows | WASAPI loopback, Opus, jitter buffer that grows when the link breaks it |
+| Audio | ✅ Windows | WASAPI loopback with per-app exclusion, Opus, a jitter buffer that grows when the link breaks it |
 | Remote cursor | ✅ Works | Sent as data, so it moves at the guest's frame rate rather than the stream's |
-| HDR hosts | ✅ Windows | Tone-mapped back into range by shader, with a video-processor fallback |
 | Direct path required | ✅ Works | A relayed session is refused rather than run; both ends check |
 | Local discovery | ✅ Works | mDNS finds a host on the same network in under a second, with no relay or DNS |
 | DHT discovery | ✅ Works | Mainline DHT, ~8 s; works where DNS is blocked |
 | Connection graph | ✅ Works | Six stages with their results; a failure stays on screen where it happened |
-| Windows service | ✅ Windows | Runs before login, with a per-desktop agent for the lock screen and UAC |
 | Notifications | ✅ Windows | Tray notification when a guest connects, admin included |
-| Fullscreen + toolbar | ✅ Works | Scaling modes, auto-hiding overlay, toggleable |
-| Screen capture | ✅ Windows | DXGI Desktop Duplication at native resolution; test pattern elsewhere |
-| Video compression | ✅ Works | H.264 (software) by default, plus lossless delta+zstd and raw |
-| Priority slider | ✅ Works | One knob for resolution, frame rate, quantiser and keyframes |
-| Pipeline threading | ✅ Works | Capture and encode off the async runtime, bounded backpressure |
-| Hardware encoding | ❌ Not wired | `Hardware` backend still runs the software encoder |
+| Localisation | ✅ Works | English and Russian; a test fails on any key the catalogue lacks |
+| Settings | ✅ Works | Persisted to JSON; unknown or bad fields fall back without losing the rest |
 | CLI subcommands | ❌ Not wired | `host.rs` / `guest.rs` are not compiled in |
 
-### Video
-
-Capture follows the **host's actual display resolution** — a remote desktop shows the
-host's screen, so there is no capture-size setting. What you choose is a *stream
-quality*: Native, or 75% / 50% / 33% of each axis. Dimensions always round down to
-even, because odd sizes break chroma subsampling in every real codec.
-
-Capture uses **DXGI Desktop Duplication** on Windows — the compositor hands over the
-already-composed desktop, so there is no per-window enumeration and no redraw cost.
-Duplication is *lost* rather than interrupted by resolution changes, driver restarts,
-UAC prompts, and the lock screen; the capturer rebuilds itself transparently and keeps
-serving the last good frame meanwhile.
-
-The default codec is **H.264**, encoded on the GPU through Media Foundation where
-that is available and by OpenH264 in software where it is not. See
-[Video Pipeline](#video-pipeline) above for the trade-offs and the CPU cost.
-
-The **lossless delta + zstd** path is still there and still worth choosing for
-text-heavy work on a fast link: each frame is XOR-ed against the previous one, which
-turns a mostly-static desktop into runs of zero that zstd collapses to almost nothing.
-Pixel-exact, CPU-only, and an unchanged screen costs a few hundred bytes instead of
-16 MB. Its weakness is motion — the delta stops being zeroes and the cost tracks
-whatever the screen did, which is why it is no longer the default.
-
-**H.265 and AV1 are implemented**, on the GPU only — there is no software path for
-either, and adding one would be a poor trade for a stream that has to stay
-interactive. Both are asked of the machine rather than assumed: a host whose GPU
-cannot encode one advertises H.264 instead, so the two ends never negotiate
-something neither can run. VP9 is still declared and unimplemented.
-
-Choosing an unavailable codec falls back to H.264 rather than to raw, so it never
-silently costs you hundreds of MB/s. The encoder backend
-(auto/hardware/software), rate control (CBR/VBR/constant-quality), bitrate limit
-and keyframe interval are all settings.
-
 ## Roadmap / Next Steps
-
-Done since this list was written: hardware H.264 (and H.265, and AV1) via Media
-Foundation, hardware decode via libavcodec D3D11VA, audio, passcode and identity
-persistence in the OS credential store, and a Windows service that runs before
-login.
 
 1. **Dirty-rectangle capture** — DXGI reports which regions changed; sending only
    those would cut both encode cost and bandwidth further.
@@ -522,29 +730,34 @@ login.
 3. **Input injection on macOS and Linux** — `CGEventPost` and XTest
 4. **Hardware encode off Windows** — VideoToolbox and VAAPI, once there is
    anything to capture on those platforms
-5. **Clipboard sync and multi-monitor**
-6. **H.265 keyframe handling** — inter frames on static content intermittently
-   come back a flat neutral grey. Characterised, not fixed; moving content is
-   correct on all three codecs.
+5. **Clipboard sync**
+6. **VP9** — declared, not implemented
+7. **H.265 colour** — a round-trip test in `codec_mf.rs`, committed failing on
+   purpose, catches HEVC frames coming back the wrong colour. Characterised, not
+   fixed.
 
 ## Testing between two machines
 
 1. Run Tain on both. Windows will prompt for **firewall access** the first time —
    allow it on both. Without it a direct path cannot be punched, and since a
    relayed session is refused, the connection will fail rather than crawl.
-2. On the host, click **Copy admin passcode** (full control) or **Copy guest passcode**
-   (view-only until approved).
-3. Get that code to the other machine and click **Paste passcode**, then the arrow.
-4. A guest code appears in the host's footer awaiting approval — click the mouse and
-   keyboard icons to grant each independently.
+2. On the host, slide the cover aside and click **Copy admin passcode** (full
+   control), or click **Copy guest passcode** (nothing until you allow it).
+3. Get that code to the other machine and click **Paste passcode**. Once it says the
+   host is ready, click the arrow.
+4. On the host, the approval popup opens by itself. For a guest code, tick what to
+   share and click **Allow**. An admin code asks only the first time each device
+   connects.
 
 **On the same network, neither machine needs the internet.** mDNS finds the host
 by multicast in under a second and the two punch directly, with no relay and no
-DNS involved. The session's toolbar says `LAN` when that is what happened.
+DNS involved. The connection graph's *Find* step says `LAN` when that is what
+happened.
 
 Across the internet they do need to be introduced, and there are three ways that
 can happen — the relay named in the connection code, the public lookup service,
-or the mainline DHT. The toolbar says which, and hovering it shows the whole
-path. If it says `code` and the connection then fails at `Direct`, the relay was
-the only route there was and nothing published an address worth dialling: a VPN
-or a strict NAT on either machine is the usual reason.
+or the mainline DHT. The graph says which, and hovering it shows the whole path.
+No address is remembered from last time: a stale one still routes somewhere, and
+kept taking connections down with it. If it says `code` and the connection then fails at `Direct`, the
+relay was the only route there was and nothing published an address worth
+dialling: a VPN or a strict NAT on either machine is the usual reason.

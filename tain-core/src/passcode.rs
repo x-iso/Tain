@@ -1,8 +1,13 @@
 //! Passcode generation and validation.
 //!
 //! Two passcode types:
-//! - **Master** — grants immediate keyboard/mouse control (no approval needed)
-//! - **Guest** — requires host approval before input is forwarded to the host
+//! - **Master** — the admin code: every screen, mouse and keyboard. The first
+//!   connection from each device still has to be allowed at the host, and is
+//!   trusted after that
+//! - **Guest** — nothing at all, not even the screen, until the host allows the
+//!   connection, and that is asked again every time
+//!
+//! Who has to be asked is [`crate::network::must_be_approved`].
 //!
 //! This module owns only the *secret*. The shareable string a user copies is a
 //! [`crate::connection_code::ConnectionCode`], which wraps a secret together
@@ -24,9 +29,9 @@ use tokio::sync::Mutex;
 /// Authorization level encoded into a passcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PasscodeType {
-    /// Master: full control granted immediately upon connection.
+    /// Master: full control, once this device has been approved at the host.
     Master,
-    /// Guest: view-only until host explicitly approves input control.
+    /// Guest: streamed nothing until the host allows this connection.
     Guest,
 }
 

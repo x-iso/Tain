@@ -190,9 +190,11 @@ struct Desktop {
 /// and the output must be on the same adapter — the one compositing the desktop
 /// — and on a hybrid laptop the process is commonly placed on the *other* chip,
 /// which then claims the display and refuses to duplicate it. Nothing inside
-/// the process can move it; see [`super::gpu_preference`], which writes a
-/// Windows setting and asks for a restart, and is a workaround wearing all the
-/// awkwardness that implies.
+/// the process can move it for the run that failed. See
+/// [`super::gpu_preference`] for the whole diagnosis, and for the Windows
+/// setting an earlier version wrote to move the next run — which made
+/// duplication work and kept the encoder off the discrete chip, and is now
+/// taken back rather than written.
 ///
 /// [`super::capture_wgc`] has no such rule, because the compositor delivers
 /// onto whatever device it is given. So it is what a machine falls back to,

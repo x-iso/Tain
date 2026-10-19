@@ -154,8 +154,8 @@ pub struct StreamHealth {
     pub path: Option<tain_core::network::ConnectionPath>,
     /// Which address lookup located this host.
     ///
-    /// `None` when nothing had to look — a code carrying a relay, or an address
-    /// remembered from last time, is an answer the guest already had. Shown in
+    /// `None` when nothing had to look — a code carrying a relay is an answer
+    /// the guest already had. Shown in
     /// place of the bare word "direct", because since a relayed session is
     /// refused outright, "direct" is the only thing it could ever say and *how*
     /// the host was found is the half that carries information.

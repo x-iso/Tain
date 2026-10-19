@@ -32,7 +32,7 @@
 //! cannot help. There is exactly one adapter with the output and it is the wrong
 //! one, and DXGI will not pair an output with a device from a different adapter.
 //!
-//! # The one lever there is
+//! # The one lever there is, and why it is no longer pulled
 //!
 //! Which GPU a process runs on is decided before `main`, from the executable and
 //! from a per-application setting, so nothing at the point of failure can change
@@ -41,23 +41,29 @@
 //! `HKCU\Software\Microsoft\DirectX\UserGpuPreferences` is that setting: one
 //! value per executable, and since Windows 10 1803 it overrides the graphics
 //! vendors' own control panels. It is what **Settings > System > Display >
-//! Graphics** writes, which is the page the old error message asked people to go
-//! and find. Writing it here is the same act, done by the program that knows it
-//! is needed rather than by somebody being talked through a settings tree over
-//! chat — and it needs no administrator rights, because an application's own
-//! preference belongs to the user running it.
+//! Graphics** writes, and it needs no administrator rights, because an
+//! application's own preference belongs to the user running it.
 //!
-//! # Why "power saving" is the answer and not merely the other option
-//!
-//! It is not a coin toss between the two chips. The integrated GPU is the one
+//! An earlier version wrote *power saving* there whenever duplication failed.
+//! That was not a coin toss between the two chips: the integrated GPU is the one
 //! the panel is wired to on these machines, and a process placed there sees an
-//! honest topology: Intel owns the internal display, the discrete chip owns
+//! honest topology — Intel owns the internal display, the discrete chip owns
 //! whatever is plugged into the ports it drives, and the adapter search in
-//! [`super::capture_dxgi`] then finds the right one for whichever display was
-//! asked for. Placed on the discrete chip it sees the fiction above.
+//! [`super::capture_dxgi`] finds the right one. Duplication worked.
 //!
-//! So this is not "try the other GPU", it is "stop being lied to about which GPU
-//! owns the desktop".
+//! It also put the encoder on the weaker chip, for the life of the installation:
+//! a laptop with a real GPU encoding on its processor, the discrete card idle,
+//! because Tain had asked Windows not to use it. The fault is now answered by
+//! [`super::capture_wgc`] instead. The compositor delivers frames onto whichever
+//! device it is given, so the process stays where it is and captures anyway.
+//!
+//! # What is left here
+//!
+//! Taking that preference back, once, on startup — see
+//! [`undo_our_old_preference`] — and the reading and writing it needs. [`set`]
+//! and [`worth_switching`] belong to the old fix and nothing in the application
+//! calls them; only the tests here do. A test in `screen_capture` fails if the
+//! capture path starts calling `set` again.
 
 /// Which chip Windows should start an executable on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -132,8 +138,9 @@ pub fn parse(value: &str) -> Preference {
 
 /// Whether moving this process to the integrated chip is worth trying.
 ///
-/// Pure, because it is the whole decision and it should be readable without a
-/// hybrid laptop to hand.
+/// The old fix's decision, and not called from the application any more — see
+/// the module note. Pure, because it is the whole decision and it should be
+/// readable without a hybrid laptop to hand.
 ///
 /// Only from a state nobody chose. A preference already set to power saving has
 /// been tried and did not help, and one set to high performance was set by
@@ -187,6 +194,9 @@ pub fn undo_our_old_preference(already_done: bool) -> bool {
 static SWITCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether this run has already asked for a different chip.
+///
+/// Only [`set`] raises it, so in the application it is always false now; see
+/// the module note.
 ///
 /// # Why this is remembered rather than read back
 ///
@@ -268,7 +278,8 @@ mod windows_impl {
     ///
     /// Takes effect at the next launch and never at this one, which is the
     /// whole awkwardness of the feature: the driver reads it before any code
-    /// here runs.
+    /// here runs. Nothing in the application calls this any more; see the
+    /// module note.
     pub fn set(preference: Preference) -> Result<()> {
         let exe = this_executable()?;
         let data = encode(preference)
@@ -318,11 +329,9 @@ mod windows_impl {
     /// Stop expressing a preference for this executable.
     ///
     /// Anything that writes a setting on somebody's behalf should be able to
-    /// unwrite it. Not reached from the capture path — which only ever adds a
-    /// preference, and only to a machine that could not capture without one —
-    /// but it is what makes the change reversible from inside Tain rather than
-    /// only from a Settings page, and it is how the test below leaves the
-    /// registry as it found it.
+    /// unwrite it. This is how [`super::undo_our_old_preference`] takes back
+    /// what an older Tain wrote, and how the test below leaves the registry as
+    /// it found it.
     pub fn clear() -> Result<()> {
         use windows::Win32::System::Registry::RegDeleteValueW;
 

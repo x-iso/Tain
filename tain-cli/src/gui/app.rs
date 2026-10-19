@@ -568,18 +568,20 @@ fn stopped_hosting(state: &AppState) {
 
 /// Opt-in debugging aids, from a comma-separated `TAIN_DEBUG` list.
 ///
-/// Debug builds only — every one of these is compiled out of release.
+/// Read in every build. What keeps sample data out of release is that
+/// `seed_demo_data` is compiled out, not anything here — so `approval`, which
+/// only acts on a demo guest, does nothing there either.
 ///
-/// | Flag       | Effect                                                    |
-/// |------------|-----------------------------------------------------------|
-/// | `demo`     | Fill the connection lists with sample rows                 |
-/// | `loopback` | Connect to our own host endpoint on startup                |
-/// | `settings` | Open the settings window immediately                       |
-/// | `approval` | Open the approval dialog for the pending demo guest        |
+/// | Flag       | Effect                                              | Builds |
+/// |------------|-----------------------------------------------------|--------|
+/// | `demo`     | Fill the connection lists with sample rows          | debug  |
+/// | `approval` | Open the approval dialog for the pending demo guest | debug  |
+/// | `settings` | Open the settings window immediately                | all    |
+/// | `loopback` | Connect to our own host endpoint on startup         | all    |
 ///
-/// `frametime` is deliberately **not** one of these: it only measures, and the
-/// build whose numbers matter is release. [`FrameTimer::from_env`] reads the
-/// same variable itself, in every build.
+/// `frametime` is not read through here: [`FrameTimer::from_env`] reads the
+/// same variable itself, in every build. It only measures, and the build whose
+/// numbers matter is release.
 ///
 /// `loopback` is available in release for the same reason. Measuring the whole
 /// pipeline — capture, encode, send, receive, decode, display — needs both ends

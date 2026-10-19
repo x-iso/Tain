@@ -840,7 +840,8 @@ fn choose_output(
 /// the two chips, encoder included, which on a laptop with a real GPU in it
 /// meant a session encoding on the processor while the discrete card sat idle —
 /// because this code had asked Windows not to use it. Nothing in the fix said
-/// so, and nothing undid it afterwards.
+/// so, and nothing undid it until a later version took the preference back on
+/// startup.
 ///
 /// Capture is not worth buying at the price of everything downstream of it. The
 /// compositor captures the desktop wherever it lives with no adapter rule at
@@ -867,10 +868,12 @@ pub(crate) fn both_ways_failed(want: Option<&str>) -> Remedy {
 ///
 /// # Why this is a type and not a sentence
 ///
-/// It is the one capture failure with a remedy, and the remedy is not something
-/// to read out to somebody: it is a per-application Windows setting Tain can
-/// write for itself. See [`crate::gpu_preference`], which explains both the
-/// failure and the setting at length.
+/// It is the one duplication failure that changes what happens next. Where it
+/// is the cause, the compositor is expected to capture the desktop instead and
+/// nothing is said; only if the compositor fails too does the guest get
+/// `both_ways_failed` rather than DXGI's own words. `capture_shared` looks for
+/// this type to tell which. See [`crate::gpu_preference`], which explains the
+/// failure at length.
 ///
 /// Recognising it by its message would not survive contact with the machines it
 /// happens on, where the text is in whatever language Windows was installed in.

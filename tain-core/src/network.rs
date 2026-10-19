@@ -163,44 +163,6 @@ pub struct ApprovalRequest {
     pub approve_tx: tokio::sync::oneshot::Sender<ApprovalDecision>,
 }
 
-/// Whether somebody at the host has to say yes before this connection runs.
-///
-/// # The two rules, and why they are different
-///
-/// **Every guest, every time.** What a guest is allowed — which screens, mouse,
-/// keyboard — is decided per connection, so there is nothing to remember and
-/// nothing that could be skipped.
-///
-/// **An admin, the first time from each endpoint.** The admin passcode is
-/// unrestricted access, so the useful question is not "what may this connection
-/// do" but "is this the owner". Asked once per endpoint rather than once per
-/// connection: asking every time would train the answer out of anyone who uses
-/// their own machine, and an approval nobody reads protects nothing.
-///
-/// Pure, and separate from the connection it is asked about, because it is the
-/// whole of the authorisation decision and every case of it should be readable
-/// without a network.
-/// How long everything that can say where the host is *now* gets before the
-/// address it answered on last time joins the dial.
-///
-/// # Why this is a clock and not "when nothing was found"
-///
-/// It was the latter, and that turned out to mean the opposite of what it said.
-/// On a filtered link mDNS and DNS do not hang — they complete, with nothing,
-/// in a second or two — so `connect` returned `NoAddress` almost at once and
-/// the saved address went in at about two seconds. The mainline DHT needs
-/// eight, and often a second ask. So the lookup that still works where the
-/// others are blocked never got a turn, and the fallback written to be a last
-/// resort was in practice tried before the thing it was meant to come after.
-///
-/// Being gated on the two lookups that fail *fastest* is what made it first. A
-/// clock is gated on the slowest one, which is the one that matters.
-///
-/// Public because the ordering is the property, and a property that has been
-/// got wrong twice deserves a test that can name the boundary it must not
-/// cross. See `a_host_that_can_be_reached_directly_is_carried_directly`.
-pub const DISCOVERY_GRACE: Duration = Duration::from_secs(15);
-
 /// This machine's identity for connections it makes to other machines.
 ///
 /// # Why outgoing connections need a name at all
@@ -321,6 +283,23 @@ async fn outgoing_endpoint() -> Result<&'static (iroh::Endpoint, super::discover
         .await
 }
 
+/// Whether somebody at the host has to say yes before this connection runs.
+///
+/// # The two rules, and why they are different
+///
+/// **Every guest, every time.** What a guest is allowed — which screens, mouse,
+/// keyboard — is decided per connection, so there is nothing to remember and
+/// nothing that could be skipped.
+///
+/// **An admin, the first time from each endpoint.** The admin passcode is
+/// unrestricted access, so the useful question is not "what may this connection
+/// do" but "is this the owner". Asked once per endpoint rather than once per
+/// connection: asking every time would train the answer out of anyone who uses
+/// their own machine, and an approval nobody reads protects nothing.
+///
+/// Pure, and separate from the connection it is asked about, because it is the
+/// whole of the authorisation decision and every case of it should be readable
+/// without a network.
 pub fn must_be_approved(
     typ: PasscodeType,
     endpoint_id: &[u8; 32],
@@ -4116,6 +4095,10 @@ pub enum DialStep {
     /// Dialling the relay named in the code.
     ViaRelay,
     /// Dialling an address this host answered on before, with no relay involved.
+    ///
+    /// Never reported any more. Nothing is remembered from last time — see the
+    /// note in [`GuestClient::connect_reporting`] — so there is no such address
+    /// to dial, and the dialling step reported is always [`Self::ViaRelay`].
     Direct,
     /// Reached the host, and waiting for hole punching to open a direct path.
     ///
@@ -4223,16 +4206,6 @@ impl GuestClient {
         /// How long to leave between asking again.
         const FIND_RETRY: Duration = Duration::from_secs(2);
 
-        // The budget has to leave room for at least one whole attempt *after*
-        // discovery's run, or the saved address would never be reached and the
-        // fallback would silently stop existing. Checked here rather than in a
-        // test because it is three constants, and a mismatch should fail the
-        // build rather than wait for somebody to connect on a filtered link.
-        const _: () = assert!(
-            DISCOVERY_GRACE.as_secs() + DIAL_TIMEOUT.as_secs() < FIND_WAIT.as_secs(),
-            "no room left to try the address this host answered on last time"
-        );
-
         // The cached resolver, as everywhere else — this is the path a user on
         // a censored link actually presses, and the one where three seconds of
         // DNS per relay is the difference between connecting and not.
@@ -4248,11 +4221,8 @@ impl GuestClient {
         let endpoint = endpoint.clone();
 
         // Only worth naming as a step when there is nothing else to go on. With
-        // a relay in the code or an address on file, this wait is a courtesy
-        // and the user should not be told the connection depends on it.
-        // No longer excused by having an address on file. That address is not
-        // tried until everything else has come back empty, so a dial with one
-        // still depends on this wait and the graph should say so.
+        // a relay in the code this wait is a courtesy, and the user should not
+        // be told the connection depends on it.
         if relay_url.is_none_or(str::is_empty) {
             on_step(DialStep::ReachingRelay);
         }
@@ -4466,8 +4436,8 @@ impl GuestClient {
 
     /// Which address lookup found this host.
     ///
-    /// `None` when nothing had to look: a code carrying a relay, or an address
-    /// remembered from last time, is an answer the guest already had.
+    /// `None` when nothing had to look: a code carrying a relay is an answer the
+    /// guest already had.
     pub fn found_via(&self) -> Option<super::discovery::Branch> {
         self.found.branch(self.connection.as_ref()?.remote_id())
     }

@@ -7,8 +7,8 @@
 //! the desktop. On a laptop with two graphics chips that is broken by default
 //! and cannot be repaired from inside the process: which chip a process runs on
 //! is decided before `main`, and the adapter holding the output is the one that
-//! refuses to duplicate it. See [`super::gpu_preference`], which is the
-//! workaround and carries the whole diagnosis.
+//! refuses to duplicate it. See [`super::gpu_preference`], which carries the
+//! whole diagnosis and the workaround that came before this one.
 //!
 //! Windows.Graphics.Capture asks DWM for frames instead. DWM already composites
 //! the desktop on whichever chip it likes and delivers textures onto *the device
