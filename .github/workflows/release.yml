@@ -1,7 +1,12 @@
-# Builds tain.exe for a pushed `v*` tag and attaches it, with its SHA-256, to
-# that tag's GitHub Release. Run by hand (Actions → Release → Run workflow) it
-# builds the same exe and keeps it as a workflow artifact instead, so all of
-# this can be tried without cutting a tag.
+# Builds tain.exe for a `v*` tag and attaches it, with its SHA-256, to that
+# tag's GitHub Release. Pushing the tag runs it; so does running it by hand
+# (Actions → Release → Run workflow) with the tag chosen, which is how to redo
+# a release's exe. Run by hand on a branch instead, it builds the same exe and
+# keeps it as a workflow artifact, so all of this can be tried without a tag.
+#
+# What decides it is the ref, not the event: a manual run is never a push,
+# even when started from a tag, and the first version keyed on the event and
+# so would not attach a manual run's exe to anything.
 #
 # A local build is allowed to be incomplete: without nasm, without ffmpeg or
 # with a stale licence list it still succeeds, and the exe still starts. That
@@ -246,8 +251,8 @@ jobs:
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "``tain.exe`` SHA-256: ``$hash``"
           Write-Output "tain.exe, $((Get-Item dist\tain.exe).Length) bytes, SHA-256 $hash"
 
-      - name: Keep the exe from a manual run
-        if: github.event_name == 'workflow_dispatch'
+      - name: Keep the exe from a branch build
+        if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v7
         with:
           name: tain-${{ github.sha }}
@@ -259,7 +264,7 @@ jobs:
       # only the exe is replaced, and the hash goes beside it as a file. One
       # this creates gets the hash in its notes as well.
       - name: Attach to the release
-        if: github.event_name == 'push'
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
