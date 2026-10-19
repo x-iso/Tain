@@ -21,8 +21,9 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
-    # A private repository pays for these minutes, at twice the Linux rate. A
-    # cold build fits well inside this; a hung one should not bill for six hours.
+    # Free on a public repository; a private one pays for Windows minutes at
+    # twice the Linux rate. A cold build fits well inside this either way, and
+    # a hung one should not hold a runner for six hours.
     timeout-minutes: 60
     defaults:
       run:
@@ -119,12 +120,49 @@ jobs:
       # builds plain C: about 17x slower per frame, and no error. nasm-rs reads
       # NASM before it looks on PATH, the same variable
       # .cargo/config.toml.example sets.
+      #
+      # Two sources, each tried three times. The first release run died here
+      # on a 503 from Chocolatey's community feed, which throttles shared
+      # runners, so it is now the fallback. MSYS2 comes first: it is on the
+      # image at C:\msys64, serves signed packages from many mirrors, and its
+      # nasm is the one scripts/build-ffmpeg.sh builds FFmpeg with. Whichever
+      # installs, it only counts once it runs from outside MSYS2, because that
+      # is how nasm-rs will run it.
       - name: Install nasm
         run: |
-          choco install nasm --yes --no-progress
-          $nasm = Join-Path $env:ProgramFiles 'NASM\nasm.exe'
-          if (-not (Test-Path $nasm)) {
-            Write-Output "::error::nasm is not at $nasm after installing it."
+          function Test-Nasm([string]$path) {
+            if (-not (Test-Path $path)) { return $false }
+            & $path -v | Out-Null
+            return $LASTEXITCODE -eq 0
+          }
+          $sources = @(
+            @{
+              Name    = 'MSYS2'
+              Path    = 'C:\msys64\ucrt64\bin\nasm.exe'
+              Install = { & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -Sy --noconfirm --needed mingw-w64-ucrt-x86_64-nasm' }
+            }
+            @{
+              Name    = 'Chocolatey'
+              Path    = Join-Path $env:ProgramFiles 'NASM\nasm.exe'
+              Install = { choco install nasm --yes --no-progress }
+            }
+          )
+          $nasm = $null
+          :sources foreach ($source in $sources) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              Write-Output "Installing nasm from $($source.Name), attempt $attempt of 3"
+              # A missing MSYS2 is a thrown error rather than an exit code.
+              try { & $source.Install } catch { Write-Output "$($source.Name): $_" }
+              if (Test-Nasm $source.Path) {
+                $nasm = $source.Path
+                break sources
+              }
+              if ($attempt -lt 3) { Start-Sleep -Seconds (20 * $attempt) }
+            }
+            Write-Output "::warning::Could not get a working nasm from $($source.Name)."
+          }
+          if (-not $nasm) {
+            Write-Output '::error::Neither MSYS2 nor Chocolatey produced a nasm that runs.'
             exit 1
           }
           & $nasm -v
