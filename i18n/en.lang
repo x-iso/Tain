@@ -491,6 +491,118 @@ Reset to defaults
 [settings.version]
 Version {version}
 
+[settings.about]
+About
+
+[settings.about.licence]
+Tain is free software under the GNU General Public License, version 3 or
+later. You may share and change it under that licence, and it comes with no
+warranty.
+
+[settings.about.licences]
+Licences…
+
+[settings.about.licences_hint]
+The full licence of Tain and of everything it includes
+
+# The licence viewer. Names and licence texts are shown as their authors wrote
+# them and are not in this file; only the one-line descriptions are.
+
+[licences.title]
+Licences
+
+[licences.blurb]
+Tain, and everything it redistributes — linked into tain.exe, or embedded in it
+and unpacked when needed. Names and licences are shown as their authors wrote
+them.
+
+[licences.source]
+home page
+
+[licences.copy]
+Copy
+
+[licences.copy_hint]
+Copy this licence to the clipboard
+
+[licences.tain]
+This application.
+
+[licences.ffmpeg]
+Hardware video decoding, and Opus audio in both directions. The FFmpeg
+libraries are embedded in tain.exe and unpacked on first use.
+
+[licences.opus]
+Encodes the host's sound for the stream.
+
+[licences.openh264]
+Software H.264, for machines without a GPU encoder or decoder.
+
+[licences.vdd]
+The optional virtual display driver. Its signed package is embedded in tain.exe
+and installed unmodified from Settings.
+
+[licences.hugeicons]
+Most of the interface's icons, some of them modified. The rest are Tain's own.
+
+[licences.iroh]
+Peer-to-peer connections: QUIC, hole punching, relays and finding a host.
+
+[licences.tailscale]
+Parts of iroh's networking come from Tailscale, whose licence asks for this
+notice.
+
+[licences.rustls]
+Encryption for every connection, and checking a relay's certificate.
+
+[licences.ring]
+The cryptography underneath that encryption.
+
+[licences.dalek]
+The keys each machine is identified by.
+
+[licences.webpki_roots]
+The root certificates a relay's certificate is checked against.
+
+[licences.tokio]
+Runs everything that waits on the network.
+
+[licences.egui]
+The interface and its windows.
+
+[licences.fonts]
+The typefaces the interface is drawn in.
+
+[licences.mpl]
+Drawing the SVG icons, and the requests that open a port on a router.
+
+[licences.tiny_skia]
+Rasterising the icons.
+
+[licences.serde]
+Reading and writing settings and messages.
+
+[licences.bincode]
+The format every message between machines is written in.
+
+[licences.zstd]
+Compression for the lossless video codec and the embedded FFmpeg libraries.
+
+[licences.windows]
+Every Windows API Tain uses: capture, encoding, audio, input and the service.
+
+[licences.keyring]
+Keeping codes and this machine's identity in the Windows credential store.
+
+[licences.arboard]
+Copying and pasting connection codes.
+
+[licences.icu]
+Unicode data for international host names.
+
+[licences.all_crates]
+Every Rust crate compiled into tain.exe, with the licence each one declares.
+
 
 # ── Settings: names for choices in dropdowns ──────────────────
 

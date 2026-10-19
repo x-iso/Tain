@@ -15,23 +15,5 @@
 .DS_Store
 Thumbs.db
 
-
-# ── Vendored ffmpeg ───────────────────────────────────────────
-#
-# Deliberately not committed, for two reasons that both get worse with time:
-#
-# - Size. ~149 MB of DLLs, executables and generated HTML. Git keeps every blob
-#   forever, so committing it once puts it in the history permanently: deleting
-#   it later frees nothing, and rewriting history on a shared repository is its
-#   own problem.
-# - Licensing. These are third-party binaries under the LGPL or GPL depending on
-#   how the build was configured. Redistributing them carries obligations —
-#   license notices, and an offer of corresponding source — worth taking on
-#   deliberately rather than by dragging a folder in.
-#
-# A clone needs this present to build a working binary, since the runtime is
-# unpacked on first run from what the build embeds.
-/third_party/ffmpeg/
-
 # Local tooling state, specific to one machine.
 /.claude/settings.local.json

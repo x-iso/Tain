@@ -110,8 +110,8 @@ fn main() {
 /// executable is unpleasant to copy around; at this size the compression would
 /// cost more in machinery than it saves in bytes.
 ///
-/// Absent is not an error. A source tree that has not run the fetch script
-/// builds a Tain whose driver section says it ships no driver — the same
+/// Absent is not an error. A source tree without the folder builds a Tain
+/// whose driver section says it ships no driver — the same
 /// arrangement ffmpeg has, and for the same reason: a missing optional
 /// dependency should cost the feature, not the build.
 fn embed_display_driver() {
@@ -176,8 +176,9 @@ fn embed_display_driver() {
 
 /// Where the vendored driver package lives, relative to the workspace root.
 ///
-/// Beside `third_party/ffmpeg` and fetched the same way, because it is the same
-/// kind of thing: a third-party binary this project needs and does not build.
+/// Beside `third_party/ffmpeg` and committed the same way, because it is the
+/// same kind of thing: a third-party binary this project embeds, with a
+/// `PROVENANCE.md` saying where it came from.
 ///
 /// Named as the release archive unpacks it, so re-fetching a newer one is a
 /// matter of replacing the folder rather than also remembering to rename it.

@@ -353,6 +353,8 @@ Two defences, because one was clearly not enough:
 - `.cargo/config.toml` points `nasm-rs` straight at the binary, so the fix lives in the repository rather than depending on each machine's PATH.
 - `tain-core/build.rs` checks for the same binary and prints a loud multi-line `cargo:warning` if it is missing, naming the exact slowdown and the install command. A warning rather than a hard error: a slow encoder still works, and blocking the build would be wrong for someone who knowingly accepts it. `OPENH264_NO_ASM=1` silences it.
 
+**Gotcha**: nasm being found is not nasm working. nasm 3.02 segfaults, with no message, on five of OpenH264's ten common x86 files when given `-g`, and `nasm-rs` adds `-g` whenever cargo sets `DEBUG` for the build script. So every dev-profile build came out plain C, while release builds, and the check above, were fine. The workspace `Cargo.toml` sets `debug = false` under `[profile.dev.package.openh264-sys2]`, which makes cargo pass `DEBUG=false` to that one build script. The cost is no debug info for OpenH264 in dev builds. `cargo build -vv` shows openh264-sys2's own output, where a plain-C build says "not using any assembly".
+
 **The general lesson**: a dependency that degrades silently is worse than one that fails. When a build script says "not using X", treat it as an error until proven otherwise.
 
 ## Capture and Encode Do Not Belong on the Async Runtime

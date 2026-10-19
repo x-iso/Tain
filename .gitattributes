@@ -12,3 +12,8 @@
 # and the next package to be vendored may have a plain-text file that is
 # catalogued.
 third_party/VirtualDisplayDriver/** -text
+
+# The FFmpeg DLLs, built by scripts/build-ffmpeg.sh. Binary, so git neither
+# diffs nor normalises them; PROVENANCE.md beside them holds their SHA-256,
+# which a rewritten byte would no longer match.
+third_party/ffmpeg/**/*.dll binary

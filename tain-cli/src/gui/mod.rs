@@ -11,6 +11,7 @@ pub mod icon;
 pub mod immersive;
 pub mod preview;
 pub mod keymap;
+pub mod licenses;
 pub mod network_bridge;
 pub mod notify;
 pub mod progress;

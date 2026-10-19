@@ -241,8 +241,10 @@ fn text_nothing_asks_for_is_worth_knowing_about() {
         }
     }
 
-    // Built where they are used, not named as literals.
-    let dynamic = ["meta.", "end."];
+    // Built where they are used, not named as literals. `licences.` keys are
+    // held in the table in tain-cli's `gui::licenses`, whose own test checks
+    // every one of them against the English catalogue.
+    let dynamic = ["meta.", "end.", "licences."];
 
     let english = tain_core::i18n::languages()
         .iter()

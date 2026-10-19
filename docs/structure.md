@@ -60,7 +60,7 @@ testable without a GPU.
 | `decode_ffmpeg.rs` | Hardware decode through libavcodec's D3D11VA path — the guest's fast route. |
 | `decode_rgba.rs` | NV12 to RGBA on the GPU, so a decoded frame never has to touch the CPU. |
 | `h264_bitstream.rs` | Just enough bitstream parsing to drive a DXVA decoder. |
-| `ffmpeg_runtime.rs` | Finds ffmpeg, or fetches it. |
+| `ffmpeg_runtime.rs` | Loads the ffmpeg DLLs: those beside the exe if there are any, otherwise the copies embedded in it, unpacked on first use. |
 | `adaptive.rs` | Measures the pipeline and decides what to give up when it cannot keep up. |
 
 ### Audio, input, and the service
@@ -108,7 +108,8 @@ testable without a GPU.
 | `immersive.rs` | Treating the session window as if it were the host's machine. |
 | `keymap.rs`, `shortcuts.rs` | egui input to protocol key events, and the rebindable session controls. |
 | `connections.rs`, `secrets.rs` | Remembered hosts, with their codes in the OS credential store. |
-| `settings.rs`, `settings_panel.rs` | Persisted settings and the window that edits them. |
+| `settings.rs`, `settings_panel.rs` | Persisted settings and the window that edits them, including About and the licence viewer. |
+| `licenses.rs` | The licence of Tain and of everything it redistributes, each embedded verbatim with `include_str!`. What the licence viewer shows. |
 | `notify.rs` | Telling the person at the keyboard that somebody has connected. |
 | `theme.rs`, `icon.rs`, `preview.rs`, `frametime.rs` | Palette and drawing helpers, the window icon, host thumbnails, and where a frame of UI time went. |
 
@@ -118,7 +119,8 @@ testable without a GPU.
 |--------|---------------|
 | `i18n/` | One `.lang` file per language — English and Russian today — compiled into the binary by `tain-core/build.rs`. Adding a language is dropping a file in, with no list to join and no Rust to edit. The format is a key in brackets and then its text, because the text is full of the apostrophes and quotation marks every other format would make a translator escape. `i18n/README.md` is written for the person adding one. |
 | `third_party/VirtualDisplayDriver/` | The virtual display driver, vendored unmodified with its licence and a provenance record, and compiled into the binary by `tain-cli/build.rs` so installing it works offline. Signed by its author, so nothing in the folder may be edited — an edit voids the signature. See `PROVENANCE.md`. |
-| `third_party/ffmpeg/` | Where `scripts/fetch-ffmpeg.ps1` puts a shared ffmpeg build. Gitignored, for its size and its licence. |
+| `third_party/ffmpeg/` | The ffmpeg Tain embeds: avcodec, avutil and swresample built with only what the shim calls, their headers, and the FFmpeg and libopus licences. Built by `scripts/build-ffmpeg.sh`; `PROVENANCE.md` records the sources, toolchain and configure line, and each DLL's SHA-256. |
+| `licenses/` | Verbatim licence texts for what Tain redistributes, and `rust-crates.txt`, every crate in the build with its licence, written by `scripts/list-crate-licences.ps1`. `licenses/README.md` says where each text came from and when to refresh them. |
 | `tain-core/ffmpeg/` | The libavcodec shim, compiled only when ffmpeg is present. |
 
 ## Dependencies
@@ -145,9 +147,10 @@ testable without a GPU.
 
 ### Optional
 
-**ffmpeg** is found or fetched by `tain-core/build.rs`, which sets the
-`db_ffmpeg` cfg only when the libavcodec shim can actually be compiled. Without
-it the crate still builds and still decodes — it loses the hardware D3D11VA
+**ffmpeg** is committed in `third_party/ffmpeg`, and found there (or wherever
+`FFMPEG_DIR` points) by `tain-core/build.rs`, which sets the `db_ffmpeg` cfg
+only when the libavcodec shim can actually be compiled. Without it the crate
+still builds and still decodes — it loses the hardware D3D11VA
 path, and sound. Anything gated on `db_ffmpeg` is one of those two: libopus is
 inside the same avcodec, so the Opus codec and the guest's playback come through
 it too.

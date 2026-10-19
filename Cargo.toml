@@ -5,5 +5,14 @@ resolver = "2"
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 description = "P2P remote desktop application built on iroh networking"
+
+# nasm-rs passes `-g` to nasm whenever cargo sets DEBUG for a build script, and
+# nasm 3.02 segfaults on half of OpenH264's x86 files with it. openh264-sys2
+# then quietly builds plain C, about 17x slower per frame. No debug info for
+# this one package makes cargo set DEBUG=false for its build script, so dev
+# builds assemble it the way release builds do. See "The nasm Trap" in
+# docs/decisions.md.
+[profile.dev.package.openh264-sys2]
+debug = false

@@ -14,11 +14,16 @@ fn main() {
     // recovered from `target/debug/build/tain-core-*/output` after this file was
     // overwritten by mistake. The directives are exact; any conditional logic
     // around them that did not run on this machine is not.
+    //
+    // The first two belonged to a nasm check that was not recovered at all.
+    // `check_nasm` is a rewrite, not a reconstruction: written to do what the
+    // README says this script does, rather than remembered.
     println!("cargo:rerun-if-env-changed=OPENH264_NO_ASM");
     println!("cargo:rerun-if-env-changed=NASM");
     println!("cargo:rerun-if-changed=build.rs");
 
     embed_languages();
+    check_nasm();
 
     println!("cargo:rerun-if-changed=ffmpeg/db_decode.c");
     println!("cargo:rerun-if-changed=ffmpeg/db_audio.c");
@@ -32,17 +37,18 @@ fn main() {
     }
 
     let Some(dir) = ffmpeg_dir() else {
-        // Named rather than merely described: the fix is one command, and a
-        // warning that says what is missing without saying how to get it just
-        // moves the search somewhere else.
+        // Named rather than merely described: a warning that says what is
+        // missing without saying where it should be just moves the search
+        // somewhere else.
         //
-        // Deliberately not fetched here. ffmpeg is optional — everything below
-        // is skipped and the crate still builds and still decodes — so a
-        // `cargo build` that quietly downloaded 149 MB would be a surprise,
-        // would fail offline, and would repeat on every clean CI runner.
+        // The build is committed in `third_party/ffmpeg`, so this is a checkout
+        // without it, or an FFMPEG_DIR naming a folder that is not there. Not
+        // fatal: ffmpeg is optional, everything below is skipped, and the crate
+        // still builds and still decodes.
         println!(
-            "cargo:warning=no ffmpeg tree found — building without hardware decode. \
-             Run scripts/fetch-ffmpeg.ps1 to download it, or set FFMPEG_DIR \n             to point at an existing shared build."
+            "cargo:warning=no ffmpeg tree found — building without hardware decode or audio. \
+             It belongs in third_party/ffmpeg (scripts/build-ffmpeg.sh rebuilds it), \
+             or set FFMPEG_DIR to an existing shared build."
         );
         return;
     };
@@ -355,4 +361,117 @@ fn embed_languages() {
     if let Err(e) = std::fs::write(&target, source) {
         println!("cargo:warning=could not write {}: {e}", target.display());
     }
+}
+
+/// Warn when `nasm` cannot be found, because nothing else will.
+///
+/// # The trap
+///
+/// `openh264-sys2` assembles OpenH264's SIMD kernels through `nasm-rs`, and
+/// when that fails it does not fail the build. It prints "not using any
+/// assembly" with a plain `println!` — which cargo keeps to itself unless asked
+/// for `-vv` — and compiles plain C instead. Measured at 2560x1600 that is
+/// 1147 ms a frame against 67 ms, about 17x, with no error anywhere and
+/// symptoms that point at the network. "The nasm Trap" in docs/decisions.md
+/// has the numbers.
+///
+/// # A prediction, not a report
+///
+/// This cannot see what `openh264-sys2` actually did. Its build script is a
+/// separate process with no ordering against this one, and it has no `links`
+/// key to hand anything back through. So this repeats nasm-rs 0.3.2's own
+/// search, in the same environment, and expects the same answer: `NASM` if it
+/// is set, and *only* that when it is — a stale `NASM` loses to a working nasm
+/// on PATH, which is the case most worth catching — otherwise `nasm`, then
+/// `nasm` in each PATH directory in turn. A candidate counts if `-v` runs and
+/// succeeds. nasm-rs also parses the version against a minimum of 1.0, which no
+/// nasm still in circulation fails.
+///
+/// Nor can it see nasm failing on the files themselves. nasm 3.02 segfaults on
+/// half of OpenH264's common x86 files when given `-g`, which nasm-rs adds
+/// whenever cargo sets `DEBUG`. Every dev-profile build used to come out plain
+/// C that way, with nasm present and this silent, until the workspace
+/// Cargo.toml turned debug info off for openh264-sys2 alone, which makes cargo
+/// pass `DEBUG=false` to its build script. The release workflow reads
+/// openh264-sys2's own build output instead, which is the authoritative check.
+/// This is the one every local build gets.
+///
+/// # Quiet only once it is fixed
+///
+/// `openh264-sys2` declares no interest in `NASM` or PATH, so installing nasm
+/// afterwards does not rebuild it: the plain-C build stays cached. Cargo
+/// replays this warning from the cached output on every build until this
+/// script runs again, so the warning asks for both crates to be cleaned. That
+/// rebuilds OpenH264 with nasm and reruns this check, and the warning goes away
+/// at the moment its reason does.
+///
+/// `NASM` is tracked anyway, as the recovered script did, so correcting it
+/// reruns this check at once — before openh264-sys2 has been cleaned. That is
+/// the one way for the warning to go quiet early, and why it spells out the
+/// clean rather than leaving it to be guessed.
+///
+/// # Why PATH is not tracked
+///
+/// Partly the same reason: nasm arriving on PATH would quiet the warning over a
+/// binary that is still slow. And `rerun-if-env-changed=PATH` would rerun this
+/// script — and so recompile this crate and everything above it — whenever
+/// cargo starts with a different PATH than last time. Git Bash hands cargo a
+/// different PATH from PowerShell's (its own tool directories come first), a
+/// Visual Studio developer prompt another, and an editor's cargo —
+/// rust-analyzer's, into the same target directory — whatever the editor was
+/// started with. Alternating between any two would recompile on every switch.
+fn check_nasm() {
+    // Asked for: openh264-sys2 skips assembly whenever this is set, so whether
+    // nasm exists does not matter.
+    if std::env::var("OPENH264_NO_ASM").is_ok() {
+        return;
+    }
+    // openh264-sys2 only has assembly for x86 and x86-64, and Windows is the
+    // platform the trap was found and measured on. The target's, not the
+    // host's: `cfg!` in a build script describes the machine running it.
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if os != "windows" || !matches!(arch.as_str(), "x86_64" | "x86") {
+        return;
+    }
+
+    // `var`, not `var_os`, as nasm-rs does: a NASM that is not valid Unicode
+    // counts as unset there too.
+    let nasm = std::env::var("NASM").ok();
+    let candidates: Vec<PathBuf> = match &nasm {
+        Some(path) => vec![PathBuf::from(path)],
+        None => {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            std::iter::once(PathBuf::from("nasm"))
+                .chain(std::env::split_paths(&path).map(|dir| dir.join("nasm")))
+                .collect()
+        }
+    };
+
+    let mut first_error = None;
+    for candidate in &candidates {
+        match std::process::Command::new(candidate).arg("-v").output() {
+            Ok(out) if out.status.success() => return,
+            Ok(out) => {
+                first_error.get_or_insert_with(|| format!("`-v` exited with {}", out.status));
+            }
+            Err(e) => {
+                first_error.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    let why = first_error.unwrap_or_default();
+
+    // Says which lookup failed, since the fix differs: a NASM pointing at the
+    // wrong place, or no nasm anywhere.
+    let found = match &nasm {
+        Some(path) => format!("NASM is set to {path}, which does not run ({why})"),
+        None => format!("NASM is not set and there is no nasm on PATH ({why})"),
+    };
+    println!(
+        "cargo:warning=nasm not found: {found}. Without it OpenH264 builds with no SIMD \
+         assembly, about 17x slower per frame. Install nasm and point NASM or PATH at it \
+         (see .cargo/config.toml.example), then run `cargo clean -p openh264-sys2 -p tain-core`: \
+         a plain-C OpenH264 stays cached otherwise, and so does this warning."
+    );
 }

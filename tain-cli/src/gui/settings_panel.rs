@@ -49,6 +49,12 @@ pub struct PanelState {
     /// defaults — is followed rather than silently overwritten by a stale
     /// pending value.
     pub pending_ui_scale: Option<(f32, f32)>,
+    /// Whether the licence viewer is open, and which entry it is showing.
+    ///
+    /// Kept here rather than in the Settings window's own state so the viewer
+    /// outlives it: closing Settings leaves a licence being read where it is.
+    pub licences_open: bool,
+    pub licences_selected: usize,
 }
 
 /// Draw the settings window. Returns true if any value changed this frame.
@@ -118,6 +124,8 @@ pub fn show(
                     virtual_display_section(ui, settings);
                     ui.add_space(10.0);
                     shortcut_section(ui, settings, panel);
+                    ui.add_space(18.0);
+                    about_section(ui, panel);
                 });
 
             ui.add_space(12.0);
@@ -1374,6 +1382,144 @@ fn shortcut_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pane
             ui.end_row();
         }
     });
+}
+
+/// Who made this, under what terms, and the way to every licence it carries.
+///
+/// The GPL asks an interactive program to show a copyright notice, say there is
+/// no warranty and that it may be shared under the licence, and say how to read
+/// the licence. This is where it does all four.
+fn about_section(ui: &mut egui::Ui, panel: &mut PanelState) {
+    heading(ui, i18n::text("settings.about"));
+    ui.label(RichText::new(super::licenses::COPYRIGHT).size(12.0).color(TEXT));
+    ui.label(
+        RichText::new(i18n::text("settings.about.licence"))
+            .size(11.0)
+            .color(TEXT_DIM),
+    );
+    ui.add_space(6.0);
+    if ui
+        .button(i18n::text("settings.about.licences"))
+        .on_hover_text(i18n::text("settings.about.licences_hint"))
+        .clicked()
+    {
+        panel.licences_open = true;
+    }
+}
+
+/// The licence viewer: entries on the left, the selected one's licence on the
+/// right.
+///
+/// The texts are embedded verbatim (see [`super::licenses`]) and shown in
+/// monospace without truncation — a notice that has been reflowed or cut short
+/// is no longer the notice its licence asks to be reproduced.
+///
+/// Drawn by the application every frame rather than from inside the Settings
+/// window, so it stands on its own: closing Settings leaves it up.
+pub fn show_licences(ctx: &Context, panel: &mut PanelState) {
+    if !panel.licences_open {
+        return;
+    }
+    let entries = super::licenses::LICENSES;
+    // The index outlives any one frame, so it is not trusted blindly.
+    if panel.licences_selected >= entries.len() {
+        panel.licences_selected = 0;
+    }
+
+    let mut open = true;
+    egui::Window::new(i18n::text("licences.title"))
+        // Fixed, because the title is translated and egui remembers a window's
+        // place by its id — see the Settings window.
+        .id(egui::Id::new("licences-window"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size([760.0, 540.0])
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(i18n::text("licences.blurb"))
+                    .size(11.0)
+                    .color(TEXT_DIM),
+            );
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            /// Width of the entry list, in points so it follows the interface
+            /// scale.
+            const LIST_W: f32 = 200.0;
+            let height = ui.available_height();
+            ui.horizontal_top(|ui| {
+                // Both columns say `top_down` outright: a child of a horizontal
+                // layout inherits its direction, which lays the list out
+                // sideways and leaves the text column a few pixels wide.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(LIST_W, height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("licences-list")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (i, entry) in entries.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(panel.licences_selected == i, entry.name)
+                                        .clicked()
+                                    {
+                                        panel.licences_selected = i;
+                                    }
+                                }
+                            });
+                    },
+                );
+                ui.separator();
+
+                let entry = &entries[panel.licences_selected];
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(entry.name).strong().color(TEXT));
+                            ui.label(RichText::new(entry.spdx).size(11.0).color(TEXT_DIM));
+                            ui.hyperlink_to(
+                                RichText::new(i18n::text("licences.source")).size(11.0),
+                                entry.url,
+                            );
+                            if ui
+                                .small_button(i18n::text("licences.copy"))
+                                .on_hover_text(i18n::text("licences.copy_hint"))
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(entry.text.to_owned());
+                            }
+                        });
+                        ui.label(RichText::new(i18n::text(entry.what)).size(12.0));
+                        if let Some(note) = entry.note {
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(note).size(11.0).color(TEXT_DIM));
+                        }
+                        ui.add_space(6.0);
+                        egui::ScrollArea::both()
+                            .id_salt("licences-text")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // Not wrapped: these texts are laid out by their
+                                // authors, and some line up columns.
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(entry.text).monospace().size(11.0),
+                                    )
+                                    .extend(),
+                                );
+                            });
+                    },
+                );
+            });
+        });
+    if !open {
+        panel.licences_open = false;
+    }
 }
 
 /// Read a key press for rebinding, ignoring bare modifier presses.

@@ -170,6 +170,7 @@ The host can approve, narrow, or disconnect individual guests without affecting 
 ```
 ├── Cargo.toml              # Workspace root
 ├── README.md               # This file
+├── LICENSE                 # GPL-3.0
 ├── tain-core/              # Everything that is not a window
 │   ├── ffmpeg/             # The libavcodec shim, compiled when ffmpeg is present
 │   └── src/
@@ -196,6 +197,9 @@ The host can approve, narrow, or disconnect individual guests without affecting 
 │       └── gui/            # app, session, session_window, network_bridge,
 │                           # settings, immersive, gl_interop, theme, …
 ├── i18n/                   # One .lang file per language
+├── licenses/               # Third-party licence texts, embedded and shown in Settings
+├── scripts/                # Building ffmpeg, listing crate licences
+├── third_party/ffmpeg/     # The slim ffmpeg build Tain embeds, with its headers
 ├── third_party/VirtualDisplayDriver/  # The vendored, signed driver package
 └── docs/                   # Architecture, module map, and the decision log
 ```
@@ -225,17 +229,27 @@ copy `.cargo/config.toml.example` to `.cargo/config.toml` and point it at your
 `nasm.exe`. That file is gitignored, because the path belongs to one machine.
 `tain-core/build.rs` warns loudly if it cannot find `nasm`. **Do not ignore that
 warning**: it is the difference between a working app and a broken-feeling one.
+If you built before `nasm` was in place, run
+`cargo clean -p openh264-sys2 -p tain-core` once it is: OpenH264 does not
+rebuild on its own, so the plain-C build would stay.
 
 ```bash
 cargo build
 ```
 
-### ffmpeg is optional
+### ffmpeg is in the repository
 
-Hardware decode goes through libavcodec. Without it the build still succeeds and
-still decodes, just without the D3D11VA path. Run `scripts/fetch-ffmpeg.ps1` to
-download a shared build into `third_party/ffmpeg`, or set `FFMPEG_DIR` to one you
-already have. The DLLs are carried inside the binary and unpacked on first use.
+Hardware decode and audio both go through ffmpeg. The build Tain uses is
+committed in `third_party/ffmpeg`, so a clone has it and needs nothing
+downloaded: avcodec, avutil and swresample, built with only the decoders and the
+Opus encoder Tain calls, a few MB in all. `scripts/build-ffmpeg.sh` is how it was
+built and how to rebuild it, and `third_party/ffmpeg/PROVENANCE.md` records
+exactly what went in. The DLLs are carried inside the binary and unpacked on
+first use.
+
+Set `FFMPEG_DIR` to build against a different shared build. Without one at all
+the build still succeeds and still decodes, through Media Foundation instead of
+D3D11VA, but has no audio.
 
 ### Tests
 
@@ -291,6 +305,42 @@ numbers are dominated by unoptimised pixel loops.
 | Interface | `egui` / `eframe` 0.29 (glow) | The application window |
 | Virtual display | [Virtual Display Driver](third_party/VirtualDisplayDriver/PROVENANCE.md) (MIT) | Vendored, pinned by hash, and compiled into the binary |
 | Async runtime | `tokio` 1.x | Required by iroh and used throughout |
+
+### Releasing
+
+A release is a pushed `v*` tag, and nothing is built locally.
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds `tain.exe`
+on GitHub's Windows runner and attaches it, with its SHA-256 beside it, to that
+tag's release. If there is no release yet, it creates one.
+
+1. Bump `version` under `[workspace.package]` in `Cargo.toml`. That is the number
+   Settings shows, and the workflow refuses a tag that disagrees with it.
+2. Regenerate the crate licence list. It is compiled into the binary, and the
+   workflow fails if it does not match `Cargo.lock`:
+
+   ```powershell
+   .\scripts\list-crate-licences.ps1
+   ```
+
+3. Commit `Cargo.toml`, `Cargo.lock` and `licenses/rust-crates.txt` on `main`.
+   The version is in `Cargo.lock` too, and the release builds with `--locked`.
+4. Tag that commit and push the tag:
+
+   ```bash
+   git tag -a v0.4.0 -m "Tain 0.4.0"
+   git push origin main v0.4.0
+   ```
+
+The job stops rather than ship an exe that only looks complete. It fails without
+`nasm`, without ffmpeg in the checkout, with any file checked out differently
+from how it was committed, or on any warning from `tain-core`'s build script. A
+release published by hand before the tag keeps its notes, and only the exe on it
+is replaced.
+
+To try it without cutting a tag, run **Release** from the Actions tab with **Run
+workflow**, on `main`. The exe comes back as a workflow artifact, kept for a
+week, and no release is touched. A run on `main` is also the only kind that
+saves the build cache, which is what the next tag's build starts from.
 
 ## Usage
 
@@ -510,6 +560,7 @@ edge. The middle 60% is a dead zone so the view does not drift while you work.
 | Interface | Scale of this app's own window (`Ctrl+plus` and `Ctrl+minus` too) |
 | Shortcuts | The session controls above |
 | Language | Follows the system unless you choose |
+| About | Copyright, licence, and the full licence of everything Tain includes |
 
 Settings are saved to `settings.json` in `%APPDATA%\Tain`. Hosting settings apply
 to new connections.
@@ -761,3 +812,38 @@ No address is remembered from last time: a stale one still routes somewhere, and
 kept taking connections down with it. If it says `code` and the connection then fails at `Direct`, the
 relay was the only route there was and nothing published an address worth
 dialling: a VPN or a strict NAT on either machine is the usual reason.
+
+## Licence
+
+Copyright © 2026 x.iso
+
+Tain is free software: you can redistribute it and/or modify it under the terms
+of the GNU General Public License as published by the Free Software Foundation,
+either version 3 of the License, or (at your option) any later version. It is
+distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See [LICENSE](LICENSE).
+
+### Third-party software
+
+Tain redistributes other people's work, all under licences that allow it. Every
+one is listed with its full text in [licenses/](licenses/README.md), and in the
+app under **Settings → About → Licences…**. The ones that ask for more than a
+notice:
+
+| Component | Licence | What it asks |
+|-----------|---------|--------------|
+| FFmpeg (avcodec, avutil, swresample) | LGPL-3.0-or-later | Its source must be available to whoever gets the binary, and a modified FFmpeg must be substitutable. DLLs of the same names placed beside `tain.exe` are loaded instead of the embedded copies |
+| resvg, usvg, attohttpc | MPL-2.0 | Their source must stay available. They are used unmodified from crates.io |
+| egui's fonts | UFL-1.0, OFL-1.1, MIT | The font licences travel with the fonts |
+| OpenH264 | BSD-2-Clause | A notice only — but H.264 itself is patent-encumbered. See [the patents note](#when-it-cant-keep-up) |
+
+Everything else (the Virtual Display Driver, the Hugeicons icons, and the Rust
+crates) is MIT, Apache-2.0, BSD, ISC or similar, and asks for its notice to be
+kept, which `licenses/` does.
+
+**Giving someone a build is distributing it under the GPL.** Whoever receives
+`tain.exe` is entitled to its complete source: Tain's at the matching tag, which
+GitHub attaches to every release, and FFmpeg's, whose release is named in its
+entry in the licence list and whose build script, `scripts/build-ffmpeg.sh`, is
+in this repository.

@@ -4579,6 +4579,8 @@ impl eframe::App for GuestApp {
                 self.settings_settling = Some(std::time::Instant::now());
             }
         }
+        // Outside the block above so it survives Settings being closed.
+        settings_panel::show_licences(ctx, &mut self.settings_panel);
         self.flush_settled_settings(ctx);
 
         t = self.frametime.phase("settings", t);

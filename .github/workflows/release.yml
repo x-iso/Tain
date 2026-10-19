@@ -1,0 +1,243 @@
+# Builds tain.exe for a pushed `v*` tag and attaches it, with its SHA-256, to
+# that tag's GitHub Release. Run by hand (Actions → Release → Run workflow) it
+# builds the same exe and keeps it as a workflow artifact instead, so all of
+# this can be tried without cutting a tag.
+#
+# A local build is allowed to be incomplete: without nasm, without ffmpeg or
+# with a stale licence list it still succeeds, and the exe still starts. That
+# is exactly why each of them fails this job instead. A release is the one build
+# nobody watches being made.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    # A private repository pays for these minutes, at twice the Linux rate. A
+    # cold build fits well inside this; a hung one should not bill for six hours.
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      # The runner's git ships with core.autocrlf=true, which rewrites LF to
+      # CRLF in every text file it checks out. The licence texts and language
+      # catalogues are compiled into the exe, and third_party/ holds a signed
+      # driver package whose catalogue hashes the bytes beside it. All of it
+      # has to be what was committed. .gitattributes covers the vendored
+      # binaries; this covers everything else.
+      - name: Turn off line-ending conversion
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Both are optional to the build. Without ffmpeg it still succeeds and
+      # makes an exe with no hardware decode and no audio; without the driver
+      # package, one whose virtual display says it ships no driver. Better to
+      # stop here than twenty minutes of compiling later.
+      - name: Check the vendored packages came with the checkout
+        run: |
+          $required = @(
+            'third_party/ffmpeg/bin/avcodec-61.dll'
+            'third_party/ffmpeg/bin/avutil-59.dll'
+            'third_party/ffmpeg/bin/swresample-5.dll'
+            'third_party/ffmpeg/include/libavcodec/avcodec.h'
+            'third_party/VirtualDisplayDriver/mttvdd.cat'
+          )
+          $missing = @($required | Where-Object { -not (git ls-files -- $_) })
+          if ($missing.Count -gt 0) {
+            foreach ($path in $missing) { Write-Output "::error::$path is not committed." }
+            exit 1
+          }
+
+      # Every tracked file, hashed as the bytes on disk (--no-filters) and
+      # compared with the blob the commit names. git status cannot see this:
+      # it applies the same conversion when it compares, so it reports clean.
+      - name: Check the checkout is byte-for-byte the commit
+        run: |
+          $entries = @(git -c core.quotePath=false ls-files --stage | Where-Object { $_ -match '^100(644|755) ' })
+          $paths = @($entries | ForEach-Object { ($_ -split "`t", 2)[1] })
+          $committed = @($entries | ForEach-Object { ($_ -split ' ')[1] })
+          # As arguments in batches, not on stdin: Windows PowerShell puts a
+          # byte-order mark on whatever it pipes to a native command.
+          $onDisk = @(for ($i = 0; $i -lt $paths.Count; $i += 100) {
+            git hash-object --no-filters -- $paths[$i..([Math]::Min($i + 99, $paths.Count - 1))]
+          })
+          if ($onDisk.Count -ne $paths.Count) {
+            Write-Output "::error::Hashed $($onDisk.Count) of $($paths.Count) checked-out files."
+            exit 1
+          }
+          $changed = @(for ($i = 0; $i -lt $paths.Count; $i++) {
+            if ($committed[$i] -ne $onDisk[$i]) { $paths[$i] }
+          })
+          if ($changed.Count -gt 0) {
+            foreach ($path in $changed) { Write-Output "::error::$path differs from the commit after checkout." }
+            exit 1
+          }
+          Write-Output "$($paths.Count) files match the commit byte for byte."
+
+      # Edition 2024 and let-chains need a recent compiler, and the one
+      # preinstalled on the image is as old as the image.
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      # Settings shows the version from Cargo.toml, not from the tag. A tag
+      # that disagrees would ship an exe that calls itself something else.
+      - name: Check the tag matches the version
+        if: github.ref_type == 'tag'
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object name -eq 'tain-cli').version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            Write-Output "::error::Tagged $env:GITHUB_REF_NAME, but [workspace.package] version in Cargo.toml is $version."
+            exit 1
+          }
+
+      # Saved only from main. A cache saved under a tag can be read by that
+      # tag alone, so one per release would spend the repository's cache space
+      # on something never read again. A tag build restores main's.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # openh264-sys2 builds OpenH264 from source, and without nasm it quietly
+      # builds plain C: about 17x slower per frame, and no error. nasm-rs reads
+      # NASM before it looks on PATH, the same variable
+      # .cargo/config.toml.example sets.
+      - name: Install nasm
+        run: |
+          choco install nasm --yes --no-progress
+          $nasm = Join-Path $env:ProgramFiles 'NASM\nasm.exe'
+          if (-not (Test-Path $nasm)) {
+            Write-Output "::error::nasm is not at $nasm after installing it."
+            exit 1
+          }
+          & $nasm -v
+          Add-Content -Path $env:GITHUB_ENV -Value "NASM=$nasm"
+
+      # --locked: a Cargo.lock that needs updating is an error here, not an edit.
+      - name: Fetch crates as Cargo.lock pins them
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
+
+      # licenses/rust-crates.txt is compiled into the exe and shown under
+      # Settings → About. Regenerated from this Cargo.lock it has to come out
+      # unchanged, or the release lists crates other than the ones it contains.
+      # Windows PowerShell, which is what made the committed copy, so that a
+      # difference means Cargo.lock and never the shell's sort rules.
+      - name: Check the crate licence list is current
+        shell: powershell
+        run: |
+          & .\scripts\list-crate-licences.ps1
+          $changed = git status --porcelain -- licenses/rust-crates.txt Cargo.lock
+          if ($changed) {
+            Write-Output '::error file=licenses/rust-crates.txt::licenses/rust-crates.txt does not match Cargo.lock. Run scripts/list-crate-licences.ps1 and commit what it writes.'
+            git --no-pager diff -- licenses/rust-crates.txt Cargo.lock
+            exit 1
+          }
+
+      # Kept in a log for the next step: everything that makes an incomplete
+      # exe says so as a warning, never as an error. Continue, because cargo
+      # writes its progress to stderr and that is not a failure.
+      - name: Build tain.exe
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cargo build --release --locked -p tain-cli 2>&1 |
+            ForEach-Object { "$_" } |
+            Tee-Object -FilePath "$env:RUNNER_TEMP\build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check nothing was left out of the build
+        run: |
+          $log = Get-Content "$env:RUNNER_TEMP\build.log"
+          $failed = $false
+
+          # Each of tain-core's build-script warnings is something missing from
+          # the exe: ffmpeg, a language, the compressed runtime.
+          foreach ($line in ($log | Select-String -Pattern '^warning: tain-core@')) {
+            Write-Output "::error::$($line.Line)"
+            $failed = $true
+          }
+          if ($log | Select-String -SimpleMatch 'no ffmpeg tree found', 'has no include/libavcodec/avcodec.h') {
+            Write-Output '::error::Built without ffmpeg: this exe has no hardware decode and no audio.'
+            $failed = $true
+          }
+
+          # When nasm fails, openh264-sys2 prints one line into its own build
+          # output, which cargo only shows with -vv. So read that, and look for
+          # the objects nasm writes beside it.
+          $runs = @(Get-ChildItem target\release\build -Directory -Filter 'openh264-sys2-*' |
+            Where-Object { Test-Path (Join-Path $_.FullName 'output') })
+          if ($runs.Count -eq 0) {
+            Write-Output '::error::Found no OpenH264 build output to check for nasm.'
+            $failed = $true
+          }
+          foreach ($run in $runs) {
+            $plainC = Select-String -Path (Join-Path $run.FullName 'output') -SimpleMatch 'not using any assembly', 'NASM compilation disabled'
+            $assembled = Test-Path (Join-Path $run.FullName 'out\cpuid.o')
+            if ($plainC -or -not $assembled) {
+              Write-Output "::error::OpenH264 ($($run.Name)) was built without nasm: no SIMD kernels, about 17x slower encoding."
+              $failed = $true
+            }
+          }
+
+          if ($failed) { exit 1 }
+
+      - name: Hash tain.exe
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\tain.exe dist\
+          $hash = (Get-FileHash dist\tain.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          # The format `sha256sum -c` reads.
+          [IO.File]::WriteAllText("$PWD\dist\tain.exe.sha256", "$hash  tain.exe`n")
+          Add-Content -Path $env:GITHUB_ENV -Value "TAIN_SHA256=$hash"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "``tain.exe`` SHA-256: ``$hash``"
+          Write-Output "tain.exe, $((Get-Item dist\tain.exe).Length) bytes, SHA-256 $hash"
+
+      - name: Keep the exe from a manual run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tain-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # A release published by hand before the tag was pushed keeps its notes;
+      # only the exe is replaced, and the hash goes beside it as a file. One
+      # this creates gets the hash in its notes as well.
+      - name: Attach to the release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag dist\tain.exe dist\tain.exe.sha256 --clobber
+          } else {
+            $notes = Join-Path $env:RUNNER_TEMP 'notes.md'
+            @(
+              "SHA-256 of ``tain.exe``: ``$env:TAIN_SHA256``"
+              ''
+              "Built from $env:GITHUB_SHA by $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            ) | Set-Content -Path $notes -Encoding utf8
+            gh release create $tag dist\tain.exe dist\tain.exe.sha256 --verify-tag --title "Tain $($tag.TrimStart('v'))" --notes-file $notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

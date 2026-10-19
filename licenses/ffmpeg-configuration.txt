@@ -1,0 +1,36 @@
+The FFmpeg libraries bundled with Tain (avcodec-61, avutil-59, swresample-5)
+were built from the FFmpeg 7.1.5 release by scripts/build-ffmpeg.sh in Tain's
+repository, as an LGPL build: --enable-version3 and no --enable-gpl, so LGPL
+version 3 or later.
+
+--disable-everything and --disable-autodetect leave only what is named below.
+The one library compiled into these DLLs is libopus 1.6.1 (--enable-libopus),
+inside avcodec, under its own BSD licence; it has its own entry in this list.
+third_party/ffmpeg/PROVENANCE.md in the repository records the sources,
+toolchain and checksums.
+
+The configure line, exactly as the libraries report it:
+
+    --prefix=/opt/ffmpeg
+    --target-os=mingw32
+    --arch=x86_64
+    --pkg-config-flags=--static
+    --enable-shared
+    --disable-static
+    --enable-version3
+    --disable-debug
+    --disable-programs
+    --disable-doc
+    --disable-autodetect
+    --disable-everything
+    --disable-avdevice
+    --disable-avformat
+    --disable-avfilter
+    --disable-swscale
+    --enable-w32threads
+    --enable-d3d11va
+    --enable-libopus
+    --enable-decoder='h264,hevc,av1,opus'
+    --enable-encoder=libopus
+    --enable-hwaccel='h264_d3d11va,h264_d3d11va2,hevc_d3d11va,hevc_d3d11va2,av1_d3d11va,av1_d3d11va2'
+    --extra-ldflags='-static-libgcc -no-pthread -Wl,--no-insert-timestamp'

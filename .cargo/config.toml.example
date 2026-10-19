@@ -6,7 +6,10 @@
 # 1147 ms per frame against 67 ms with assembly: a 17x regression with no error
 # and symptoms that look like a network problem rather than an encoder one.
 #
-# `rdp-core/build.rs` warns loudly if it cannot find nasm. Do not ignore it.
+# `tain-core/build.rs` warns loudly if it cannot find nasm. Do not ignore it.
+# If you built before nasm was in place, run
+# `cargo clean -p openh264-sys2 -p tain-core` once it is: OpenH264 does not
+# rebuild on its own, so the plain-C build would stay.
 #
 # The Windows winget package installs to the path below but does *not* add
 # itself to PATH, which is the common reason to need this file. Adjust to match
