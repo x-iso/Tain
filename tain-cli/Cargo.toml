@@ -49,6 +49,9 @@ windows = { version = "0.58", features = [
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_OpenGL",
+    # Which monitor a fullscreen session window covers, to hang it a pixel
+    # past it — see `title_bar`.
+    "Win32_Graphics_Gdi",
     # Holding a reference on the decoder's device — see `gl_interop`.
     "Win32_Graphics_Direct3D11",
     # Registering and controlling the Tain service.

@@ -2782,6 +2782,18 @@ there — only a taskbar, so the touch keyboard and other topmost windows keep
 their place. A loopback session cannot be trusted to show this: its picture is
 of the screen, taskbar included. `WindowFromPoint` over the taskbar can.
 
+**Gotcha**: and then it must not fit the monitor exactly. Topmost with nothing
+over it, a window covering its monitor is one Windows stops compositing and
+shows directly — and in that mode the picture flickered between the latest
+frame and an older one, and frames came out three or four refreshes apart:
+`TAIN_DEBUG=frametime` measured 32 fps fullscreen against 118 windowed on a
+120 Hz screen, with the session window's own work unchanged at about 7 ms. The
+rest was the main window, hidden behind, presenting every frame to a compositor
+that had gone idle. The taskbar sitting on top had been keeping the compositor
+busy all along. So the subclass hangs a fullscreen window one pixel past its
+monitor, over an edge with no other monitor beyond it, and after winit's own
+`WM_WINDOWPOSCHANGING`, which snaps a fullscreen window to its monitor.
+
 ## A Finger Is Not a Mouse
 
 **Decision**: `gui/touch.rs` notices when input comes from a finger and, while

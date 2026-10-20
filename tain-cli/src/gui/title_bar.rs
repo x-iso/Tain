@@ -223,6 +223,9 @@ mod platform {
     use std::sync::{Mutex, MutexGuard};
 
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONULL,
+    };
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -236,9 +239,9 @@ mod platform {
         HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_NOTOPMOST, HWND_TOPMOST,
         NCCALCSIZE_PARAMS, SC_MAXIMIZE, SC_RESTORE, SM_CXPADDEDBORDER, SM_CYSIZEFRAME,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINDOWINFO,
-        WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-        WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SYSCOMMAND, WS_CAPTION,
-        WS_EX_TOPMOST,
+        WINDOWPOS, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
+        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SYSCOMMAND,
+        WM_WINDOWPOSCHANGING, WS_CAPTION, WS_EX_TOPMOST,
     };
 
     use super::{Hit, Layout};
@@ -365,6 +368,75 @@ mod platform {
         }
     }
 
+    /// Hang a fullscreen window one pixel past its monitor.
+    ///
+    /// # Why it must not fit exactly
+    ///
+    /// A topmost window that covers its monitor exactly, with nothing over it,
+    /// is one Windows stops compositing and shows directly. In that mode the
+    /// picture flickered between the latest frame and an older one, and frames
+    /// came out three or four refreshes apart: about 32 a second on a 120 Hz
+    /// screen, where the same session windowed managed 118. The main window,
+    /// hidden behind, presents every frame too, and its present waited on a
+    /// compositor that had gone idle.
+    ///
+    /// One pixel over is enough for Windows to keep compositing, and is off the
+    /// screen. It goes over an edge with no monitor beyond it, so that it does
+    /// not show as a line along the next screen.
+    fn overhang(window: HWND, pos: &mut WINDOWPOS) {
+        if pos.flags.0 & SWP_NOSIZE.0 != 0 {
+            return;
+        }
+        let (x, y) = if pos.flags.0 & SWP_NOMOVE.0 != 0 {
+            let mut current = RECT::default();
+            // SAFETY: a live window and a RECT to write.
+            if unsafe { GetWindowRect(window, &mut current) }.is_err() {
+                return;
+            }
+            (current.left, current.top)
+        } else {
+            (pos.x, pos.y)
+        };
+        let rect = RECT { left: x, top: y, right: x + pos.cx, bottom: y + pos.cy };
+
+        // SAFETY: read-only queries about the monitors.
+        let fits_a_monitor = unsafe {
+            let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONULL);
+            let mut info =
+                MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            !monitor.is_invalid()
+                && GetMonitorInfoW(monitor, &mut info).as_bool()
+                && info.rcMonitor == rect
+        };
+        if !fits_a_monitor {
+            return;
+        }
+
+        // SAFETY: as above.
+        let nothing_at =
+            |x, y| unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL) }.is_invalid();
+        let (mid_x, mid_y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+        if nothing_at(mid_x, rect.bottom) {
+            pos.cy += 1;
+        } else if nothing_at(rect.right, mid_y) {
+            pos.cx += 1;
+        } else if nothing_at(mid_x, rect.top - 1) {
+            pos.x = x;
+            pos.y = y - 1;
+            pos.cy += 1;
+            pos.flags.0 &= !SWP_NOMOVE.0;
+        } else if nothing_at(rect.left - 1, mid_y) {
+            pos.x = x - 1;
+            pos.y = y;
+            pos.cx += 1;
+            pos.flags.0 &= !SWP_NOMOVE.0;
+        } else {
+            // Below, whatever is there: a monitor in the middle of a grid of
+            // them has nowhere better.
+            pos.cy += 1;
+        }
+    }
+
     /// Whether a taskbar is in front of the window along any of its edges.
     fn taskbar_in_front(window: HWND) -> bool {
         let mut rect = RECT::default();
@@ -470,6 +542,16 @@ mod platform {
                 // SAFETY: as above.
                 unsafe { (*params).rgrc[0].top = top + inset };
                 LRESULT(0)
+            }
+            // Without a caption style the window is fullscreen. After the
+            // default procedure, because winit's snaps a fullscreen window to
+            // its monitor and would undo this.
+            WM_WINDOWPOSCHANGING if !has_caption(window) => {
+                let result = default();
+                // SAFETY: this message's WINDOWPOS, valid until it returns.
+                let pos = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
+                overhang(window, pos);
+                result
             }
             WM_NCHITTEST => {
                 let hit = default();
