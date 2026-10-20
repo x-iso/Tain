@@ -19,10 +19,10 @@ testable without a GPU.
 |--------|--------------|
 | `network.rs` | `HostServer` and `GuestClient`. The accept loop, the handshake, who has to be approved, the streams, the adaptive control loop, and the refusal of any session a relay would have to carry. Also the identity this machine dials with, derived from the one it hosts on. The largest module here by a distance. |
 | `protocol.rs` | Every message that crosses the wire, the framing helpers, and the reason codes a session ends with. |
-| `connection_code.rs` | Self-contained codes: type byte, secret, endpoint id, and relay, in one base58check string. |
+| `connection_code.rs` | Self-contained codes: type byte, secret, endpoint id, and relay, in one base58check string. The same code as a `tain://connect/` link, and the leniency that lets a link survive a launcher. |
 | `passcode.rs` | Master and guest secrets, and validating them. Approval deliberately does not live here: a guest code is shared, so approval keyed on the secret would approve everyone holding it. |
 | `session.rs` | The live session registry: ids, per-session grants, which displays or windows each session may see, cleanup. |
-| `discovery.rs` | mDNS and mainline-DHT address lookup, and the record of which branch found a host. |
+| `discovery.rs` | mDNS and mainline-DHT address lookup, and the record of which branch found a host. Also the relays every endpoint is built with: n0's, or the user's own beside or instead of them. |
 | `dns_cache.rs` | Relay addresses remembered from last time, so a filtered link can still reach them. |
 
 ### Capture
@@ -91,6 +91,7 @@ testable without a GPU.
 | `unattended_host.rs` | The host the service starts on the console desktop while the application is closed. It runs the application's own hosting path with the owner's settings, takes trusted devices from the credential store rather than the settings file, and has nobody to approve anything. |
 | `agent.rs` | The per-desktop agent process. One per desktop that matters, so the secure desktop the lock screen and UAC prompts run on can be captured and clicked. It also removes a virtual display left behind by a Tain that was killed. |
 | `display_driver.rs` | Installing and removing the vendored virtual display driver, elevated, and the driver's control pipe, which is how a monitor is made to exist. |
+| `links.rs` | `tain://` links: registering the scheme for this user, finding a link on the command line, and the named pipe a newly started Tain uses to pass one to the Tain already running. |
 | `console.rs` | Attaching a console to a GUI-subsystem binary. |
 | `logging.rs`, `migrate.rs` | Where the log goes, and carrying an older installation across the rename. |
 | `host.rs`, `guest.rs` | Headless host and guest paths. Not compiled in: `main.rs` declares no module for them. |

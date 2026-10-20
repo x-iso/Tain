@@ -443,6 +443,24 @@ pub struct Settings {
     pub fullscreen_on_connect: bool,
     #[serde(deserialize_with = "lenient")]
     pub shortcuts: ShortcutBindings,
+
+    // Network
+    /// Relays of the user's own, as typed — `relay.example.org` or a full URL.
+    ///
+    /// Kept as text rather than parsed, so an entry that does not parse yet is
+    /// still there to be corrected instead of vanishing mid-edit. What is used
+    /// is what parses; see `tain_core::discovery::RelayChoice`, which also says
+    /// what a list of them does and does not change.
+    #[serde(deserialize_with = "lenient")]
+    pub custom_relays: Vec<String>,
+    /// Use `custom_relays` instead of n0's relays rather than beside them.
+    pub custom_relays_only: bool,
+    /// Whether `tain://` links open this copy of Tain.
+    ///
+    /// On by default: a link is only worth sending if clicking it does
+    /// something. Registered for the signed-in user only, so it needs no
+    /// administrator and touches nobody else's account. See `crate::links`.
+    pub open_links: bool,
 }
 
 impl Default for Settings {
@@ -493,6 +511,9 @@ impl Default for Settings {
             scaling_mode: ScalingMode::default(),
             fullscreen_on_connect: false,
             shortcuts: ShortcutBindings::default(),
+            custom_relays: Vec::new(),
+            custom_relays_only: false,
+            open_links: true,
         }
     }
 }
@@ -500,6 +521,21 @@ impl Default for Settings {
 /// serde's default for [`Settings::ui_scale`], which is not `Default::default`.
 fn one() -> f32 {
     1.0
+}
+
+/// Relay entries as they are kept: trimmed, without blanks, each once.
+///
+/// One function for the settings file and the text box that edits it, so the
+/// box's idea of the list and the saved one cannot drift apart while typing.
+pub fn relay_entries<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if !line.is_empty() && !kept.iter().any(|k| k.eq_ignore_ascii_case(line)) {
+            kept.push(line.to_string());
+        }
+    }
+    kept
 }
 
 /// The range the interface scale may be set to.
@@ -582,6 +618,16 @@ impl Settings {
             self.custom_device_name =
                 self.custom_device_name.chars().take(tain_core::MAX_DEVICE_NAME).collect();
         }
+        // Tidied but never dropped for not parsing — see `custom_relays`.
+        self.custom_relays = relay_entries(self.custom_relays.iter().map(String::as_str));
+    }
+
+    /// The relays these settings ask for, and the entries that are not relays.
+    pub fn relay_choice(&self) -> (tain_core::discovery::RelayChoice, Vec<String>) {
+        tain_core::discovery::RelayChoice::from_entries(
+            &self.custom_relays,
+            self.custom_relays_only,
+        )
     }
 
     /// The name this machine publishes to the other side, if any.

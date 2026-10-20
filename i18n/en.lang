@@ -19,26 +19,33 @@ english
 [header.host]
 Host:
 
-[header.copy_admin]
-Copy admin passcode
+[header.admin_code]
+Admin passcode
 
-[header.copy_admin_short]
-Copy admin
+[header.admin_code_short]
+Admin
 
-[header.copy_guest]
-Copy guest passcode
+[header.guest_code]
+Guest passcode
 
-[header.copy_guest_short]
-Copy guest
+[header.guest_code_short]
+Guest
 
 [header.copied]
 Copied to clipboard
+
+[header.link_copied]
+Link copied
 
 [header.copied_short]
 Copied
 
 [header.copy_hint]
 Copy this code and send it to the other machine
+
+[header.copy_link_hint]
+Copy it as a link instead. Clicked on a computer with Tain,
+the link opens Tain and connects.
 
 [header.no_code]
 No code generated yet
@@ -459,6 +466,55 @@ session by right-clicking the pointer button on its toolbar.
 
 [settings.security.pre_ticked_warning]
 ⚠ Input will be pre-ticked — check the dialog before allowing a guest.
+
+
+# ── Settings: network ─────────────────────────────────────────
+
+[settings.network]
+Network
+
+[settings.network.open_links]
+Open tain:// links with this copy of Tain
+
+[settings.network.open_links_hint]
+A link copied from the header opens Tain and connects in one click. This is
+registered for your Windows account only. Turn it off to leave links to
+another copy of Tain.
+
+[settings.network.relays]
+Your own relays
+
+[settings.network.relays_blurb]
+Two machines meet on a relay before they connect directly. Tain uses n0's
+public relays; you can add iroh relay servers of your own, beside them or
+instead of them.
+
+[settings.network.relays_hint]
+relay.example.org — one per line
+
+[settings.network.relay_invalid]
+⚠ Not a relay address, so not used: {entry}
+
+[settings.network.relays_only]
+Use only these relays
+
+[settings.network.relays_only_hint]
+Never use n0's relays. This machine can then be reached only through yours,
+so a guest has to be able to reach your relay from wherever they are.
+
+[settings.network.relays_none]
+Only n0's relays are used.
+
+[settings.network.relays_beside_note]
+Tain uses whichever relay answers fastest, and yours if n0's can't be reached.
+Codes and links carry the relay this machine is on, so guests need no setup.
+
+[settings.network.relays_only_note]
+Only your relays are used. Codes and links carry the one this machine is on,
+so guests need no setup.
+
+[settings.network.relays_restart]
+⚠ Restart Tain to use these relays.
 
 
 # ── Settings: language ────────────────────────────────────────

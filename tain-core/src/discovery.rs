@@ -240,6 +240,122 @@ fn worth_publishing(addr: &iroh::TransportAddr) -> bool {
     }
 }
 
+/// Relays of the user's own, and whether they join n0's or replace them.
+///
+/// # What a relay is for here, and what a list of them changes
+///
+/// A relay is where two endpoints meet to hole punch: every connection starts
+/// on one, and a session that cannot get off it is refused (see `network`).
+/// An endpoint keeps one connection open, to its *home* relay, and that is the
+/// only relay anybody can reach it through — which is why a code carries that
+/// one and not a list.
+///
+/// iroh chooses the home relay from its map by latency. So **beside** n0's,
+/// a relay of the user's own is the home relay whenever it answers fastest and
+/// the fallback whenever n0's cannot be reached at all — on a network that
+/// blocks them, say. **Instead of** n0's, it is the only place this machine
+/// can be found, and n0's relays are never contacted for it.
+///
+/// Neither changes how a guest dials. iroh connects to whatever relay an
+/// address names, in its map or not, so a guest reaches a host on a private
+/// relay with nothing configured — the code says where.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayChoice {
+    pub custom: Vec<iroh::RelayUrl>,
+    /// Use `custom` instead of n0's relays. Ignored when `custom` is empty:
+    /// an endpoint with no relays at all can only be found on its own network,
+    /// which is not something to fall into by emptying a list.
+    pub only: bool,
+}
+
+impl RelayChoice {
+    /// Everything that parses, with what does not set aside to report.
+    pub fn from_entries(entries: &[String], only: bool) -> (Self, Vec<String>) {
+        let mut custom = Vec::new();
+        let mut rejected = Vec::new();
+        for entry in entries {
+            match parse_relay(entry) {
+                Ok(url) if !custom.contains(&url) => custom.push(url),
+                Ok(_) => {}
+                Err(_) => rejected.push(entry.clone()),
+            }
+        }
+        // Cleared rather than kept and ignored, so two choices that do the same
+        // thing compare equal.
+        let only = only && !custom.is_empty();
+        (Self { custom, only }, rejected)
+    }
+
+    /// Whether this changes anything from iroh's own relays.
+    pub fn is_default(&self) -> bool {
+        self.custom.is_empty()
+    }
+
+    fn relay_mode(&self) -> iroh::RelayMode {
+        let default = iroh::endpoint::default_relay_mode();
+        if self.custom.is_empty() {
+            return default;
+        }
+        if self.only {
+            return iroh::RelayMode::custom(self.custom.iter().cloned());
+        }
+        let map = default.relay_map();
+        for url in &self.custom {
+            map.insert(url.clone(), std::sync::Arc::new(iroh::RelayConfig::from(url.clone())));
+        }
+        iroh::RelayMode::Custom(map)
+    }
+}
+
+/// A relay address as somebody would type it.
+///
+/// `https://` is assumed when no scheme is given, because a bare host name is
+/// what people copy out of a server's configuration, and iroh relays are
+/// served over HTTPS.
+pub fn parse_relay(entry: &str) -> anyhow::Result<iroh::RelayUrl> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        anyhow::bail!("an empty relay address");
+    }
+    let url = if entry.contains("://") { entry.to_string() } else { format!("https://{entry}") };
+    let parsed: iroh::RelayUrl =
+        url.parse().map_err(|e| anyhow::anyhow!("not a relay address: {entry} ({e})"))?;
+    if !matches!(parsed.scheme(), "https" | "http") || parsed.host_str().is_none_or(str::is_empty)
+    {
+        anyhow::bail!("not an http or https address: {entry}");
+    }
+    Ok(parsed)
+}
+
+/// The relays every endpoint is built with.
+///
+/// Set once at startup, before anything binds: an endpoint takes its relay map
+/// when it is built, so a change here reaches only the endpoints built after
+/// it — which is why the setting says it applies from the next start.
+static RELAYS: std::sync::RwLock<RelayChoice> =
+    std::sync::RwLock::new(RelayChoice { custom: Vec::new(), only: false });
+
+/// Build every endpoint from now on with these relays.
+pub fn use_relays(choice: RelayChoice) {
+    if choice.is_default() {
+        debug!("Relays: n0's");
+    } else {
+        let urls: Vec<String> = choice.custom.iter().map(|u| u.to_string()).collect();
+        info!(
+            "Relays: {} {}",
+            urls.join(", "),
+            if choice.only { "only" } else { "beside n0's" }
+        );
+    }
+    *RELAYS.write().unwrap() = choice;
+}
+
+/// The relays endpoints are being built with, for saying when a setting
+/// differs from what is in use.
+pub fn relays_in_use() -> RelayChoice {
+    RELAYS.read().unwrap().clone()
+}
+
 /// A builder configured the way every endpoint here wants to be.
 ///
 /// This is `presets::N0` written out, because the services it installs have to
@@ -255,7 +371,8 @@ pub fn endpoint_builder() -> iroh::endpoint::Builder {
         .address_lookup(
             iroh::address_lookup::PkarrPublisher::n0_dns().addr_filter(publishable()),
         )
-        .relay_mode(iroh::endpoint::default_relay_mode())
+        // n0's, or the user's own beside or instead of them. See `RelayChoice`.
+        .relay_mode(relays_in_use().relay_mode())
         // Relay hostnames answered from what was resolved last time, so a link
         // that cannot reach DNS can still reach the relays. See `dns_cache`.
         .dns_resolver(super::dns_cache::resolver())
@@ -428,5 +545,57 @@ mod tests {
             "https://euc1-1.relay.n0.iroh.link./".parse().expect("relay url"),
         );
         assert!(worth_publishing(&relay));
+    }
+
+    /// A host name on its own is what people copy out of a server's config.
+    #[test]
+    fn a_relay_is_read_the_way_people_type_it() {
+        let bare = parse_relay(" relay.example.org ").expect("a bare host name");
+        assert_eq!(bare.scheme(), "https");
+        assert_eq!(bare.host_str(), Some("relay.example.org"));
+
+        let port = parse_relay("http://10.0.0.5:3340").expect("a scheme and port");
+        assert_eq!(port.scheme(), "http");
+        assert_eq!(port.port(), Some(3340));
+
+        for junk in ["", "   ", "ftp://relay.example.org", "https://", "not a url at all"] {
+            assert!(parse_relay(junk).is_err(), "accepted {junk:?}");
+        }
+    }
+
+    /// What will not parse is reported rather than dropped without a word, and
+    /// the same relay written twice is one relay.
+    #[test]
+    fn entries_that_do_not_parse_are_set_aside() {
+        let entries = [
+            "relay.example.org".to_string(),
+            "https://relay.example.org/".to_string(),
+            "ftp://nope".to_string(),
+        ];
+        let (choice, rejected) = RelayChoice::from_entries(&entries, true);
+        assert_eq!(choice.custom.len(), 1);
+        assert_eq!(rejected, vec!["ftp://nope".to_string()]);
+    }
+
+    /// Beside n0's, instead of them, or n0's alone when there is nothing to
+    /// add — including when "only these" is ticked over an empty list.
+    #[test]
+    fn the_relay_map_is_what_was_chosen() {
+        let ours = parse_relay("relay.example.org").unwrap();
+        let n0 = iroh::endpoint::default_relay_mode().relay_map();
+        assert!(!n0.is_empty(), "the comparison needs n0's relays to exist");
+
+        let none = RelayChoice { custom: Vec::new(), only: true };
+        assert_eq!(none.relay_mode(), iroh::endpoint::default_relay_mode());
+
+        let beside = RelayChoice { custom: vec![ours.clone()], only: false }.relay_mode();
+        let beside = beside.relay_map();
+        assert!(beside.contains(&ours));
+        assert_eq!(beside.len(), n0.len() + 1);
+
+        let instead = RelayChoice { custom: vec![ours.clone()], only: true }.relay_mode();
+        let instead = instead.relay_map();
+        assert!(instead.contains(&ours));
+        assert_eq!(instead.len(), 1);
     }
 }

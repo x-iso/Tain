@@ -154,6 +154,27 @@ Base58**check** is deliberate: codes get pasted through chat clients, and a trun
 or mangled paste must fail loudly rather than producing a valid-looking code that
 dials the wrong host.
 
+The same code travels as a link, `tain://connect/MASTER-<base58check>`, with nothing
+added. Tain registers the scheme for the signed-in user (no administrator needed),
+so clicking a link starts Tain and connects. If Tain is already running, the new
+process passes the link to it over a named pipe and exits. A second copy would host
+on the same identity. The pipe only accepts the same user, and the sender checks the
+pipe is served from its own session before writing a passcode into it. A link pasted
+into *Paste passcode* works the same as the code.
+
+### Relays
+
+A relay is where two machines meet to hole punch. Tain uses n0's public relays, and
+**Settings → Network** takes a list of your own `iroh-relay` servers, either beside
+n0's or instead of them. Beside them, iroh picks whichever answers fastest as this
+machine's home relay, and yours whenever n0's can't be reached. With *Use only these
+relays*, n0's relays are never contacted. Either way a code carries the relay the
+host is on, and iroh dials any relay an address names, so guests need no relay
+settings of their own. If the host moves to another relay mid-run, the codes it
+hands out from then on name the new one, with the same secrets. The list is read at
+startup. The unattended host reads the
+same list from the settings the application hands the service.
+
 ### Multi-User Support
 
 Each guest connection gets its own iroh QUIC streams and session ID. The `SessionManager` tracks:
@@ -386,6 +407,7 @@ matter is the release one:
 | `approval` | Open the approval popup for the pending demo guest (with `demo`) | debug |
 | `loopback` | Connect to our own host endpoint on startup, to exercise the video path on one machine | **all** |
 | `frametime` | Report where a frame of UI time went, once a second | **all** |
+| `links` | Register `tain://` links to this build. Debug builds otherwise leave them to the copy you actually use | debug |
 
 `loopback` and `frametime` stay in release because measuring the pipeline needs
 both ends running, and a debug build's per-pixel decode is slow for reasons that
@@ -417,13 +439,14 @@ attaches to that terminal, or pass `--console` to get a console of its own.
 
 The header holds both halves of the app:
 
-- **Host:** *Copy admin passcode*, behind a cover you slide aside rather than
-  click, so a stray click or a key repeat cannot copy it. The first time, a warning
-  explains what the code grants. The cover closes again after the copy, on a reset,
-  and by itself after twenty seconds. *Copy guest passcode* has no cover. Each
-  code has a reset button beside it, and the guest code can reset itself when the
-  last guest leaves.
-- **Connect:** *Paste passcode* reads a code from the clipboard and checks the host
+- **Host:** *Admin passcode*, behind a cover you slide aside rather than click, so
+  a stray click or a key repeat cannot copy it. The first time, a warning explains
+  what the code grants. The cover closes again after the copy, on a reset, and by
+  itself after twenty seconds. *Guest passcode* has no cover. Each button copies
+  its code, and the link segment at its end copies it as a `tain://` link instead.
+  Each code has a reset button beside it, and the guest code can reset itself when
+  the last guest leaves.
+- **Connect:** *Paste passcode* reads a code or a link from the clipboard and checks the host
   before you commit to anything. It reports the host as ready, ready but going to
   ask, expired, or not answering. The arrow then opens the session.
 

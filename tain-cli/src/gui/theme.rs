@@ -611,6 +611,105 @@ pub fn labelled_button(
     resp
 }
 
+/// Width of a [`split_button`]'s second action: square, at button height.
+pub const SPLIT_SIDE_W: f32 = BUTTON_HEIGHT;
+
+/// What a [`split_button`] leaves for its label: the inset, the icon and the
+/// gap before it, and the second action.
+pub fn split_button_label_room(width: f32) -> f32 {
+    (width - SPLIT_SIDE_W - 12.0 - 18.0 - 8.0).max(0.0)
+}
+
+/// A [`labelled_button`] with a second, square action at its right end.
+///
+/// One frame around both, so they read as two ways of doing one thing — a
+/// passcode copied as a code or as a link — rather than as two buttons that
+/// happen to be neighbours. The second action sits on a darker segment and
+/// brightens on its own, so which half is about to be pressed is never in
+/// doubt.
+///
+/// Returns the main action's response, then the second's.
+#[allow(clippy::too_many_arguments)]
+pub fn split_button(
+    ui: &mut Ui,
+    size: Vec2,
+    label: &str,
+    src: egui::ImageSource<'_>,
+    side_src: egui::ImageSource<'_>,
+    fill: Color32,
+    stroke: Color32,
+    enabled: bool,
+) -> (Response, Response) {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, whole) = ui.allocate_exact_size(size, Sense::hover());
+    let side_rect = Rect::from_min_max(
+        egui::pos2(rect.right() - SPLIT_SIDE_W.min(rect.width()), rect.top()),
+        rect.max,
+    );
+    let main_rect = Rect::from_min_max(rect.min, egui::pos2(side_rect.left(), rect.bottom()));
+    // Ids from the allocation rather than the label, which changes to
+    // "Copied" for a moment and must not make the button a new widget.
+    let main = ui.interact(main_rect, whole.id.with("main"), sense);
+    let side = ui.interact(side_rect, whole.id.with("side"), sense);
+
+    if ui.is_rect_visible(rect) {
+        // The same three states as `labelled_button`, per half: brighter on
+        // hover, brighter again while pressed, because under a finger hover
+        // lasts exactly as long as the press.
+        let lit = |resp: &Response, colour: Color32| {
+            if enabled && resp.is_pointer_button_down_on() {
+                colour.gamma_multiply(1.6)
+            } else if enabled && resp.hovered() {
+                colour.gamma_multiply(1.35)
+            } else {
+                colour
+            }
+        };
+        let (main_fill, side_fill) = (lit(&main, fill), lit(&side, fill));
+        let (main_fill, side_fill, stroke, text) = if enabled {
+            (main_fill, side_fill, stroke, TEXT)
+        } else {
+            (
+                main_fill.gamma_multiply(0.6),
+                side_fill.gamma_multiply(0.6),
+                stroke.gamma_multiply(0.5),
+                TEXT_DIM,
+            )
+        };
+
+        let font = egui::FontId::proportional(13.0);
+        let label = elide_to_width(ui, label, &font, split_button_label_room(size.x));
+
+        let painter = ui.painter();
+        painter.rect_filled(rect, CORNER, main_fill);
+        // The side segment's own fill, then a shade over it: darkening by
+        // shading works on any fill, where scaling a colour down would also
+        // scale away its opacity.
+        let side_rounding = egui::Rounding { nw: 0.0, sw: 0.0, ne: CORNER, se: CORNER };
+        painter.rect_filled(side_rect, side_rounding, side_fill);
+        painter.rect_filled(side_rect, side_rounding, Color32::from_black_alpha(96));
+        // The outline last, so it runs unbroken around both halves.
+        painter.rect_stroke(rect, CORNER, Stroke::new(1.0, stroke));
+        painter.text(
+            main_rect.left_center() + Vec2::new(12.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &label,
+            font,
+            text,
+        );
+
+        let icon_rect = snap(
+            ui,
+            Rect::from_center_size(main_rect.right_center() - Vec2::new(18.0, 0.0), Vec2::splat(18.0)),
+        );
+        sharp_image(src, icon_rect.size()).paint_at(ui, icon_rect);
+        let side_icon = snap(ui, Rect::from_center_size(side_rect.center(), Vec2::splat(18.0)));
+        sharp_image(side_src, side_icon.size()).paint_at(ui, side_icon);
+    }
+
+    (main, side)
+}
+
 /// One screen, as a button that shows whether it is being shared.
 ///
 /// # Why icons and not a column of checkboxes

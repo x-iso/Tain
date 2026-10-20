@@ -21,6 +21,23 @@ All notable changes to Tain are documented here. This project adheres to
   when it's the only session, and type. It renames the host's saved card too,
   and what you type there isn't sent to the host.
 
+- **Send a link instead of a code.** Each passcode button now has a link
+  segment at its end, which copies the code as a `tain://` link. Clicked on a
+  computer with Tain, the link opens Tain and connects. If Tain is already
+  open, the link goes to it rather than starting a second copy, and clicking
+  the same link again brings that session forward. Tain registers the link
+  type for your Windows account the first time it runs, and again whenever
+  it's started from somewhere else. Settings → Network turns that off. A link
+  also works in *Paste passcode*.
+
+- **Use your own relays.** Settings → Network takes a list of iroh relay
+  servers, used beside n0's public relays or, with *Use only these relays*,
+  instead of them. Codes and links carry the relay this machine is on, so the
+  people connecting to it need no relay settings of their own. If it moves to
+  another relay while Tain is running, the codes you copy from then on name
+  the new one, and the passcodes themselves stay the same. The unattended host
+  uses the same list.
+
 ### Changed
 
 - **One row of chrome in the session window.** It used to spend three:

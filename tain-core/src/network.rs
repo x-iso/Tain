@@ -603,6 +603,48 @@ impl HostServer {
         status.get().first().map(|relay| relay.url().to_string())
     }
 
+    /// Wait for this host's relay to be something other than `current`, and
+    /// say what it is now. `None` once the endpoint has closed.
+    ///
+    /// # Why anything has to watch
+    ///
+    /// A code is rendered once, with the relay of the moment, and is then
+    /// copied for as long as the application runs. The relay does not stay put:
+    /// iroh moves to another when the one it is on stops answering — with the
+    /// user's own relays as a fallback, that is the fallback working — and a
+    /// host that came up before any relay answered has none in its codes at
+    /// all. Either way the code being handed out names somewhere this host is
+    /// not, and a guest on a network where the lookups are blocked has nothing
+    /// else to go on.
+    ///
+    /// Only a relay that is *chosen* counts. A relay that drops and comes back
+    /// stays the home relay throughout, so a reconnect is not reported, and
+    /// having none at all is never reported — see
+    /// [`ConnectionCode::readdressed`] for why a code keeps its last one.
+    pub async fn next_home_relay(&self, current: Option<&str>) -> Option<String> {
+        use iroh::Watcher as _;
+        let mut status = self.endpoint.home_relay_status();
+        // Ends with the endpoint, which closing does not do to the watcher.
+        let closed = self.endpoint.closed();
+        tokio::pin!(closed);
+        loop {
+            let chosen = status.get().first().map(|relay| relay.url().to_string());
+            if let Some(relay) = chosen
+                && Some(relay.as_str()) != current
+            {
+                return Some(relay);
+            }
+            tokio::select! {
+                updated = status.updated() => {
+                    if updated.is_err() {
+                        return None;
+                    }
+                }
+                _ = &mut closed => return None,
+            }
+        }
+    }
+
     /// Wrap a secret into a shareable code carrying this host's address.
     fn code_for(&self, typ: PasscodeType, secret: [u8; 32]) -> String {
         ConnectionCode::with_relay(typ, secret, self.endpoint_id_bytes(), self.home_relay())
@@ -5037,6 +5079,28 @@ mod tests {
 
     fn endpoint(byte: u8) -> [u8; 32] {
         [byte; 32]
+    }
+
+    /// The relay a host comes up on is reported, the same relay again is not
+    /// news, and a closed host stops being waited on.
+    #[tokio::test]
+    #[ignore = "binds a real endpoint, so it needs a relay to answer"]
+    async fn a_host_reports_the_relay_it_is_on() {
+        let server = HostServer::bind().await.expect("bind");
+        let relay = tokio::time::timeout(Duration::from_secs(30), server.next_home_relay(None))
+            .await
+            .expect("no relay within 30s")
+            .expect("the endpoint is open");
+        assert!(relay.starts_with("http"), "not a relay: {relay}");
+
+        let again =
+            tokio::time::timeout(Duration::from_secs(2), server.next_home_relay(Some(&relay)));
+        assert!(again.await.is_err(), "the relay it is already on was reported as a move");
+
+        server.shutdown().await.expect("shutdown");
+        let after =
+            tokio::time::timeout(Duration::from_secs(5), server.next_home_relay(Some(&relay)));
+        assert_eq!(after.await.expect("still waiting on a closed host"), None);
     }
 
     /// Two dials from this machine arrive as the same machine.

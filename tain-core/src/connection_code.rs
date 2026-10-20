@@ -30,6 +30,22 @@
 //! Base58**check** is deliberate: these get pasted through chat clients, and a
 //! truncated or mangled paste must fail loudly rather than producing a valid-
 //! looking code that dials the wrong endpoint.
+//!
+//! ## The same code as a link
+//!
+//! ```text
+//! tain://connect/MASTER-<base58check>
+//! ```
+//!
+//! Nothing is added: a link is the code with a scheme in front, so whatever
+//! the code carries — the relay included — the link carries too, and a link
+//! pasted into the paste button works exactly as the code would. Windows hands
+//! a clicked link to the program registered for the scheme, which is what lets
+//! one click on another machine open Tain and connect.
+//!
+//! The code sits in the path and not where a host name would go, because
+//! browsers lowercase the host part of a URL and base58 is case-sensitive: a
+//! code there would arrive mangled and, thanks to the checksum, refused.
 
 use anyhow::{Context, Result};
 
@@ -45,6 +61,35 @@ const PAYLOAD_LEN: usize = 1 + 32 + 32;
 /// the same code path. Codes people saved before this existed keep working —
 /// they simply have no relay to offer.
 const RELAY_FLAG: u8 = 0x80;
+
+/// The URL scheme Tain registers for itself.
+pub const LINK_SCHEME: &str = "tain";
+
+/// The part of a link before the code.
+const LINK_PATH: &str = "connect/";
+
+/// The code inside a `tain:` link, or `None` if `input` is not a link at all.
+///
+/// Lenient about what launchers and chat clients do to a URL on its way: the
+/// scheme in any case, the slashes doubled or not, and a trailing slash, query
+/// or fragment, which some browsers add. Strict about everything else, because
+/// what comes back is handed to [`ConnectionCode::parse`] and its checksum.
+pub fn code_in_link(input: &str) -> Option<&str> {
+    let input = input.trim();
+    let scheme = input.get(..LINK_SCHEME.len() + 1)?;
+    if !scheme.eq_ignore_ascii_case(&format!("{LINK_SCHEME}:")) {
+        return None;
+    }
+    let rest = &input[scheme.len()..];
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let rest = match rest.get(..LINK_PATH.len()) {
+        Some(path) if path.eq_ignore_ascii_case(LINK_PATH) => &rest[LINK_PATH.len()..],
+        _ => rest,
+    };
+    // Base58 has neither, so nothing of the code is cut off with them.
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    Some(rest.trim_end_matches('/'))
+}
 
 /// A parsed connection code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,9 +137,29 @@ impl ConnectionCode {
         format!("{}-{}", self.passcode_type.prefix(), body)
     }
 
-    /// Parse a code produced by [`Self::encode`].
+    /// The same code addressed to `relay`, or `None` when that changes nothing
+    /// worth changing.
+    ///
+    /// Only the address moves: the secret, and so whoever already holds the
+    /// code, is untouched. And no relay is never an improvement on one — a host
+    /// that has lost its relay for a moment is usually about to get it back,
+    /// and a code naming the last one beats a code naming none.
+    pub fn readdressed(&self, relay: Option<&str>) -> Option<Self> {
+        let relay = relay.filter(|url| !url.is_empty())?;
+        if self.relay_url.as_deref() == Some(relay) {
+            return None;
+        }
+        Some(Self { relay_url: Some(relay.to_string()), ..self.clone() })
+    }
+
+    /// Render as a link that opens Tain and connects. See the module notes.
+    pub fn link(&self) -> String {
+        format!("{LINK_SCHEME}://{LINK_PATH}{}", self.encode())
+    }
+
+    /// Parse a code produced by [`Self::encode`], or a link from [`Self::link`].
     pub fn parse(input: &str) -> Result<Self> {
-        let input = input.trim();
+        let input = code_in_link(input).unwrap_or(input).trim();
         let (prefix, body) = input
             .split_once('-')
             .context("Not a connection code — expected PREFIX-<code>")?;
@@ -231,6 +296,92 @@ mod tests {
             );
             assert_eq!(ConnectionCode::parse(&code.encode()).unwrap().passcode_type, typ);
         }
+    }
+
+    /// A link is the code, relay and all, behind the scheme.
+    #[test]
+    fn a_link_round_trips_with_its_relay() {
+        let code = ConnectionCode::with_relay(
+            PasscodeType::Guest,
+            [7u8; 32],
+            [9u8; 32],
+            Some("https://relay.example.org./".to_string()),
+        );
+        let link = code.link();
+        assert!(link.starts_with("tain://connect/GUEST-"), "unexpected link: {link}");
+        assert_eq!(ConnectionCode::parse(&link).expect("round trip"), code);
+    }
+
+    /// What launchers and browsers do to a URL must not cost the code.
+    #[test]
+    fn a_link_survives_what_launchers_do_to_it() {
+        let code = sample(PasscodeType::Master);
+        let encoded = code.encode();
+        for link in [
+            format!("tain://connect/{encoded}"),
+            format!("TAIN://connect/{encoded}"),
+            format!("tain://Connect/{encoded}/"),
+            format!("tain:connect/{encoded}"),
+            format!("tain://{encoded}"),
+            format!("tain://connect/{encoded}?from=chat"),
+            format!("  tain://connect/{encoded}#top\n"),
+        ] {
+            assert_eq!(ConnectionCode::parse(&link).ok(), Some(code.clone()), "{link}");
+        }
+    }
+
+    /// Only a link is unwrapped; anything else reaches the parser as it was.
+    #[test]
+    fn only_a_link_is_unwrapped() {
+        assert_eq!(code_in_link("MASTER-abc"), None);
+        assert_eq!(code_in_link("https://connect/MASTER-abc"), None);
+        assert_eq!(code_in_link("tai"), None);
+        assert_eq!(code_in_link("tain://connect/MASTER-abc/"), Some("MASTER-abc"));
+        // A link with no code in it is still a link, and fails as a code.
+        assert_eq!(code_in_link("tain://connect/"), Some(""));
+        assert!(ConnectionCode::parse("tain://connect/").is_err());
+    }
+
+    /// A host that moves relay keeps its secret; only the address changes.
+    #[test]
+    fn a_code_follows_its_host_to_a_new_relay() {
+        let old = ConnectionCode::with_relay(
+            PasscodeType::Master,
+            [7u8; 32],
+            [9u8; 32],
+            Some("https://euc1-1.relay.n0.iroh.link./".to_string()),
+        );
+        let moved = old.readdressed(Some("https://relay.example.org/")).expect("a new relay");
+        assert_eq!(moved.relay_url.as_deref(), Some("https://relay.example.org/"));
+        assert_eq!((moved.secret, moved.endpoint_id), (old.secret, old.endpoint_id));
+        assert_eq!(moved.passcode_type, old.passcode_type);
+
+        // A code issued before any relay answered gets one when it does.
+        let bare = sample(PasscodeType::Guest);
+        assert!(bare.readdressed(Some("https://relay.example.org/")).is_some());
+    }
+
+    /// Nothing to do when the relay is the same, and never a step backwards to
+    /// no relay at all.
+    #[test]
+    fn a_code_keeps_its_relay_rather_than_losing_it() {
+        let code = ConnectionCode::with_relay(
+            PasscodeType::Guest,
+            [7u8; 32],
+            [9u8; 32],
+            Some("https://relay.example.org/".to_string()),
+        );
+        assert_eq!(code.readdressed(Some("https://relay.example.org/")), None);
+        assert_eq!(code.readdressed(None), None);
+        assert_eq!(code.readdressed(Some("")), None);
+    }
+
+    /// A browser that lowercases the whole thing produces a code that must be
+    /// refused, not one that dials somewhere else.
+    #[test]
+    fn a_lowercased_link_is_refused() {
+        let link = sample(PasscodeType::Guest).link().to_lowercase();
+        assert!(ConnectionCode::parse(&link).is_err());
     }
 
     fn sample(typ: PasscodeType) -> ConnectionCode {

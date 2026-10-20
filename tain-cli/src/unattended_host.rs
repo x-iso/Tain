@@ -118,6 +118,23 @@ mod platform {
             .identity()
             .context("no host identity has been handed to the service — nothing to host as")?;
 
+        let saved = crate::service::settings_path()
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<crate::gui::settings::Settings>(&text).ok());
+
+        // Read before binding, because the relays are: a host that answers
+        // while the application is closed has to be found where the
+        // application's codes say it is, and with "only these relays" chosen
+        // that is nowhere n0 runs.
+        if let Some(settings) = &saved {
+            let (relays, unusable) = settings.relay_choice();
+            for entry in unusable {
+                tracing::warn!("Ignoring the relay {entry:?} — it is not a relay address");
+            }
+            tain_core::discovery::use_relays(relays);
+        }
+
         let server = Arc::new(
             tain_core::HostServer::bind_with_identity(Some(identity))
                 .await
@@ -147,10 +164,6 @@ mod platform {
 
         let approved = secrets.trusted_admins();
         let approved_count = approved.len();
-        let saved = crate::service::settings_path()
-            .ok()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| serde_json::from_str::<crate::gui::settings::Settings>(&text).ok());
         if saved.is_none() {
             // No file yet, or one this build cannot read. The line says why the
             // picture may not look the way the settings panel promises.

@@ -55,6 +55,10 @@ pub struct PanelState {
     /// outlives it: closing Settings leaves a licence being read where it is.
     pub licences_open: bool,
     pub licences_selected: usize,
+    /// The relay list as it is being typed, and the saved list it was taken
+    /// from. See [`network_section`] for why the box does not edit the setting
+    /// directly.
+    pub relay_draft: Option<(String, Vec<String>)>,
 }
 
 /// Draw the settings window. Returns true if any value changed this frame.
@@ -118,6 +122,8 @@ pub fn show(
                     audio_section(ui, settings, panel);
                     ui.add_space(10.0);
                     security_section(ui, settings);
+                    ui.add_space(10.0);
+                    network_section(ui, settings, panel);
                     ui.add_space(18.0);
                     unattended_section(ui, settings);
                     ui.add_space(18.0);
@@ -163,6 +169,7 @@ pub fn show(
     if !*open {
         panel.capturing = None;
         panel.pending_ui_scale = None;
+        panel.relay_draft = None;
     }
 
     if *settings != before {
@@ -1198,6 +1205,85 @@ fn security_section(ui: &mut egui::Ui, settings: &mut Settings) {
             RichText::new(i18n::text("settings.security.pre_ticked_warning"))
                 .size(11.0)
                 .color(AMBER),
+        );
+    }
+}
+
+/// What opens when a link is clicked, and which relays this machine is found
+/// through.
+fn network_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelState) {
+    heading(ui, i18n::text("settings.network"));
+
+    ui.checkbox(&mut settings.open_links, i18n::text("settings.network.open_links"))
+        .on_hover_text(i18n::text("settings.network.open_links_hint"));
+    ui.add_space(8.0);
+
+    ui.label(i18n::text("settings.network.relays"));
+    ui.label(
+        RichText::new(i18n::text("settings.network.relays_blurb")).size(11.0).color(TEXT_DIM),
+    );
+    ui.add_space(4.0);
+
+    // # A draft, so typing is not undone as it happens
+    //
+    // The saved list is tidied — blank lines dropped — and a box rebuilt from
+    // it every frame would swallow the newline somebody had just typed before
+    // they could start the next line. So the box edits its own text, and the
+    // list it was taken from says whether something else has replaced the
+    // setting since: Reset to defaults, say.
+    if panel.relay_draft.as_ref().is_none_or(|(_, from)| *from != settings.custom_relays) {
+        panel.relay_draft =
+            Some((settings.custom_relays.join("\n"), settings.custom_relays.clone()));
+    }
+    if let Some((text, from)) = panel.relay_draft.as_mut() {
+        let edited = ui
+            .add(
+                egui::TextEdit::multiline(text)
+                    .desired_rows(2)
+                    .desired_width(ui.available_width())
+                    .hint_text(i18n::text("settings.network.relays_hint")),
+            )
+            .changed();
+        if edited {
+            let entries = super::settings::relay_entries(text.lines());
+            *from = entries.clone();
+            settings.custom_relays = entries;
+        }
+    }
+
+    // Kept, and said plainly, rather than dropped: a typo is something to
+    // correct, and a list that quietly lost an entry is not one to trust.
+    let (choice, unusable) = settings.relay_choice();
+    for entry in &unusable {
+        ui.label(
+            RichText::new(i18n::format("settings.network.relay_invalid", &[("entry", entry)]))
+                .size(11.0)
+                .color(AMBER),
+        );
+    }
+
+    ui.add_enabled_ui(!choice.custom.is_empty(), |ui| {
+        ui.checkbox(&mut settings.custom_relays_only, i18n::text("settings.network.relays_only"))
+            .on_hover_text(i18n::text("settings.network.relays_only_hint"));
+    });
+    ui.label(
+        RichText::new(i18n::text(if choice.custom.is_empty() {
+            "settings.network.relays_none"
+        } else if choice.only {
+            "settings.network.relays_only_note"
+        } else {
+            "settings.network.relays_beside_note"
+        }))
+        .size(11.0)
+        .color(TEXT_DIM),
+    );
+
+    // Every endpoint takes its relays when it is built, and all of them are
+    // built at launch. Said only when it is true, rather than as a standing
+    // caveat nobody reads.
+    if choice != tain_core::discovery::relays_in_use() {
+        ui.label(
+            RichText::new(i18n::text("settings.network.relays_restart")).size(11.0).color(AMBER),
         );
     }
 }

@@ -265,11 +265,76 @@ impl HostPanelState {
     }
 
     fn passcode(&self, typ: PasscodeType) -> Option<String> {
+        self.slot(typ).lock().unwrap().clone()
+    }
+
+    /// Where the code of this type is kept for the header to show.
+    fn slot(&self, typ: PasscodeType) -> &Arc<Mutex<Option<String>>> {
         match typ {
-            PasscodeType::Master => self.master_passcode.lock().unwrap().clone(),
-            PasscodeType::Guest => self.guest_passcode.lock().unwrap().clone(),
+            PasscodeType::Master => &self.master_passcode,
+            PasscodeType::Guest => &self.guest_passcode,
         }
     }
+
+    /// Change the code of this type on screen, and in the credential store to
+    /// match. `next` is given the code showing now and returns its successor,
+    /// or `None` to leave it be. Returns whether anything changed.
+    ///
+    /// # One lock across both
+    ///
+    /// Three things replace these codes: a reset, the server rotating the
+    /// guest code, and the host moving to another relay. The last works from
+    /// whatever code is showing, so the read, the store and the screen have to
+    /// be one step. With the store written outside the lock, a reset landing
+    /// in between left the screen showing the new code and the store holding
+    /// the one it replaced — which the next launch would have brought back.
+    fn replace_code(
+        &self,
+        settings: &Settings,
+        typ: PasscodeType,
+        next: impl FnOnce(Option<&str>) -> Option<String>,
+    ) -> bool {
+        let mut shown = self.slot(typ).lock().unwrap();
+        let Some(code) = next(shown.as_deref()) else {
+            return false;
+        };
+        remember_code(&self.secrets, settings, typ, &code);
+        *shown = Some(code);
+        true
+    }
+}
+
+/// Keep the codes on screen addressed to the relay this host is on now.
+///
+/// See `HostServer::next_home_relay` for why it moves. Runs for as long as the
+/// host does.
+async fn follow_home_relay(
+    server: Arc<tain_core::HostServer>,
+    host: HostPanelState,
+    settings: Arc<Mutex<Settings>>,
+) {
+    // Nothing yet, so the relay of the moment is reported straight away. A
+    // code issued before any relay answered gets one; a code that already
+    // names it is left as it is.
+    let mut current: Option<String> = None;
+    while let Some(relay) = server.next_home_relay(current.as_deref()).await {
+        let settings = settings.lock().unwrap().clone();
+        let mut moved = false;
+        for typ in [PasscodeType::Master, PasscodeType::Guest] {
+            moved |= host.replace_code(&settings, typ, |shown| readdress(shown, &relay));
+        }
+        if moved {
+            info!("This host is on {relay} now, and its codes say so");
+        }
+        current = Some(relay);
+    }
+}
+
+/// The code showing, addressed to `relay` — or `None` to leave it as it is,
+/// because there is none, it is not a code, or it already names that relay.
+fn readdress(shown: Option<&str>, relay: &str) -> Option<String> {
+    let code = ConnectionCode::parse(shown?).ok()?;
+    Some(code.readdressed(Some(relay))?.encode())
 }
 
 /// Read the autoreset preference for one passcode type.
@@ -578,6 +643,7 @@ fn stopped_hosting(state: &AppState) {
 /// | `approval` | Open the approval dialog for the pending demo guest | debug  |
 /// | `settings` | Open the settings window immediately                | all    |
 /// | `loopback` | Connect to our own host endpoint on startup         | all    |
+/// | `links`    | Register `tain://` links to this build anyway       | debug  |
 ///
 /// `frametime` is not read through here: [`FrameTimer::from_env`] reads the
 /// same variable itself, in every build. It only measures, and the build whose
@@ -918,6 +984,11 @@ pub async fn init_host_server(state: &AppState) -> anyhow::Result<HostHandles> {
         state.host.clone(),
         Arc::clone(&state.settings),
     ));
+    tokio::spawn(follow_home_relay(
+        Arc::clone(&server),
+        state.host.clone(),
+        Arc::clone(&state.settings),
+    ));
     Ok(HostHandles {
         sessions: server.sessions(),
         approval_rx,
@@ -1184,12 +1255,7 @@ async fn run_command_loop(
             HostCommand::RegeneratePasscode(typ) => match server.regenerate_passcode(typ).await {
                 Ok(code) => {
                     let current = settings.lock().unwrap().clone();
-                    remember_code(&host_state.secrets, &current, typ, &code);
-                    let slot = match typ {
-                        PasscodeType::Master => &host_state.master_passcode,
-                        PasscodeType::Guest => &host_state.guest_passcode,
-                    };
-                    *slot.lock().unwrap() = Some(code);
+                    host_state.replace_code(&current, typ, |_| Some(code));
                 }
                 Err(e) => error!("Failed to regenerate {} passcode: {}", typ.prefix(), e),
             },
@@ -1244,6 +1310,15 @@ fn read_clipboard() -> Option<String> {
 
 // ── Application ──────────────────────────────────────────────
 
+/// Which form of a passcode went to the clipboard, so the button says which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Copied {
+    /// The code itself, for pasting into Tain.
+    Code,
+    /// A `tain://` link to it, for clicking. See `crate::links`.
+    Link,
+}
+
 /// Mutations collected during a render pass, applied once the guard is released.
 #[derive(Default)]
 struct PendingEdits {
@@ -1257,7 +1332,7 @@ struct PendingEdits {
     regenerate: Vec<PasscodeType>,
     /// Autoreset toggled from the header. Same setting the settings window edits.
     set_autoreset: Vec<(PasscodeType, bool)>,
-    copied: Option<PasscodeType>,
+    copied: Option<(PasscodeType, Copied)>,
     paste_passcode: bool,
     connect: bool,
     open_settings: bool,
@@ -1661,8 +1736,16 @@ pub struct GuestApp {
     /// Approval decisions the server is still waiting on, keyed by session.
     /// Nothing is streamed to these guests until one of these is answered.
     pending_approvals: HashMap<u32, PendingApproval>,
-    /// Which passcode was most recently copied, for transient UI feedback.
-    copied_at: Option<(PasscodeType, std::time::Instant)>,
+    /// Which passcode was most recently copied, and as what, for transient UI
+    /// feedback.
+    copied_at: Option<(PasscodeType, Copied, std::time::Instant)>,
+    /// Links clicked while this application is running. See `crate::links`.
+    links_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// The link this process was started with, and when it arrived.
+    ///
+    /// Held until there is an identity to dial with — see
+    /// [`GuestApp::open_launch_link`].
+    launch_link: Option<(String, std::time::Instant)>,
     /// The guard over the admin passcode's copy button.
     admin_cover: AdminCover,
     /// Whether the one-time explanation of what that code is, is on screen.
@@ -1757,6 +1840,8 @@ impl GuestApp {
             command_tx: None,
             pending_approvals: HashMap::new(),
             copied_at: None,
+            links_rx: None,
+            launch_link: None,
             admin_cover: AdminCover::default(),
             admin_warning_open: false,
             sessions: Vec::new(),
@@ -1857,6 +1942,100 @@ impl GuestApp {
         self.resweep_tx = Some(handles.resweep_tx);
     }
 
+    /// Take the links clicked while this application runs. See `crate::links`.
+    pub fn listen_for_links(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        crate::links::listen(move |link| {
+            // Woken, because a window nobody is touching draws no frames, and
+            // the frame is where the link is opened.
+            if tx.send(link).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        self.links_rx = Some(rx);
+    }
+
+    /// Open `link`, which this process was started with, as soon as it can be
+    /// dialled properly. See [`Self::open_launch_link`].
+    pub fn open_link_at_launch(&mut self, link: String) {
+        self.launch_link = Some((link, std::time::Instant::now()));
+    }
+
+    /// Open whatever links have arrived. Cheap, and safe to call every frame.
+    fn take_links(&mut self, ctx: &egui::Context) {
+        self.open_launch_link(ctx);
+        let arrived: Vec<String> = match &self.links_rx {
+            Some(rx) => rx.try_iter().collect(),
+            None => return,
+        };
+        for link in arrived {
+            self.open_link(&link, ctx);
+        }
+    }
+
+    /// The link this process was started with, once there is an identity to
+    /// dial it as.
+    ///
+    /// # Why it waits at all
+    ///
+    /// This machine dials from one endpoint, bound on first use with whatever
+    /// identity the process has by then (see `network::OUTGOING_ENDPOINT`). A
+    /// stored identity is adopted before the window opens, so wherever Tain has
+    /// run before this is immediate. On a first run there is no identity until
+    /// the host has bound, and dialling before that would leave this machine a
+    /// stranger to every host for as long as the process runs — an admin code
+    /// asked about each time and never recognised. So it waits for the host,
+    /// for as long as the host looks like it is getting somewhere.
+    fn open_launch_link(&mut self, ctx: &egui::Context) {
+        /// Enough for a host to bind on an ordinary network. Past it, dialling
+        /// as a stranger beats not dialling.
+        const IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let Some((_, arrived)) = &self.launch_link else { return };
+        let ready = tain_core::network::has_identity()
+            || self.state.host.error.lock().unwrap().is_some()
+            || arrived.elapsed() >= IDENTITY_WAIT;
+        if !ready {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        if let Some((link, _)) = self.launch_link.take() {
+            self.open_link(&link, ctx);
+        }
+    }
+
+    /// Connect to the host a link names, or show the session already open to
+    /// it.
+    fn open_link(&mut self, link: &str, ctx: &egui::Context) {
+        let code = match ConnectionCode::parse(link) {
+            Ok(code) => code,
+            Err(e) => {
+                warn!("A link that is not a usable code: {e:#}");
+                self.connect_error = Some(format!("{e}"));
+                // Where the error is, so the click is not answered by nothing.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                return;
+            }
+        };
+        info!("Opening a link to {}", code.redacted());
+
+        // The same link clicked twice is asking to see that machine, not for a
+        // second session to it.
+        let endpoint = super::connections::endpoint_hex(&code.endpoint_id);
+        if let Some(index) =
+            self.sessions.iter().position(|s| s.endpoint_hex == endpoint && s.is_active())
+        {
+            self.session_window.active_tab = index;
+        } else {
+            self.connect_with(&code.encode(), ctx);
+        }
+        // A window that is already open does not come forward on its own; a
+        // new one does, and asking costs nothing.
+        SessionWindow::bring_forward(ctx);
+    }
+
     fn send(&self, cmd: HostCommand) {
         if let Some(ref tx) = self.command_tx {
             if tx.send(cmd).is_err() {
@@ -1932,13 +2111,7 @@ impl GuestApp {
                 // so the credential store has to follow or a restart would put
                 // back a code that no longer opens anything.
                 let settings = self.state.settings();
-                remember_code(
-                    &self.state.host.secrets,
-                    &settings,
-                    PasscodeType::Guest,
-                    &code,
-                );
-                *self.state.host.guest_passcode.lock().unwrap() = Some(code);
+                self.state.host.replace_code(&settings, PasscodeType::Guest, |_| Some(code));
             }
         }
 
@@ -2584,6 +2757,9 @@ impl GuestApp {
         let settings = self.state.settings.lock().unwrap().clone();
         self.state.save_settings();
         self.send(HostCommand::ApplySettings(settings.to_session_config()));
+        // A registry read when nothing changed, so asked on every settle rather
+        // than tracking whether this one setting did.
+        crate::links::sync_registration(settings.open_links);
     }
 
     /// What the admin passcode is, said once, before it can be copied.
@@ -3426,9 +3602,12 @@ impl GuestApp {
         edits: &mut PendingEdits,
     ) {
         let code = self.state.host.passcode(typ);
-        let recently_copied = self.copied_at.is_some_and(|(t, at)| {
-            t == typ && at.elapsed() < std::time::Duration::from_millis(1200)
-        });
+        let recently_copied = self
+            .copied_at
+            .filter(|(t, _, at)| {
+                *t == typ && at.elapsed() < std::time::Duration::from_millis(1200)
+            })
+            .map(|(_, what, _)| what);
 
         // # The long form if it fits, measured rather than guessed
         //
@@ -3438,32 +3617,30 @@ impl GuestApp {
         // is the question the threshold was standing in for, and it is the
         // same question in every language.
         let font = egui::FontId::proportional(13.0);
-        // What `labelled_button` leaves for the label: the inset, the icon and
-        // the gap before it.
-        let room = (width - 12.0 - 18.0 - 8.0).max(0.0);
+        let room = theme::split_button_label_room(width);
         let roomy = |long: &str| theme::text_fits(ui, long, &font, room);
 
         let (long, short, fill, stroke) = match typ {
             PasscodeType::Master => (
-                t!("header.copy_admin"),
-                t!("header.copy_admin_short"),
+                t!("header.admin_code"),
+                t!("header.admin_code_short"),
                 ADMIN_FILL,
                 ADMIN_STROKE,
             ),
             PasscodeType::Guest => (
-                t!("header.copy_guest"),
-                t!("header.copy_guest_short"),
+                t!("header.guest_code"),
+                t!("header.guest_code_short"),
                 GUEST_FILL,
                 GUEST_STROKE,
             ),
         };
-        let (long, short) = if recently_copied {
-            (t!("header.copied"), t!("header.copied_short"))
-        } else {
-            (long, short)
+        let (long, short) = match recently_copied {
+            Some(Copied::Code) => (t!("header.copied"), t!("header.copied_short")),
+            Some(Copied::Link) => (t!("header.link_copied"), t!("header.copied_short")),
+            None => (long, short),
         };
         let label = if roomy(long) { long } else { short };
-        let stroke = if recently_copied { LIVE_GREEN } else { stroke };
+        let stroke = if recently_copied.is_some() { LIVE_GREEN } else { stroke };
 
         ui.horizontal(|ui| {
             // # The admin code is kept behind a cover
@@ -3508,11 +3685,19 @@ impl GuestApp {
                 return;
             }
 
-            let resp = theme::labelled_button(
+            // # One button, two forms of the same code
+            //
+            // The code to paste into Tain, or a link to click on a machine that
+            // has it — the same secret either way, so they share one frame
+            // rather than looking like two things to decide between. The link
+            // half is behind the admin cover too: it hands over exactly what
+            // the code does.
+            let (copy, link) = theme::split_button(
                 ui,
                 egui::vec2(width, BUTTON_HEIGHT),
                 label,
                 egui::include_image!("../../assets/copy_passcode.svg"),
+                egui::include_image!("../../assets/link.svg"),
                 fill,
                 stroke,
                 code.is_some(),
@@ -3520,21 +3705,36 @@ impl GuestApp {
 
             // A disabled button with no explanation is a dead end — say why
             // there is no code to copy.
-            let resp = match (&code, self.state.host.error.lock().unwrap().clone()) {
-                (Some(_), _) => {
-                    resp.on_hover_text(t!("header.copy_hint"))
-                }
+            let (copy, link) = match (&code, self.state.host.error.lock().unwrap().clone()) {
+                (Some(_), _) => (
+                    copy.on_hover_text(t!("header.copy_hint")),
+                    link.on_hover_text(t!("header.copy_link_hint")),
+                ),
                 (None, Some(e)) => {
-                    resp.on_hover_text(t!("header.host_offline", reason = e))
+                    let why = t!("header.host_offline", reason = e);
+                    (copy.on_hover_text(why.clone()), link.on_hover_text(why))
                 }
-                (None, None) => resp.on_hover_text(t!("header.no_code")),
+                (None, None) => (
+                    copy.on_hover_text(t!("header.no_code")),
+                    link.on_hover_text(t!("header.no_code")),
+                ),
             };
 
-            if resp.clicked()
-                && let Some(code) = code
-            {
-                ui.ctx().copy_text(code);
-                edits.copied = Some(typ);
+            if let Some(code) = code {
+                if copy.clicked() {
+                    ui.ctx().copy_text(code);
+                    edits.copied = Some((typ, Copied::Code));
+                } else if link.clicked() {
+                    match ConnectionCode::parse(&code) {
+                        Ok(parsed) => {
+                            ui.ctx().copy_text(parsed.link());
+                            edits.copied = Some((typ, Copied::Link));
+                        }
+                        // Our own code, so this is a bug rather than a typo —
+                        // but a silent button is the worse outcome.
+                        Err(e) => warn!("Could not make a link of this machine's code: {e:#}"),
+                    }
+                }
             }
 
             render_passcode_row_tail(ui, typ, &self.state.settings(), edits);
@@ -4499,6 +4699,7 @@ impl eframe::App for GuestApp {
         // `attach_when_ready`.
         self.take_pending_handles();
         self.poll_channels();
+        self.take_links(ctx);
         t = self.frametime.phase("poll", t);
 
         if self.auto_connect {
@@ -4650,8 +4851,8 @@ impl eframe::App for GuestApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
-        if let Some(typ) = edits.copied {
-            self.copied_at = Some((typ, std::time::Instant::now()));
+        if let Some((typ, what)) = edits.copied {
+            self.copied_at = Some((typ, what, std::time::Instant::now()));
             // The cover is for the *next* accident, not this deliberate copy.
             if typ == PasscodeType::Master {
                 self.admin_cover.close();
@@ -5976,6 +6177,48 @@ mod tests {
         // secret here would show the user a code that dials nowhere.
         let saved = ConnectionCode::new(CorePasscodeType::Guest, SECRET, THEIRS).encode();
         assert_eq!(restorable_secret(&saved, CorePasscodeType::Guest, OURS), None);
+    }
+
+    /// A host that moves relay hands out codes naming the new one, and the
+    /// stored copy follows — with the secret, and so every existing holder of
+    /// the code, untouched.
+    #[test]
+    fn a_shown_code_follows_the_host_to_a_new_relay() {
+        let host = HostPanelState::new();
+        // Admin codes are kept by default, so the store has something to say.
+        let settings = Settings::default();
+        assert!(!settings.admin_autoreset);
+        let typ = CorePasscodeType::Master;
+
+        let issued = ConnectionCode::with_relay(
+            typ,
+            SECRET,
+            OURS,
+            Some("https://euc1-1.relay.n0.iroh.link./".to_string()),
+        )
+        .encode();
+        assert!(host.replace_code(&settings, typ, |_| Some(issued.clone())));
+
+        let ours = "https://relay.example.org/";
+        assert!(host.replace_code(&settings, typ, |shown| readdress(shown, ours)));
+        let shown = ConnectionCode::parse(&host.passcode(typ).expect("a code")).unwrap();
+        assert_eq!(shown.relay_url.as_deref(), Some(ours));
+        assert_eq!(shown.secret, SECRET, "moving relay is not a new code");
+        assert_eq!(host.secrets.code(typ), host.passcode(typ), "the store fell behind");
+
+        // On the same relay again — a reconnect — there is nothing to do.
+        assert!(!host.replace_code(&settings, typ, |shown| readdress(shown, ours)));
+    }
+
+    /// No code yet, nothing to readdress: the relay arriving first must not
+    /// invent one.
+    #[test]
+    fn a_relay_arriving_before_any_code_changes_nothing() {
+        let host = HostPanelState::new();
+        let settings = Settings::default();
+        let typ = CorePasscodeType::Guest;
+        assert!(!host.replace_code(&settings, typ, |shown| readdress(shown, "https://r.example/")));
+        assert_eq!(host.passcode(typ), None);
     }
 
     #[test]

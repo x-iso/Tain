@@ -244,6 +244,17 @@ impl Default for SessionWindow {
 }
 
 impl SessionWindow {
+    /// The viewport every session tab lives in.
+    fn viewport_id() -> ViewportId {
+        ViewportId::from_hash_of("tain-sessions")
+    }
+
+    /// Put the session window in front, as a click on its taskbar button would.
+    pub fn bring_forward(ctx: &egui::Context) {
+        ctx.send_viewport_cmd_to(Self::viewport_id(), egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd_to(Self::viewport_id(), egui::ViewportCommand::Focus);
+    }
+
     /// Reset window chrome when the last session goes away.
     ///
     /// Leaving `fullscreen` set would make the next session open fullscreen for
@@ -299,7 +310,7 @@ impl SessionWindow {
         );
 
         parent.show_viewport_immediate(
-            ViewportId::from_hash_of("tain-sessions"),
+            Self::viewport_id(),
             builder,
             |ctx, _class| {
                 // Its own input, which the main window's hook never sees. Read

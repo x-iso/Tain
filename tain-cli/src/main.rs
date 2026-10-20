@@ -11,6 +11,7 @@ mod agent;
 mod console;
 mod display_driver;
 mod gui;
+mod links;
 mod logging;
 mod migrate;
 mod service;
@@ -185,6 +186,21 @@ async fn main() -> Result<()> {
         };
     }
 
+    // # A clicked link, when a Tain is already open
+    //
+    // Windows starts a new process for every `tain://` link. With a Tain
+    // already running here the link is that one's to open — a second would
+    // host on the same identity and put a second window up — so it is handed
+    // over before this process touches the service, a socket or a window. See
+    // `links`.
+    let link = links::from_args(&args);
+    if let Some(link) = &link
+        && links::hand_to_running(link)
+    {
+        info!("Handed a link to the Tain already running");
+        return Ok(());
+    }
+
     // Installed but not running is a state nobody asked for — Windows starts it
     // at boot, so reaching here stopped means it was stopped by hand or failed
     // once. Starting it needs administrator rights and often will not be
@@ -230,6 +246,29 @@ async fn main() -> Result<()> {
     tain_core::i18n::follow(&state.settings().language);
     #[cfg(debug_assertions)]
     gui::app::seed_demo_data(&state);
+
+    // Before anything binds: an endpoint takes its relays when it is built, and
+    // the prober and the host are both built a few lines down.
+    let (relays, unusable) = state.settings().relay_choice();
+    for entry in unusable {
+        warn!("Ignoring the relay {entry:?} — it is not a relay address");
+    }
+    tain_core::discovery::use_relays(relays);
+
+    // # Dial as this machine from the first moment
+    //
+    // `init_host_server` adopts the identity once the host has bound, which
+    // can take a while — and a link opened at launch dials straight away. The
+    // dialling endpoint is bound once per process, so a dial before the
+    // identity arrived would be a stranger to every host until the next start.
+    // A stored identity is the same key either way; a first run has none yet,
+    // and waits for the host as it always has.
+    if let Some(identity) = state.host.secrets.identity() {
+        tain_core::network::adopt_identity(identity);
+    }
+
+    // Kept pointing at this copy, which may have moved since it last ran.
+    links::sync_registration(state.settings().open_links);
 
     // Binding waits for relay connectivity, so this can fail or stall on a bad
     // network. That must not stop the window from opening — the UI reports the
@@ -314,6 +353,12 @@ async fn main() -> Result<()> {
             // frames have already been drawn.
             app.attach_when_ready(handles_rx);
             app.apply_debug_flags();
+            // Links clicked from now on, and the one this process was started
+            // with if it was — see `links`.
+            app.listen_for_links(&cc.egui_ctx);
+            if let Some(link) = link {
+                app.open_link_at_launch(link);
+            }
             Ok(Box::new(app))
         }),
     )
