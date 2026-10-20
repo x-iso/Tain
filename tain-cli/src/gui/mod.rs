@@ -21,5 +21,6 @@ pub mod settings;
 pub mod settings_panel;
 pub mod shortcuts;
 pub mod theme;
+pub mod title_bar;
 
 pub use app::{init_host_server, init_prober, AppState, GuestApp};

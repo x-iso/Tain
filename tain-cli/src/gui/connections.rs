@@ -124,8 +124,25 @@ impl ConnectionStatus {
 pub struct SavedConnection {
     /// Hex of the host's 32-byte endpoint id. The stable identity of the row.
     pub endpoint_id: String,
-    /// What to call it. Seeded from the host's own name, then editable.
+    /// What to call it, once it has a name of its own: the one the host
+    /// published, or one typed here. Ignored while [`Self::number`] is set —
+    /// read [`Self::name`] rather than this.
     pub display_name: String,
+    /// For a host with no name yet, the number it goes by: "Host #3".
+    ///
+    /// # Why a number and not part of the endpoint
+    ///
+    /// This used to be "PC" and the first eight hex digits of the endpoint id,
+    /// which is stable and unique and tells a person nothing — and in a tab, it
+    /// never fitted. A number reads like a name and still tells two anonymous
+    /// hosts apart. It is kept rather than counted from the list's order, which
+    /// changes every time a different host is used.
+    ///
+    /// Cleared for good by the first real name, whichever side gives it: which
+    /// is also how a published name knows it may still replace this one, and
+    /// that a name typed here must never be replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u32>,
     /// Unix seconds of the last connection attempt, for ordering.
     #[serde(default)]
     pub last_connected: u64,
@@ -171,6 +188,7 @@ impl SavedConnection {
         Self {
             endpoint_id,
             display_name,
+            number: None,
             last_connected: now_secs(),
             preview: None,
             legacy_code: None,
@@ -178,6 +196,14 @@ impl SavedConnection {
             status: ConnectionStatus::default(),
             probed: None,
             probe_why: None,
+        }
+    }
+
+    /// What the card and the session's tab call this host.
+    pub fn name(&self) -> String {
+        match self.number {
+            Some(n) => tain_core::i18n::format("session.host_number", &[("n", &n.to_string())]),
+            None => self.display_name.clone(),
         }
     }
 
@@ -254,6 +280,7 @@ impl ConnectionStore {
                     secrets: super::secrets::SecretStore::Os,
                 };
                 store.migrate_plaintext_codes();
+                store.migrate_placeholder_names();
                 store.refresh_code_flags();
                 store.sort();
                 store
@@ -288,6 +315,40 @@ impl ConnectionStore {
             // file now is what actually removes the plaintext.
             self.save();
         }
+    }
+
+    /// Number the rows an older build left on their "PC 1A2B3C4D" placeholder.
+    ///
+    /// Oldest first, so the first host this machine ever reached is the one
+    /// called "Host #1". A row whose name differs from its placeholder was
+    /// named — by its host or by hand — and keeps it.
+    fn migrate_placeholder_names(&mut self) {
+        let mut order: Vec<usize> = (0..self.entries.len())
+            .filter(|&i| {
+                let entry = &self.entries[i];
+                entry.number.is_none()
+                    && entry.display_name == legacy_placeholder(&entry.endpoint_id)
+            })
+            .collect();
+        if order.is_empty() {
+            return;
+        }
+        order.sort_by_key(|&i| self.entries[i].last_connected);
+        for i in order {
+            let number = self.next_number();
+            let entry = &mut self.entries[i];
+            entry.number = Some(number);
+            entry.display_name.clear();
+        }
+        self.save();
+    }
+
+    /// The lowest number no row is using, so a forgotten host's number is
+    /// handed on rather than the count climbing for ever.
+    fn next_number(&self) -> u32 {
+        (1..)
+            .find(|n| !self.entries.iter().any(|e| e.number == Some(*n)))
+            .expect("fewer rows than numbers")
     }
 
     /// Ask the credential store which rows still have a code.
@@ -335,10 +396,10 @@ impl ConnectionStore {
 
     /// Record a connection attempt, creating or refreshing the row.
     ///
-    /// A name the user typed is never overwritten by one the host published —
-    /// renaming a machine is a deliberate act, and losing it on every reconnect
-    /// would make the rename feature useless.
-    pub fn record(&mut self, endpoint_id: String, code: String, fallback_name: &str) {
+    /// A new row goes by a number until it has a name — see
+    /// [`SavedConnection::number`]. An existing row keeps whatever it is
+    /// called.
+    pub fn record(&mut self, endpoint_id: String, code: String) {
         // The code goes to the credential store, never into `self.entries`.
         // `stored` is whether that actually worked, so a machine with no
         // credential store shows "no saved code" rather than a button that
@@ -351,8 +412,8 @@ impl ConnectionStore {
                 existing.has_code = stored;
             }
             None => {
-                let mut entry =
-                    SavedConnection::new(endpoint_id, fallback_name.to_string());
+                let mut entry = SavedConnection::new(endpoint_id, String::new());
+                entry.number = Some(self.next_number());
                 entry.has_code = stored;
                 entry.status = ConnectionStatus::Connecting;
                 self.entries.push(entry);
@@ -362,28 +423,43 @@ impl ConnectionStore {
         self.save();
     }
 
-    /// Apply the name a host published, if the row is still using its
-    /// placeholder. Returns true if anything changed.
-    pub fn adopt_host_name(&mut self, endpoint_id: &str, host_name: &str, placeholder: &str) -> bool {
+    /// Apply the name a host published, if the row still goes by a number.
+    /// Returns true if anything changed.
+    ///
+    /// A name the user typed is never overwritten by one the host published —
+    /// renaming a machine is a deliberate act, and losing it on every reconnect
+    /// would make the rename feature useless.
+    pub fn adopt_host_name(&mut self, endpoint_id: &str, host_name: &str) -> bool {
         let Some(entry) = self.entries.iter_mut().find(|c| c.endpoint_id == endpoint_id) else {
             return false;
         };
-        if entry.display_name != placeholder || entry.display_name == host_name {
+        if entry.number.is_none() {
             return false;
         }
+        entry.number = None;
         entry.display_name = host_name.to_string();
         self.save();
         true
     }
 
     /// Rename a row. Returns true if it existed.
+    ///
+    /// Even to nothing: the card renames on every keystroke, so an empty name
+    /// is usually a name halfway through being retyped, and must not snap back
+    /// to a number under the cursor.
     pub fn rename(&mut self, endpoint_id: &str, name: String) -> bool {
         let Some(entry) = self.entries.iter_mut().find(|c| c.endpoint_id == endpoint_id) else {
             return false;
         };
+        entry.number = None;
         entry.display_name = name;
         self.save();
         true
+    }
+
+    /// What a host is called, if it is remembered.
+    pub fn name_of(&self, endpoint_id: &str) -> Option<String> {
+        self.entries.iter().find(|c| c.endpoint_id == endpoint_id).map(SavedConnection::name)
     }
 
     /// Remember what this host's screen looked like.
@@ -516,13 +592,9 @@ pub fn endpoint_hex(endpoint_id: &[u8; 32]) -> String {
     endpoint_id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Short human-readable stand-in for a host with no published name.
-///
-/// Takes the hex rather than the raw id so the same call works when all we have
-/// is a stored row. Deriving it means it stays stable across reconnects, which
-/// is what lets [`ConnectionStore::adopt_host_name`] tell a placeholder from a
-/// name the user typed.
-pub fn placeholder_name(endpoint_hex: &str) -> String {
+/// The stand-in older builds gave a host with no published name, kept only so
+/// [`ConnectionStore::migrate_placeholder_names`] can recognise it.
+fn legacy_placeholder(endpoint_hex: &str) -> String {
     let prefix: String = endpoint_hex.chars().take(8).collect();
     format!("PC {}", prefix.to_uppercase())
 }
@@ -547,7 +619,7 @@ mod tests {
     #[test]
     fn a_saved_connection_remembers_no_address() {
         let mut store = ConnectionStore::new();
-        store.record("aa".into(), "MASTER-x".into(), "Host");
+        store.record("aa".into(), "MASTER-x".into());
 
         let written = serde_json::to_string(&store.entries).expect("a saved list serialises");
         assert!(
@@ -576,6 +648,7 @@ mod tests {
                     preview: None,
                 endpoint_id: (*id).to_string(),
                 display_name: (*name).to_string(),
+                number: None,
                 legacy_code: None,
                 has_code: true,
                 last_connected: i as u64,
@@ -596,7 +669,7 @@ mod tests {
         let mut store = ConnectionStore::new();
         assert!(store.path.is_none());
 
-        store.record("host-1".into(), "CODE".into(), "PC");
+        store.record("host-1".into(), "CODE".into());
         store.rename("host-1", "Renamed".into());
         store.forget("host-1");
 
@@ -614,44 +687,99 @@ mod tests {
             .entries
             .push(SavedConnection::new(id("studio"), "Studio".into()));
 
-        store.record(id("studio"), "NEW".into(), "PC ABC");
+        store.record(id("studio"), "NEW".into());
 
         assert_eq!(store.entries().len(), 1, "same machine, same row");
-        assert_eq!(store.entries()[0].display_name, "Studio", "the name the user gave stands");
+        assert_eq!(store.entries()[0].name(), "Studio", "the name the user gave stands");
     }
 
     #[test]
-    fn a_new_host_gets_a_row_with_its_placeholder_name() {
+    fn a_new_host_goes_by_a_number_until_it_has_a_name() {
         let mut store = ConnectionStore::new();
-        store.record(id("fresh"), "CODE".into(), "PC DEAD");
+        store.record(id("first"), "CODE".into());
+        store.record(id("second"), "CODE".into());
 
-        assert_eq!(store.entries().len(), 1);
-        assert_eq!(store.entries()[0].display_name, "PC DEAD");
+        assert_eq!(store.name_of(&id("first")).as_deref(), Some("Host #1"));
+        assert_eq!(store.name_of(&id("second")).as_deref(), Some("Host #2"));
     }
 
     #[test]
-    fn a_published_host_name_replaces_the_placeholder_but_not_a_rename() {
+    fn a_forgotten_hosts_number_is_handed_on() {
         let mut store = ConnectionStore::new();
-        store.record(id("named"), "CODE".into(), "PC ABC");
+        store.record(id("a"), "CODE".into());
+        store.record(id("b"), "CODE".into());
+        store.forget(&id("a"));
 
-        assert!(store.adopt_host_name(&id("named"), "Studio desktop", "PC ABC"));
-        assert_eq!(store.entries()[0].display_name, "Studio desktop");
+        store.record(id("c"), "CODE".into());
+        assert_eq!(store.name_of(&id("c")).as_deref(), Some("Host #1"));
+    }
+
+    #[test]
+    fn a_published_host_name_replaces_the_number_but_not_a_rename() {
+        let mut store = ConnectionStore::new();
+        store.record(id("named"), "CODE".into());
+
+        assert!(store.adopt_host_name(&id("named"), "Studio desktop"));
+        assert_eq!(store.name_of(&id("named")).as_deref(), Some("Studio desktop"));
 
         // Once the user has named it, the host does not get to overrule them.
         store.rename(&id("named"), "My laptop".into());
-        assert!(!store.adopt_host_name(&id("named"), "Studio desktop", "PC ABC"));
-        assert_eq!(store.entries()[0].display_name, "My laptop");
+        assert!(!store.adopt_host_name(&id("named"), "Studio desktop"));
+        assert_eq!(store.name_of(&id("named")).as_deref(), Some("My laptop"));
+    }
+
+    #[test]
+    fn a_rename_beats_a_host_name_that_arrives_later() {
+        // Renaming from the tab can happen before the host's name has been
+        // adopted, and the host must not take it back on the next frame.
+        let mut store = ConnectionStore::new();
+        store.record(id("early"), "CODE".into());
+        store.rename(&id("early"), "Mine".into());
+        assert!(!store.adopt_host_name(&id("early"), "Studio"));
+        assert_eq!(store.name_of(&id("early")).as_deref(), Some("Mine"));
+    }
+
+    #[test]
+    fn clearing_a_name_does_not_snap_back_to_a_number() {
+        // The card renames on every keystroke: an empty name is one halfway
+        // through being retyped.
+        let mut store = ConnectionStore::new();
+        store.record(id("retyped"), "CODE".into());
+        store.rename(&id("retyped"), String::new());
+        assert_eq!(store.name_of(&id("retyped")).as_deref(), Some(""));
     }
 
     #[test]
     fn adopting_a_name_twice_is_a_no_op() {
         let mut store = ConnectionStore::new();
-        store.record(id("twice"), "CODE".into(), "PC ABC");
-        assert!(store.adopt_host_name(&id("twice"), "Studio", "PC ABC"));
-        assert!(
-            !store.adopt_host_name(&id("twice"), "Studio", "PC ABC"),
-            "nothing left to change"
-        );
+        store.record(id("twice"), "CODE".into());
+        assert!(store.adopt_host_name(&id("twice"), "Studio"));
+        assert!(!store.adopt_host_name(&id("twice"), "Studio"), "nothing left to change");
+    }
+
+    #[test]
+    fn an_older_builds_placeholders_become_numbers_oldest_first() {
+        let mut store = ConnectionStore::new();
+        let row = |hex: &str, name: String, when: u64| {
+            let mut entry = SavedConnection::new(hex.into(), name);
+            entry.last_connected = when;
+            entry
+        };
+        store.entries = vec![
+            row("bbbb0000", legacy_placeholder("bbbb0000"), 200),
+            row("aaaa0000", legacy_placeholder("aaaa0000"), 100),
+            // Named by its host or by hand, which an older build could not
+            // tell apart either — so it stays named.
+            row("cccc0000", "Studio".into(), 50),
+        ];
+
+        store.migrate_placeholder_names();
+
+        assert_eq!(store.name_of("aaaa0000").as_deref(), Some("Host #1"));
+        assert_eq!(store.name_of("bbbb0000").as_deref(), Some("Host #2"));
+        assert_eq!(store.name_of("cccc0000").as_deref(), Some("Studio"));
+        // And a published name can still take a number's place.
+        assert!(store.adopt_host_name("aaaa0000", "Laptop"));
     }
 
     #[test]
@@ -659,8 +787,8 @@ mod tests {
         // A full round trip through the real credential store: "forget" has to
         // delete the secret, not just hide the row.
         let mut store = ConnectionStore::new();
-        store.record(id("forget-a"), "CODE-A".into(), "A");
-        store.record(id("forget-b"), "CODE-B".into(), "B");
+        store.record(id("forget-a"), "CODE-A".into());
+        store.record(id("forget-b"), "CODE-B".into());
 
         // No credential store on this machine (a headless Linux box, say) —
         // there is nothing to assert about storage that did not happen.
@@ -686,7 +814,7 @@ mod tests {
         assert_eq!(store.entries()[0].endpoint_id, "newer");
 
         // Reconnecting to the old one floats it back to the top.
-        store.record("old".into(), "CODE".into(), "Old");
+        store.record("old".into(), "CODE".into());
         assert_eq!(store.entries()[0].endpoint_id, "old");
     }
 
@@ -694,7 +822,7 @@ mod tests {
     fn the_list_does_not_grow_without_bound() {
         let mut store = ConnectionStore::new();
         for i in 0..(MAX_ENTRIES + 20) {
-            store.record(format!("host-{i}"), "CODE".into(), "PC");
+            store.record(format!("host-{i}"), "CODE".into());
         }
         assert_eq!(store.entries().len(), MAX_ENTRIES);
     }
@@ -787,6 +915,7 @@ mod tests {
             preview: None,
             endpoint_id: "abc".into(),
             display_name: "Old PC".into(),
+            number: None,
             legacy_code: None,
             has_code: false,
             last_connected: 0,
@@ -821,17 +950,18 @@ mod tests {
     fn renaming_an_unknown_host_reports_failure() {
         let mut store = ConnectionStore::new();
         assert!(!store.rename("nope", "X".into()));
-        assert!(!store.adopt_host_name("nope", "X", "Y"));
+        assert!(!store.adopt_host_name("nope", "X"));
+        assert_eq!(store.name_of("nope"), None);
     }
 
     #[test]
-    fn a_placeholder_names_the_machine_without_leaking_the_secret() {
+    fn the_legacy_placeholder_is_recognised_as_it_was_written() {
         let hex = endpoint_hex(&[0xAB; 32]);
         assert_eq!(hex.len(), 64);
-        assert_eq!(placeholder_name(&hex), "PC ABABABAB");
+        assert_eq!(legacy_placeholder(&hex), "PC ABABABAB");
         // A short or empty id must not panic on the slice.
-        assert_eq!(placeholder_name("abc"), "PC ABC");
-        assert_eq!(placeholder_name(""), "PC ");
+        assert_eq!(legacy_placeholder("abc"), "PC ABC");
+        assert_eq!(legacy_placeholder(""), "PC ");
     }
 
     #[test]

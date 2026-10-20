@@ -2265,18 +2265,22 @@ impl GuestApp {
         // or is refused is still one the user tried to make, and having the row
         // already there is what makes retrying easy.
         let endpoint_hex = super::connections::endpoint_hex(&code.endpoint_id);
-        let placeholder = super::connections::placeholder_name(&endpoint_hex);
-        self.state
-            .previous_connections
-            .lock()
-            .unwrap()
-            .record(endpoint_hex.clone(), code.encode(), &placeholder);
+        let name = {
+            let mut conns = self.state.previous_connections.lock().unwrap();
+            conns.record(endpoint_hex.clone(), code.encode());
+            conns.name_of(&endpoint_hex)
+        };
 
         let settings = self.state.settings();
         let repaint_ctx = ctx.clone();
-        let session = GuestSession::start(code, &settings, loopback, move || {
+        let mut session = GuestSession::start(code, &settings, loopback, move || {
             repaint_ctx.request_repaint()
         });
+        // Named now rather than on the next reconcile, which runs before this
+        // frame's tabs are drawn and would leave the first one showing the id.
+        if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
+            session.label = name;
+        }
 
         // The paste answer has served its purpose — it was there to say whether
         // this would work, and now there is a session to report on instead.
@@ -2524,10 +2528,22 @@ impl GuestApp {
         let mut conns = self.state.previous_connections.lock().unwrap();
         conns.apply_status(&live);
         for (endpoint_hex, name) in names {
-            // Only replaces the generated placeholder, never a name the user
-            // typed — `adopt_host_name` is what enforces that.
-            let placeholder = super::connections::placeholder_name(&endpoint_hex);
-            conns.adopt_host_name(&endpoint_hex, &name, &placeholder);
+            // Only replaces the number a nameless host goes by, never a name
+            // the user typed — `adopt_host_name` is what enforces that.
+            conns.adopt_host_name(&endpoint_hex, &name);
+        }
+
+        // # The tab says what the card says
+        //
+        // One name per host, wherever it was chosen: on the card, on the tab,
+        // or by the host itself. An empty one is a card being retyped, and the
+        // tab keeps the last name it had until there is a new one.
+        for session in self.sessions.iter_mut() {
+            if let Some(name) = conns.name_of(&session.endpoint_hex)
+                && !name.trim().is_empty()
+            {
+                session.label = name;
+            }
         }
     }
 
@@ -3657,7 +3673,7 @@ impl GuestApp {
                 .max_rect(name_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        let mut name = conn.display_name.clone();
+        let mut name = conn.name();
         if name_ui
             .add(
                 egui::TextEdit::singleline(&mut name)
@@ -4656,6 +4672,20 @@ impl eframe::App for GuestApp {
                 &settings,
                 &mut self.immersive,
             );
+
+            // A tab renamed in place renames the host, so the card under
+            // Previous connections changes with it. The tab is told directly
+            // too, so it holds the name even for a host that has been forgotten
+            // and has no card to read it back from.
+            if !actions.rename.is_empty() {
+                let mut conns = self.state.previous_connections.lock().unwrap();
+                for (endpoint_hex, name) in actions.rename {
+                    conns.rename(&endpoint_hex, name.clone());
+                    for session in self.sessions.iter_mut().filter(|s| s.endpoint_hex == endpoint_hex) {
+                        session.label = name.clone();
+                    }
+                }
+            }
 
             if actions.close_all {
                 self.close_all_sessions();
@@ -5850,16 +5880,15 @@ mod tests {
 
         let code = ConnectionCode::new(CorePasscodeType::Guest, [7u8; 32], [0xAB; 32]);
         let hex = super::super::connections::endpoint_hex(&code.endpoint_id);
-        let placeholder = super::super::connections::placeholder_name(&hex);
         app.state
             .previous_connections
             .lock()
             .unwrap()
-            .record(hex.clone(), code.encode(), &placeholder);
+            .record(hex.clone(), code.encode());
 
         let conns = app.state.previous_connections.lock().unwrap();
         assert_eq!(conns.entries().len(), 1);
-        assert_eq!(conns.entries()[0].display_name, "PC ABABABAB");
+        assert_eq!(conns.entries()[0].name(), "Host #1");
         assert_eq!(conns.code_for(&hex), Some(code.encode()), "and it can dial again");
     }
 

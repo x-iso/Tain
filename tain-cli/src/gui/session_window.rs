@@ -11,6 +11,14 @@
 //! It is an **immediate** viewport rather than a deferred one, because the
 //! render callback needs `&mut` access to the sessions it draws; a deferred
 //! viewport's callback must be `Send + Sync + 'static`.
+//!
+//! # One row
+//!
+//! Windowed, the tabs and the tools share the row Windows would have spent on
+//! the window's title, with minimize, maximize and close at the end of it; see
+//! `title_bar` for how that row is taken from Windows. In fullscreen there is
+//! no header at all, and the same row comes down over the picture when the
+//! pointer reaches the top edge.
 
 use egui::{Context, RichText, ViewportId};
 
@@ -26,6 +34,7 @@ use super::keymap;
 use super::session::GuestSession;
 use super::settings::{ScalingMode, Settings};
 use super::theme::{self, *};
+use super::title_bar::{self, TitleBar};
 
 /// egui reports scroll in points; the wire uses Windows wheel-delta units.
 /// One notch is roughly 50 points on a typical mouse.
@@ -56,8 +65,8 @@ fn scroll_to_wheel(delta: egui::Vec2) -> ScrollEvent {
     ScrollEvent { dx: -to_wheel(delta.x), dy: to_wheel(delta.y) }
 }
 
-/// Leading blank in a tab label, holding the space the status dot is painted in.
-const DOT_GAP: &str = "   ";
+/// Height of the header, and of the bar that stands in for it in fullscreen.
+const BAR_H: f32 = 36.0;
 
 /// What the session window is asking the app to do.
 #[derive(Default)]
@@ -66,6 +75,19 @@ pub struct SessionWindowActions {
     pub close: Vec<u64>,
     /// The window itself was closed; every session should end.
     pub close_all: bool,
+    /// Hosts renamed from their tab, as endpoint hex and the new name. The
+    /// name belongs to the remembered host, not the tab, so the card under
+    /// Previous connections takes it too.
+    pub rename: Vec<(String, String)>,
+}
+
+/// A session's name being edited where it stands.
+struct Rename {
+    tab_id: u64,
+    text: String,
+    /// Until the field has been drawn once, which is when it takes the focus
+    /// and selects the old name, so typing replaces it.
+    fresh: bool,
 }
 
 /// Handle session shortcuts against this window's own input.
@@ -145,8 +167,12 @@ fn handle_shortcuts(
 
     // Escape always leaves fullscreen, regardless of bindings — it is the
     // universal escape hatch. It deliberately never disconnects: a reflexive
-    // press should not destroy a session.
-    if window.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    // press should not destroy a session. While a tab is being renamed it
+    // cancels the rename instead, and only that.
+    if window.fullscreen
+        && window.renaming.is_none()
+        && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+    {
         window.request_fullscreen(false);
         consumed.push(egui::Key::Escape);
     }
@@ -173,6 +199,20 @@ pub struct SessionWindow {
     /// of the video, and without this a click on a button was also delivered to
     /// whatever was under it on the host.
     toolbar_rect: Option<egui::Rect>,
+    /// The window's own caption; see `title_bar`.
+    title_bar: TitleBar,
+    /// How wide the tools were last frame.
+    ///
+    /// They are laid out from the right edge, and egui lays a row out left to
+    /// right in one pass, so where the row starts depends on how long it turned
+    /// out to be. `None` until measured: that frame is drawn invisibly rather
+    /// than in the wrong place.
+    tools_width: Option<f32>,
+    renaming: Option<Rename>,
+    /// Whether the rename field was drawn this frame. One that was not — its
+    /// tab closed, or the fullscreen bar went away under it — has lost its
+    /// focus without anyone pressing anything, and is dropped.
+    rename_drawn: bool,
 }
 
 impl Default for SessionWindow {
@@ -184,6 +224,10 @@ impl Default for SessionWindow {
             show_stats: false,
             pending_fullscreen: None,
             toolbar_rect: None,
+            title_bar: TitleBar::default(),
+            tools_width: None,
+            renaming: None,
+            rename_drawn: false,
         }
     }
 }
@@ -198,6 +242,11 @@ impl SessionWindow {
         self.fullscreen = false;
         self.pending_fullscreen = None;
         self.show_toolbar = true;
+        // The window goes with the last session, and the next one is a new
+        // window whose caption has to be taken over again.
+        self.title_bar = TitleBar::default();
+        self.tools_width = None;
+        self.renaming = None;
     }
 
     pub fn request_fullscreen(&mut self, on: bool) {
@@ -230,13 +279,19 @@ impl SessionWindow {
         let title =
             tain_core::i18n::plural("session.window_title", sessions.len() as u64, &[]);
 
-        parent.show_viewport_immediate(
-            ViewportId::from_hash_of("tain-sessions"),
+        let builder = self.title_bar.builder(
             egui::ViewportBuilder::default()
-                .with_title(title)
+                .with_title(title.clone())
                 .with_inner_size([1280.0, 760.0])
                 .with_min_inner_size([480.0, 320.0]),
+        );
+
+        parent.show_viewport_immediate(
+            ViewportId::from_hash_of("tain-sessions"),
+            builder,
             |ctx, _class| {
+                let window_buttons = self.title_bar.update(ctx, &title);
+
                 if let Some(on) = self.pending_fullscreen.take() {
                     self.fullscreen = on;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
@@ -278,7 +333,14 @@ impl SessionWindow {
                     &mut actions,
                 );
 
-                self.render_contents(ctx, sessions, immersive, &reserved, &mut actions);
+                self.render_contents(
+                    ctx,
+                    sessions,
+                    immersive,
+                    &reserved,
+                    &mut actions,
+                    window_buttons,
+                );
 
                 // Keep the pointer confined to *this* window while immersive.
                 if immersive.is_active() {
@@ -309,19 +371,35 @@ impl SessionWindow {
         immersive: &mut Immersive,
         reserved: &[egui::Key],
         actions: &mut SessionWindowActions,
+        window_buttons: bool,
     ) {
-        // The tab strip is hidden in fullscreen with a single session — the
-        // point of fullscreen is to see the remote screen and nothing else.
-        let show_tabs = sessions.len() > 1 || !self.fullscreen;
-        if show_tabs {
-            egui::TopBottomPanel::top("session-tabs")
-                .exact_height(32.0)
-                .frame(
-                    egui::Frame::none()
-                        .fill(HEADER_BG)
-                        .inner_margin(egui::Margin::symmetric(8.0, 4.0)),
-                )
-                .show(ctx, |ui| self.render_tabs(ui, sessions, actions));
+        // Decided before anything is drawn, so the frame that ends a rename —
+        // Enter, which is also a key press — does not send that Enter on to
+        // the host as well.
+        let typing = self.renaming.is_some();
+        self.rename_drawn = false;
+
+        if self.fullscreen {
+            // No header, so nothing for the frame to treat as one. The window
+            // has no caption style in fullscreen either, so this is belt and
+            // braces.
+            self.title_bar.publish(ctx, title_bar::Layout::default());
+        } else {
+            egui::TopBottomPanel::top("session-header")
+                .exact_height(BAR_H)
+                .show_separator_line(false)
+                .frame(egui::Frame::none().fill(HEADER_BG))
+                .show(ctx, |ui| {
+                    let row = ui.max_rect();
+                    let mut layout =
+                        self.render_bar(ui, row, sessions, immersive, actions, window_buttons);
+                    // While a menu is open, a click on empty header is how it
+                    // gets dismissed, so the header is all egui's until then.
+                    if !ctx.memory(|m| m.any_popup_open()) {
+                        layout.caption = Some(row);
+                    }
+                    self.title_bar.publish(ctx, layout);
+                });
         }
 
         egui::CentralPanel::default()
@@ -416,7 +494,9 @@ impl SessionWindow {
                         // pointer first delivers a bare click and then presses
                         // Ctrl afterwards — which is every modified click, on
                         // the frame it happens.
-                        if session.sends_keyboard() {
+                        // Not while a name is being typed: those keys are for
+                        // the rename field, and the host would get them all.
+                        if session.sends_keyboard() && !typing {
                             forward_keyboard(session, ui, immersive, reserved);
                         }
                         if session.sends_mouse() && !over_toolbar {
@@ -446,59 +526,339 @@ impl SessionWindow {
                 // to say what happened.
                 render_shared_window_notice(ui, session, viewport);
 
-                self.render_toolbar(ui, viewport, sessions, immersive, actions);
+                self.render_overlay(ui, viewport, sessions, immersive, actions);
             });
+
+        if !self.rename_drawn {
+            self.renaming = None;
+        }
     }
 
+    /// The row of tabs and tools: the window's header, or in fullscreen the
+    /// bar that stands in for it.
+    ///
+    /// Returns where everything clickable in it is, which the frame has to
+    /// leave alone when it decides what drags the window. The caption itself is
+    /// the caller's to fill in: only the header has one.
+    fn render_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: egui::Rect,
+        sessions: &mut [GuestSession],
+        immersive: &mut Immersive,
+        actions: &mut SessionWindowActions,
+        window_buttons: bool,
+    ) -> title_bar::Layout {
+        const PAD: f32 = 8.0;
+        /// Always left between the tabs and the tools, so there is somewhere
+        /// to take hold of the window however many tabs there are.
+        const GRIP: f32 = 32.0;
+
+        let mut layout = title_bar::Layout::default();
+        let buttons = if window_buttons { 3.0 * title_bar::BUTTON_W } else { 0.0 };
+        let tools_right = row.right() - buttons - PAD;
+        let tools_left = (tools_right - self.tools_width.unwrap_or(0.0)).max(row.left() + PAD);
+
+        if let Some(session) = sessions.get_mut(self.active_tab) {
+            let mut tools = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("session-tools")
+                    .max_rect(egui::Rect::from_x_y_ranges(tools_left..=tools_right, row.y_range()))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            // A window too narrow for them clips the tools, rather than letting
+            // them run on under the window buttons.
+            let clip = tools.clip_rect();
+            tools.set_clip_rect(egui::Rect::from_min_max(
+                clip.min,
+                egui::pos2(clip.max.x.min(tools_right), clip.max.y),
+            ));
+            if self.tools_width.is_none() {
+                tools.set_invisible();
+            }
+            // Only the fullscreen bar is over video; the header is gray.
+            theme::chips_over(
+                &mut tools,
+                if self.fullscreen { theme::Backdrop::Video } else { theme::Backdrop::Header },
+            );
+
+            self.render_tools(&mut tools, session, immersive, actions);
+
+            let used = tools.min_rect();
+            if self.tools_width.is_none_or(|w| (w - used.width()).abs() > 0.5) {
+                self.tools_width = Some(used.width());
+                ui.ctx().request_repaint();
+            }
+            layout.controls.push(used);
+        }
+
+        let space = egui::Rect::from_x_y_ranges(
+            row.left() + PAD..=(tools_left - GRIP).max(row.left() + PAD),
+            row.y_range(),
+        );
+        // Immersive mode hands every key to the host before egui sees it, so a
+        // rename field opened then could never be typed into.
+        let can_rename = !immersive.is_active();
+        if sessions.len() > 1 {
+            self.render_tabs(ui, space, sessions, actions, can_rename, &mut layout.controls);
+        } else if let Some(session) = sessions.first() {
+            let title = self.render_title(ui, space, session, actions, can_rename);
+            layout.controls.push(title);
+        }
+
+        // Last, so that they paint over anything that overflowed toward them.
+        if window_buttons {
+            self.render_window_buttons(ui, row, &mut layout);
+        }
+        layout
+    }
+
+    /// The sessions, one tab each, in `space`. Double-clicking one renames it.
+    ///
+    /// Only drawn for two or more: one tab is a control with nothing to switch
+    /// to, and its name is shown anyway — see `render_title`.
     fn render_tabs(
         &mut self,
         ui: &mut egui::Ui,
+        space: egui::Rect,
         sessions: &[GuestSession],
         actions: &mut SessionWindowActions,
+        can_rename: bool,
+        controls: &mut Vec<egui::Rect>,
     ) {
-        ui.horizontal(|ui| {
-            for (index, session) in sessions.iter().enumerate() {
-                let selected = index == self.active_tab;
-                let dot = match session.status() {
-                    s if s.is_active() => LIVE_GREEN,
-                    _ => OFFLINE_RED,
-                };
+        const TAB_H: f32 = 26.0;
+        const GAP: f32 = 4.0;
+        const MAX_W: f32 = 220.0;
+        /// Dot, its margins, and the close button with its own: everything in
+        /// a tab but the name.
+        const CHROME_W: f32 = 48.0;
 
-                // Spaces, not a bullet character. The dot the user sees is
-                // painted below — it has to be, because it carries the colour
-                // that says live or offline. The text only reserves room for
-                // it, and a `●` doing that job rendered as an empty box in
-                // egui's bundled fonts, sitting behind the real dot.
-                let response = ui.selectable_label(
-                    selected,
-                    RichText::new(format!("{DOT_GAP}{}", session.label)).color(if selected {
-                        TEXT
-                    } else {
-                        TEXT_DIM
-                    }),
-                );
-                ui.painter().circle_filled(
-                    response.rect.left_center() + egui::vec2(9.0, 0.0),
-                    3.5,
-                    dot,
-                );
-                if response.clicked() {
-                    self.active_tab = index;
-                }
+        // Shared out equally once they no longer fit, the way browsers do it:
+        // a tab that kept its width would be the only one left readable, at
+        // the expense of the ones that then cannot be found.
+        let count = sessions.len() as f32;
+        let share = ((space.width() - GAP * (count - 1.0)) / count).max(0.0);
+        let painter = ui.painter_at(space);
+        let mut x = space.left();
 
-                if ui
-                    .small_button("×")
-                    .on_hover_text(t!("session.close_tab"))
-                    .clicked()
-                {
-                    actions.close.push(session.tab_id);
-                }
-                ui.add_space(6.0);
+        for (index, session) in sessions.iter().enumerate() {
+            let selected = index == self.active_tab;
+            let renaming = self.renaming.as_ref().is_some_and(|r| r.tab_id == session.tab_id);
+            let text = RichText::new(&session.label).color(if selected { TEXT } else { TEXT_DIM });
+            let natural = egui::WidgetText::from(text.clone())
+                .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+                .size()
+                .x
+                + CHROME_W;
+            // A name being typed gets all the room a tab may have, so the field
+            // is not as cramped as the name it is replacing.
+            let width = if renaming { MAX_W } else { natural.min(MAX_W) }.min(share);
+
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x, space.center().y - TAB_H / 2.0),
+                egui::vec2(width, TAB_H),
+            );
+            x += width + GAP;
+            let close_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.right() - 13.0, rect.center().y),
+                egui::vec2(18.0, 18.0),
+            );
+
+            // The tab first and its close button second: where two widgets
+            // overlap, egui gives the click to the one added last.
+            let tab = ui.interact(
+                rect.intersect(space),
+                ui.id().with(("session-tab", session.tab_id)),
+                egui::Sense::click(),
+            );
+            let close = ui.interact(
+                close_rect.intersect(space),
+                ui.id().with(("session-tab-close", session.tab_id)),
+                egui::Sense::click(),
+            );
+
+            let fill = if selected {
+                CARD_BG_HOVER
+            } else if tab.contains_pointer() {
+                CARD_INNER_BG
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            painter.rect_filled(rect, 6.0, fill);
+            painter.circle_filled(
+                egui::pos2(rect.left() + 12.0, rect.center().y),
+                3.5,
+                status_colour(session),
+            );
+
+            let text_left = rect.left() + 22.0;
+            let text_rect = egui::Rect::from_min_max(
+                egui::pos2(text_left, rect.top() + 2.0),
+                egui::pos2((close_rect.left() - 4.0).max(text_left), rect.bottom() - 2.0),
+            );
+            if can_rename && tab.double_clicked() {
+                self.start_rename(session);
             }
-        });
+            let mut elided = false;
+            if self.renaming.as_ref().is_some_and(|r| r.tab_id == session.tab_id) {
+                self.render_rename(ui, text_rect.intersect(space), session, actions);
+            } else {
+                let galley = egui::WidgetText::from(text).into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Truncate),
+                    text_rect.width(),
+                    egui::TextStyle::Body,
+                );
+                elided = galley.elided;
+                painter.galley(
+                    egui::pos2(text_left, rect.center().y - galley.size().y / 2.0),
+                    galley,
+                    TEXT,
+                );
+            }
+
+            if close.hovered() {
+                painter.circle_filled(close_rect.center(), 9.0, egui::Color32::from_white_alpha(24));
+            }
+            let ink = if close.hovered() { TEXT } else { TEXT_DIM };
+            cross(&painter, close_rect.center(), 3.5, egui::Stroke::new(1.2, ink));
+
+            let close_clicked = close.clicked();
+            close.on_hover_text(t!("session.close_tab"));
+            let tab_clicked = tab.clicked();
+            if elided {
+                tab.on_hover_text(&session.label);
+            }
+            if close_clicked {
+                actions.close.push(session.tab_id);
+            } else if tab_clicked {
+                self.active_tab = index;
+            }
+            controls.push(rect.intersect(space));
+        }
     }
 
-    fn render_toolbar(
+    /// The session's name where the tabs would be, when there is only one.
+    ///
+    /// Dragging it moves the window, as dragging a title does, and
+    /// double-clicking renames the session as it would a tab. Returns where it
+    /// is, which the frame leaves to egui rather than treating as caption.
+    fn render_title(
+        &mut self,
+        ui: &mut egui::Ui,
+        space: egui::Rect,
+        session: &GuestSession,
+        actions: &mut SessionWindowActions,
+        can_rename: bool,
+    ) -> egui::Rect {
+        let middle = space.center().y;
+        let painter = ui.painter_at(space);
+        painter.circle_filled(egui::pos2(space.left() + 6.0, middle), 3.5, status_colour(session));
+        let text_left = space.left() + 16.0;
+
+        if self.renaming.as_ref().is_some_and(|r| r.tab_id == session.tab_id) {
+            let field = egui::Rect::from_x_y_ranges(
+                text_left..=space.right().max(text_left),
+                (middle - 11.0)..=(middle + 11.0),
+            );
+            self.render_rename(ui, field, session, actions);
+            return field;
+        }
+
+        let galley = egui::WidgetText::from(RichText::new(&session.label).color(TEXT)).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            (space.right() - text_left).max(0.0),
+            egui::TextStyle::Body,
+        );
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(space.left(), middle - 12.0),
+            egui::pos2((text_left + galley.size().x + 4.0).min(space.right()), middle + 12.0),
+        );
+        let elided = galley.elided;
+        painter.galley(egui::pos2(text_left, middle - galley.size().y / 2.0), galley, TEXT);
+
+        // # A control, so that it can be double-clicked
+        //
+        // As part of the caption it would drag the window for free, but
+        // Windows would also take the double-click, to maximize. So egui takes
+        // it, and hands a drag back to Windows' own move loop, which snaps the
+        // same way a caption drag does.
+        let resp = ui.interact(
+            rect,
+            ui.id().with(("session-title", session.tab_id)),
+            egui::Sense::click_and_drag(),
+        );
+        if resp.drag_started() && !self.fullscreen {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if can_rename && resp.double_clicked() {
+            self.start_rename(session);
+        }
+        if elided {
+            resp.on_hover_text(&session.label);
+        }
+        rect
+    }
+
+    fn start_rename(&mut self, session: &GuestSession) {
+        self.renaming =
+            Some(Rename { tab_id: session.tab_id, text: session.label.clone(), fresh: true });
+    }
+
+    /// The field that stands in for a session's name while it is renamed.
+    ///
+    /// Enter or clicking away keeps the new name; Escape, or leaving it empty,
+    /// keeps the old one.
+    fn render_rename(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        session: &GuestSession,
+        actions: &mut SessionWindowActions,
+    ) {
+        self.rename_drawn = true;
+        let Some(rename) = self.renaming.as_mut() else { return };
+
+        let id = ui.id().with(("session-rename", session.tab_id));
+        let mut field = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let mut output = egui::TextEdit::singleline(&mut rename.text)
+            .id(id)
+            .text_color(TEXT)
+            .margin(egui::vec2(4.0, 2.0))
+            .desired_width(rect.width())
+            .show(&mut field);
+
+        let mut finished = false;
+        if rename.fresh {
+            rename.fresh = false;
+            output.response.request_focus();
+            let all = egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(rename.text.chars().count()),
+            );
+            output.state.cursor.set_char_range(Some(all));
+            output.state.store(ui.ctx(), id);
+        } else if output.response.lost_focus() {
+            finished = true;
+            let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let name = rename.text.trim();
+            if !cancelled && !name.is_empty() && name != session.label {
+                actions.rename.push((session.endpoint_hex.clone(), name.to_string()));
+            }
+        }
+        if finished {
+            self.renaming = None;
+        }
+    }
+
+    /// What is drawn over the picture: in fullscreen, the bar that stands in
+    /// for the header; windowed, only the stats row, once asked for.
+    fn render_overlay(
         &mut self,
         ui: &mut egui::Ui,
         viewport: egui::Rect,
@@ -509,15 +869,36 @@ impl SessionWindow {
         // How close to the top edge counts as reaching for the toolbar.
         const REVEAL_BAND: f32 = 90.0;
 
-        let near_top = ui
-            .ctx()
-            .pointer_latest_pos()
-            .is_some_and(|p| p.y < viewport.top() + REVEAL_BAND);
+        if !self.fullscreen {
+            // The header holds the bar, so the picture is left alone apart
+            // from the numbers.
+            self.toolbar_rect = None;
+            if self.show_stats
+                && let Some(session) = sessions.get(self.active_tab)
+            {
+                let row = egui::Rect::from_min_size(
+                    viewport.left_top(),
+                    egui::vec2(viewport.width(), BAR_H),
+                );
+                paint_toolbar_backdrop(ui.painter(), row);
+                render_stats_in(ui, row, session);
+                self.toolbar_rect = Some(row);
+            }
+            return;
+        }
 
-        // Collapsed, or auto-hidden in fullscreen: leave a small handle that
+        // A name being typed into the bar keeps it down: the pointer has no
+        // reason to stay up there while the keyboard is busy.
+        let near_top = self.renaming.is_some()
+            || ui
+                .ctx()
+                .pointer_latest_pos()
+                .is_some_and(|p| p.y < viewport.top() + REVEAL_BAND);
+
+        // Collapsed, or not being reached for: leave a small handle that
         // appears when the pointer comes near, so the bar is discoverable
         // rather than only reachable by remembering the shortcut.
-        if !self.show_toolbar || (self.fullscreen && !near_top) {
+        if !self.show_toolbar || !near_top {
             self.toolbar_rect = None;
             if near_top {
                 self.render_reveal_handle(ui, viewport);
@@ -525,34 +906,48 @@ impl SessionWindow {
             return;
         }
 
-        let Some(session) = sessions.get_mut(self.active_tab) else { return };
-        // The toolbar is where the input toggles live, so it is also where they
-        // first learn what the host permitted.
-        session.seed_input_toggles();
-        let tab_id = session.tab_id;
-
-        const ROW: f32 = 38.0;
         let rows = if self.show_stats { 2.0 } else { 1.0 };
         let bar = egui::Rect::from_min_size(
             viewport.left_top(),
-            egui::vec2(viewport.width(), ROW * rows),
+            egui::vec2(viewport.width(), BAR_H * rows),
         );
         self.toolbar_rect = Some(bar);
+        // # The header's row, on the fading backdrop
+        //
+        // The same tabs and tools as windowed, but not the header's flat fill:
+        // here they sit on live video, and a solid slab across it would be the
+        // header coming back.
         paint_toolbar_backdrop(ui.painter(), bar);
 
         // Drawn after the backdrop and before the controls, so the row's own
         // layout does not have to leave a gap for something centred.
         self.render_collapse_handle(ui, bar);
 
-        let first_row = egui::Rect::from_min_size(bar.left_top(), egui::vec2(bar.width(), ROW));
-        let mut content = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(first_row.shrink2(egui::vec2(12.0, 6.0)))
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        );
+        let row = egui::Rect::from_min_size(bar.left_top(), egui::vec2(bar.width(), BAR_H));
+        self.render_bar(ui, row, sessions, immersive, actions, false);
+
+        if self.show_stats
+            && let Some(session) = sessions.get(self.active_tab)
+        {
+            render_stats_in(ui, egui::Rect::from_min_size(row.left_bottom(), row.size()), session);
+        }
+    }
+
+    /// The controls for the session on screen, left to right.
+    fn render_tools(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &mut GuestSession,
+        immersive: &mut Immersive,
+        actions: &mut SessionWindowActions,
+    ) {
+        // The toolbar is where the input toggles live, so it is also where they
+        // first learn what the host permitted.
+        session.seed_input_toggles();
+        let tab_id = session.tab_id;
 
         let (w, h) = session.remote_size();
-        content.label(RichText::new(format!("{w}×{h}")).size(12.0).color(TEXT));
+        ui.label(RichText::new(format!("{w}×{h}")).size(12.0).color(TEXT));
 
         // # Next to the size, not in the stats
         //
@@ -566,31 +961,102 @@ impl SessionWindow {
         // has to say, and the full path is on hover.
         match session.relay_warning() {
             Some(advice) => {
-                content.add_space(10.0);
-                content
-                    .label(RichText::new("⚠ relayed").size(12.0).color(AMBER))
+                ui.add_space(10.0);
+                ui.label(RichText::new("⚠ relayed").size(12.0).color(AMBER))
                     .on_hover_text(advice);
             }
             None => {
                 if let Some(branch) = session.found_via() {
-                    content.add_space(10.0);
-                    content
-                        .label(RichText::new(branch.label()).size(12.0).color(LIVE_GREEN))
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(branch.label()).size(12.0).color(LIVE_GREEN))
                         .on_hover_text(session.path_summary());
                 }
             }
         }
 
-        render_display_picker(&mut content, session);
+        render_display_picker(ui, session);
 
-        content.add_space(12.0);
-        render_input_toggles(&mut content, session, &mut self.show_stats);
+        ui.add_space(12.0);
+        render_input_toggles(ui, session, &mut self.show_stats);
 
-        let mut toggle_fullscreen = false;
-        content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Icons rather than words, to match the toggles on the left half of
-            // the bar. Disconnect keeps a distinct glyph because it is the one
-            // control here that ends something.
+        if session.loopback {
+            ui.add_space(12.0);
+            ui.label(RichText::new(i18n::text("session.loopback")).size(12.0).color(AMBER))
+                .on_hover_text(i18n::text("session.loopback_hint"));
+        }
+
+        ui.add_space(12.0);
+        for mode in ScalingMode::ALL {
+            let selected = session.scaling == mode;
+            if theme::icon_toggle(
+                ui,
+                16.0,
+                if selected { theme::IconState::On } else { theme::IconState::Off },
+                match mode {
+                    ScalingMode::Fit => egui::include_image!("../../assets/fit.svg"),
+                    ScalingMode::Actual => egui::include_image!("../../assets/1to1.svg"),
+                },
+                mode.description(),
+            )
+            .clicked()
+            {
+                session.set_scaling(mode);
+            }
+            ui.add_space(4.0);
+        }
+
+        ui.add_space(6.0);
+        let on = immersive.is_active();
+        if theme::icon_toggle(
+            ui,
+            16.0,
+            if on { theme::IconState::On } else { theme::IconState::Off },
+            egui::include_image!("../../assets/immersive_mode.svg"),
+            if on {
+                t!("session.immersive_on")
+            } else {
+                t!("session.immersive_off")
+            },
+        )
+        .clicked()
+        {
+            immersive.set_active(!on);
+            if on {
+                // Leaving immersive mode: anything the hook was holding has
+                // to be let go on the host, or it stays down there forever.
+                session.release_held_keys();
+            }
+        }
+
+        ui.add_space(6.0);
+        // Two drawings rather than one toggled state: the icon shows what the
+        // click will *do*, which for a mode switch is clearer than showing
+        // which mode is current.
+        let full = self.fullscreen;
+        if theme::icon_toggle(
+            ui,
+            16.0,
+            theme::IconState::Off,
+            if full {
+                egui::include_image!("../../assets/windowed.svg")
+            } else {
+                egui::include_image!("../../assets/fullscreen.svg")
+            },
+            if full { t!("session.leave_fullscreen") } else { t!("session.go_fullscreen") },
+        )
+        .clicked()
+        {
+            self.toggle_fullscreen();
+        }
+
+        // # Disconnect only in fullscreen
+        //
+        // Windowed, the window's close button ends a lone session and a tab's
+        // close button ends one of several, so a disconnect button would only
+        // repeat one of them. Fullscreen has neither. It keeps a distinct
+        // glyph because it is the one control here that ends something.
+        if full {
+            ui.add_space(6.0);
             if theme::icon_toggle(
                 ui,
                 16.0,
@@ -602,98 +1068,86 @@ impl SessionWindow {
             {
                 actions.close.push(tab_id);
             }
-
-            ui.add_space(6.0);
-            // Two drawings rather than one toggled state: the icon shows what
-            // the click will *do*, which for a mode switch is clearer than
-            // showing which mode is current.
-            let full = self.fullscreen;
-            if theme::icon_toggle(
-                ui,
-                16.0,
-                theme::IconState::Off,
-                if full {
-                    egui::include_image!("../../assets/windowed.svg")
-                } else {
-                    egui::include_image!("../../assets/fullscreen.svg")
-                },
-                if full { t!("session.leave_fullscreen") } else { t!("session.go_fullscreen") },
-            )
-            .clicked()
-            {
-                toggle_fullscreen = true;
-            }
-
-            ui.add_space(6.0);
-            let on = immersive.is_active();
-            if theme::icon_toggle(
-                ui,
-                16.0,
-                if on { theme::IconState::On } else { theme::IconState::Off },
-                egui::include_image!("../../assets/immersive_mode.svg"),
-                if on {
-                    t!("session.immersive_on")
-                } else {
-                    t!("session.immersive_off")
-                },
-            )
-            .clicked()
-            {
-                immersive.set_active(!on);
-                if on {
-                    // Leaving immersive mode: anything the hook was holding has
-                    // to be let go on the host, or it stays down there forever.
-                    session.release_held_keys();
-                }
-            }
-
-            ui.add_space(10.0);
-            // Reversed: in a right-to-left layout the first item added lands
-            // rightmost, so iterating forwards would render 1:1 before Fit.
-            for mode in ScalingMode::ALL.into_iter().rev() {
-                let selected = session.scaling == mode;
-                if theme::icon_toggle(
-                    ui,
-                    16.0,
-                    if selected { theme::IconState::On } else { theme::IconState::Off },
-                    match mode {
-                        ScalingMode::Fit => egui::include_image!("../../assets/fit.svg"),
-                        ScalingMode::Actual => egui::include_image!("../../assets/1to1.svg"),
-                    },
-                    mode.description(),
-                )
-                .clicked()
-                {
-                    session.set_scaling(mode);
-                }
-                ui.add_space(4.0);
-            }
-
-            if session.loopback {
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(i18n::text("session.loopback")).size(12.0).color(AMBER),
-                )
-                .on_hover_text(i18n::text("session.loopback_hint"));
-            }
-        });
-
-        if self.show_stats {
-            let second = egui::Rect::from_min_size(
-                bar.left_top() + egui::vec2(0.0, ROW),
-                egui::vec2(bar.width(), ROW),
-            );
-            let mut stats = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(second.shrink2(egui::vec2(12.0, 6.0)))
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            render_stats_row(&mut stats, session);
         }
+    }
 
-        if toggle_fullscreen {
-            self.toggle_fullscreen();
+    /// Minimize, maximize and close, drawn the way Windows draws its own.
+    ///
+    /// Painted rather than set in a font: Windows' glyphs are in Segoe Fluent
+    /// Icons, which egui does not have, and a few strokes on the pixel grid are
+    /// crisper than any substitute at this size.
+    fn render_window_buttons(
+        &self,
+        ui: &mut egui::Ui,
+        row: egui::Rect,
+        layout: &mut title_bar::Layout,
+    ) {
+        /// Windows 11's close-button red.
+        const CLOSE_RED: egui::Color32 = egui::Color32::from_rgb(0xC4, 0x2B, 0x1C);
+        /// Half the glyphs' width.
+        const HALF: f32 = 5.0;
+
+        let w = title_bar::BUTTON_W;
+        let button = |n: f32| {
+            egui::Rect::from_min_size(
+                egui::pos2(row.right() - (3.0 - n) * w, row.top()),
+                egui::vec2(w, row.height()),
+            )
+        };
+        let (minimize, maximize, close) = (button(0.0), button(1.0), button(2.0));
+
+        let ctx = ui.ctx().clone();
+        let painter = ui.painter();
+        // Dimmed while another window is in front, as Windows' own are.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        let stroke = hairline(&ctx, if focused { TEXT } else { TEXT_DIM });
+
+        let resp = ui.interact(minimize, ui.id().with("window-minimize"), egui::Sense::click());
+        painter.rect_filled(minimize, 0.0, button_fill(resp.hovered(), resp.is_pointer_button_down_on()));
+        let c = crisp(painter, minimize.center());
+        painter.line_segment([c - egui::vec2(HALF, 0.0), c + egui::vec2(HALF, 0.0)], stroke);
+        if resp.clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
+        layout.controls.push(minimize);
+
+        // Windows hit-tests this one itself, for snap layouts, so egui never
+        // sees the pointer over it: the frame says what state it is in, and
+        // the frame clicks it.
+        let (hovered, pressed) = self.title_bar.maximize_state();
+        painter.rect_filled(maximize, 0.0, button_fill(hovered, pressed));
+        let c = crisp(painter, maximize.center());
+        if ctx.input(|i| i.viewport().maximized).unwrap_or(false) {
+            // Restore: a square with another behind it, up and to the right.
+            let front = egui::Rect::from_min_max(
+                crisp(painter, c + egui::vec2(-HALF, -HALF + 2.0)),
+                crisp(painter, c + egui::vec2(HALF - 2.0, HALF)),
+            );
+            painter.rect_stroke(front, 1.0, stroke);
+            let back = front.translate(egui::vec2(2.0, -2.0));
+            painter.line_segment([back.left_top(), back.right_top()], stroke);
+            painter.line_segment([back.right_top(), back.right_bottom()], stroke);
+        } else {
+            let square = egui::Rect::from_min_max(
+                crisp(painter, c - egui::vec2(HALF, HALF)),
+                crisp(painter, c + egui::vec2(HALF, HALF)),
+            );
+            painter.rect_stroke(square, 1.0, stroke);
+        }
+        layout.maximize = Some(maximize);
+
+        let resp = ui.interact(close, ui.id().with("window-close"), egui::Sense::click());
+        let lit = resp.hovered() || resp.is_pointer_button_down_on();
+        if lit {
+            painter.rect_filled(close, 0.0, CLOSE_RED);
+        }
+        let ink = if lit { hairline(&ctx, egui::Color32::WHITE) } else { stroke };
+        cross(painter, close.center(), HALF, ink);
+        if resp.clicked() {
+            // The same as closing it any other way: every session ends.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        layout.controls.push(close);
     }
 }
 
@@ -794,6 +1248,53 @@ fn paint_toolbar_backdrop(painter: &egui::Painter, rect: egui::Rect) {
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(1, 2, 3);
     painter.add(mesh);
+}
+
+/// The stats row in `row`, inset the way the bar's own row is.
+fn render_stats_in(ui: &mut egui::Ui, row: egui::Rect, session: &GuestSession) {
+    let mut stats = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(row.shrink2(egui::vec2(12.0, 6.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    render_stats_row(&mut stats, session);
+}
+
+/// Live or not, as the dot beside a session's name says it.
+fn status_colour(session: &GuestSession) -> egui::Color32 {
+    if session.status().is_active() { LIVE_GREEN } else { OFFLINE_RED }
+}
+
+/// An × centred on `at`, `half` points from the middle to each corner.
+fn cross(painter: &egui::Painter, at: egui::Pos2, half: f32, stroke: egui::Stroke) {
+    painter.line_segment([at + egui::vec2(-half, -half), at + egui::vec2(half, half)], stroke);
+    painter.line_segment([at + egui::vec2(-half, half), at + egui::vec2(half, -half)], stroke);
+}
+
+/// A window button's background: none until the pointer is on it.
+fn button_fill(hovered: bool, pressed: bool) -> egui::Color32 {
+    if pressed {
+        egui::Color32::from_white_alpha(30)
+    } else if hovered {
+        egui::Color32::from_white_alpha(16)
+    } else {
+        egui::Color32::TRANSPARENT
+    }
+}
+
+/// A line a whole number of pixels wide: one at 100%, two at 200%.
+///
+/// A width in points lands between pixels on any other scale, and a glyph
+/// this small turns to grey smear when it does.
+fn hairline(ctx: &Context, colour: egui::Color32) -> egui::Stroke {
+    let ppp = ctx.pixels_per_point();
+    egui::Stroke::new(ppp.round().max(1.0) / ppp, colour)
+}
+
+/// `at`, moved to the middle of the pixel it falls in, so a hairline through
+/// it covers that pixel rather than half of each neighbour.
+fn crisp(painter: &egui::Painter, at: egui::Pos2) -> egui::Pos2 {
+    egui::pos2(painter.round_to_pixel_center(at.x), painter.round_to_pixel_center(at.y))
 }
 
 /// The tab that collapses the toolbar, and the one that brings it back.
@@ -961,9 +1462,6 @@ fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stat
     // right as *what I send* — pointer, keyboard — then *what I see* — the
     // host's pointer, its sound. The numbers are the first of the second group:
     // they are about this connection, not about anything being sent to it.
-    //
-    // It also stops the one toggle that changes the toolbar's own height from
-    // sitting next to a control that grows on hover.
     let stats_on = *show_stats;
     if theme::icon_toggle(
         ui,
@@ -1009,9 +1507,15 @@ fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stat
 ///
 /// # Why it appears on hover rather than living there
 ///
-/// The toolbar sits over the video, and every control on it is a permanent hole
-/// in the picture. A slider is much wider than an icon, and volume is set once
-/// and then left — so it earns its space only while someone is reaching for it.
+/// A slider is much wider than an icon, and volume is set once and then left —
+/// so it earns its space only while someone is reaching for it.
+///
+/// # Why below the icon rather than beside it
+///
+/// The tools are laid out from the right edge. A slider opening inside the row
+/// would widen it and push every control left of it sideways — the speaker
+/// included, out from under the pointer, which would close the slider again the
+/// frame after it opened. In a layer of its own it takes no room in the row.
 ///
 /// The hover region is the icon *and the slider together*, remembered from the
 /// last frame. Keying it off the icon alone would make the slider vanish the
@@ -1050,27 +1554,40 @@ fn volume_control(ui: &mut egui::Ui, session: &mut GuestSession) {
 
     let mut hot = icon.rect;
     if icon.hovered() || near {
-        ui.add_space(4.0);
-        ui.spacing_mut().slider_width = 64.0;
-        let slider = ui.add(
-            egui::Slider::new(&mut session.volume, 0.0..=1.0)
-                .show_value(false)
-                .custom_formatter(|_, _| String::new()),
-        );
-        if slider.changed() {
-            // Moving the slider up is an unambiguous request to hear it, so it
-            // undoes the mute rather than leaving the user dragging a control
-            // that does nothing.
-            if session.volume > 0.0 {
-                session.want_sound = true;
-            }
-            session.apply_sound_preference();
-        }
-        hot = hot.union(slider.rect);
-        slider.on_hover_text(t!(
-            "session.volume",
-            percent = (session.volume * 100.0).round()
-        ));
+        // Over the picture, which is fine: being a layer above it is also what
+        // keeps the pointer on the slider from reaching the host.
+        let area = egui::Area::new(hot_id.with("slider"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::CENTER_TOP)
+            .fixed_pos(icon.rect.center_bottom() + egui::vec2(0.0, 4.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_black_alpha(235))
+                    .rounding(4.0)
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().slider_width = 64.0;
+                        let slider = ui.add(
+                            egui::Slider::new(&mut session.volume, 0.0..=1.0)
+                                .show_value(false)
+                                .custom_formatter(|_, _| String::new()),
+                        );
+                        if slider.changed() {
+                            // Moving the slider up is an unambiguous request to
+                            // hear it, so it undoes the mute rather than leaving
+                            // the user dragging a control that does nothing.
+                            if session.volume > 0.0 {
+                                session.want_sound = true;
+                            }
+                            session.apply_sound_preference();
+                        }
+                        slider.on_hover_text(t!(
+                            "session.volume",
+                            percent = (session.volume * 100.0).round()
+                        ));
+                    });
+            });
+        hot = hot.union(area.response.rect);
     }
     // A little larger than the controls, so crossing the gap between them does
     // not count as leaving.

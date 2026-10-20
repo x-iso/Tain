@@ -241,7 +241,11 @@ The timeout **denies** rather than downgrading. An unattended machine must not e
 
 **Colour tracks confidence; the label tracks state; pressability is separate from both.** The old card coloured the triangle by status, so a perfectly usable row got a red triangle that reads as "broken". Green now means *measured and confirmed*, and everything else is grey or amber — but an unreachable or stale row is still pressable, because the probe is a snapshot and the machine may have come back in the last few seconds. Refusing the attempt on our own guess would be the same overreach in a new place.
 
-**A published host name never overwrites a name the user typed.** `adopt_host_name` only replaces the generated `PC ABABABAB` placeholder. Renaming a machine is deliberate, and losing it on every reconnect would make the rename pointless.
+**A published host name never overwrites a name the user typed.** `adopt_host_name` only replaces the number a nameless host goes by. Renaming a machine is deliberate, and losing it on every reconnect would make the rename pointless.
+
+**A nameless host is "Host #3", not its endpoint.** The stand-in used to be `PC ABABABAB`, eight hex digits of the endpoint id — stable and unique, and meaningless to a person; in a session tab it never fitted. `SavedConnection::number` is kept per row, handed out lowest-free so a forgotten host's number is reused, and cleared for good by the first real name from either side — which is also how `adopt_host_name` tells it from a typed name, now that there is no derivable string to compare against. Rows an older build left on the old placeholder are numbered on load, oldest first. Formatted at display time through `session.host_number`, so it follows the language.
+
+**The tab says what the card says.** A session's tab takes its name from the host's row every frame, and renaming the tab in place (double-click) renames the row, so the two cannot disagree. An empty name is not adopted by the tab: the card renames on every keystroke, and an empty name is one halfway through being retyped.
 
 **Gotcha**: a store only writes to disk if it was **loaded** from disk — `ConnectionStore::new()` carries no path and `save()` is a no-op for it. The mutating methods persist as a side effect, so before that distinction existed the unit tests wrote their fixtures into the developer's own `connections.json`; 62 rows named "PC" appeared in the running app. Any test touching the store must build it with `new()`, and `AppState::new()` (which loads the real file) has to be overridden — see `app_with_scratch_connections`.
 
@@ -271,7 +275,7 @@ The timeout **denies** rather than downgrading. An unattended machine must not e
 
 **Icons** come from `tain-cli/assets/*.svg` via `egui_extras` with the `svg` feature; `egui_extras::install_image_loaders` must be called before the first `include_image!`. The palette in `theme.rs` is lifted from those SVGs so hand-drawn chrome matches imported art.
 
-**Window decorations stay native.** Matching the mockup's integrated title bar would mean `with_decorations(false)` plus hand-rolled drag and resize, costing Windows snap layouts and resize borders. Not worth it — so the header carries no logo row (the mark is the window icon instead, see `gui/icon.rs`) and settings sits in its own rule-separated section pinned to the right window edge.
+**Window decorations stay native** in the main window. Matching the mockup's integrated title bar would mean `with_decorations(false)` plus hand-rolled drag and resize, costing Windows snap layouts and resize borders. Not worth it — so the header carries no logo row (the mark is the window icon instead, see `gui/icon.rs`) and settings sits in its own rule-separated section pinned to the right window edge. The session window does take its caption over, by a route that keeps both — see "The Session Window Draws Its Own Title Bar".
 
 **The window icon is rasterised by hand** rather than through an SVG library. `usvg` 0.37 splits parsing across several crates, and the mark is three flat shapes in one colour — `gui/icon.rs` fills them directly with 4× supersampling. Keep it in sync if `logo.svg` changes; its tests assert specific pixels.
 
@@ -2722,3 +2726,46 @@ turn it off.
 shortcut and the window losing the foreground both end immersive mode, and both
 now drop capture as well — ending the mode while leaving the cursor hidden and
 pinned is indistinguishable from the escape having failed.
+
+## The Session Window Draws Its Own Title Bar
+
+**Decision**: the session window's tabs and tools share the row Windows would
+spend on its caption, with minimize, maximize and close at the end of it. In
+fullscreen there is no header, and the same row comes down over the picture on
+the fading backdrop when the pointer reaches the top. Tabs appear only with two
+or more sessions; one session shows its name instead. Disconnect is only in the
+fullscreen bar, because windowed the window's or the tab's close button already
+does it.
+
+**Not `with_decorations(false)`.** That is what the main window rejected, and
+the reasons were right: winit then makes the whole window client area, so the
+resize borders outside the window go, the shadow goes, and Windows 11 cannot
+offer snap layouts over a maximize button it cannot find. For a remote desktop
+it is worse than for most apps — the grips would have to move inside the window,
+onto the edges of the remote screen, where the host's taskbar and scrollbars are.
+
+**The native frame stays and only the caption goes.** `gui/title_bar.rs`
+subclasses the window and answers `WM_NCCALCSIZE` with the default frame minus
+its top, so the other three borders stay outside the window, and
+`WM_NCHITTEST` with what egui published that frame: empty header is
+`HTCAPTION`, which makes dragging, double-click, the system menu and Aero Snap
+Windows' own; our maximize button is `HTMAXBUTTON`, which brings snap layouts.
+A strip at the top stands in for the top border. This is how Windows Terminal
+does it.
+
+**Gotcha**: egui hands out the main window's handle only. The session window
+is found by its title among the interface thread's windows, while still hidden —
+it is created invisible and shown once the caption is gone, so nobody sees the
+native one for a frame. If it cannot be found, it is shown with Windows' title
+bar, and the header draws no window buttons of its own.
+
+**Gotcha**: the maximize button is hit-tested by Windows, so egui never sees
+the pointer over it and cannot light it up. The subclass tracks hover and press
+from the non-client mouse messages, and handles the click itself — the default
+procedure would run its own modal loop and draw a Windows 7 button over ours.
+
+**Gotcha**: the tools are laid out from the right, which egui cannot do in one
+left-to-right pass, so their width is measured each frame and the row placed by
+last frame's. Anything that grows inside the row would shove every control left
+of it sideways, so the volume slider now opens below the speaker in a layer of
+its own instead of beside it.

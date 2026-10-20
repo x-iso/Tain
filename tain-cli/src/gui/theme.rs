@@ -298,6 +298,38 @@ pub fn icon(ui: &mut Ui, size: f32, src: egui::ImageSource<'_>) {
     }
 }
 
+/// What a row of [`icon_toggle`]s is drawn on.
+pub enum Backdrop {
+    /// The session window's gray header.
+    Header,
+    /// The fading black bar over the picture, in fullscreen.
+    Video,
+}
+
+/// Choose the chips behind every toggle drawn in `ui` from here on: the one
+/// behind a lit toggle, and the one behind an unlit toggle being hovered.
+///
+/// # Why they darken on the header and lighten on the video
+///
+/// A lit chip has to stand apart from what surrounds it without competing with
+/// the icon on it. On the gray header a light chip rises toward the icon's own
+/// white and bleaches it out; a dark one sinks the button in instead, the way a
+/// key that is down looks. Over black video there is nothing darker to sink
+/// into, so there it stays light, and faint enough to leave the art its
+/// contrast.
+///
+/// Carried in the `Ui`'s widget visuals rather than passed to every toggle:
+/// the row decides, once, and everything drawn in it follows.
+pub fn chips_over(ui: &mut Ui, backdrop: Backdrop) {
+    let (lit, hovered) = match backdrop {
+        Backdrop::Header => (Color32::from_black_alpha(90), Color32::from_black_alpha(45)),
+        Backdrop::Video => (Color32::from_white_alpha(22), Color32::from_white_alpha(12)),
+    };
+    let widgets = &mut ui.visuals_mut().widgets;
+    widgets.active.weak_bg_fill = lit;
+    widgets.hovered.weak_bg_fill = hovered;
+}
+
 /// A clickable icon carrying one of three states.
 ///
 /// # Why three and not two
@@ -332,12 +364,14 @@ pub fn icon_toggle(
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size) + padding * 2.0, sense);
 
     if ui.is_rect_visible(rect) {
+        // Set by whoever owns the row, for what is behind it — see `chips_over`.
+        let chips = &ui.visuals().widgets;
         match state {
             IconState::On => {
-                ui.painter().rect_filled(rect, 4.0, Color32::from_white_alpha(30));
+                ui.painter().rect_filled(rect, 4.0, chips.active.weak_bg_fill);
             }
             IconState::Off if resp.hovered() => {
-                ui.painter().rect_filled(rect, 4.0, Color32::from_white_alpha(16));
+                ui.painter().rect_filled(rect, 4.0, chips.hovered.weak_bg_fill);
             }
             _ => {}
         }
