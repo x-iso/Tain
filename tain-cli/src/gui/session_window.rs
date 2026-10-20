@@ -755,12 +755,12 @@ impl SessionWindow {
         let painter = ui.painter_at(space);
         painter.circle_filled(egui::pos2(space.left() + 6.0, middle), 3.5, status_colour(session));
         let text_left = space.left() + 16.0;
+        let field = egui::Rect::from_x_y_ranges(
+            text_left..=space.right().max(text_left),
+            (middle - 11.0)..=(middle + 11.0),
+        );
 
         if self.renaming.as_ref().is_some_and(|r| r.tab_id == session.tab_id) {
-            let field = egui::Rect::from_x_y_ranges(
-                text_left..=space.right().max(text_left),
-                (middle - 11.0)..=(middle + 11.0),
-            );
             self.render_rename(ui, field, session, actions);
             return field;
         }
@@ -775,8 +775,6 @@ impl SessionWindow {
             egui::pos2(space.left(), middle - 12.0),
             egui::pos2((text_left + galley.size().x + 4.0).min(space.right()), middle + 12.0),
         );
-        let elided = galley.elided;
-        painter.galley(egui::pos2(text_left, middle - galley.size().y / 2.0), galley, TEXT);
 
         // # A control, so that it can be double-clicked
         //
@@ -792,9 +790,22 @@ impl SessionWindow {
         if resp.drag_started() && !self.fullscreen {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
+
+        // # The field is drawn this frame, not the next
+        //
+        // A rename whose field was not drawn in a frame is dropped at the end of
+        // it — see `rename_drawn` — and the frame that saw the double-click is
+        // one of those frames. Deciding after the name had been painted, as this
+        // first did, opened the rename and closed it again before anything
+        // could be seen.
         if can_rename && resp.double_clicked() {
             self.start_rename(session);
+            self.render_rename(ui, field, session, actions);
+            return field;
         }
+
+        let elided = galley.elided;
+        painter.galley(egui::pos2(text_left, middle - galley.size().y / 2.0), galley, TEXT);
         if elided {
             resp.on_hover_text(&session.label);
         }
