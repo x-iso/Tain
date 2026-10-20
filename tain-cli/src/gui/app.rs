@@ -3652,7 +3652,9 @@ impl GuestApp {
         // the width always, and testing the pointer against the card rect rather
         // than the card's own response, fixes both.
         let forget_w = 22.0;
-        let hovered = ui.rect_contains_pointer(rect);
+        // A finger hovers over nothing, so on a touch screen the button is
+        // simply there — otherwise it could never be reached at all.
+        let hovered = ui.rect_contains_pointer(rect) || super::touch::active();
         let name_rect = egui::Rect::from_min_size(
             inner.min,
             egui::vec2(inner.width() - forget_w, name_h),
@@ -3735,10 +3737,33 @@ impl GuestApp {
             // label beside it says what the state is. Conflating the two is what
             // produced a red "offline" card with a button that worked.
             let ready = conn.can_reconnect() && conn.status.can_connect();
-            let (tri, resp) = ui.allocate_exact_size(
-                egui::vec2(20.0, 20.0),
+            let (tri, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+            // # The target is bigger than the triangle
+            //
+            // Twenty points is under four millimetres on a high-density
+            // screen, which a fingertip covers several times over — taps on it
+            // missed more often than they landed, and nothing on the card said
+            // which had happened. The disc behind it is the target, and it
+            // lights while hovered and darkens while pressed, so both kinds of
+            // pointer can see they are on it.
+            let target = egui::Rect::from_center_size(tri.center(), egui::vec2(34.0, 34.0));
+            let resp = ui.interact(
+                target,
+                ui.id().with(("reconnect", &conn.endpoint_id)),
                 if ready { egui::Sense::click() } else { egui::Sense::hover() },
             );
+            if ready {
+                let fill = if resp.is_pointer_button_down_on() {
+                    Some(egui::Color32::from_white_alpha(36))
+                } else if resp.hovered() {
+                    Some(egui::Color32::from_white_alpha(18))
+                } else {
+                    None
+                };
+                if let Some(fill) = fill {
+                    ui.painter().circle_filled(target.center(), 15.0, fill);
+                }
+            }
             theme::play_triangle(ui, tri, conn.status.accent());
 
             let resp = resp.on_hover_text(match conn.status {
@@ -4419,6 +4444,12 @@ impl eframe::App for GuestApp {
         WINDOW_BG.to_normalized_gamma_f32()
     }
 
+    /// Before egui sees the input, so that the first tap after using the mouse
+    /// is already measured with a finger's slack — see `touch`.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        super::touch::observe(ctx, &raw_input.events, raw_input.time.unwrap_or(0.0));
+    }
+
     /// Tell every connected guest before the window goes.
     ///
     /// # Why this is not already covered
@@ -4702,6 +4733,8 @@ impl eframe::App for GuestApp {
         // from the network task as frames arrive.
         self.frametime.phase("session-window", t);
         self.frametime.end();
+        // Last, so it sits over everything this window drew.
+        super::touch::paint_feedback(ctx, false);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }

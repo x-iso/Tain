@@ -68,6 +68,10 @@ fn scroll_to_wheel(delta: egui::Vec2) -> ScrollEvent {
 /// Height of the header, and of the bar that stands in for it in fullscreen.
 const BAR_H: f32 = 36.0;
 
+/// How long the fullscreen bar stays down after a finger last used it, in
+/// seconds. See `render_overlay`.
+const TOUCH_REVEAL: f64 = 5.0;
+
 /// What the session window is asking the app to do.
 #[derive(Default)]
 pub struct SessionWindowActions {
@@ -213,6 +217,11 @@ pub struct SessionWindow {
     /// tab closed, or the fullscreen bar went away under it — has lost its
     /// focus without anyone pressing anything, and is dropped.
     rename_drawn: bool,
+    /// Until when, in egui's seconds, a finger has the fullscreen bar down.
+    touch_reveal_until: f64,
+    /// Whether the pointer is on the remote picture this frame, where a touch
+    /// is the host's and gets no mark of ours — see `touch::paint_feedback`.
+    pointer_on_picture: bool,
 }
 
 impl Default for SessionWindow {
@@ -228,6 +237,8 @@ impl Default for SessionWindow {
             tools_width: None,
             renaming: None,
             rename_drawn: false,
+            touch_reveal_until: 0.0,
+            pointer_on_picture: false,
         }
     }
 }
@@ -247,6 +258,7 @@ impl SessionWindow {
         self.title_bar = TitleBar::default();
         self.tools_width = None;
         self.renaming = None;
+        self.touch_reveal_until = 0.0;
     }
 
     pub fn request_fullscreen(&mut self, on: bool) {
@@ -290,12 +302,23 @@ impl SessionWindow {
             ViewportId::from_hash_of("tain-sessions"),
             builder,
             |ctx, _class| {
+                // Its own input, which the main window's hook never sees. Read
+                // out under the lock and acted on after it, because switching
+                // modes edits the style, and that waits on the same lock.
+                let (events, time) = ctx.input(|i| (i.events.clone(), i.time));
+                super::touch::observe(ctx, &events, time);
+
                 let window_buttons = self.title_bar.update(ctx, &title);
 
                 if let Some(on) = self.pending_fullscreen.take() {
                     self.fullscreen = on;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
                 }
+                // Over the taskbar while fullscreen, but only while in front;
+                // see `TitleBar::keep_above_taskbar`.
+                let (focused, now) =
+                    ctx.input(|i| (i.viewport().focused.unwrap_or(false), i.time));
+                self.title_bar.keep_above_taskbar(self.fullscreen && focused, now);
 
                 // Closing the window ends every session in it.
                 if ctx.input(|i| i.viewport().close_requested()) {
@@ -358,6 +381,8 @@ impl SessionWindow {
                         immersive.confine_cursor(rect, ctx.pixels_per_point());
                     }
                 }
+
+                super::touch::paint_feedback(ctx, self.pointer_on_picture);
             },
         );
 
@@ -378,6 +403,7 @@ impl SessionWindow {
         // the host as well.
         let typing = self.renaming.is_some();
         self.rename_drawn = false;
+        self.pointer_on_picture = false;
 
         if self.fullscreen {
             // No header, so nothing for the frame to treat as one. The window
@@ -485,6 +511,7 @@ impl SessionWindow {
                             .ctx()
                             .pointer_latest_pos()
                             .is_some_and(|p| self.toolbar_rect.is_some_and(|r| r.contains(p)));
+                        self.pointer_on_picture = resp.contains_pointer() && !over_toolbar;
                         // # Keyboard first, deliberately
                         //
                         // A click carries no modifier state on the wire: the
@@ -787,7 +814,10 @@ impl SessionWindow {
             ui.id().with(("session-title", session.tab_id)),
             egui::Sense::click_and_drag(),
         );
-        if resp.drag_started() && !self.fullscreen {
+        // Not for a finger: Windows starts the move from wherever the mouse
+        // cursor is, which a finger never put anywhere. The empty header either
+        // side is Windows' own caption, and drags under a finger natively.
+        if resp.drag_started() && !self.fullscreen && !super::touch::active() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
 
@@ -898,20 +928,32 @@ impl SessionWindow {
             return;
         }
 
+        // # Under a finger the bar is asked for, not reached for
+        //
+        // A mouse brings the bar down by coming near the top edge, which costs
+        // nothing because a pointer can be somewhere without pressing. A finger
+        // is only anywhere while it is pressing, and a press near the top of
+        // the picture belongs to the host — its browser's tabs, as likely as
+        // not. So with a finger the handle is always showing, a tap on it
+        // brings the bar down for a few seconds, using the bar keeps it down,
+        // and a tap on the picture puts it away.
+        let touch = super::touch::active();
+        let now = ui.input(|i| i.time);
+        let reached_for = if touch {
+            now < self.touch_reveal_until
+        } else {
+            ui.ctx().pointer_latest_pos().is_some_and(|p| p.y < viewport.top() + REVEAL_BAND)
+        };
         // A name being typed into the bar keeps it down: the pointer has no
         // reason to stay up there while the keyboard is busy.
-        let near_top = self.renaming.is_some()
-            || ui
-                .ctx()
-                .pointer_latest_pos()
-                .is_some_and(|p| p.y < viewport.top() + REVEAL_BAND);
+        let near_top = self.renaming.is_some() || reached_for;
 
         // Collapsed, or not being reached for: leave a small handle that
         // appears when the pointer comes near, so the bar is discoverable
         // rather than only reachable by remembering the shortcut.
         if !self.show_toolbar || !near_top {
             self.toolbar_rect = None;
-            if near_top {
+            if near_top || touch {
                 self.render_reveal_handle(ui, viewport);
             }
             return;
@@ -923,6 +965,21 @@ impl SessionWindow {
             egui::vec2(viewport.width(), BAR_H * rows),
         );
         self.toolbar_rect = Some(bar);
+
+        if touch {
+            let (pressing, pressed) = ui.input(|i| (i.pointer.primary_down(), i.pointer.any_pressed()));
+            // Popups opened from the bar — the pointer's options, the volume —
+            // hang below it, and count as using it.
+            let on_bar = ui.ctx().pointer_latest_pos().is_some_and(|p| bar.contains(p))
+                || ui.ctx().is_pointer_over_area();
+            if pressing && on_bar {
+                self.touch_reveal_until = now + TOUCH_REVEAL;
+            } else if pressed && !on_bar && self.renaming.is_none() {
+                self.touch_reveal_until = 0.0;
+            }
+            let left = (self.touch_reveal_until - now).max(0.0);
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(left));
+        }
         // # The header's row, on the fading backdrop
         //
         // The same tabs and tools as windowed, but not the header's flat fill:
@@ -1381,6 +1438,10 @@ impl SessionWindow {
 
         if resp.clicked() {
             self.show_toolbar = true;
+            // For a finger, which brings the bar down for a while rather than
+            // for as long as it hovers. Harmless for a mouse, which goes by
+            // where the pointer is instead.
+            self.touch_reveal_until = ui.input(|i| i.time) + TOUCH_REVEAL;
         }
         resp.on_hover_text(t!("session.show_toolbar"));
     }
@@ -1563,8 +1624,20 @@ fn volume_control(ui: &mut egui::Ui, session: &mut GuestSession) {
         session.apply_sound_preference();
     }
 
+    // # Pinned open by a long press, for a finger
+    //
+    // The slider appears while the pointer is near, and a finger is never near
+    // anything — it lands, and the tap has already gone to the speaker. Holding
+    // it instead, or right-clicking, keeps the slider open until a press
+    // somewhere else, the way a menu closes.
+    let pin = hot_id.with("pinned");
+    if icon.secondary_clicked() {
+        ui.memory_mut(|m| m.toggle_popup(pin));
+    }
+    let pinned = ui.memory(|m| m.is_popup_open(pin));
+
     let mut hot = icon.rect;
-    if icon.hovered() || near {
+    if icon.hovered() || near || pinned {
         // Over the picture, which is fine: being a layer above it is also what
         // keeps the pointer on the slider from reaching the host.
         let area = egui::Area::new(hot_id.with("slider"))
@@ -1599,6 +1672,13 @@ fn volume_control(ui: &mut egui::Ui, session: &mut GuestSession) {
                     });
             });
         hot = hot.union(area.response.rect);
+    }
+    // A press anywhere but the speaker and its slider puts a pinned one away.
+    let pressed_away = ui.input(|i| {
+        i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !hot.contains(p))
+    });
+    if pinned && pressed_away {
+        ui.memory_mut(|m| m.close_popup());
     }
     // A little larger than the controls, so crossing the gap between them does
     // not count as leaving.

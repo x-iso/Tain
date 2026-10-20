@@ -2769,3 +2769,54 @@ left-to-right pass, so their width is measured each frame and the row placed by
 last frame's. Anything that grows inside the row would shove every control left
 of it sideways, so the volume slider now opens below the speaker in a layer of
 its own instead of beside it.
+
+**Gotcha**: the taskbar stayed on top of the fullscreen session window, and had
+before this title bar existed — the same build from before it did the same.
+The shell does recognise the window as full-screen (`SHQueryUserNotificationState`
+says busy); the taskbar stays in front regardless. So while fullscreen and in
+front, the window is topmost, and lets go on losing the focus, stepping behind
+whatever took it. The first raise loses: the taskbar raises itself again while
+the window is turning fullscreen. So `keep_above_taskbar` looks along the
+window's edges a few times a second and goes back above a taskbar it finds
+there — only a taskbar, so the touch keyboard and other topmost windows keep
+their place. A loopback session cannot be trusted to show this: its picture is
+of the screen, taskbar included. `WindowFromPoint` over the taskbar can.
+
+## A Finger Is Not a Mouse
+
+**Decision**: `gui/touch.rs` notices when input comes from a finger and, while
+it does, widens egui's hit radius (5 → 16 points) and click slop (6 → 12),
+stops labels taking drags, and draws a mark under the finger with a ring that
+fills toward the long press. The mouse's settings come back when it is used.
+
+**What egui already did**: egui-winit turns the first finger into a pointer,
+so a tap is a click on what was under the finger when it landed, and a press
+held still for `max_click_duration` is a secondary click. Windows adds no mouse
+messages of its own: it makes them only from pointer messages left to the
+default procedure, and winit consumes them — measured with an injected tap
+against a window that passes them on and one that does not.
+
+**What it did not**: allow for the finger. Five points of slack is a mouse
+pointer's; a label that can be dragged to select text is a list that cannot be
+scrolled; and a twenty-point button that shows nothing when pressed looks dead
+whether or not it was hit — the report was the saved-connection card's connect
+button. That one now has a 34-point target with hover and pressed states, and
+the shared toggles and buttons show being pressed, which under a finger is the
+only state there is.
+
+**Hover-only controls get a way in**: the card's forget button is always shown
+in touch mode; the volume slider pins open on a long press or a right-click; and
+in fullscreen the bar is asked for rather than reached for — the handle is always
+showing, a tap brings the bar down for five seconds, using it keeps it down. A
+press near the top of the picture belongs to the host, so it cannot double as
+"show me the bar" the way a mouse's mere presence there does.
+
+**Gotcha**: a mouse move is not a mouse. Windows posts moves with no hand on the
+mouse whenever a window appears or changes under a resting pointer, and those
+used to take a finger's settings away mid-gesture. Where there is a system
+cursor, a move only counts if the cursor moved; a finger leaves it where it was.
+A click or a wheel counts at once.
+
+**Gotcha**: the session window is an immediate viewport, which eframe's
+`raw_input_hook` never sees, so it reports its own input from inside its frame.
+The style is shared, so either window's finger sets it for both.

@@ -102,7 +102,8 @@ testable without a GPU.
 | `app.rs` | The application: tabs, host panel, guest panel, the whole main window. |
 | `session.rs` | One guest session and everything the UI needs to drive it, pointer capture included. |
 | `session_window.rs` | A separate window holding one tab per live session, its header of tabs and tools, and the bar that replaces it in fullscreen. |
-| `title_bar.rs` | Taking the session window's caption over from Windows while keeping its resize borders, snap and snap layouts. |
+| `title_bar.rs` | Taking the session window's caption over from Windows while keeping its resize borders, snap and snap layouts; keeping it above the taskbar in fullscreen. |
+| `touch.rs` | Telling a finger from a mouse, widening targets for it, and marking where it is. |
 | `network_bridge.rs` | The guest's async half: connect, receive, decode, forward input, report telemetry. |
 | `progress.rs` | How far a connection has got, drawn as the path it took. |
 | `gl_interop.rs` | Drawing a decoded Direct3D texture straight from OpenGL, with no readback. |

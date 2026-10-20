@@ -82,6 +82,11 @@ impl Layout {
 /// Where the session window is in taking over its own caption.
 pub struct TitleBar {
     stage: Stage,
+    /// Whether the window is being kept above the taskbar — see
+    /// [`TitleBar::keep_above_taskbar`].
+    above: bool,
+    /// When to next look for a taskbar in front, in egui's seconds.
+    recheck_at: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,7 +107,7 @@ enum Stage {
 impl Default for TitleBar {
     fn default() -> Self {
         let stage = if cfg!(target_os = "windows") { Stage::Looking(0) } else { Stage::Native };
-        Self { stage }
+        Self { stage, above: false, recheck_at: 0.0 }
     }
 }
 
@@ -126,6 +131,7 @@ impl TitleBar {
         // new one has to be found and taken over again.
         if self.stage == Stage::Custom && !platform::attached() {
             self.stage = Stage::Looking(0);
+            self.above = false;
         }
 
         match self.stage {
@@ -170,13 +176,53 @@ impl TitleBar {
     pub fn maximize_state(&self) -> (bool, bool) {
         platform::maximize_state()
     }
+
+    /// Keep the window above the taskbar while it is fullscreen and in front.
+    ///
+    /// # Why it has to be asked for
+    ///
+    /// Windows is meant to step the taskbar aside for a window that covers its
+    /// monitor and has the focus, and it does recognise this one — the shell
+    /// reports a full-screen application while it is up — but the taskbar here
+    /// stayed on top of it regardless, and did so before the window drew its
+    /// own title bar too. Measured with `WindowFromPoint` over the taskbar,
+    /// which a loopback session's picture of the screen cannot fool.
+    ///
+    /// Topmost is what puts it above. Only while it has the focus, though: a
+    /// topmost window covering the screen is one nothing can be switched to,
+    /// so on losing the focus it lets go and steps behind whatever took it.
+    ///
+    /// # And it has to be kept there
+    ///
+    /// The taskbar is topmost too, and it raises itself again while the window
+    /// is turning fullscreen — after this has run, so the first raise lost. So
+    /// a few times a second this looks along the window's edges, where a
+    /// taskbar would be, and goes back above one it finds in front. Only a
+    /// taskbar: other topmost windows, the touch keyboard among them, are left
+    /// where they put themselves. `time` is egui's, in seconds.
+    pub fn keep_above_taskbar(&mut self, above: bool, time: f64) {
+        /// How often to look, in seconds.
+        const RECHECK: f64 = 0.25;
+
+        if !matches!(self.stage, Stage::Settling | Stage::Custom) {
+            return;
+        }
+        if above != self.above {
+            self.above = above;
+            self.recheck_at = time + RECHECK;
+            platform::keep_above_taskbar(above);
+        } else if above && time >= self.recheck_at {
+            self.recheck_at = time + RECHECK;
+            platform::stay_above_taskbar();
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
 mod platform {
     use std::sync::{Mutex, MutexGuard};
 
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, TRUE, WPARAM};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -184,12 +230,15 @@ mod platform {
     };
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumThreadWindows, GetWindowInfo, GetWindowLongW, GetWindowTextW, IsZoomed, PostMessageW,
-        SetWindowPos, GWL_STYLE, HTCAPTION, HTCLIENT, HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+        EnumThreadWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowInfo,
+        GetWindowLongW, GetWindowRect, GetWindowTextW, IsZoomed, PostMessageW, SetWindowPos,
+        WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, HTCAPTION, HTCLIENT,
+        HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_NOTOPMOST, HWND_TOPMOST,
         NCCALCSIZE_PARAMS, SC_MAXIMIZE, SC_RESTORE, SM_CXPADDEDBORDER, SM_CYSIZEFRAME,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINDOWINFO,
         WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
         WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SYSCOMMAND, WS_CAPTION,
+        WS_EX_TOPMOST,
     };
 
     use super::{Hit, Layout};
@@ -271,6 +320,80 @@ mod platform {
 
     pub fn maximize_state() -> (bool, bool) {
         shared().as_ref().map_or((false, false), |s| (s.hovered, s.pressed))
+    }
+
+    pub fn keep_above_taskbar(above: bool) {
+        let Some(window) = shared().as_ref().map(|s| HWND(s.window as *mut _)) else { return };
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        // SAFETY: z-order changes to a live window of this thread, which is
+        // neither moved, sized nor activated by them.
+        unsafe {
+            if above {
+                let _ = SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0, flags);
+                return;
+            }
+            let _ = SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+            // That leaves it on top of every ordinary window, the one that just
+            // took the focus included — which would then be behind a picture
+            // covering the whole screen. So it goes under that one. Not under a
+            // topmost one, such as the taskbar itself: placed after a topmost
+            // window, it would become topmost again.
+            let front = GetForegroundWindow();
+            let front_is_topmost =
+                GetWindowLongW(front, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+            if !front.is_invalid() && front != window && !front_is_topmost {
+                let _ = SetWindowPos(window, front, 0, 0, 0, 0, flags);
+            }
+        }
+    }
+
+    pub fn stay_above_taskbar() {
+        let Some(window) = shared().as_ref().map(|s| HWND(s.window as *mut _)) else { return };
+        if taskbar_in_front(window) {
+            // SAFETY: as in `keep_above_taskbar`.
+            unsafe {
+                let _ = SetWindowPos(
+                    window,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    /// Whether a taskbar is in front of the window along any of its edges.
+    fn taskbar_in_front(window: HWND) -> bool {
+        let mut rect = RECT::default();
+        // SAFETY: a live window and a RECT to write.
+        if unsafe { GetWindowRect(window, &mut rect) }.is_err() {
+            return false;
+        }
+        let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+        let edges = [
+            (x, rect.top + 2),
+            (x, rect.bottom - 3),
+            (rect.left + 2, y),
+            (rect.right - 3, y),
+        ];
+        edges.into_iter().any(|(x, y)| {
+            // SAFETY: read-only queries about whatever is at a screen point.
+            let hit = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
+            hit != window && is_taskbar(hit)
+        })
+    }
+
+    /// The taskbar, or one of its copies on another monitor.
+    fn is_taskbar(window: HWND) -> bool {
+        let mut class = [0u16; 32];
+        // SAFETY: reading a window's class name into a buffer it is told the
+        // length of.
+        let len = unsafe { GetClassNameW(window, &mut class) }.max(0) as usize;
+        let class = String::from_utf16_lossy(&class[..len]);
+        class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd"
     }
 
     /// The session window, found by its title among this thread's windows.
@@ -533,6 +656,10 @@ mod platform {
     pub fn maximize_state() -> (bool, bool) {
         (false, false)
     }
+
+    pub fn keep_above_taskbar(_above: bool) {}
+
+    pub fn stay_above_taskbar() {}
 }
 
 #[cfg(test)]

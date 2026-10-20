@@ -366,8 +366,21 @@ pub fn icon_toggle(
     if ui.is_rect_visible(rect) {
         // Set by whoever owns the row, for what is behind it — see `chips_over`.
         let chips = &ui.visuals().widgets;
+        // # Pressed shows the lit chip
+        //
+        // Hover was the only feedback, and under a finger hover and press are
+        // the same few frames — so a toggle that was already lit showed no
+        // change at all when tapped. Pressing an unlit one previews being lit;
+        // pressing a lit one doubles its chip.
+        let pressed = state != IconState::Unavailable && resp.is_pointer_button_down_on();
         match state {
             IconState::On => {
+                ui.painter().rect_filled(rect, 4.0, chips.active.weak_bg_fill);
+                if pressed {
+                    ui.painter().rect_filled(rect, 4.0, chips.active.weak_bg_fill);
+                }
+            }
+            IconState::Off if pressed => {
                 ui.painter().rect_filled(rect, 4.0, chips.active.weak_bg_fill);
             }
             IconState::Off if resp.hovered() => {
@@ -550,7 +563,15 @@ pub fn labelled_button(
     let (rect, resp) = ui.allocate_exact_size(size, sense);
 
     if ui.is_rect_visible(rect) {
-        let fill = if enabled && resp.hovered() { fill.gamma_multiply(1.35) } else { fill };
+        // Brighter again while pressed: under a finger hover lasts exactly as
+        // long as the press, so this is the only change a tap can show.
+        let fill = if enabled && resp.is_pointer_button_down_on() {
+            fill.gamma_multiply(1.6)
+        } else if enabled && resp.hovered() {
+            fill.gamma_multiply(1.35)
+        } else {
+            fill
+        };
         let (fill, stroke, text) = if enabled {
             (fill, stroke, TEXT)
         } else {
