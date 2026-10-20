@@ -170,6 +170,7 @@ The host can approve, narrow, or disconnect individual guests without affecting 
 ```
 ├── Cargo.toml              # Workspace root
 ├── README.md               # This file
+├── CHANGELOG.md            # What changed in each version
 ├── LICENSE                 # GPL-3.0
 ├── tain-core/              # Everything that is not a window
 │   ├── ffmpeg/             # The libavcodec shim, compiled when ffmpeg is present
@@ -315,16 +316,21 @@ tag's release. If there is no release yet, it creates one.
 
 1. Bump `version` under `[workspace.package]` in `Cargo.toml`. That is the number
    Settings shows, and the workflow refuses a tag that disagrees with it.
-2. Regenerate the crate licence list. It is compiled into the binary, and the
+2. Make sure [CHANGELOG.md](CHANGELOG.md) has a section for that version, dated
+   today. Every change adds its own entry as it is committed, under the version
+   in `Cargo.toml` until that version is tagged, so the section should already
+   cover everything since the last release.
+3. Regenerate the crate licence list. It is compiled into the binary, and the
    workflow fails if it does not match `Cargo.lock`:
 
    ```powershell
    .\scripts\list-crate-licences.ps1
    ```
 
-3. Commit `Cargo.toml`, `Cargo.lock` and `licenses/rust-crates.txt` on `main`.
-   The version is in `Cargo.lock` too, and the release builds with `--locked`.
-4. Tag that commit and push the tag:
+4. Commit `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md` and
+   `licenses/rust-crates.txt` on `main`. The version is in `Cargo.lock` too, and
+   the release builds with `--locked`.
+5. Tag that commit and push the tag:
 
    ```bash
    git tag -a v0.4.0 -m "Tain 0.4.0"
