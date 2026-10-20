@@ -33,6 +33,7 @@ use super::immersive::Immersive;
 use super::keymap;
 use super::session::GuestSession;
 use super::settings::{ScalingMode, Settings};
+use super::shortcut_hint::ShortcutHint;
 use super::theme::{self, *};
 use super::title_bar::{self, TitleBar};
 
@@ -94,6 +95,21 @@ struct Rename {
     fresh: bool,
 }
 
+/// A binding's modifiers, as the hook's `MOD_*` bits.
+fn modifier_bits(binding: &super::shortcuts::Shortcut) -> u8 {
+    let mut bits = 0;
+    if binding.ctrl {
+        bits |= super::immersive::MOD_CTRL;
+    }
+    if binding.shift {
+        bits |= super::immersive::MOD_SHIFT;
+    }
+    if binding.alt {
+        bits |= super::immersive::MOD_ALT;
+    }
+    bits
+}
+
 /// Handle session shortcuts against this window's own input.
 ///
 /// Returns the keys consumed, which must not be forwarded to the host.
@@ -122,21 +138,25 @@ fn handle_shortcuts(
     // in settings while a session is running.
     let immersive_binding = bindings.get(ShortcutAction::ToggleImmersive);
     if let Some(vk) = immersive_binding.egui_key().and_then(keymap::vk_for) {
-        let mut mods = 0;
-        if immersive_binding.ctrl {
-            mods |= super::immersive::MOD_CTRL;
-        }
-        if immersive_binding.shift {
-            mods |= super::immersive::MOD_SHIFT;
-        }
-        if immersive_binding.alt {
-            mods |= super::immersive::MOD_ALT;
-        }
-        immersive.set_escape_shortcut(vk, mods);
+        immersive.set_escape_shortcut(vk, modifier_bits(immersive_binding));
     }
+    // And the others the user has kept for this machine while immersed, for
+    // the same reason. Tagged by their place in `ShortcutAction::ALL`.
+    let kept: Vec<(u8, u16, u8)> = ShortcutAction::ALL
+        .into_iter()
+        .enumerate()
+        .filter(|(_, action)| *action != ShortcutAction::ToggleImmersive)
+        .filter_map(|(tag, action)| {
+            let binding = bindings.get(action);
+            let vk = binding.egui_key().and_then(keymap::vk_for)?;
+            binding.in_immersive.then_some((tag as u8, vk, modifier_bits(binding)))
+        })
+        .collect();
+    immersive.set_hook_shortcuts(&kept);
 
     // The hook reports this rather than egui, for the reason above.
     if immersive.escape_requested() {
+        window.shortcut_hint.used();
         immersive.set_active(false);
         // And the pointer with it. The hook's shortcut is the one way out that
         // is guaranteed to work while every other key is being swallowed, so
@@ -148,7 +168,24 @@ fn handle_shortcuts(
         }
     }
 
+    // From the hook while immersed, from egui otherwise — never both for one
+    // press, because the hook swallows what it recognises.
+    let from_hook = immersive.take_hook_shortcuts();
+    let mut triggered: Vec<ShortcutAction> = ShortcutAction::ALL
+        .into_iter()
+        .enumerate()
+        .filter(|(tag, _)| from_hook & (1 << tag) != 0)
+        .map(|(_, action)| action)
+        .collect();
     if let Some(action) = ctx.input(|i| bindings.triggered(i)) {
+        if let Some(key) = bindings.get(action).egui_key() {
+            consumed.push(key);
+        }
+        triggered.push(action);
+    }
+
+    for action in triggered {
+        window.shortcut_hint.used();
         match action {
             ShortcutAction::Disconnect => {
                 if let Some(session) = active.as_ref() {
@@ -163,9 +200,6 @@ fn handle_shortcuts(
                     session.pointer_captured = !session.pointer_captured;
                 }
             }
-        }
-        if let Some(key) = bindings.get(action).egui_key() {
-            consumed.push(key);
         }
     }
 
@@ -222,6 +256,11 @@ pub struct SessionWindow {
     /// Whether the pointer is on the remote picture this frame, where a touch
     /// is the host's and gets no mark of ours — see `touch::paint_feedback`.
     pointer_on_picture: bool,
+    /// The reminder of what the shortcuts are; see `shortcut_hint`.
+    shortcut_hint: ShortcutHint,
+    /// Where the picture was drawn this frame, for the reminder to sit in its
+    /// corner.
+    picture_rect: Option<egui::Rect>,
 }
 
 impl Default for SessionWindow {
@@ -239,6 +278,8 @@ impl Default for SessionWindow {
             rename_drawn: false,
             touch_reveal_until: 0.0,
             pointer_on_picture: false,
+            shortcut_hint: ShortcutHint::default(),
+            picture_rect: None,
         }
     }
 }
@@ -394,6 +435,20 @@ impl SessionWindow {
                 }
 
                 super::touch::paint_feedback(ctx, self.pointer_on_picture);
+
+                if let Some(picture) = self.picture_rect {
+                    let in_front = self.title_bar.in_front().unwrap_or_else(|| {
+                        ctx.input(|i| i.viewport().focused.unwrap_or(false))
+                    });
+                    self.shortcut_hint.show(
+                        ctx,
+                        picture.left_bottom(),
+                        &settings.shortcuts,
+                        immersive.held_modifiers(),
+                        immersive.is_active(),
+                        in_front,
+                    );
+                }
             },
         );
 
@@ -446,6 +501,7 @@ impl SessionWindow {
                 session.upload_pending_frame(ctx);
 
                 let viewport = ui.max_rect();
+                self.picture_rect = Some(viewport);
                 // In physical pixels, which is what the host would have to
                 // encode — points would under-report on a scaled display.
                 session.report_viewport(viewport.size(), ctx.pixels_per_point());

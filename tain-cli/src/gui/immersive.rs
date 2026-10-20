@@ -148,6 +148,27 @@ impl Immersive {
         platform::set_escape_shortcut(vk, mods);
     }
 
+    /// The other shortcuts that keep working while the mode is on, each as
+    /// `(tag, vk, mods)`, for the hook to recognise for the same reason as the
+    /// escape shortcut. Set from the user's bindings every frame, like it.
+    pub fn set_hook_shortcuts(&mut self, shortcuts: &[(u8, u16, u8)]) {
+        platform::set_hook_shortcuts(shortcuts);
+    }
+
+    /// The tags of those pressed since the last call, as bits.
+    pub fn take_hook_shortcuts(&mut self) -> u32 {
+        platform::take_hook_shortcuts()
+    }
+
+    /// Which modifiers are held, as `MOD_*` bits.
+    ///
+    /// The hook's view while the mode is on, because it swallows the keys
+    /// before Windows records them as held. Windows' own otherwise, for the
+    /// reasons given at [`key_is_down`].
+    pub fn held_modifiers(&self) -> u8 {
+        if self.active { platform::held_modifiers() } else { platform::os_modifiers() }
+    }
+
     /// End the mode if this application is no longer in front.
     ///
     /// # A recovery path, not a gate
@@ -587,6 +608,15 @@ mod platform {
     /// Set by the hook when the escape shortcut is pressed; polled by the app.
     static ESCAPE_PRESSED: AtomicBool = AtomicBool::new(false);
 
+    /// The other shortcuts that keep working while the keyboard is the host's.
+    ///
+    /// One slot each, packed as `vk | mods << 16 | (tag + 1) << 24` for the same
+    /// reason as [`ESCAPE`], with zero for an empty slot. See
+    /// [`set_hook_shortcuts`].
+    static HOOK_SHORTCUTS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+    /// Bit `tag` set by the hook when that shortcut is pressed; taken by the app.
+    static HOOK_TRIGGERED: AtomicU32 = AtomicU32::new(0);
+
     /// Modifier state as the hook sees it, which is the only view that is
     /// correct while the keys themselves are being swallowed.
     static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
@@ -657,6 +687,45 @@ mod platform {
     /// Whether the escape shortcut has been pressed since the last call.
     pub fn take_escape_request() -> bool {
         ESCAPE_PRESSED.swap(false, Ordering::Relaxed)
+    }
+
+    /// Tell the hook which other combinations stay this machine's while it has
+    /// the keyboard, each as `(tag, vk, mods)`. Beyond eight are ignored.
+    ///
+    /// Recognised by the hook for the same reason as the escape shortcut: egui
+    /// sees nothing while every key is being swallowed.
+    pub fn set_hook_shortcuts(shortcuts: &[(u8, u16, u8)]) {
+        for (slot, cell) in HOOK_SHORTCUTS.iter().enumerate() {
+            let packed = shortcuts.get(slot).map_or(0, |&(tag, vk, mods)| {
+                vk as u32 | (mods as u32) << 16 | (tag as u32 + 1) << 24
+            });
+            cell.store(packed, Ordering::Relaxed);
+        }
+    }
+
+    /// The tags of the shortcuts pressed since the last call, as bits.
+    pub fn take_hook_shortcuts() -> u32 {
+        HOOK_TRIGGERED.swap(0, Ordering::Relaxed)
+    }
+
+    /// Which modifiers are held, as the hook has seen them.
+    pub fn held_modifiers() -> u8 {
+        current_mods()
+    }
+
+    /// Which modifiers are held, according to Windows.
+    pub fn os_modifiers() -> u8 {
+        let mut bits = 0;
+        if key_is_down(VK_CONTROL) {
+            bits |= MOD_CTRL;
+        }
+        if key_is_down(VK_SHIFT) {
+            bits |= MOD_SHIFT;
+        }
+        if key_is_down(VK_MENU) {
+            bits |= MOD_ALT;
+        }
+        bits
     }
 
     fn note_modifier(vk: u16, pressed: bool) {
@@ -955,6 +1024,22 @@ mod platform {
                 if pressed && escape_vk != 0 && vk == escape_vk && current_mods() == escape_mods {
                     ESCAPE_PRESSED.store(true, Ordering::Relaxed);
                     return LRESULT(1);
+                }
+
+                // The other shortcuts the user kept for this machine. Kept
+                // from the host like the way out, and reported the same way.
+                if pressed {
+                    let mods = current_mods();
+                    for cell in &HOOK_SHORTCUTS {
+                        let packed = cell.load(Ordering::Relaxed);
+                        if packed != 0
+                            && vk == (packed & 0xFFFF) as u16
+                            && mods == ((packed >> 16) & 0xFF) as u8
+                        {
+                            HOOK_TRIGGERED.fetch_or(1 << ((packed >> 24) - 1), Ordering::Relaxed);
+                            return LRESULT(1);
+                        }
+                    }
                 }
 
                 push_captured(vk, info.scanCode as u16, extended, pressed);
@@ -1792,6 +1877,16 @@ mod platform {
     pub fn set_escape_shortcut(_vk: u16, _mods: u8) {}
     pub fn take_escape_request() -> bool {
         false
+    }
+    pub fn set_hook_shortcuts(_shortcuts: &[(u8, u16, u8)]) {}
+    pub fn take_hook_shortcuts() -> u32 {
+        0
+    }
+    pub fn held_modifiers() -> u8 {
+        0
+    }
+    pub fn os_modifiers() -> u8 {
+        0
     }
     pub fn clip_cursor(_rect: egui::Rect, _pixels_per_point: f32) {}
     pub fn release_cursor() {}

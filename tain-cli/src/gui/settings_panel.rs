@@ -1416,20 +1416,22 @@ fn shortcut_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pane
     // Capture happens outside the grid so a press is consumed before any widget
     // below can react to it.
     if let Some(action) = panel.capturing
-        && let Some(shortcut) = capture_pressed_key(ui.ctx())
+        && let Some(mut shortcut) = capture_pressed_key(ui.ctx())
     {
+        // A new combination, not a new decision about immersive mode.
+        shortcut.in_immersive = settings.shortcuts.get(action).in_immersive;
         settings.shortcuts.set(action, shortcut);
         panel.capturing = None;
     }
 
     let conflicts = settings.shortcuts.conflicts();
 
-    egui::Grid::new("shortcuts").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+    egui::Grid::new("shortcuts").num_columns(4).spacing([12.0, 8.0]).show(ui, |ui| {
         for action in ShortcutAction::ALL {
             ui.label(action.label()).on_hover_text(action.description());
 
             let capturing = panel.capturing == Some(action);
-            let shortcut = settings.shortcuts.get(action);
+            let shortcut = settings.shortcuts.get(action).clone();
             let text = if capturing {
                 i18n::text("settings.shortcuts.press_a_key").to_string()
             } else {
@@ -1445,6 +1447,27 @@ fn shortcut_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut Pane
                 .clicked()
             {
                 panel.capturing = if capturing { None } else { Some(action) };
+            }
+
+            // The immersive mode shortcut is the way out of it, so it works
+            // there whatever this says — shown ticked and left alone.
+            if action == ShortcutAction::ToggleImmersive {
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut true, i18n::text("settings.shortcuts.in_immersive")),
+                )
+                .on_disabled_hover_text(i18n::text("settings.shortcuts.immersive_always"));
+            } else {
+                let mut in_immersive = shortcut.in_immersive;
+                if ui
+                    .checkbox(&mut in_immersive, i18n::text("settings.shortcuts.in_immersive"))
+                    .on_hover_text(i18n::text("settings.shortcuts.in_immersive_hint"))
+                    .changed()
+                {
+                    let mut changed = shortcut.clone();
+                    changed.in_immersive = in_immersive;
+                    settings.shortcuts.set(action, changed);
+                }
             }
 
             // Warn rather than block: refusing the first half of a swap is more

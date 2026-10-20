@@ -1199,6 +1199,22 @@ Click, then press the combination you want
 Without a modifier this key is indistinguishable from typing, so the host will
 never receive it
 
+[settings.shortcuts.in_immersive]
+In immersive mode
+
+[settings.shortcuts.in_immersive_hint]
+Keep this shortcut working while immersive mode sends the keyboard to the
+host. Untick it to send the combination to the host instead
+
+[settings.shortcuts.immersive_always]
+Always works: it is the way out of immersive mode
+
+[shortcut.hint_title]
+Tain shortcuts
+
+[shortcut.hint_to_host]
+goes to the host
+
 [shortcut.disconnect]
 Disconnect
 

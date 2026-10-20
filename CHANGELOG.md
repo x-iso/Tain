@@ -38,6 +38,12 @@ All notable changes to Tain are documented here. This project adheres to
   the new one, and the passcodes themselves stay the same. The unattended host
   uses the same list.
 
+- **A reminder of the shortcuts.** Hold Ctrl or Shift for a second during a
+  session and the picture's lower left lists Tain's shortcuts, with the keys
+  already held lit and the key that would fire one picked out. It's there to
+  remind you what they are, and to warn you when a combination you meant for
+  the host is one key away from being taken by Tain instead.
+
 ### Changed
 
 - **One row of chrome in the session window.** It used to spend three:
@@ -63,6 +69,12 @@ All notable changes to Tain are documented here. This project adheres to
   session window. It now stays behind the window for as long as the window is
   in front, and the window steps back as soon as something else takes the
   focus.
+
+- **Shortcuts work in immersive mode.** Immersive mode left only its own
+  shortcut working, so a session couldn't be put back in a window, ended or
+  given its pointer back from the keyboard until immersive mode was left. They
+  all work there now. Settings → Shortcuts has *In immersive mode* beside each
+  one, to send that combination to the host instead while immersed.
 
 ## [0.3.0] - 2026-10-19
 

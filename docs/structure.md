@@ -110,6 +110,7 @@ testable without a GPU.
 | `gl_interop.rs` | Drawing a decoded Direct3D texture straight from OpenGL, with no readback. |
 | `immersive.rs` | Treating the session window as if it were the host's machine. |
 | `keymap.rs`, `shortcuts.rs` | egui input to protocol key events, and the rebindable session controls. |
+| `shortcut_hint.rs` | The reminder of the shortcuts that comes up while Ctrl or Shift is held. |
 | `connections.rs`, `secrets.rs` | Remembered hosts, with their codes in the OS credential store. |
 | `settings.rs`, `settings_panel.rs` | Persisted settings and the window that edits them, including About and the licence viewer. |
 | `licenses.rs` | The licence of Tain and of everything it redistributes, each embedded verbatim with `include_str!`. What the licence viewer shows. |

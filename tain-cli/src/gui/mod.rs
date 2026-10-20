@@ -19,6 +19,7 @@ pub mod session;
 pub mod session_window;
 pub mod settings;
 pub mod settings_panel;
+pub mod shortcut_hint;
 pub mod shortcuts;
 pub mod theme;
 pub mod title_bar;

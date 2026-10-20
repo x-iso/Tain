@@ -2832,3 +2832,41 @@ A click or a wheel counts at once.
 **Gotcha**: the session window is an immediate viewport, which eframe's
 `raw_input_hook` never sees, so it reports its own input from inside its frame.
 The style is shared, so either window's finger sets it for both.
+
+## Shortcuts Keep Working in Immersive Mode, and Say What They Are
+
+**Decision**: each shortcut has *In immersive mode*, on by default. While
+immersive mode is on, the keyboard hook recognises the ones that have it and
+keeps them from the host, as it always did for the immersive mode shortcut
+itself — which ignores the setting, being the way out. Holding Ctrl or Shift for
+a second in a session brings up a reminder of the shortcuts in the picture's
+lower left.
+
+**Why the hook**: immersive mode swallows every key before Windows records it,
+so egui never sees a modifier held and `ShortcutBindings::triggered` cannot
+match anything. Only the escape shortcut was handed to the hook, which is why it
+was the only one that worked. The others now go to the hook every frame too, in
+a table of packed atomics beside the escape — the callback still takes no lock —
+and come back as bits the session window acts on exactly as it acts on egui's.
+
+**Why on by default**: off would keep the old behaviour, where a session could
+not be put back in a window or ended from the keyboard until immersive mode was
+left. On is how every shortcut already behaves outside immersive mode. Off is
+for a combination somebody needs on the host while immersed — a terminal's
+Ctrl+Shift+C — which is the case immersive mode exists for.
+
+**Why the reminder**: every shortcut is a chord somebody may be halfway through
+for another reason — Ctrl and Shift held to extend a selection, Shift held in a
+game — and nothing said a Tain shortcut was one key away. It lights the held
+modifiers, picks out the key that would fire one, and fades what cannot fire: a
+modifier held that a binding does not use, since bindings match exactly, and in
+immersive mode the ones left to the host. It comes up after a second so that
+somebody who knows the keys never sees it, and stays away after a shortcut fires
+until the modifiers are let go.
+
+**Gotcha**: where the modifiers come from depends on the mode. Immersed, the
+hook's own record is the only one that is right, since the keys it swallows are
+never recorded as held. Otherwise it is Windows', `GetAsyncKeyState`, because
+egui's flag in this immediate viewport is not dependable — see `key_is_down`.
+The reminder also asks Windows whether the session window is in front, so a
+modifier held in another application brings up nothing.

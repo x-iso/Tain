@@ -177,6 +177,15 @@ impl TitleBar {
         platform::maximize_state()
     }
 
+    /// Whether the window is the one in front, asked of Windows — or `None`
+    /// with Windows' own title bar, where this has no handle on the window.
+    pub fn in_front(&self) -> Option<bool> {
+        if !matches!(self.stage, Stage::Settling | Stage::Custom) {
+            return None;
+        }
+        platform::in_front()
+    }
+
     /// Keep the window above the taskbar while it is fullscreen and in front.
     ///
     /// # Why it has to be asked for
@@ -348,6 +357,12 @@ mod platform {
                 let _ = SetWindowPos(window, front, 0, 0, 0, 0, flags);
             }
         }
+    }
+
+    pub fn in_front() -> Option<bool> {
+        let window = shared().as_ref().map(|s| HWND(s.window as *mut _))?;
+        // SAFETY: a read-only query.
+        Some(unsafe { GetForegroundWindow() } == window)
     }
 
     pub fn stay_above_taskbar() {
@@ -742,6 +757,10 @@ mod platform {
     pub fn keep_above_taskbar(_above: bool) {}
 
     pub fn stay_above_taskbar() {}
+
+    pub fn in_front() -> Option<bool> {
+        None
+    }
 }
 
 #[cfg(test)]

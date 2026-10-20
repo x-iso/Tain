@@ -82,11 +82,40 @@ pub struct Shortcut {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
+    /// Whether it still works here while immersive mode is giving the host the
+    /// keyboard, rather than going to the host with everything else.
+    ///
+    /// # Why it is a choice, and why it starts on
+    ///
+    /// Immersive mode used to leave only its own shortcut working — the way
+    /// out — and send the rest to the host, so a session could not be put back
+    /// in a window or ended from the keyboard until immersive mode was left.
+    /// On by default, which is how every shortcut behaves outside immersive
+    /// mode anyway. Off for a combination somebody needs on the host while
+    /// immersed, which is the case immersive mode exists for. The immersive
+    /// mode shortcut itself ignores this: it is the way out.
+    ///
+    /// Absent from a settings file written before it existed, which reads as
+    /// on.
+    #[serde(default = "always")]
+    pub in_immersive: bool,
+}
+
+fn always() -> bool {
+    true
 }
 
 impl Shortcut {
     pub fn new(key: egui::Key, ctrl: bool, shift: bool, alt: bool) -> Self {
-        Self { key: KeyName(key.name().to_string()), ctrl, shift, alt }
+        Self { key: KeyName(key.name().to_string()), ctrl, shift, alt, in_immersive: true }
+    }
+
+    /// Whether two bindings are pressed the same way, whatever else differs.
+    pub fn same_combination(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.ctrl == other.ctrl
+            && self.shift == other.shift
+            && self.alt == other.alt
     }
 
     /// The bound key, or `None` if the stored name is not one egui knows.
@@ -213,7 +242,7 @@ impl ShortcutBindings {
         let mut conflicting = Vec::new();
         for (i, a) in ShortcutAction::ALL.iter().enumerate() {
             for b in &ShortcutAction::ALL[i + 1..] {
-                if self.get(*a) == self.get(*b) {
+                if self.get(*a).same_combination(self.get(*b)) {
                     conflicting.push(*a);
                     conflicting.push(*b);
                 }
@@ -284,12 +313,24 @@ mod tests {
     fn an_unknown_key_name_never_matches_and_is_not_safe() {
         // A config file naming a key this egui build doesn't have must not panic
         // or silently bind to something else.
-        let bogus = Shortcut { key: KeyName("Nonexistent".into()), ctrl: true, shift: false, alt: false };
+        let bogus = Shortcut {
+            key: KeyName("Nonexistent".into()),
+            ctrl: true,
+            shift: false,
+            alt: false,
+            in_immersive: true,
+        };
         assert_eq!(bogus.egui_key(), None);
         // ctrl alone still reads as "safe"; the key itself simply never fires.
         assert!(bogus.is_safe());
 
-        let bare = Shortcut { key: KeyName("Nonexistent".into()), ctrl: false, shift: false, alt: false };
+        let bare = Shortcut {
+            key: KeyName("Nonexistent".into()),
+            ctrl: false,
+            shift: false,
+            alt: false,
+            in_immersive: true,
+        };
         assert!(!bare.is_safe());
     }
 
@@ -328,6 +369,24 @@ mod tests {
         assert!(conflicts.contains(&ShortcutAction::ToggleToolbar));
         assert!(conflicts.contains(&ShortcutAction::ToggleFullscreen));
         assert!(!conflicts.contains(&ShortcutAction::Disconnect));
+    }
+
+    #[test]
+    fn a_binding_from_an_older_settings_file_works_in_immersive_mode() {
+        let json = r#"{ "key": "W", "ctrl": true, "shift": true, "alt": false }"#;
+        let shortcut: Shortcut = serde_json::from_str(json).unwrap();
+        assert!(shortcut.in_immersive);
+    }
+
+    #[test]
+    fn conflicts_are_about_keys_not_about_immersive_mode() {
+        // The same combination is still a conflict whichever of them has
+        // been told to stand aside for the host while immersed.
+        let mut bindings = ShortcutBindings::default();
+        let mut same = bindings.get(ShortcutAction::ToggleFullscreen).clone();
+        same.in_immersive = false;
+        bindings.set(ShortcutAction::ToggleToolbar, same);
+        assert!(bindings.conflicts().contains(&ShortcutAction::ToggleToolbar));
     }
 
     #[test]
