@@ -532,11 +532,70 @@ pub enum IconState {
     Unavailable,
 }
 
-/// Draw a clickable icon that brightens on hover.
-pub fn icon_button(ui: &mut Ui, size: f32, src: egui::ImageSource<'_>, hover: &str) -> Response {
+/// What an icon looks like while it is hovered or pressed: the icon itself
+/// with light around it, drawn as art, on a canvas with room for the light.
+///
+/// # Why drawn rather than generated
+///
+/// Lighting icons up in code went through a lighter disc behind them, which
+/// read as a stain on the gray of a card, then several attempts at a glow
+/// around the outline without a blur to make one. None of them looked right.
+/// The glow is art now, made where there is a blur.
+pub struct HoverArt {
+    pub src: egui::ImageSource<'static>,
+    /// Where the art's canvas falls, in the plain icon's own units, so that
+    /// the icon in it lands exactly on the plain one.
+    pub canvas: Rect,
+    /// How wide the plain icon is, in those units.
+    pub icon_width: f32,
+}
+
+impl HoverArt {
+    /// `settings_glow.svg`. Its gear is drawn 29/24 the size of the plain
+    /// icon's and shifted, so the canvas is scaled back down to match: the gear
+    /// should light up on hover, not grow.
+    pub fn settings() -> Self {
+        const SCALE: f32 = 29.0 / 24.0;
+        Self {
+            src: egui::include_image!("../../assets/settings_glow.svg"),
+            canvas: Rect::from_min_size(
+                Pos2::new(-4.505_66 / SCALE, -4.873_92 / SCALE),
+                Vec2::splat(39.0 / SCALE),
+            ),
+            icon_width: 24.0,
+        }
+    }
+
+    /// `reset_passcode_glow.svg`: the same icon, shifted by 2.25 on a canvas
+    /// of 29.
+    pub fn reset_passcode() -> Self {
+        Self {
+            src: egui::include_image!("../../assets/reset_passcode_glow.svg"),
+            canvas: Rect::from_min_size(Pos2::new(-2.25, -2.25), Vec2::splat(29.0)),
+            icon_width: 24.0,
+        }
+    }
+}
+
+/// Draw a clickable icon that brightens on hover, and shows `hover_art` while
+/// hovered or pressed where it has some.
+pub fn icon_button(
+    ui: &mut Ui,
+    size: f32,
+    src: egui::ImageSource<'_>,
+    hover_art: Option<HoverArt>,
+    hover: &str,
+) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     if ui.is_rect_visible(rect) {
         let rect = snap(ui, rect);
+        if let Some(art) = hover_art.filter(|_| resp.hovered() || resp.is_pointer_button_down_on()) {
+            let k = rect.width() / art.icon_width;
+            let canvas =
+                Rect::from_min_size(rect.min + art.canvas.min.to_vec2() * k, art.canvas.size() * k);
+            sharp_image(art.src, canvas.size()).paint_at(ui, canvas);
+            return resp.on_hover_text(hover);
+        }
         let img = sharp_image(src, rect.size());
         // Only dim when idle — tinting a coloured icon at full strength would
         // wash out its own palette.
@@ -1149,18 +1208,49 @@ pub fn header_separator(ui: &mut Ui) {
     );
 }
 
-/// A right-pointing play triangle, drawn rather than imported so it can be
-/// recoloured per state (the asset is a fixed red).
-pub fn play_triangle(ui: &Ui, rect: Rect, color: Color32) {
-    let h = rect.height();
-    let w = rect.width();
-    let c = rect.center();
-    let points = vec![
-        Pos2::new(c.x - w * 0.35, c.y - h * 0.45),
-        Pos2::new(c.x + w * 0.45, c.y),
-        Pos2::new(c.x - w * 0.35, c.y + h * 0.45),
-    ];
-    ui.painter().add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+/// The saved card's play button, in `colour`, centred in `rect` — with its
+/// glow while `lit`, which is while it is hovered or pressed.
+///
+/// The art, recoloured: see [`play_source`] for how one green drawing becomes
+/// every state's colour.
+pub fn play_button(ui: &Ui, rect: Rect, colour: Color32, lit: bool) {
+    /// `play_button.svg` is 17 by 19; `play_button_glow.svg` puts the same
+    /// triangle at (6.5, 5) on a canvas of 28 by 29.
+    const PLAIN: Vec2 = Vec2::new(17.0, 19.0);
+    const GLOW_AT: Vec2 = Vec2::new(-6.5, -5.0);
+    const GLOW: Vec2 = Vec2::new(28.0, 29.0);
+
+    // Nine tenths of the height, as the triangle drawn here before it was.
+    let k = rect.height() * 0.9 / PLAIN.y;
+    let icon = Rect::from_center_size(rect.center(), PLAIN * k);
+    if lit {
+        let canvas = Rect::from_min_size(icon.min + GLOW_AT * k, GLOW * k);
+        sharp_image(play_source(true), canvas.size()).tint(colour).paint_at(ui, canvas);
+    } else {
+        sharp_image(play_source(false), icon.size()).tint(colour).paint_at(ui, icon);
+    }
+}
+
+/// The play art, made white so a tint gives it the status's colour.
+///
+/// # Why white
+///
+/// It is drawn green, and a tint multiplies: green times gray is dark green,
+/// never gray, so the art could not take the gray and amber of the other
+/// states. White times any colour is that colour. The swap is done once, on the
+/// bytes, and egui keeps the rasterised result under the new name.
+fn play_source(glow: bool) -> egui::ImageSource<'static> {
+    use std::sync::{Arc, OnceLock};
+    static PLAIN: OnceLock<Arc<[u8]>> = OnceLock::new();
+    static GLOW: OnceLock<Arc<[u8]>> = OnceLock::new();
+
+    let (cell, uri, svg) = if glow {
+        (&GLOW, "bytes://play_button_glow_white.svg", include_str!("../../assets/play_button_glow.svg"))
+    } else {
+        (&PLAIN, "bytes://play_button_white.svg", include_str!("../../assets/play_button.svg"))
+    };
+    let bytes = cell.get_or_init(|| svg.replace("#34C759", "white").into_bytes().into());
+    egui::ImageSource::Bytes { uri: uri.into(), bytes: egui::load::Bytes::Shared(bytes.clone()) }
 }
 
 /// Stroke a rounded rect with a dashed outline, matching `incoming_card_pending.svg`.

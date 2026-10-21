@@ -116,6 +116,7 @@ fn render_passcode_row_tail(
         ui,
         20.0,
         egui::include_image!("../../assets/reset_passcode.svg"),
+        Some(theme::HoverArt::reset_passcode()),
         match typ {
             PasscodeType::Master => t!("header.reset_admin_hint"),
             PasscodeType::Guest => t!("header.reset_guest_hint"),
@@ -3581,6 +3582,7 @@ impl GuestApp {
                     ui,
                     22.0,
                     egui::include_image!("../../assets/settings.svg"),
+                    Some(theme::HoverArt::settings()),
                     t!("header.settings"),
                 )
                 .clicked()
@@ -3943,8 +3945,8 @@ impl GuestApp {
             // Twenty points is under four millimetres on a high-density
             // screen, which a fingertip covers several times over — taps on it
             // missed more often than they landed, and nothing on the card said
-            // which had happened. The disc behind it is the target, and it
-            // lights while hovered and darkens while pressed, so both kinds of
+            // which had happened. The target is a 34-point square around it,
+            // and the button glows while hovered or pressed, so both kinds of
             // pointer can see they are on it.
             let target = egui::Rect::from_center_size(tri.center(), egui::vec2(34.0, 34.0));
             let resp = ui.interact(
@@ -3952,19 +3954,8 @@ impl GuestApp {
                 ui.id().with(("reconnect", &conn.endpoint_id)),
                 if ready { egui::Sense::click() } else { egui::Sense::hover() },
             );
-            if ready {
-                let fill = if resp.is_pointer_button_down_on() {
-                    Some(egui::Color32::from_white_alpha(36))
-                } else if resp.hovered() {
-                    Some(egui::Color32::from_white_alpha(18))
-                } else {
-                    None
-                };
-                if let Some(fill) = fill {
-                    ui.painter().circle_filled(target.center(), 15.0, fill);
-                }
-            }
-            theme::play_triangle(ui, tri, conn.status.accent());
+            let lit = ready && (resp.hovered() || resp.is_pointer_button_down_on());
+            theme::play_button(ui, tri, conn.status.accent(), lit);
 
             let resp = resp.on_hover_text(match conn.status {
                 ConnectionStatus::Ready => t!("previous.connect"),
@@ -4199,6 +4190,7 @@ impl GuestApp {
                     ui,
                     22.0,
                     kbd,
+                    None,
                     match (pending, keyboard_on) {
                         (true, true) => t!("incoming.offered_not_granted"),
                         (true, false) => t!("incoming.decide_first"),
@@ -4230,6 +4222,7 @@ impl GuestApp {
                     ui,
                     22.0,
                     mouse,
+                    None,
                     match (pending, mouse_on) {
                         (true, true) => t!("incoming.offered_not_granted"),
                         (true, false) => t!("incoming.decide_first"),
