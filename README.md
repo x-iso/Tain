@@ -463,8 +463,14 @@ screen. Closing the window ends every session in it; closing a tab ends just tha
 The toolbar over the video starts with what you send — the **pointer** and the
 **keyboard**, each of which can be kept local — then what you receive: connection
 **stats**, the **host's pointer**, and its **sound** with a volume control. The
-screen picker, scaling, fullscreen and immersive mode are on the toolbar too.
-Right-click the pointer button for aim sensitivity and pointer capture.
+screen picker, scaling, the mini view, fullscreen and immersive mode are on the
+toolbar too. Right-click the pointer button for aim sensitivity and pointer
+capture.
+
+The **mini view** shrinks the window into a corner of the screen, above every
+other window, for keeping an eye on a host while working on this machine. Its
+bar appears while the pointer is on it: drag it by the name, and use it, or a
+double-click, to go back to the full window.
 
 The **screen picker** offers whatever the host allowed. Screens are labelled by
 where they sit (*Main*, *Left*, *Above*, *Virtual*, …), and there is also a view of

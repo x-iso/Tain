@@ -1268,6 +1268,12 @@ Leave fullscreen
 [session.go_fullscreen]
 Go fullscreen
 
+[session.go_mini]
+Mini view: a small window in the corner of the screen, kept above the others
+
+[session.leave_mini]
+Back to the full window
+
 [session.immersive_on]
 Immersive — every key goes to the host and the pointer stays here
 

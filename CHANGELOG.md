@@ -44,6 +44,16 @@ All notable changes to Tain are documented here. This project adheres to
   remind you what they are, and to warn you when a combination you meant for
   the host is one key away from being taken by Tain instead.
 
+- **Mini view.** A new button beside fullscreen shrinks the session window
+  into the corner of the screen and keeps it above your other windows, so you
+  can watch the host while working on something else. It shows the whole
+  picture whatever the scaling, and the host sends a picture only as large as
+  the window. Hover it for a bar to drag it by, with the volume, disconnect,
+  and the way back to the full window; double-clicking the bar goes back too.
+  The window returns to where it was and how big, maximised included, and the
+  next mini view opens wherever you left the last one. Immersive mode ends on
+  the way in, since it would keep the pointer in the corner.
+
 ### Changed
 
 - **One row of chrome in the session window.** It used to spend three:

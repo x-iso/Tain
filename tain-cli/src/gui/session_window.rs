@@ -73,6 +73,14 @@ const BAR_H: f32 = 36.0;
 /// seconds. See `render_overlay`.
 const TOUCH_REVEAL: f64 = 5.0;
 
+/// The box the mini view's picture is fitted into, in points. It takes the
+/// host's shape, as large as fits: a wide screen is the full width and less
+/// tall, a portrait one the full height and narrower.
+const MINI: egui::Vec2 = egui::vec2(400.0, 300.0);
+
+/// The smallest the mini view can be made by hand: still room for its bar.
+const MINI_MIN: egui::Vec2 = egui::vec2(200.0, 112.0);
+
 /// What the session window is asking the app to do.
 #[derive(Default)]
 pub struct SessionWindowActions {
@@ -222,6 +230,11 @@ fn handle_shortcuts(
 pub struct SessionWindow {
     pub active_tab: usize,
     pub fullscreen: bool,
+    /// The mini view: the window small in a corner of the screen and above
+    /// every other, for keeping an eye on the host while working on this
+    /// machine. It has no header; its bar is over the picture while the pointer
+    /// is. See `TitleBar::go_small`.
+    pub mini: bool,
     pub show_toolbar: bool,
     /// Whether the stats occupy a second toolbar row.
     ///
@@ -231,6 +244,9 @@ pub struct SessionWindow {
     /// Set while the fullscreen command is in flight, so the toolbar label does
     /// not flicker before the OS catches up.
     pending_fullscreen: Option<bool>,
+    /// Going small or coming back, carried out in the window's own frame; see
+    /// `request_mini`.
+    pending_mini: Option<bool>,
     /// Where the toolbar was last drawn, in screen points.
     ///
     /// Kept so pointer input can be withheld from it — the toolbar sits on top
@@ -268,9 +284,11 @@ impl Default for SessionWindow {
         Self {
             active_tab: 0,
             fullscreen: false,
+            mini: false,
             show_toolbar: true,
             show_stats: false,
             pending_fullscreen: None,
+            pending_mini: None,
             toolbar_rect: None,
             title_bar: TitleBar::default(),
             tools_width: None,
@@ -304,6 +322,10 @@ impl SessionWindow {
         self.active_tab = 0;
         self.fullscreen = false;
         self.pending_fullscreen = None;
+        // The same for the mini view. Where it was is remembered by the frame,
+        // and the next one goes there.
+        self.mini = false;
+        self.pending_mini = None;
         self.show_toolbar = true;
         // The window goes with the last session, and the next one is a new
         // window whose caption has to be taken over again.
@@ -315,10 +337,26 @@ impl SessionWindow {
 
     pub fn request_fullscreen(&mut self, on: bool) {
         self.pending_fullscreen = Some(on);
+        // Fullscreen from the mini view goes by way of the full window, which
+        // is then where leaving fullscreen comes back to.
+        if on && self.mini {
+            self.pending_mini = Some(false);
+        }
     }
 
     pub fn toggle_fullscreen(&mut self) {
         self.request_fullscreen(!self.fullscreen);
+    }
+
+    /// Go to the mini view, or back from it.
+    pub fn request_mini(&mut self, on: bool) {
+        self.pending_mini = Some(on);
+        // From fullscreen, out of it first: winit leaves fullscreen by putting
+        // the window back where it was, and would take the small one with it.
+        // `show` holds the mini view back until that is done.
+        if on && self.fullscreen {
+            self.request_fullscreen(false);
+        }
     }
 
     /// Draw the window and everything in it.
@@ -362,9 +400,30 @@ impl SessionWindow {
 
                 let window_buttons = self.title_bar.update(ctx, &title);
 
+                // # The mini view and fullscreen, in order
+                //
+                // Back from small first, so that fullscreen asked for from the
+                // mini view starts from the full window. Small last, and never
+                // in the frame that leaves fullscreen: winit does that after
+                // this frame, by putting the window back where it was, which
+                // would take the small one back with it.
+                if self.pending_mini == Some(false) {
+                    self.pending_mini = None;
+                    if self.mini {
+                        self.mini = false;
+                        self.title_bar.go_back();
+                    }
+                }
+                let leaving_fullscreen = self.fullscreen && self.pending_fullscreen == Some(false);
                 if let Some(on) = self.pending_fullscreen.take() {
                     self.fullscreen = on;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+                }
+                if self.pending_mini == Some(true) && !leaving_fullscreen {
+                    self.pending_mini = None;
+                    if !self.mini {
+                        self.go_small(ctx, sessions.get_mut(self.active_tab), immersive);
+                    }
                 }
                 // Over the taskbar while fullscreen, but only while in front;
                 // see `TitleBar::keep_above_taskbar`.
@@ -455,6 +514,35 @@ impl SessionWindow {
         actions
     }
 
+    /// Make the window the mini view of `session`, shaped like its picture.
+    fn go_small(
+        &mut self,
+        ctx: &Context,
+        session: Option<&mut GuestSession>,
+        immersive: &mut Immersive,
+    ) {
+        let remote = session.as_ref().map_or((0, 0), |s| s.remote_size());
+        if !self.title_bar.go_small(ctx, mini_size(remote), MINI_MIN) {
+            return;
+        }
+        self.mini = true;
+
+        // # Immersive mode does not come along
+        //
+        // It keeps the pointer inside this window, and a pointer kept inside a
+        // corner of the screen cannot reach anything else — which is what the
+        // mini view is for. The pointer's capture goes for the same reason.
+        let immersed = immersive.is_active();
+        immersive.set_active(false);
+        if let Some(session) = session {
+            if immersed {
+                // Anything the hook was holding has to be let go on the host.
+                session.release_held_keys();
+            }
+            session.pointer_captured = false;
+        }
+    }
+
     fn render_contents(
         &mut self,
         ctx: &Context,
@@ -476,6 +564,10 @@ impl SessionWindow {
             // has no caption style in fullscreen either, so this is belt and
             // braces.
             self.title_bar.publish(ctx, title_bar::Layout::default());
+        } else if self.mini {
+            // No header either. The bar over the picture is all the mini view
+            // has, and it tells the frame where it is — see
+            // `render_mini_overlay`.
         } else {
             egui::TopBottomPanel::top("session-header")
                 .exact_height(BAR_H)
@@ -502,9 +594,13 @@ impl SessionWindow {
 
                 let viewport = ui.max_rect();
                 self.picture_rect = Some(viewport);
+                // The mini view shows the whole picture: 1:1 in a window that
+                // size is a corner of the host's screen the size of a stamp.
+                // The session keeps its own mode for when it comes back.
+                let scaling = if self.mini { ScalingMode::Fit } else { session.scaling };
                 // In physical pixels, which is what the host would have to
                 // encode — points would under-report on a scaled display.
-                session.report_viewport(viewport.size(), ctx.pixels_per_point());
+                session.report_viewport(scaling, viewport.size(), ctx.pixels_per_point());
                 // Bind the id and size up front: `auto_pan` needs `&mut session`
                 // while the texture handle borrows it immutably.
                 // Two ways a frame reaches the screen. A texture egui owns,
@@ -525,12 +621,14 @@ impl SessionWindow {
                         // position rather than lagging one frame behind it.
                         let pointer = ctx.pointer_latest_pos();
                         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-                        session.auto_pan(viewport, src, pointer, dt);
-                        let panning = session.scaling == ScalingMode::Actual
+                        if scaling == ScalingMode::Actual {
+                            session.auto_pan(viewport, src, pointer, dt);
+                        }
+                        let panning = scaling == ScalingMode::Actual
                             && theme::pan_limit(viewport.size(), src) != egui::Vec2::ZERO;
 
                         let rect =
-                            theme::scaled_rect(session.scaling, viewport, src, session.pan, ctx.pixels_per_point());
+                            theme::scaled_rect(scaling, viewport, src, session.pan, ctx.pixels_per_point());
                         let painter = ui.painter_at(viewport);
                         match texture_id {
                             Some(texture_id) => {
@@ -977,6 +1075,11 @@ impl SessionWindow {
         // How close to the top edge counts as reaching for the toolbar.
         const REVEAL_BAND: f32 = 90.0;
 
+        if self.mini {
+            self.render_mini_overlay(ui, viewport, sessions, actions);
+            return;
+        }
+
         if !self.fullscreen {
             // The header holds the bar, so the picture is left alone apart
             // from the numbers.
@@ -1034,18 +1137,7 @@ impl SessionWindow {
         self.toolbar_rect = Some(bar);
 
         if touch {
-            let (pressing, pressed) = ui.input(|i| (i.pointer.primary_down(), i.pointer.any_pressed()));
-            // Popups opened from the bar — the pointer's options, the volume —
-            // hang below it, and count as using it.
-            let on_bar = ui.ctx().pointer_latest_pos().is_some_and(|p| bar.contains(p))
-                || ui.ctx().is_pointer_over_area();
-            if pressing && on_bar {
-                self.touch_reveal_until = now + TOUCH_REVEAL;
-            } else if pressed && !on_bar && self.renaming.is_none() {
-                self.touch_reveal_until = 0.0;
-            }
-            let left = (self.touch_reveal_until - now).max(0.0);
-            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(left));
+            self.keep_bar_for_touch(ui, bar);
         }
         // # The header's row, on the fading backdrop
         //
@@ -1066,6 +1158,157 @@ impl SessionWindow {
         {
             render_stats_in(ui, egui::Rect::from_min_size(row.left_bottom(), row.size()), session);
         }
+    }
+
+    /// Under a finger, keep `bar` down while it is being used, and put it away
+    /// at a press anywhere else. See `render_overlay`.
+    fn keep_bar_for_touch(&mut self, ui: &egui::Ui, bar: egui::Rect) {
+        let now = ui.input(|i| i.time);
+        let (pressing, pressed) = ui.input(|i| (i.pointer.primary_down(), i.pointer.any_pressed()));
+        // Popups opened from the bar — the pointer's options, the volume —
+        // hang below it, and count as using it.
+        let on_bar = ui.ctx().pointer_latest_pos().is_some_and(|p| bar.contains(p))
+            || ui.ctx().is_pointer_over_area();
+        if pressing && on_bar {
+            self.touch_reveal_until = now + TOUCH_REVEAL;
+        } else if pressed && !on_bar && self.renaming.is_none() {
+            self.touch_reveal_until = 0.0;
+        }
+        let left = (self.touch_reveal_until - now).max(0.0);
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(left));
+    }
+
+    /// The mini view's bar, over the top of the picture.
+    ///
+    /// # Whenever the pointer is on the window
+    ///
+    /// Not only near the top, as in fullscreen: the whole window is not much
+    /// taller than that band, and the bar is the way back. Kept while Windows
+    /// is moving the window by it, when the pointer is Windows' and egui is
+    /// told it has gone. A finger asks for it with the handle, as in
+    /// fullscreen. The collapsed toolbar does not apply: hidden here, the bar
+    /// would leave a window with no way back but a shortcut.
+    fn render_mini_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        viewport: egui::Rect,
+        sessions: &mut [GuestSession],
+        actions: &mut SessionWindowActions,
+    ) {
+        let ctx = ui.ctx().clone();
+        let touch = super::touch::active();
+        let shown = if touch {
+            ui.input(|i| i.time) < self.touch_reveal_until
+        } else {
+            ctx.pointer_latest_pos().is_some() || self.title_bar.moving()
+        };
+        if !shown {
+            self.toolbar_rect = None;
+            if touch {
+                self.render_reveal_handle(ui, viewport);
+            }
+            self.title_bar.publish(&ctx, title_bar::Layout::default());
+            return;
+        }
+        let Some(session) = sessions.get_mut(self.active_tab) else { return };
+
+        let bar = egui::Rect::from_min_size(viewport.left_top(), egui::vec2(viewport.width(), BAR_H));
+        self.toolbar_rect = Some(bar);
+        if touch {
+            self.keep_bar_for_touch(ui, bar);
+        }
+        paint_toolbar_backdrop(ui.painter(), bar);
+        let layout = self.render_mini_bar(ui, bar, session, actions);
+        self.title_bar.publish(&ctx, layout);
+    }
+
+    /// The session's name, to hold the window by, and the few controls a
+    /// picture this size has room for.
+    ///
+    /// Returns where they are, for the frame. Under a finger the name is
+    /// caption, which Windows drags natively; under a mouse it is egui's, and a
+    /// drag is handed to Windows' move loop the way the header's title does —
+    /// a caption would take the pointer from egui, and with it the bar.
+    fn render_mini_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: egui::Rect,
+        session: &mut GuestSession,
+        actions: &mut SessionWindowActions,
+    ) -> title_bar::Layout {
+        const PAD: f32 = 8.0;
+
+        let mut layout = title_bar::Layout::default();
+
+        // From the right edge, so the name gets whatever they leave.
+        let mut tools = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("mini-tools")
+                .max_rect(row.shrink2(egui::vec2(PAD, 0.0)))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        theme::chips_over(&mut tools, theme::Backdrop::Video);
+        if theme::icon_toggle(
+            &mut tools,
+            16.0,
+            theme::IconState::Off,
+            egui::include_image!("../../assets/cancel.svg"),
+            t!("session.disconnect"),
+        )
+        .clicked()
+        {
+            actions.close.push(session.tab_id);
+        }
+        tools.add_space(6.0);
+        if theme::icon_toggle(
+            &mut tools,
+            16.0,
+            theme::IconState::On,
+            egui::include_image!("../../assets/mini_view.svg"),
+            t!("session.leave_mini"),
+        )
+        .clicked()
+        {
+            self.request_mini(false);
+        }
+        tools.add_space(6.0);
+        volume_control(&mut tools, session);
+        // As on the full bar: the stream may have opened since the last click.
+        session.apply_sound_preference();
+        let used = tools.min_rect();
+        layout.controls.push(used);
+
+        let grip = egui::Rect::from_x_y_ranges(
+            row.left() + PAD..=(used.left() - PAD).max(row.left() + PAD),
+            row.y_range(),
+        );
+        let middle = grip.center().y;
+        let painter = ui.painter_at(grip);
+        painter.circle_filled(egui::pos2(grip.left() + 6.0, middle), 3.5, status_colour(session));
+        let text_left = grip.left() + 16.0;
+        let galley = egui::WidgetText::from(RichText::new(&session.label).color(TEXT)).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            (grip.right() - text_left).max(0.0),
+            egui::TextStyle::Body,
+        );
+        let elided = galley.elided;
+        painter.galley(egui::pos2(text_left, middle - galley.size().y / 2.0), galley, TEXT);
+
+        let resp = ui.interact(grip, ui.id().with("mini-grip"), egui::Sense::click_and_drag());
+        if super::touch::active() {
+            layout.caption = Some(row);
+        } else if resp.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        // As a title bar is double-clicked to fill the screen: the full window.
+        if resp.double_clicked() {
+            self.request_mini(false);
+        }
+        if elided {
+            resp.on_hover_text(&session.label);
+        }
+        layout
     }
 
     /// The controls for the session on screen, left to right.
@@ -1160,6 +1403,24 @@ impl SessionWindow {
                 // Leaving immersive mode: anything the hook was holding has
                 // to be let go on the host, or it stays down there forever.
                 session.release_held_keys();
+            }
+        }
+
+        // Only where the frame is this window's own, which is what moves it;
+        // see `TitleBar::go_small`. In the mini view the same icon, lit, is
+        // the way back.
+        if self.title_bar.can_go_small() {
+            ui.add_space(6.0);
+            if theme::icon_toggle(
+                ui,
+                16.0,
+                theme::IconState::Off,
+                egui::include_image!("../../assets/mini_view.svg"),
+                t!("session.go_mini"),
+            )
+            .clicked()
+            {
+                self.request_mini(true);
             }
         }
 
@@ -1284,6 +1545,18 @@ impl SessionWindow {
         }
         layout.controls.push(close);
     }
+}
+
+/// The mini view's picture, in points, for a host whose screen is `remote`
+/// pixels: its shape, as large as fits in [`MINI`]. 16:9 until the size is
+/// known, which is what most screens are.
+fn mini_size(remote: (u16, u16)) -> egui::Vec2 {
+    let (w, h) = match remote {
+        (0, _) | (_, 0) => (16.0, 9.0),
+        (w, h) => (w as f32, h as f32),
+    };
+    let scale = (MINI.x / w).min(MINI.y / h);
+    (egui::vec2(w, h) * scale).round().max(MINI_MIN)
 }
 
 /// Draw the host's pointer over the video.
@@ -3035,6 +3308,57 @@ mod tests {
         window.pending_fullscreen = None;
         window.toggle_fullscreen();
         assert_eq!(window.pending_fullscreen, Some(false));
+    }
+
+    #[test]
+    fn the_mini_view_from_fullscreen_leaves_fullscreen_first() {
+        // winit leaves fullscreen by putting the window back where it was, so
+        // a window made small before then would be put straight back.
+        let mut window = SessionWindow { fullscreen: true, ..SessionWindow::default() };
+
+        window.request_mini(true);
+
+        assert_eq!(window.pending_fullscreen, Some(false));
+        assert_eq!(window.pending_mini, Some(true));
+    }
+
+    #[test]
+    fn fullscreen_from_the_mini_view_goes_back_to_the_window_first() {
+        // So that leaving fullscreen lands in the full window, not the corner.
+        let mut window = SessionWindow { mini: true, ..SessionWindow::default() };
+
+        window.toggle_fullscreen();
+
+        assert_eq!(window.pending_fullscreen, Some(true));
+        assert_eq!(window.pending_mini, Some(false));
+    }
+
+    #[test]
+    fn resetting_leaves_the_mini_view_so_the_next_session_opens_full_size() {
+        let mut window =
+            SessionWindow { mini: true, pending_mini: Some(true), ..SessionWindow::default() };
+
+        window.reset();
+
+        assert!(!window.mini);
+        assert_eq!(window.pending_mini, None);
+    }
+
+    #[test]
+    fn the_mini_view_takes_the_hosts_shape() {
+        // Wide: the full width, and less tall.
+        assert_eq!(mini_size((1920, 1080)), egui::vec2(400.0, 225.0));
+        // Portrait: the full height, and narrower.
+        assert_eq!(mini_size((1200, 1600)), egui::vec2(225.0, 300.0));
+        // Not yet known: the shape most screens are.
+        assert_eq!(mini_size((0, 0)), egui::vec2(400.0, 225.0));
+    }
+
+    #[test]
+    fn the_mini_view_keeps_room_for_its_bar() {
+        // Three screens side by side would be a sliver; it is letterboxed
+        // instead.
+        assert_eq!(mini_size((5760, 1080)), egui::vec2(400.0, MINI_MIN.y));
     }
 
     #[test]

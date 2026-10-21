@@ -25,11 +25,17 @@
 //!
 //! The header itself is drawn by egui, which says each frame where its empty
 //! space and its maximize button are — see [`Layout`].
+//!
+//! Having the frame in hand is also what lets the mini view put the window in
+//! a corner and back again exactly — see [`TitleBar::go_small`].
 
-use egui::{Context, Pos2, Rect, ViewportBuilder, ViewportCommand, ViewportId};
+use egui::{Context, Pos2, Rect, Vec2, ViewportBuilder, ViewportCommand, ViewportId};
 
 /// Width of the minimize, maximize and close buttons: Windows' own.
 pub const BUTTON_W: f32 = 46.0;
+
+/// How far the mini view sits from the corner of its screen, in points.
+const SMALL_MARGIN: f32 = 16.0;
 
 /// Frames to spend looking for the window before settling for the native
 /// title bar.
@@ -225,6 +231,50 @@ impl TitleBar {
             platform::stay_above_taskbar();
         }
     }
+
+    /// Whether the window can be made the mini view: only one whose frame this
+    /// has taken over, because that is where the handle to move it comes from.
+    pub fn can_go_small(&self) -> bool {
+        matches!(self.stage, Stage::Settling | Stage::Custom)
+    }
+
+    /// Shrink the window to a client area of `size` points and keep it above
+    /// every other window, until [`TitleBar::go_back`]. It goes where the last
+    /// one was left, or else into the bottom right corner of its screen, clear
+    /// of the taskbar. `min` is how small it can then be made by hand.
+    ///
+    /// # Why the frame does this rather than egui
+    ///
+    /// winit sizes a window by adding Windows' idea of its frame to the size
+    /// asked for, and Windows' idea includes the caption this has taken away.
+    /// So every size given through egui comes out a caption's height too tall,
+    /// and a window sent small and back that way would grow by one each time.
+    /// Here the frame is measured as it really is, and going back restores the
+    /// placement saved on the way in — maximized, if it was.
+    ///
+    /// The smaller minimum is the frame's for the same reason: changing winit's
+    /// makes winit restate the window's size, a caption's height taller.
+    ///
+    /// Returns whether the window went small.
+    pub fn go_small(&mut self, ctx: &Context, size: Vec2, min: Vec2) -> bool {
+        if !self.can_go_small() {
+            return false;
+        }
+        let ppp = ctx.pixels_per_point();
+        let px = |points: f32| (points * ppp).round() as i32;
+        platform::go_small((px(size.x), px(size.y)), (px(min.x), px(min.y)), px(SMALL_MARGIN))
+    }
+
+    /// Put the window back where and how it was before [`TitleBar::go_small`].
+    pub fn go_back(&mut self) {
+        platform::go_back();
+    }
+
+    /// Whether Windows is moving or sizing the window, which it does with the
+    /// pointer as its own: egui is told the pointer has left.
+    pub fn moving(&self) -> bool {
+        platform::moving()
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -233,7 +283,8 @@ mod platform {
 
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONULL,
+        GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, MonitorFromWindow, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
     };
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
@@ -243,14 +294,15 @@ mod platform {
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumThreadWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowInfo,
-        GetWindowLongW, GetWindowRect, GetWindowTextW, IsZoomed, PostMessageW, SetWindowPos,
-        WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, HTCAPTION, HTCLIENT,
-        HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT, HWND_NOTOPMOST, HWND_TOPMOST,
-        NCCALCSIZE_PARAMS, SC_MAXIMIZE, SC_RESTORE, SM_CXPADDEDBORDER, SM_CYSIZEFRAME,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINDOWINFO,
-        WINDOWPOS, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
-        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SYSCOMMAND,
-        WM_WINDOWPOSCHANGING, WS_CAPTION, WS_EX_TOPMOST,
+        GetWindowLongW, GetWindowPlacement, GetWindowRect, GetWindowTextW, IsIconic, IsZoomed,
+        PostMessageW, SetWindowPlacement, SetWindowPos, ShowWindow, WindowFromPoint, GA_ROOT,
+        GWL_EXSTYLE, GWL_STYLE, HTCAPTION, HTCLIENT, HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+        HWND_NOTOPMOST, HWND_TOPMOST, MINMAXINFO, NCCALCSIZE_PARAMS, SC_MAXIMIZE, SC_RESTORE,
+        SM_CXPADDEDBORDER, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, WINDOWINFO, WINDOWPLACEMENT, WINDOWPOS,
+        WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_NCCALCSIZE, WM_NCDESTROY,
+        WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE,
+        WM_NCMOUSEMOVE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WS_CAPTION, WS_EX_TOPMOST,
     };
 
     use super::{Hit, Layout};
@@ -268,15 +320,36 @@ mod platform {
         /// To redraw the maximize button when the pointer reaches or leaves
         /// it, which egui has no way to notice for itself.
         wake: egui::Context,
+        /// Set while the window is the mini view.
+        small: Option<Small>,
+        /// Whether Windows is moving or sizing the window.
+        moving: bool,
+    }
+
+    /// The mini view's side of [`Shared`].
+    struct Small {
+        /// Where and how the window was before, to go back to.
+        before: WINDOWPLACEMENT,
+        /// The smallest client area it can be made, in pixels.
+        min: (i32, i32),
     }
 
     static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
+
+    /// Where the mini view was last, frame included, in screen pixels: where
+    /// the next one goes. Kept apart from [`Shared`] because it outlives the
+    /// window, which closes with the last session.
+    static SMALL_AT: Mutex<Option<RECT>> = Mutex::new(None);
 
     /// Any constant: a subclass is identified by its procedure and this.
     const SUBCLASS_ID: usize = 1;
 
     fn shared() -> MutexGuard<'static, Option<Shared>> {
         SHARED.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn small_at() -> MutexGuard<'static, Option<RECT>> {
+        SMALL_AT.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn attached() -> bool {
@@ -294,6 +367,8 @@ mod platform {
             hovered: false,
             pressed: false,
             wake: ctx.clone(),
+            small: None,
+            moving: false,
         });
 
         // SAFETY: a window this thread created, and a procedure that lives as
@@ -381,6 +456,134 @@ mod platform {
                 );
             }
         }
+    }
+
+    pub fn go_small(size: (i32, i32), min: (i32, i32), margin: i32) -> bool {
+        let Some(window) = shared().as_ref().map(|s| HWND(s.window as *mut _)) else {
+            return false;
+        };
+        let mut before = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            flags: Default::default(),
+            showCmd: 0,
+            ptMinPosition: POINT::default(),
+            ptMaxPosition: POINT::default(),
+            rcNormalPosition: RECT::default(),
+        };
+        // SAFETY: a live window and a structure sized for the call.
+        if unsafe { GetWindowPlacement(window, &mut before) }.is_err() {
+            return false;
+        }
+        let Some(spot) = small_spot(window, size, margin) else { return false };
+
+        // Before the window moves: moving it asks for its minimum, which has
+        // to be the small one by then.
+        match shared().as_mut() {
+            Some(state) => state.small = Some(Small { before, min }),
+            None => return false,
+        }
+
+        // SAFETY: a live window of this thread, restored and then placed.
+        unsafe {
+            // Moved as it is, a maximized window would still be maximized, and
+            // fill the screen again the next time anything asked.
+            if is_zoomed(window) {
+                let _ = ShowWindow(window, SW_RESTORE);
+            }
+            let _ = SetWindowPos(
+                window,
+                HWND_TOPMOST,
+                spot.left,
+                spot.top,
+                spot.right - spot.left,
+                spot.bottom - spot.top,
+                SWP_NOACTIVATE,
+            );
+        }
+        true
+    }
+
+    pub fn go_back() {
+        let Some((window, small)) = shared()
+            .as_mut()
+            .and_then(|s| Some((HWND(s.window as *mut _), s.small.take()?)))
+        else {
+            return;
+        };
+        remember_spot(window);
+        // SAFETY: a live window of this thread, put back as it was: below the
+        // topmost windows, then where `GetWindowPlacement` said it was.
+        unsafe {
+            let _ = SetWindowPos(
+                window,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPlacement(window, &small.before);
+        }
+    }
+
+    pub fn moving() -> bool {
+        shared().as_ref().is_some_and(|s| s.moving)
+    }
+
+    /// Where the mini view goes, frame included: where the last one was if
+    /// that is still on a screen, or else the bottom right corner of the
+    /// window's own screen, `margin` clear of its edges and the taskbar.
+    fn small_spot(window: HWND, (width, height): (i32, i32), margin: i32) -> Option<RECT> {
+        if let Some(spot) = *small_at() {
+            // SAFETY: a read-only query about the monitors.
+            if !unsafe { MonitorFromRect(&spot, MONITOR_DEFAULTTONULL) }.is_invalid() {
+                return Some(spot);
+            }
+        }
+
+        let mut info =
+            MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        // SAFETY: read-only queries about the window's monitor.
+        let found = unsafe {
+            GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mut info)
+        };
+        if !found.as_bool() {
+            return None;
+        }
+        // The client area is placed, and the frame drawn around it the way
+        // `procedure` leaves it: the borders on the left, right and bottom are
+        // outside the window, unseen; the top one went with the caption.
+        let border = border(window);
+        let (right, bottom) = (info.rcWork.right - margin, info.rcWork.bottom - margin);
+        Some(RECT {
+            left: right - width - border,
+            top: bottom - height,
+            right: right + border,
+            bottom: bottom + border,
+        })
+    }
+
+    /// Remember where the mini view is, for the next one. Not if it has been
+    /// maximized or minimized, which are not places.
+    fn remember_spot(window: HWND) {
+        let mut spot = RECT::default();
+        // SAFETY: read-only queries about a live window.
+        let placed = !is_zoomed(window)
+            && !unsafe { IsIconic(window) }.as_bool()
+            && unsafe { GetWindowRect(window, &mut spot) }.is_ok();
+        if placed {
+            *small_at() = Some(spot);
+        }
+    }
+
+    /// The smallest the mini view can be made, frame included as
+    /// [`small_spot`] adds it — or `None` when the window is not small, and
+    /// winit's minimum stands.
+    fn small_minimum(window: HWND) -> Option<POINT> {
+        let (width, height) = shared().as_ref()?.small.as_ref()?.min;
+        let border = border(window);
+        Some(POINT { x: width + 2 * border, y: height + border })
     }
 
     /// Hang a fullscreen window one pixel past its monitor.
@@ -583,6 +786,20 @@ mod platform {
                 set_hovered(window, false);
                 default()
             }
+            // After the default procedure, which is winit's, and which gives
+            // the minimum it was told — too large for the mini view.
+            WM_GETMINMAXINFO => {
+                let result = default();
+                if let Some(min) = small_minimum(window) {
+                    // SAFETY: this message's MINMAXINFO, valid until it returns.
+                    unsafe { (*(lparam.0 as *mut MINMAXINFO)).ptMinTrackSize = min };
+                }
+                result
+            }
+            WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE => {
+                set_moving(message == WM_ENTERSIZEMOVE);
+                default()
+            }
             // Ours, not the default procedure's: it would run its own modal
             // loop for the button and draw a Windows 7 maximize button over the
             // header while it did.
@@ -614,6 +831,11 @@ mod platform {
                 }
                 let mut held = shared();
                 if held.as_ref().is_some_and(|s| s.window == window.0 as usize) {
+                    // Closed small, with its last session: the next mini view
+                    // still goes where this one was.
+                    if held.as_ref().is_some_and(|s| s.small.is_some()) {
+                        remember_spot(window);
+                    }
                     *held = None;
                 }
                 drop(held);
@@ -702,6 +924,19 @@ mod platform {
         wake.request_repaint_of(egui::ViewportId::ROOT);
     }
 
+    fn set_moving(moving: bool) {
+        let wake = {
+            let mut held = shared();
+            let Some(state) = held.as_mut() else { return };
+            state.moving = moving;
+            state.wake.clone()
+        };
+        // Outside the lock, as in `set_hovered`. A move or resize that ends
+        // with the pointer off the window is the frame that puts the mini
+        // view's bar away.
+        wake.request_repaint_of(egui::ViewportId::ROOT);
+    }
+
     /// Set the pressed state, returning what it was.
     fn set_pressed(pressed: bool) -> bool {
         let (was, wake) = {
@@ -760,6 +995,16 @@ mod platform {
 
     pub fn in_front() -> Option<bool> {
         None
+    }
+
+    pub fn go_small(_size: (i32, i32), _min: (i32, i32), _margin: i32) -> bool {
+        false
+    }
+
+    pub fn go_back() {}
+
+    pub fn moving() -> bool {
+        false
     }
 }
 

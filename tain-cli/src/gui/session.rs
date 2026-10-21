@@ -601,8 +601,12 @@ impl GuestSession {
     /// before it was sent, so "actual size" shows no more detail than Fit did
     /// and the mode does nothing. It is also what makes "all screens at 1:1"
     /// mean full resolution rather than a wall squeezed into one window.
-    pub fn report_viewport(&self, size: egui::Vec2, pixels_per_point: f32) {
-        let wanted = match self.scaling {
+    ///
+    /// `scaling` is the mode the picture is drawn in, which is the session's
+    /// own except in the mini view: that always fits, and a window that small
+    /// is the most worth saying so for.
+    pub fn report_viewport(&self, scaling: ScalingMode, size: egui::Vec2, pixels_per_point: f32) {
+        let wanted = match scaling {
             ScalingMode::Actual => None,
             ScalingMode::Fit => {
                 let to_px =

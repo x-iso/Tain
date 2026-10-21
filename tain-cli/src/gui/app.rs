@@ -6043,11 +6043,13 @@ mod tests {
         // Regression: disconnecting while fullscreen left the window stuck.
         let mut app = GuestApp::new(AppState::new());
         app.session_window.fullscreen = true;
+        app.session_window.mini = true;
         app.session_window.active_tab = 2;
 
         app.after_sessions_changed();
 
         assert!(!app.session_window.fullscreen);
+        assert!(!app.session_window.mini);
         assert_eq!(app.session_window.active_tab, 0);
         assert!(!app.immersive.is_active());
     }
