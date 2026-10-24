@@ -336,6 +336,14 @@ pub struct SessionConfig {
     pub exclude_audio_processes: Vec<String>,
     /// Opus bitrate in kbit/s. 0 falls back to the codec's default.
     pub audio_bitrate_kbps: u32,
+    /// The playback device whose sound is streamed, by Windows endpoint id.
+    ///
+    /// `None` follows the system default, including when it changes. A chosen
+    /// device that is unplugged falls back to the default until it returns.
+    /// Applied to the whole process, so sessions already running move too —
+    /// see [`HostServer::set_session_config`]. Set aside while applications are
+    /// excluded, which captures applications rather than a device.
+    pub audio_capture_device: Option<String>,
     /// What this machine calls itself, sent to guests so their saved-connection
     /// list reads as machine names instead of hex. `None` stays anonymous.
     pub host_name: Option<String>,
@@ -417,6 +425,7 @@ impl Default for SessionConfig {
             auto_regen_guest_passcode: true,
             exclude_audio_processes: Vec::new(),
             audio_bitrate_kbps: 160,
+            audio_capture_device: None,
             host_name: None,
             priority: crate::LatencyPriority::default(),
             // Off: resizing somebody's desktop because a guest connected is a
@@ -572,6 +581,10 @@ impl HostServer {
         // every session already running follows the new value rather than only
         // the ones started afterwards.
         super::local_input::set_window(config.local_input_wins_for);
+        // The same for the device sound is captured from: one machine, one set
+        // of speakers, and every running capture follows it.
+        #[cfg(target_os = "windows")]
+        super::audio_device::set_capture_device(config.audio_capture_device.clone());
         *self.config.lock().unwrap() = config;
     }
 
@@ -1343,11 +1356,24 @@ impl HostServer {
             }
         };
 
+        // Notices have no fallback. They exist to say what an older guest would
+        // not understand, and the control stream is exactly where it would fail
+        // to — see `protocol::Notice`. Without this stream they are not sent.
+        let notice_send =
+            match open_tagged_stream(&conn, super::protocol::stream_kind::NOTICES).await {
+                Ok(stream) => Some(stream),
+                Err(e) => {
+                    debug!("No notices stream ({e}) — the guest will not be told where sound comes from");
+                    None
+                }
+            };
+
         run_session(
             send,
             recv,
             audio_send,
             video_send,
+            notice_send,
             session_id,
             Arc::clone(&self.sessions),
             config,
@@ -1469,11 +1495,12 @@ async fn open_tagged_stream(
 /// Generic over the stream halves so it can be exercised over `tokio::io::duplex`
 /// in tests without standing up an iroh endpoint.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_session<W, R, A, V>(
+pub async fn run_session<W, R, A, V, N>(
     mut send: W,
     recv: R,
     audio_send: Option<A>,
     video_send: Option<V>,
+    notice_send: Option<N>,
     session_id: u32,
     sessions: Arc<SessionManager>,
     config: SessionConfig,
@@ -1488,6 +1515,7 @@ where
     R: tokio::io::AsyncReadExt + Unpin + Send + 'static,
     A: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
     V: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
+    N: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
 {
     info!("Session #{} running", session_id);
 
@@ -1562,12 +1590,39 @@ where
     // Without a second stream, audio shares the main one — worse, not broken.
     let audio_sink = if audio_writer.is_some() { audio_tx } else { out_tx.clone() };
 
+    // Notices go down their own stream or nowhere: see `protocol::Notice`.
+    // Without one, the receiver goes with the closure and every send is a
+    // quiet no-op, which is the right answer for a guest that cannot hear them.
+    let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<super::protocol::Notice>();
+    let notice_writer = notice_send.map(|mut stream| {
+        tokio::spawn(async move {
+            while let Some(notice) = notice_rx.recv().await {
+                // A guest from before notices existed stops this stream
+                // without reading it, and the write fails. That ends the
+                // notices and nothing else: the session never depended on them.
+                if let Err(e) = write_stream_message(&mut stream, &notice).await {
+                    debug!("Session #{session_id}: notices stopped ({e}) — an older guest, most likely");
+                    return;
+                }
+            }
+            let _ = stream.shutdown().await;
+        })
+    });
+
     let audio = spawn_audio_pipeline(
         session_id,
         audio_sink,
+        notice_tx.clone(),
         &config.exclude_audio_processes,
         config.audio_bitrate_kbps,
     );
+    if audio.is_none() {
+        // The reasons are in the log here; the guest only needs to know that
+        // silence is this end's doing, not its own.
+        let _ = notice_tx.send(super::protocol::Notice::AudioSource(
+            super::protocol::AudioSource::Unavailable,
+        ));
+    }
 
     let encoder = super::encoder::create_encoder(config.encode.clone())?;
     // The pointer goes out on the session's outbound channel, not the frame
@@ -1674,6 +1729,9 @@ where
         audio.stop();
     }
     if let Some(writer) = audio_writer {
+        writer.abort();
+    }
+    if let Some(writer) = notice_writer {
         writer.abort();
     }
     if let Some(mut video) = video_send {
@@ -2229,11 +2287,13 @@ impl HostTally {
 fn spawn_audio_pipeline(
     session_id: u32,
     out_tx: mpsc::UnboundedSender<Message>,
+    notices: mpsc::UnboundedSender<super::protocol::Notice>,
     exclude: &[String],
     bitrate_kbps: u32,
 ) -> Option<AudioPipeline> {
     use super::audio_capture::{audio_sessions, LoopbackCapture};
     use super::audio_codec::{OpusEncoder, DEFAULT_BITRATE};
+    use super::protocol::{AudioSource, Notice};
 
     // Resolved now rather than saved: a pid is different every launch, and this
     // is the moment the named applications are most likely to be running.
@@ -2274,20 +2334,55 @@ fn spawn_audio_pipeline(
         }
     };
 
+    // Applications are captured one by one, with no device in between, so
+    // there is nothing to follow and this is said once. Otherwise the device is
+    // watched below, because it changes under a running session.
+    let follows_device = pids.is_empty();
+    if !follows_device {
+        let _ = notices.send(Notice::AudioSource(AudioSource::Applications));
+    }
+
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let thread = std::thread::Builder::new()
         .name(format!("audio-send-{session_id}"))
         .spawn(move || {
             // Held for the life of the thread: dropping it stops the capture.
-            let _capture = capture;
+            let capture = capture;
             let src = format.channels as usize;
             let dst = channels as usize;
             let mut mono = Vec::new();
+            // What the guest was last told, and when it was last checked. A
+            // lock and a short string, but a hundred times a second is still
+            // a hundred times more often than a device changes.
+            const RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
+            let mut told: Option<AudioSource> = None;
+            let mut checked: Option<std::time::Instant> = None;
 
             while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let Ok(chunk) = chunks.recv_timeout(std::time::Duration::from_millis(500)) else {
-                    continue;
+                if follows_device && checked.is_none_or(|at| at.elapsed() >= RECHECK) {
+                    checked = Some(std::time::Instant::now());
+                    let now = match capture.device() {
+                        Some(device) => AudioSource::Device(device.name),
+                        None => AudioSource::NoDevice,
+                    };
+                    if told.as_ref() != Some(&now) {
+                        let _ = notices.send(Notice::AudioSource(now.clone()));
+                        told = Some(now);
+                    }
+                }
+
+                let chunk = match chunks.recv_timeout(std::time::Duration::from_millis(500)) {
+                    Ok(chunk) => chunk,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    // The capture has finished for good. Waiting on a channel
+                    // that can never deliver returns at once, every time, and
+                    // this loop spun a core on it for the rest of the session.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        info!("Session #{session_id}: audio capture ended");
+                        let _ = notices.send(Notice::AudioSource(AudioSource::Unavailable));
+                        break;
+                    }
                 };
                 let samples = if src == dst {
                     &chunk.samples[..]
@@ -2306,6 +2401,7 @@ fn spawn_audio_pipeline(
                     Ok(packets) => packets.to_vec(),
                     Err(e) => {
                         warn!("Session #{session_id}: audio encode failed ({e})");
+                        let _ = notices.send(Notice::AudioSource(AudioSource::Unavailable));
                         break;
                     }
                 };
@@ -2342,6 +2438,7 @@ fn spawn_audio_pipeline(
 fn spawn_audio_pipeline(
     _session_id: u32,
     _out_tx: mpsc::UnboundedSender<Message>,
+    _notices: mpsc::UnboundedSender<super::protocol::Notice>,
     _exclude: &[String],
     _bitrate_kbps: u32,
 ) -> Option<AudioPipeline> {
@@ -5016,10 +5113,14 @@ impl Prober {
 // ── Utility functions for reading/writing bincode messages ───
 
 /// Write a length-prefixed, bincode-serialized Message to an async writer.
-pub async fn write_stream_message<W: tokio::io::AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    msg: &Message,
-) -> Result<()> {
+///
+/// Anything serializable rather than only a [`Message`], because the notices
+/// stream carries [`super::protocol::Notice`]s in the same framing.
+pub async fn write_stream_message<W, T>(writer: &mut W, msg: &T) -> Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+    T: serde::Serialize + ?Sized,
+{
     let data = bincode::serialize(msg)?;
     let len = u32::try_from(data.len()).context("Message exceeds u32 length prefix")?;
 
@@ -5690,6 +5791,7 @@ mod tests {
             encode: EncodeConfig::default(),
             exclude_audio_processes: Vec::new(),
             audio_bitrate_kbps: 160,
+            audio_capture_device: None,
             approval_timeout: Duration::from_millis(50),
             auto_regen_guest_passcode: false,
             host_name: None,
@@ -5717,6 +5819,19 @@ mod tests {
         tokio::io::DuplexStream,
         tokio::task::JoinHandle<Result<()>>,
     ) {
+        spawn_session_with_notices(sessions, session_id, None)
+    }
+
+    /// [`spawn_session`], with the host's end of a notices stream.
+    fn spawn_session_with_notices(
+        sessions: Arc<SessionManager>,
+        session_id: u32,
+        notices: Option<tokio::io::DuplexStream>,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
         // host_w → guest_r (frames), guest_w → host_r (input)
         let (host_w, guest_r) = duplex(1 << 20);
         let (guest_w, host_r) = duplex(1 << 20);
@@ -5724,7 +5839,7 @@ mod tests {
         let config = test_config();
         let capturer = crate::screen_capture::create_capturer(config.capture.clone()).unwrap();
         let handle =
-            // Neither side stream exists in the duplex harness: audio and
+            // Neither media stream exists in the duplex harness: audio and
             // video both fall back to the main one, which is the behaviour
             // being exercised here and the fallback worth keeping covered.
             tokio::spawn(run_session(
@@ -5732,6 +5847,7 @@ mod tests {
                 host_r,
                 None::<tokio::io::DuplexStream>,
                 None::<tokio::io::DuplexStream>,
+                notices,
                 session_id,
                 sessions,
                 config.clone(),
@@ -5767,6 +5883,67 @@ mod tests {
                 frames += 1;
             }
         }
+
+        handle.abort();
+    }
+
+    /// The guest is told where the host's sound comes from, on the notices
+    /// stream and nowhere else.
+    ///
+    /// Which answer depends on the machine running the test — a device, none,
+    /// or no sound at all in a build without ffmpeg — and any of them is right.
+    /// What is being checked is that one arrives without being asked for.
+    #[tokio::test]
+    async fn the_guest_is_told_where_the_sound_comes_from() {
+        let sessions = Arc::new(SessionManager::new());
+        let id = sessions.add_session([0u8; 32], ControlGrants::ALL, PasscodeType::Master);
+        let (host_notices, mut guest_notices) = duplex(1 << 16);
+        let (_guest_w, _guest_r, handle) =
+            spawn_session_with_notices(Arc::clone(&sessions), id, Some(host_notices));
+
+        let bytes = tokio::time::timeout(Duration::from_secs(10), read_stream_message(&mut guest_notices))
+            .await
+            .expect("no notice arrived")
+            .unwrap()
+            .expect("the notices stream closed without one");
+        let Some(crate::protocol::Notice::AudioSource(source)) =
+            crate::protocol::Notice::decode(&bytes)
+        else {
+            panic!("the first notice was not about sound");
+        };
+        println!("the host reports {source:?}");
+
+        handle.abort();
+    }
+
+    /// A guest from before notices stops the stream without reading it. The
+    /// session must not notice.
+    #[tokio::test]
+    async fn a_guest_that_ignores_notices_keeps_its_session() {
+        let sessions = Arc::new(SessionManager::new());
+        let id = sessions.add_session([0u8; 32], ControlGrants::ALL, PasscodeType::Master);
+        let (host_notices, guest_notices) = duplex(1 << 16);
+        // What an older guest does with a side stream of a kind it does not
+        // know: nothing, and then lets go of it.
+        drop(guest_notices);
+        let (_guest_w, mut guest_r, handle) =
+            spawn_session_with_notices(Arc::clone(&sessions), id, Some(host_notices));
+
+        let mut frames = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while frames < 3 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "only {frames} frames arrived");
+            let bytes = tokio::time::timeout(remaining, read_stream_message(&mut guest_r))
+                .await
+                .expect("timed out waiting for a frame")
+                .unwrap()
+                .expect("the session ended because a notice could not be delivered");
+            if matches!(bincode::deserialize::<Message>(&bytes).unwrap(), Message::Frame(_)) {
+                frames += 1;
+            }
+        }
+        assert!(!handle.is_finished(), "the session ended");
 
         handle.abort();
     }

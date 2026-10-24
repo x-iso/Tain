@@ -32,7 +32,7 @@ use tain_core::protocol::{
 use super::immersive::Immersive;
 use super::keymap;
 use super::session::GuestSession;
-use super::settings::{ScalingMode, Settings};
+use super::settings::{ChosenDevice, ScalingMode, Settings};
 use super::shortcut_hint::ShortcutHint;
 use super::theme::{self, *};
 use super::title_bar::{self, TitleBar};
@@ -92,6 +92,10 @@ pub struct SessionWindowActions {
     /// name belongs to the remembered host, not the tab, so the card under
     /// Previous connections takes it too.
     pub rename: Vec<(String, String)>,
+    /// A playback device picked from a session's volume control, `Some(None)`
+    /// being the system default. The same setting as the one in Settings, so
+    /// every session moves, not only the one it was picked from.
+    pub playback_device: Option<Option<ChosenDevice>>,
 }
 
 /// A session's name being edited where it stands.
@@ -277,6 +281,9 @@ pub struct SessionWindow {
     /// Where the picture was drawn this frame, for the reminder to sit in its
     /// corner.
     picture_rect: Option<egui::Rect>,
+    /// The playback device the settings name, copied in every frame for the
+    /// volume control to mark. `None` is the system default.
+    playback: Option<ChosenDevice>,
 }
 
 impl Default for SessionWindow {
@@ -298,6 +305,7 @@ impl Default for SessionWindow {
             pointer_on_picture: false,
             shortcut_hint: ShortcutHint::default(),
             picture_rect: None,
+            playback: None,
         }
     }
 }
@@ -372,6 +380,7 @@ impl SessionWindow {
             return actions;
         }
         self.active_tab = self.active_tab.min(sessions.len() - 1);
+        self.playback = settings.audio_output_device.clone();
 
         // A session is open, so the keys egui cannot express are worth taking
         // from the hook. Narrow and non-destructive — see `Immersive`. Switched
@@ -1272,7 +1281,7 @@ impl SessionWindow {
             self.request_mini(false);
         }
         tools.add_space(6.0);
-        volume_control(&mut tools, session);
+        volume_control(&mut tools, session, self.playback.as_ref(), &mut actions.playback_device);
         // As on the full bar: the stream may have opened since the last click.
         session.apply_sound_preference();
         let used = tools.min_rect();
@@ -1355,7 +1364,13 @@ impl SessionWindow {
         render_display_picker(ui, session);
 
         ui.add_space(12.0);
-        render_input_toggles(ui, session, &mut self.show_stats);
+        render_input_toggles(
+            ui,
+            session,
+            &mut self.show_stats,
+            self.playback.as_ref(),
+            &mut actions.playback_device,
+        );
 
         if session.loopback {
             ui.add_space(12.0);
@@ -1799,7 +1814,13 @@ impl SessionWindow {
 ///
 /// A toggle the host has not permitted is shown disabled rather than hidden, so
 /// the reason input is not working is visible instead of absent.
-fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stats: &mut bool) {
+fn render_input_toggles(
+    ui: &mut egui::Ui,
+    session: &mut GuestSession,
+    show_stats: &mut bool,
+    playback: Option<&ChosenDevice>,
+    picked: &mut Option<Option<ChosenDevice>>,
+) {
     let grants = session.grants();
 
     // # Which art goes with which state
@@ -1909,7 +1930,7 @@ fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stat
     }
 
     ui.add_space(4.0);
-    volume_control(ui, session);
+    volume_control(ui, session, playback, picked);
     // Applied unconditionally: the stream may have opened after the last click,
     // and it must not come up unmuted for someone who muted it.
     session.apply_sound_preference();
@@ -1933,7 +1954,18 @@ fn render_input_toggles(ui: &mut egui::Ui, session: &mut GuestSession, show_stat
 /// last frame. Keying it off the icon alone would make the slider vanish the
 /// moment the pointer moved onto it, which is the classic way to build a control
 /// nobody can use.
-fn volume_control(ui: &mut egui::Ui, session: &mut GuestSession) {
+///
+/// # And where the sound plays
+///
+/// Under the slider, the devices it can play on — rows rather than a combo
+/// box, because a combo's list is a popup of its own outside this one, and
+/// moving the pointer onto it would leave the region that keeps this open.
+fn volume_control(
+    ui: &mut egui::Ui,
+    session: &mut GuestSession,
+    playback: Option<&ChosenDevice>,
+    picked: &mut Option<Option<ChosenDevice>>,
+) {
     let hot_id = ui.id().with(("volume-hover", session.tab_id));
     let previous: Option<egui::Rect> = ui.memory(|m| m.data.get_temp(hot_id));
     let near = match (previous, ui.ctx().pointer_latest_pos()) {
@@ -2009,6 +2041,10 @@ fn volume_control(ui: &mut egui::Ui, session: &mut GuestSession) {
                             "session.volume",
                             percent = (session.volume * 100.0).round()
                         ));
+
+                        ui.add_space(4.0);
+                        ui.separator();
+                        playback_choice(ui, session, hot_id.with("devices"), playback, picked);
                     });
             });
         hot = hot.union(area.response.rect);
@@ -2023,6 +2059,85 @@ fn volume_control(ui: &mut egui::Ui, session: &mut GuestSession) {
     // A little larger than the controls, so crossing the gap between them does
     // not count as leaving.
     ui.memory_mut(|m| m.data.insert_temp(hot_id, hot.expand(8.0)));
+}
+
+/// The devices the host's sound can play on, as rows to pick from, and what is
+/// actually happening when that is not what was picked.
+///
+/// The list is kept for a couple of seconds rather than read every frame: an
+/// open popup redraws continuously, and listing devices is a trip through COM.
+fn playback_choice(
+    ui: &mut egui::Ui,
+    session: &GuestSession,
+    cache_id: egui::Id,
+    chosen: Option<&ChosenDevice>,
+    picked: &mut Option<Option<ChosenDevice>>,
+) {
+    const RELIST_SECS: f64 = 2.0;
+    let now = ui.input(|i| i.time);
+    let cached: Option<(f64, Vec<tain_core::AudioDevice>)> =
+        ui.memory(|m| m.data.get_temp(cache_id));
+    let devices = match cached {
+        Some((at, devices)) if now - at < RELIST_SECS => devices,
+        _ => {
+            let devices = tain_core::playback_devices();
+            ui.memory_mut(|m| m.data.insert_temp(cache_id, (now, devices.clone())));
+            devices
+        }
+    };
+
+    // Device names run long, and the warnings are sentences; without a limit
+    // any of them would stretch the popup across the picture.
+    ui.set_max_width(260.0);
+
+    // The far end first, because it is the half of "no sound" this machine
+    // cannot see for itself. Nothing at all from a host too old to say.
+    if let Some(source) = session.host_audio_source() {
+        use tain_core::protocol::AudioSource;
+        let (text, colour) = match &source {
+            AudioSource::Device(name) => {
+                (i18n::format("session.host_source.device", &[("name", name)]), TEXT)
+            }
+            AudioSource::Applications => {
+                (i18n::text("session.host_source.applications").to_string(), TEXT)
+            }
+            AudioSource::NoDevice => (i18n::text("session.host_source.no_device").to_string(), AMBER),
+            AudioSource::Unavailable => {
+                (i18n::text("session.host_source.unavailable").to_string(), AMBER)
+            }
+        };
+        ui.label(RichText::new(text).size(11.0).color(colour));
+        ui.add_space(2.0);
+        ui.separator();
+    }
+
+    ui.label(RichText::new(t!("session.play_on")).size(11.0).color(TEXT_DIM));
+    let default_label = super::settings_panel::system_default_label(&devices);
+    if ui.selectable_label(chosen.is_none(), default_label).clicked() && chosen.is_some() {
+        *picked = Some(None);
+    }
+    for device in &devices {
+        let on = chosen.is_some_and(|c| c.id == device.id);
+        if ui.selectable_label(on, &device.name).clicked() && !on {
+            *picked = Some(Some(device.into()));
+        }
+    }
+    // Still listed while unplugged, so the choice does not look like the
+    // default while it waits for the device to come back.
+    if let Some(missing) = chosen.filter(|c| !devices.iter().any(|d| d.id == c.id)) {
+        ui.selectable_label(
+            true,
+            i18n::format("settings.audio.not_connected", &[("name", &missing.name)]),
+        )
+        .on_hover_text(i18n::text("settings.audio.not_connected_hint"));
+    }
+
+    // Sound has arrived and there is nothing to play it on. The one state in
+    // which no choice above can be right, and the one that used to look like
+    // the host sending nothing.
+    if let Some(None) = session.playback_device() {
+        ui.label(RichText::new(t!("session.no_output_device")).size(11.0).color(AMBER));
+    }
 }
 
 /// Fold a grant and a local preference into what the icon should say.

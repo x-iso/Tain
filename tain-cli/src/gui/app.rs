@@ -4813,6 +4813,12 @@ impl eframe::App for GuestApp {
                 // outside `main`, so picking a language did nothing until the
                 // application was restarted.
                 tain_core::i18n::follow(&settings.language);
+                // Playback too, for the same reason: picking a device and
+                // hearing nothing change for a quarter of a second reads as a
+                // pick that did not take. Setting the same one again is free.
+                tain_core::set_playback_device(
+                    settings.audio_output_device.as_ref().map(|device| device.id.clone()),
+                );
                 // The edit is visible immediately, but writing it to disk and
                 // rebuilding the capture pipeline wait for the user to settle —
                 // see `settings_settling`.
@@ -4910,6 +4916,14 @@ impl eframe::App for GuestApp {
                         session.label = name.clone();
                     }
                 }
+            }
+
+            // Chosen from a session's volume control, and the same setting as
+            // the one in Settings: every session plays on it from now on.
+            if let Some(device) = actions.playback_device {
+                tain_core::set_playback_device(device.as_ref().map(|d| d.id.clone()));
+                self.state.settings.lock().unwrap().audio_output_device = device;
+                self.state.save_settings();
             }
 
             if actions.close_all {

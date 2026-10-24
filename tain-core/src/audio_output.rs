@@ -18,6 +18,14 @@
 //! device away from every other application on the machine — including, on the
 //! host side of a loopback test, the thing being captured. Not a trade worth
 //! making for a remote desktop.
+//!
+//! ## Which device
+//!
+//! The one chosen with [`super::audio_device::set_playback_device`], or the
+//! default — and it moves when either changes or the device goes away. With no
+//! device at all the stream keeps running and waits for one, so a guest whose
+//! headphones were unplugged when the session started hears the host as soon as
+//! they are back. See [`super::audio_device`].
 
 #![cfg(all(target_os = "windows", db_ffmpeg))]
 
@@ -26,20 +34,21 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::*;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+    IAudioClient, IAudioRenderClient, IMMDevice, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED,
+    CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
+use super::audio_device::{resolve, should_move, DeviceWatch, PLAYBACK};
 use super::audio_render::JitterBuffer;
 use super::encoder::LatencyPriority;
+use crate::AudioDevice;
 
 /// A running playback stream. Stopped when dropped.
 pub struct AudioOutput {
@@ -48,6 +57,9 @@ pub struct AudioOutput {
     /// Gain, as the bits of an `f32`. An atomic because the render thread reads
     /// it on every callback and must never take a lock to do so.
     volume: Arc<AtomicU32>,
+    /// What is playing the sound right now, or `None` while there is nothing to
+    /// play it on. Written by the render thread when it opens or loses one.
+    device: Arc<Mutex<Option<AudioDevice>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -58,7 +70,11 @@ const FULL_VOLUME: u32 = 0x3f80_0000;
 const _: () = assert!(f32::from_bits(FULL_VOLUME) == 1.0);
 
 impl AudioOutput {
-    /// Open the default playback device and start feeding it.
+    /// Start playing, on the chosen device or the default.
+    ///
+    /// Succeeds without any device to play on: the stream waits for one rather
+    /// than giving up for the whole session. What does fail here is what no
+    /// device would fix — no decoder, no COM.
     ///
     /// `priority` bounds the jitter buffer — see
     /// [`JitterBuffer`](super::audio_render::JitterBuffer). It is the guest's
@@ -68,17 +84,23 @@ impl AudioOutput {
         let buffer = Arc::new(Mutex::new(JitterBuffer::new(sample_rate, channels, priority)?));
         let muted = Arc::new(AtomicBool::new(false));
         let volume = Arc::new(AtomicU32::new(FULL_VOLUME));
+        let device = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
         let thread = std::thread::Builder::new()
             .name("audio-render".into())
             .spawn({
-                let buffer = Arc::clone(&buffer);
-                let muted = Arc::clone(&muted);
-                let volume = Arc::clone(&volume);
-                let stop = Arc::clone(&stop);
-                move || render_thread(sample_rate, channels, buffer, muted, volume, stop, ready_tx)
+                let stream = Stream {
+                    sample_rate,
+                    channels,
+                    buffer: Arc::clone(&buffer),
+                    muted: Arc::clone(&muted),
+                    volume: Arc::clone(&volume),
+                    device: Arc::clone(&device),
+                    stop: Arc::clone(&stop),
+                };
+                move || render_thread(stream, ready_tx)
             })
             .context("could not start the audio render thread")?;
 
@@ -87,7 +109,12 @@ impl AudioOutput {
             .context("the audio render thread stopped before it was ready")??;
 
         info!("Playing host audio at {sample_rate} Hz, {channels} channels");
-        Ok(Self { buffer, muted, volume, stop, thread: Some(thread) })
+        Ok(Self { buffer, muted, volume, device, stop, thread: Some(thread) })
+    }
+
+    /// The device the sound is playing on, or `None` while there is none.
+    pub fn device(&self) -> Option<AudioDevice> {
+        self.device.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Hand one received block to the jitter buffer.
@@ -160,63 +187,168 @@ const BUFFER_DURATION: i64 = 40 * 10_000;
 /// wake-up does not underrun, and no more.
 const DEVICE_TARGET_MS: u32 = 15;
 
-#[allow(clippy::too_many_arguments)]
-fn render_thread(
+/// How long to wait before looking for a device again, when there was none and
+/// nothing has said one arrived.
+const RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long to wait before reopening a device that failed straight away.
+const LOST_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Everything the render thread shares with the [`AudioOutput`] that owns it.
+struct Stream {
     sample_rate: u32,
     channels: u16,
     buffer: Arc<Mutex<JitterBuffer>>,
     muted: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
+    device: Arc<Mutex<Option<AudioDevice>>>,
     stop: Arc<AtomicBool>,
-    ready: std::sync::mpsc::Sender<Result<()>>,
-) {
+}
+
+impl Stream {
+    fn set_device(&self, device: Option<AudioDevice>) {
+        *self.device.lock().unwrap_or_else(|e| e.into_inner()) = device;
+    }
+}
+
+fn render_thread(stream: Stream, ready: std::sync::mpsc::Sender<Result<()>>) {
     // SAFETY: paired with CoUninitialize below; every COM object stays on this
-    // thread.
+    // thread, and `play` has dropped all of them by the time it returns.
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if com.is_err() {
         let _ = ready.send(Err(anyhow::anyhow!("CoInitializeEx failed: {com:?}")));
         return;
     }
-
-    match open_render(sample_rate, channels) {
-        Ok((client, render, event, device_frames)) => {
-            if ready.send(Ok(())).is_err() {
-                // SAFETY: balances the CoInitializeEx above.
-                unsafe { CoUninitialize() };
-                return;
-            }
-            run(
-                &client, &render, event, device_frames, sample_rate, channels, &buffer,
-                &muted, &volume, &stop,
-            );
-            // SAFETY: the event was created here and is not used again.
-            unsafe {
-                let _ = client.Stop();
-                let _ = CloseHandle(event);
-            }
-        }
-        Err(e) => {
-            let _ = ready.send(Err(e));
-        }
-    }
+    play(&stream, &ready);
     // SAFETY: balances the CoInitializeEx above.
     unsafe { CoUninitialize() };
 }
 
-/// Open the default render endpoint at the stream's format.
+/// Play on whichever device is right, for as long as the stream runs.
+///
+/// The one chosen in settings while it is plugged in, the default otherwise —
+/// and when the default changes, the device goes away, or the choice is
+/// changed, playback moves. The jitter buffer is the stream's, not the
+/// device's, so moving costs the few milliseconds of reopening and nothing
+/// that was already received.
+fn play(stream: &Stream, ready: &std::sync::mpsc::Sender<Result<()>>) {
+    let enumerator = match super::audio_device::enumerator() {
+        Ok(enumerator) => enumerator,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    // Without notifications a lost device is still noticed — the stream fails —
+    // but a new default would not be followed until then.
+    let watch = DeviceWatch::register(&enumerator)
+        .map_err(|e| warn!("Audio playback will not follow device changes: {e:#}"))
+        .ok();
+    let changed = || watch.as_ref().is_some_and(DeviceWatch::take);
+
+    // Ready whether or not there is a device: see `AudioOutput::start`.
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+
+    let mut said_missing = false;
+    while !stream.stop.load(Ordering::Relaxed) {
+        let seen = PLAYBACK.generation();
+        let chosen = PLAYBACK.chosen();
+        let opened = resolve(&enumerator, chosen.as_deref()).and_then(|(device, about, how)| {
+            open_render(&device, stream.sample_rate, stream.channels)
+                .map(|opened| (opened, about, how))
+        });
+
+        let ((client, render, event, device_frames), about, how) = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                // Once per absence. The old message said the session would
+                // stay silent, which was true and is not any more.
+                if !said_missing {
+                    warn!("No audio output ({e:#}) — waiting for a playback device");
+                    said_missing = true;
+                }
+                stream.set_device(None);
+                // Anything happening to any device is worth another look, and
+                // so is time passing, in case a notification went astray.
+                let retry = || changed() || PLAYBACK.generation() != seen;
+                idle(stream, RETRY_EVERY, &retry);
+                continue;
+            }
+        };
+
+        info!("Playing host audio on {} — {}", about.name, how.describe());
+        said_missing = false;
+        stream.set_device(Some(about.clone()));
+        let generation = std::cell::Cell::new(seen);
+        let moved = || should_move(&enumerator, changed(), &PLAYBACK, &generation, &about.id);
+        let opened_at = std::time::Instant::now();
+        let ended = run(&client, &render, event, device_frames, stream, &moved);
+        // SAFETY: the event was created for this client and is not used again.
+        unsafe {
+            let _ = client.Stop();
+            let _ = CloseHandle(event);
+        }
+
+        match ended {
+            Ended::Stopped => break,
+            Ended::Moved => {}
+            Ended::Lost => {
+                info!("Stopped playing on {} — looking for another device", about.name);
+                // A device that fails as soon as it opens would otherwise be
+                // reopened as fast as the loop can turn.
+                if opened_at.elapsed() < std::time::Duration::from_secs(1) {
+                    idle(stream, LOST_PAUSE, &|| false);
+                }
+            }
+        }
+    }
+}
+
+/// Keep the jitter buffer moving in real time while nothing is playing it.
+///
+/// The network goes on delivering whether or not there is a device, and the
+/// buffer only sheds a backlog when it is pulled from. Left alone it would grow
+/// for as long as the device was missing — without limit — and then play all
+/// of it late.
+fn idle(stream: &Stream, limit: std::time::Duration, until: &dyn Fn() -> bool) {
+    let mut scratch = Vec::new();
+    let started = std::time::Instant::now();
+    let mut pulled = 0u64;
+    while !stream.stop.load(Ordering::Relaxed) && started.elapsed() < limit && !until() {
+        std::thread::sleep(std::time::Duration::from_millis(DEVICE_TARGET_MS as u64));
+        let due = (started.elapsed().as_secs_f64() * stream.sample_rate as f64) as u64;
+        let frames = due.saturating_sub(pulled) as usize;
+        if frames == 0 {
+            continue;
+        }
+        stream.buffer.lock().unwrap().pull(frames, &mut scratch);
+        pulled += frames as u64;
+    }
+}
+
+/// Why [`run`] returned.
+enum Ended {
+    /// The stream is being shut down.
+    Stopped,
+    /// A different device should be playing now.
+    Moved,
+    /// The device stopped working: unplugged, disabled, or its format changed
+    /// under the stream.
+    Lost,
+}
+
+/// Open a playback device at the stream's format.
 fn open_render(
+    device: &IMMDevice,
     sample_rate: u32,
     channels: u16,
 ) -> Result<(IAudioClient, IAudioRenderClient, HANDLE, u32)> {
-    // SAFETY: standard WASAPI activation; every returned pointer is checked and
-    // the format is freed before returning.
+    // SAFETY: standard WASAPI activation; every returned pointer is checked, the
+    // format is freed before returning, and the event is closed on every path
+    // that does not hand it back.
     unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .context("could not create the audio device enumerator")?;
-        let device = enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .context("no default playback device")?;
         let client: IAudioClient = device
             .Activate(CLSCTX_ALL, None)
             .context("could not activate a render client")?;
@@ -240,9 +372,6 @@ fn open_render(
         // channel mask this does not fill in, and a mismatched one is refused.
         format.wFormatTag = 0x0003;
 
-        let event = CreateEventW(None, false, false, None)
-            .context("could not create the render event")?;
-
         client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -256,37 +385,46 @@ fn open_render(
             )
             .context("the audio engine refused a render client")?;
 
-        client.SetEventHandle(event).context("could not attach the render event")?;
-        let device_frames = client.GetBufferSize().context("could not read the buffer size")?;
-        let render: IAudioRenderClient =
-            client.GetService().context("could not get a render client")?;
+        let event = CreateEventW(None, false, false, None)
+            .context("could not create the render event")?;
+        let started = (|| -> Result<(IAudioRenderClient, u32)> {
+            client.SetEventHandle(event).context("could not attach the render event")?;
+            let device_frames =
+                client.GetBufferSize().context("could not read the buffer size")?;
+            let render: IAudioRenderClient =
+                client.GetService().context("could not get a render client")?;
 
-        // Primed with one target's worth of silence, not the whole buffer.
-        // Enough that the first callback has something to play; filling it
-        // completely would put every sample that followed 40 ms behind.
-        let prime = (sample_rate * DEVICE_TARGET_MS / 1000).min(device_frames);
-        let data = render.GetBuffer(prime)?;
-        std::ptr::write_bytes(data, 0, prime as usize * channels as usize * 4);
-        render.ReleaseBuffer(prime, 0)?;
+            // Primed with one target's worth of silence, not the whole buffer.
+            // Enough that the first callback has something to play; filling it
+            // completely would put every sample that followed 40 ms behind.
+            let prime = (sample_rate * DEVICE_TARGET_MS / 1000).min(device_frames);
+            let data = render.GetBuffer(prime)?;
+            std::ptr::write_bytes(data, 0, prime as usize * channels as usize * 4);
+            render.ReleaseBuffer(prime, 0)?;
 
-        client.Start().context("could not start playback")?;
-        Ok((client, render, event, device_frames))
+            client.Start().context("could not start playback")?;
+            Ok((render, device_frames))
+        })();
+        match started {
+            Ok((render, device_frames)) => Ok((client, render, event, device_frames)),
+            Err(e) => {
+                let _ = CloseHandle(event);
+                Err(e)
+            }
+        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run(
     client: &IAudioClient,
     render: &IAudioRenderClient,
     event: HANDLE,
     device_frames: u32,
-    sample_rate: u32,
-    channels: u16,
-    buffer: &Mutex<JitterBuffer>,
-    muted: &AtomicBool,
-    volume: &AtomicU32,
-    stop: &AtomicBool,
-) {
+    stream: &Stream,
+    moved: &dyn Fn() -> bool,
+) -> Ended {
+    let Stream { sample_rate, channels, buffer, muted, volume, stop, .. } = stream;
+    let (sample_rate, channels) = (*sample_rate, *channels);
     // Reused across callbacks: allocating in the render path is how a stream
     // develops an occasional click nobody can reproduce.
     let mut pcm: Vec<f32> = Vec::with_capacity(device_frames as usize * channels as usize);
@@ -294,17 +432,26 @@ fn run(
     let mut scratch: Vec<f32> = Vec::with_capacity(pcm.capacity());
 
     while !stop.load(Ordering::Relaxed) {
-        // SAFETY: waiting on an event this thread owns.
-        if unsafe { WaitForSingleObject(event, WAIT_TIMEOUT_MS) } != WAIT_OBJECT_0 {
-            continue;
+        // Once a period: two atomic loads unless something has happened.
+        if moved() {
+            return Ended::Moved;
         }
+
+        // A timeout is not skipped. A device that has gone away can stop
+        // signalling, and the padding read below is what says so — skipping
+        // it would leave a stream waiting on a dead device for as long as
+        // nothing else happened to notice. Topping up after a timeout is
+        // harmless: the padding says how much room there really is.
+        // SAFETY: waiting on an event this thread owns.
+        unsafe { WaitForSingleObject(event, WAIT_TIMEOUT_MS) };
 
         // SAFETY: reading how much of our own buffer the device has consumed.
         let padding = match unsafe { client.GetCurrentPadding() } {
             Ok(used) => used,
             Err(e) => {
-                warn!("Audio playback stopped: {e}");
-                return;
+                // Not a warning any more: the caller finds another device.
+                info!("Audio playback lost its device: {e}");
+                return Ended::Lost;
             }
         };
         // Top up to the target, not to the brim. Anything beyond the target is
@@ -343,8 +490,8 @@ fn run(
             let data = match render.GetBuffer(free) {
                 Ok(data) => data,
                 Err(e) => {
-                    warn!("Audio playback stopped: {e}");
-                    return;
+                    info!("Audio playback lost its device: {e}");
+                    return Ended::Lost;
                 }
             };
             let wanted = free as usize * channels as usize;
@@ -356,11 +503,12 @@ fn run(
                 std::ptr::write_bytes((data as *mut f32).add(n), 0, wanted - n);
             }
             if let Err(e) = render.ReleaseBuffer(free, 0) {
-                warn!("Audio playback stopped: {e}");
-                return;
+                info!("Audio playback lost its device: {e}");
+                return Ended::Lost;
             }
         }
     }
+    Ended::Stopped
 }
 
 #[cfg(test)]
@@ -380,6 +528,51 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         // Dropping must join the render thread rather than leaving it running.
         drop(output);
+    }
+
+    /// Choosing another device moves playback that is already running, and
+    /// choosing the default again brings it back.
+    ///
+    /// Needs two playback devices, and leaves the system default alone: the
+    /// move is made by choosing, which is Tain's own setting. Muted, so the
+    /// only thing played on either is silence.
+    #[test]
+    #[ignore = "touches the real playback devices"]
+    fn choosing_another_device_moves_playback_that_is_running() {
+        // SAFETY: COM has to be up for the enumeration; this is a test thread.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let devices = crate::audio_device::playback_devices();
+        let Some(other) = devices.iter().find(|d| !d.default).cloned() else {
+            eprintln!("only one playback device — skipping");
+            return;
+        };
+        crate::audio_device::set_playback_device(None);
+        let output = AudioOutput::start(48_000, 2, LatencyPriority::BALANCED).expect("output");
+        output.set_muted(true);
+
+        // Opening is the render thread's job and happens after `start`.
+        let settle = |want: &dyn Fn(Option<&AudioDevice>) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline && !want(output.device().as_ref()) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            output.device()
+        };
+
+        let before = settle(&|d| d.is_some()).expect("playing on the default");
+        assert!(before.default, "started on {} rather than the default", before.name);
+
+        crate::audio_device::set_playback_device(Some(other.id.clone()));
+        let moved = settle(&|d| d.is_some_and(|d| d.id == other.id));
+        // Put back before asserting, so a failure does not leave the choice set.
+        crate::audio_device::set_playback_device(None);
+        let back = settle(&|d| d.is_some_and(|d| d.id == before.id));
+
+        assert_eq!(moved.map(|d| d.id), Some(other.id.clone()), "did not move to {}", other.name);
+        assert_eq!(back.map(|d| d.id), Some(before.id.clone()), "did not come back to {}", before.name);
+        println!("moved {} -> {} -> {}", before.name, other.name, before.name);
     }
 
     /// Audible end to end: encode a tone, play it, and hear it.

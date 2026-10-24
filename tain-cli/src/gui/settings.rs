@@ -390,6 +390,22 @@ pub struct Settings {
     /// user expects is worse than sending all of it.
     /// Opus bitrate in kbit/s. See [`tain_core::AUDIO_BITRATES_KBPS`].
     pub audio_bitrate_kbps: u32,
+    /// The playback device whose sound guests hear. `None` follows the system
+    /// default, including when it changes.
+    ///
+    /// Reaches sessions already running. See
+    /// [`tain_core::SessionConfig::audio_capture_device`] for what happens while
+    /// it is unplugged, and why excluding apps sets it aside.
+    #[serde(default, deserialize_with = "lenient")]
+    pub audio_capture_device: Option<ChosenDevice>,
+    /// Where a host's sound plays on this machine. `None` follows the system
+    /// default, and so does a chosen device while it is unplugged.
+    ///
+    /// One setting for every session rather than one each, unlike the volume:
+    /// the volume is about the machine at the other end, and this is about the
+    /// speakers at this one.
+    #[serde(default, deserialize_with = "lenient")]
+    pub audio_output_device: Option<ChosenDevice>,
     /// Let the priority slider pick the encoder's quality target and keyframe
     /// interval, rather than setting them by hand.
     ///
@@ -499,6 +515,8 @@ impl Default for Settings {
             exclude_audio_processes: Vec::new(),
             exclude_audio_process: String::new(),
             audio_bitrate_kbps: 160,
+            audio_capture_device: None,
+            audio_output_device: None,
             follow_priority: true,
             device_name_mode: DeviceNameMode::default(),
             custom_device_name: String::new(),
@@ -521,6 +539,26 @@ impl Default for Settings {
 /// serde's default for [`Settings::ui_scale`], which is not `Default::default`.
 fn one() -> f32 {
     1.0
+}
+
+/// A playback device somebody picked: its id, and its name beside it.
+///
+/// # Why the name is kept as well
+///
+/// The id is what finds the device again, and nobody can read it. The name is
+/// only for saying *which* device was chosen while it is unplugged — "Headphones
+/// (not connected)" rather than a GUID, or a choice that silently looks like
+/// the default.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ChosenDevice {
+    pub id: String,
+    pub name: String,
+}
+
+impl From<&tain_core::AudioDevice> for ChosenDevice {
+    fn from(device: &tain_core::AudioDevice) -> Self {
+        Self { id: device.id.clone(), name: device.name.clone() }
+    }
 }
 
 /// Relay entries as they are kept: trimmed, without blanks, each once.
@@ -582,6 +620,14 @@ impl Settings {
                 true
             }
         });
+
+        // A device choice with no id finds nothing, so it means the default —
+        // and saying so here keeps the pickers from showing a nameless entry.
+        for device in [&mut self.audio_capture_device, &mut self.audio_output_device] {
+            if device.as_ref().is_some_and(|d| d.id.trim().is_empty()) {
+                *device = None;
+            }
+        }
 
         // Trimmed, because it is matched as a substring and a stray space from a
         // paste would silently match nothing at all.
@@ -713,6 +759,7 @@ impl Settings {
             auto_regen_guest_passcode: self.guest_autoreset,
             exclude_audio_processes: self.exclude_audio_processes.clone(),
             audio_bitrate_kbps: self.audio_bitrate_kbps,
+            audio_capture_device: self.audio_capture_device.as_ref().map(|d| d.id.clone()),
             host_name: self.device_name(),
             priority: self.priority(),
             virtual_display_follows_guest: self.virtual_display_follows_guest,
@@ -1399,6 +1446,10 @@ mod tests {
             max_bitrate_kbps: 9001,
             audio_bitrate_kbps: 96,
             exclude_audio_processes: vec!["teams.exe".into(), "spotify.exe".into()],
+            audio_capture_device: Some(ChosenDevice {
+                id: "{0.0.0.00000000}.{9d3b961a-6bf7-4573-ba37-a18d5493dfb2}".into(),
+                name: "Speakers".into(),
+            }),
             codec: CodecSetting::H264,
             local_input_wins_ms: 1234,
             approval_timeout_secs: 42,
@@ -1420,6 +1471,7 @@ mod tests {
         assert_eq!(got.encode.fps, sent.encode.fps);
         assert_eq!(got.encode.target_bitrate_kbps, sent.encode.target_bitrate_kbps);
         assert_eq!(got.audio_bitrate_kbps, sent.audio_bitrate_kbps);
+        assert_eq!(got.audio_capture_device, sent.audio_capture_device);
         assert_eq!(got.host_name, sent.host_name);
         assert_eq!(got.local_input_wins_for, sent.local_input_wins_for);
         assert_eq!(got.approval_timeout, sent.approval_timeout);
@@ -1432,5 +1484,37 @@ mod tests {
         let defaults = Settings::default().to_session_config();
         assert_ne!(got.encode.fps, defaults.encode.fps);
         assert!(!got.exclude_audio_processes.is_empty());
+        assert!(got.audio_capture_device.is_some());
+    }
+
+    /// A device choice with nothing to find a device by is no choice at all.
+    #[test]
+    fn a_device_choice_without_an_id_means_the_default() {
+        let mut settings = Settings {
+            audio_capture_device: Some(ChosenDevice { id: "  ".into(), name: "Speakers".into() }),
+            audio_output_device: Some(ChosenDevice { id: String::new(), name: String::new() }),
+            ..Settings::default()
+        };
+        settings.sanitize();
+        assert_eq!(settings.audio_capture_device, None);
+        assert_eq!(settings.audio_output_device, None);
+        assert_eq!(settings.to_session_config().audio_capture_device, None);
+    }
+
+    /// A file written before these settings existed, or with one mangled,
+    /// follows the default rather than losing everything else.
+    #[test]
+    fn device_choices_are_read_leniently() {
+        let loaded: Settings = serde_json::from_str(
+            r#"{ "target_fps": 90, "audio_output_device": 7,
+                 "audio_capture_device": { "id": "{0.0.0.00000000}.{x}", "name": "Speakers" } }"#,
+        )
+        .expect("one bad field must not fail the file");
+        assert_eq!(loaded.target_fps, 90);
+        assert_eq!(loaded.audio_output_device, None);
+        assert_eq!(
+            loaded.audio_capture_device.map(|d| d.name),
+            Some("Speakers".to_string())
+        );
     }
 }

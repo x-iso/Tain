@@ -35,6 +35,7 @@ fn test_config() -> SessionConfig {
         auto_regen_guest_passcode: true,
         exclude_audio_processes: Vec::new(),
         audio_bitrate_kbps: 160,
+        audio_capture_device: None,
         host_name: Some("Test Host".into()),
         priority: Default::default(),
         // These stream a synthetic frame with no display behind it; a test

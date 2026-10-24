@@ -43,6 +43,8 @@ pub mod wallpaper;
 #[cfg(target_os = "windows")]
 pub mod audio_capture;
 #[cfg(target_os = "windows")]
+pub mod audio_device;
+#[cfg(target_os = "windows")]
 pub mod capture_dxgi;
 #[cfg(target_os = "windows")]
 pub mod capture_hdr;
@@ -146,6 +148,45 @@ impl From<audio_capture::AudioSession> for AudioSession {
     fn from(session: audio_capture::AudioSession) -> Self {
         Self { pid: session.pid, name: session.name }
     }
+}
+
+/// A playback device, as the pickers offer it.
+///
+/// Defined here rather than in `audio_device` so the UI compiles on every
+/// platform, where that module does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDevice {
+    /// Windows' endpoint id. Survives reboots and replugging, which is what
+    /// makes it the thing to save.
+    pub id: String,
+    /// What Windows' Sound settings call it.
+    pub name: String,
+    /// Whether it is the system default right now.
+    pub default: bool,
+}
+
+/// Every playback device that is plugged in, the default first.
+///
+/// Both the host's capture and the guest's playback choose from these: the
+/// host captures what a playback device is playing, not a microphone.
+pub fn playback_devices() -> Vec<AudioDevice> {
+    #[cfg(target_os = "windows")]
+    {
+        return audio_device::playback_devices();
+    }
+    #[allow(unreachable_code)]
+    Vec::new()
+}
+
+/// Play the sound of hosts on this device, or on the default with `None`.
+///
+/// Process-wide, and reaches sessions that are already playing. See
+/// `audio_device` for what happens when the device is unplugged.
+pub fn set_playback_device(id: Option<String>) {
+    #[cfg(target_os = "windows")]
+    audio_device::set_playback_device(id);
+    #[cfg(not(target_os = "windows"))]
+    let _ = id;
 }
 
 /// Opus bitrates offered in the settings, in kbit/s.

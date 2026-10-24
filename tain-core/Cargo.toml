@@ -87,6 +87,9 @@ windows = { version = "0.58", features = [
     "Win32_Media_MediaFoundation",
     # System audio capture via WASAPI loopback, including per-process exclusion.
     "Win32_Media_Audio",
+    # IMMNotificationClient and a device's friendly name, for following the
+    # default playback device and naming it. See `audio_device`.
+    "Win32_UI_Shell_PropertiesSystem",
     # CreateEventW lives behind Threading but is typed against SECURITY_ATTRIBUTES.
     "Win32_System_Threading",
     "Win32_Security",

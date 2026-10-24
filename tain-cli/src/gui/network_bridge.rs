@@ -558,6 +558,11 @@ pub struct GuestSessionState {
     pub audio: Arc<Mutex<Option<tain_core::audio_output::AudioOutput>>>,
     /// Set once opening a playback device has failed, so it is tried once.
     pub audio_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// Where the host says its sound is coming from, once it has said.
+    ///
+    /// `None` from a host older than notices, which says nothing — not the same
+    /// as a host saying it has nothing. See `protocol::Notice`.
+    pub host_audio: Arc<Mutex<Option<tain_core::protocol::AudioSource>>>,
     /// The decoder's D3D11 device, once a GPU decoder has been built.
     ///
     /// Zero until then. Published so the render thread can open it for sharing
@@ -649,6 +654,7 @@ impl GuestSessionState {
             #[cfg(all(target_os = "windows", db_ffmpeg))]
             audio: Arc::new(Mutex::new(None)),
             audio_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            host_audio: Arc::new(Mutex::new(None)),
             gpu_device: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             present_on_gpu: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drawing_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1026,6 +1032,13 @@ pub async fn run_guest_session(
                                     debug!("Guest video stream ended: {e}");
                                 }
                             }
+                            tain_core::protocol::stream_kind::NOTICES => {
+                                if let Err(e) = receive_notices(&mut stream, &state).await {
+                                    debug!("Guest notices stream ended: {e}");
+                                }
+                            }
+                            // What makes a new kind of stream safe to add: an
+                            // older guest lands here and lets it go.
                             other => debug!("Ignoring a side stream of unknown kind {other}"),
                         }
                     });
@@ -1604,6 +1617,32 @@ fn report_tally(
     }
 }
 
+/// Read the host's notices until the stream ends.
+///
+/// A notice this build cannot decode is skipped, never an error: it is a host
+/// newer than this guest saying something this guest has no use for, and the
+/// guarantee that makes notices safe to add is that nothing here fails on one.
+/// See `protocol::Notice`.
+async fn receive_notices<R>(recv: &mut R, shared: &GuestSessionState) -> Result<()>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    use tain_core::protocol::Notice;
+
+    while let Some(data) = read_stream_message(recv).await? {
+        match Notice::decode(&data) {
+            Some(Notice::AudioSource(source)) => {
+                // Sanitized on arrival: the host chose this string, we did not.
+                let source = source.sanitized();
+                info!("The host's sound: {source:?}");
+                *shared.host_audio.lock().unwrap() = source;
+            }
+            None => debug!("Skipping a notice this build does not know ({} bytes)", data.len()),
+        }
+    }
+    Ok(())
+}
+
 async fn receive_loop<R>(
     recv: &mut R,
     shared: &GuestSessionState,
@@ -1765,10 +1804,16 @@ where
                 // nothing to send should not make the guest seize a playback
                 // device, and the format is not known until audio arrives.
                 // Asked once. Without this the failure below repeats for every
-                // packet — a hundred times a second on a machine that simply
-                // has no playback device or no ffmpeg beside the exe.
+                // packet — a hundred times a second on a machine with no
+                // ffmpeg beside the exe. (Not for want of a device: playback
+                // waits for one of those. See `AudioOutput::start`.)
+                //
+                // Skipped, not returned from. Returning ended this loop, which
+                // is the reader for a whole stream — the audio stream, left
+                // unread so the host's writes backed up behind it, or the
+                // control stream itself when audio shares it.
                 if shared.audio_failed.load(Ordering::Relaxed) {
-                    return Ok(());
+                    continue;
                 }
                 let mut output = shared.audio.lock().unwrap();
                 if output.is_none() {
@@ -1781,13 +1826,13 @@ where
                     ) {
                         Ok(started) => *output = Some(started),
                         Err(e) => {
-                            // Once. A machine with no playback device would
-                            // otherwise log this a hundred times a second.
+                            // Once. A machine with no decoder would otherwise
+                            // log this a hundred times a second.
                             warn!("No audio output ({e}) — the session stays silent");
                             *output = None;
                             drop(output);
                             shared.audio_failed.store(true, Ordering::Relaxed);
-                            return Ok(());
+                            continue;
                         }
                     }
                 }
@@ -2269,6 +2314,39 @@ mod tests {
     /// session stuck on "waiting for video" with the reason in the log all
     /// along. The codec belongs to the session rather than to whichever reader
     /// happened to hear about it.
+    /// A notice from a host newer than this guest is passed over, and the ones
+    /// after it are still read — the property that makes notices safe to add.
+    #[tokio::test]
+    async fn a_notice_this_guest_does_not_know_is_skipped_not_fatal() {
+        use tain_core::protocol::{AudioSource, Notice};
+
+        let shared = GuestSessionState::new();
+        let (mut host, mut guest) = tokio::io::duplex(64 * 1024);
+        let write = tain_core::network::write_stream_message;
+
+        write(&mut host, &Notice::AudioSource(AudioSource::Device("Speakers".into())))
+            .await
+            .unwrap();
+        // A variant past the end of `Notice`, as a later host would send it.
+        let mut future = bincode::serialize(&77u32).unwrap();
+        future.extend(bincode::serialize("from the future").unwrap());
+        let len = (future.len() as u32).to_be_bytes();
+        tokio::io::AsyncWriteExt::write_all(&mut host, &len).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut host, &future).await.unwrap();
+        // And a name that needs cleaning, after it.
+        write(&mut host, &Notice::AudioSource(AudioSource::Device("Headphones\u{7}".into())))
+            .await
+            .unwrap();
+        drop(host);
+
+        receive_notices(&mut guest, &shared).await.expect("an unknown notice must not end the stream");
+        assert_eq!(
+            *shared.host_audio.lock().unwrap(),
+            Some(AudioSource::Device("Headphones".into())),
+            "the notice after the unknown one was not read, or not cleaned"
+        );
+    }
+
     #[tokio::test]
     async fn a_reader_takes_the_codec_from_the_session_when_it_never_hears_it() {
         use tain_core::protocol::{FrameMessage, Message};
@@ -2588,6 +2666,7 @@ mod tests {
             auto_regen_guest_passcode: false,
             exclude_audio_processes: Vec::new(),
             audio_bitrate_kbps: 160,
+            audio_capture_device: None,
             host_name: Some("Test Host".into()),
             priority: Default::default(),
             virtual_display_follows_guest: false,

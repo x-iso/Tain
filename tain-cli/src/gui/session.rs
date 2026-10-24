@@ -466,6 +466,23 @@ impl GuestSession {
         None
     }
 
+    /// Where the host says its sound comes from: `None` until it has said, and
+    /// from a host too old to say.
+    pub fn host_audio_source(&self) -> Option<tain_core::protocol::AudioSource> {
+        self.shared.host_audio.lock().unwrap().clone()
+    }
+
+    /// Where this session's sound is playing: `None` before any has arrived,
+    /// `Some(None)` while there is no device to play it on.
+    pub fn playback_device(&self) -> Option<Option<tain_core::AudioDevice>> {
+        #[cfg(all(target_os = "windows", db_ffmpeg))]
+        {
+            return self.shared.audio.lock().unwrap().as_ref().map(|o| o.device());
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
     /// Milliseconds of audio buffered, for the stats row.
     pub fn audio_buffered_ms(&self) -> Option<u32> {
         #[cfg(all(target_os = "windows", db_ffmpeg))]

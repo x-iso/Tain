@@ -244,6 +244,11 @@ async fn main() -> Result<()> {
     // Before anything draws. The catalogues are compiled in, so this is a
     // lookup rather than any kind of load — see `tain_core::i18n`.
     tain_core::i18n::follow(&state.settings().language);
+    // Before any session can open playback. The capture side is handed its
+    // device with the rest of the host's settings, in `set_session_config`.
+    tain_core::set_playback_device(
+        state.settings().audio_output_device.map(|device| device.id),
+    );
     #[cfg(debug_assertions)]
     gui::app::seed_demo_data(&state);
 

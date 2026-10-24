@@ -338,11 +338,13 @@ pub const MAX_DEVICE_NAME: usize = 40;
 /// Control characters would let a remote peer smuggle newlines into a label; the
 /// length cap stops a 4 MB "name" from stretching the card off the screen.
 pub fn sanitize_device_name(raw: &str) -> Option<String> {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_DEVICE_NAME)
-        .collect();
+    clean_label(raw, MAX_DEVICE_NAME)
+}
+
+/// A string from the far end, without control characters and at most `max`
+/// characters long. `None` when nothing is left.
+fn clean_label(raw: &str, max: usize) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(max).collect();
     let trimmed = cleaned.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
@@ -1069,25 +1071,110 @@ pub struct AudioMessage {
     pub channels: u8,
 }
 
-/// Maximum message size in bytes.
-///
-/// Sized for a worst-case keyframe: uncompressed 4K BGRA is 33 MiB, and a
 /// What a unidirectional stream carries, sent as its first byte.
 ///
 /// # Why the stream announces itself
 ///
-/// There are two of them now — sound and pictures — and a guest accepting them
-/// cannot tell which is which. Arrival order would work until the day the host
-/// opens them in the other order, or one fails to open at all, and the symptom
-/// then is video decoded as audio: not an error, just noise and a black screen.
-/// One byte removes the question.
+/// There are several of them now — sound, pictures, notices — and a guest
+/// accepting them cannot tell which is which. Arrival order would work until the
+/// day the host opens them in the other order, or one fails to open at all, and
+/// the symptom then is video decoded as audio: not an error, just noise and a
+/// black screen. One byte removes the question.
+///
+/// It also makes a new kind of stream safe to add: a guest skips a stream whose
+/// kind it does not know, and has since there were two. See [`Notice`].
 pub mod stream_kind {
     /// Encoded audio.
     pub const AUDIO: u8 = 1;
     /// Encoded video frames.
     pub const VIDEO: u8 = 2;
+    /// [`super::Notice`]s: what the host says that an older guest would not
+    /// understand.
+    pub const NOTICES: u8 = 3;
 }
 
+/// Something the host tells the guest on the [`stream_kind::NOTICES`] stream.
+///
+/// # Why these are not `Message`s
+///
+/// [`Message`] is bincode with no version on it. A variant the far end does not
+/// know fails to decode, and a message that fails to decode ends the session —
+/// so a new one can never be sent to a guest that might be older, and nothing
+/// can tell a host whether it is.
+///
+/// Notices go where an older guest is not listening. They have a stream of
+/// their own, which a guest from before it existed skips without reading, as it
+/// skips any side stream of a kind it does not know. And a guest that does read
+/// it skips any notice it cannot decode rather than failing — see
+/// [`Notice::decode`] — so a host newer than *that* guest can add more.
+///
+/// Which makes the rule for adding one: it must be something a guest can do
+/// without, and it goes at the end, because bincode numbers variants by
+/// position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Notice {
+    /// Where the host's sound is coming from. Sent when the session starts and
+    /// whenever it changes.
+    AudioSource(AudioSource),
+}
+
+impl Notice {
+    /// Decode one notice, or `None` for one this build does not know.
+    ///
+    /// `None` is not an error, and the caller carries on reading: it is a host
+    /// newer than this guest saying something this guest has no use for. Each
+    /// notice is its own length-prefixed frame, so skipping one cannot lose the
+    /// stream's place.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        bincode::deserialize(bytes).ok()
+    }
+}
+
+/// Where the host's sound is coming from.
+///
+/// # Why the guest is told
+///
+/// A guest that hears nothing cannot see the other machine, and "no sound" has
+/// causes at both ends: the host streaming a device nothing plays on, the host
+/// having no device, the guest's own speakers. The guest can see its own side;
+/// this is the host's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioSource {
+    /// A playback device, by the name Windows gives it.
+    Device(String),
+    /// The host has no playback device, and sends silence until it has one.
+    NoDevice,
+    /// The host's applications, with some left out of the stream. Taken from
+    /// the applications themselves rather than from a device.
+    Applications,
+    /// No sound at all: the host could not capture or encode any.
+    Unavailable,
+}
+
+/// Longest playback device name a guest will show.
+///
+/// Not [`MAX_DEVICE_NAME`], which is for what a machine calls itself: Windows'
+/// own device names run past forty — "FxSound Speakers (FxSound Audio
+/// Enhancer)" is forty-one.
+pub const MAX_AUDIO_DEVICE_NAME: usize = 96;
+
+impl AudioSource {
+    /// This, made safe to show. The name is the host's, not ours, so it is
+    /// cleaned the way a machine name is; one with nothing left after that is
+    /// dropped rather than shown as a blank.
+    pub fn sanitized(self) -> Option<Self> {
+        match self {
+            AudioSource::Device(name) => {
+                clean_label(&name, MAX_AUDIO_DEVICE_NAME).map(AudioSource::Device)
+            }
+            other => Some(other),
+        }
+    }
+}
+
+/// Maximum message size in bytes.
+///
+/// Sized for a worst-case keyframe: uncompressed 4K BGRA is 33 MiB, and a
 /// compressed keyframe of a photographic desktop can be a large fraction of
 /// that. The old 10 MiB cap was fine for a 640×360 test pattern but would kill
 /// a session the moment real capture ran at native resolution.
@@ -1331,6 +1418,62 @@ mod tests {
         // like, so neither kind may be it.
         assert_ne!(stream_kind::AUDIO, 0);
         assert_ne!(stream_kind::VIDEO, 0);
+
+        let kinds = [stream_kind::AUDIO, stream_kind::VIDEO, stream_kind::NOTICES];
+        for (i, a) in kinds.iter().enumerate() {
+            assert_ne!(*a, 0);
+            for b in &kinds[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn a_notice_survives_the_wire() {
+        for source in [
+            AudioSource::Device("Speakers (Realtek(R) Audio)".into()),
+            AudioSource::NoDevice,
+            AudioSource::Applications,
+            AudioSource::Unavailable,
+        ] {
+            let notice = Notice::AudioSource(source);
+            let bytes = bincode::serialize(&notice).unwrap();
+            assert_eq!(Notice::decode(&bytes), Some(notice));
+        }
+    }
+
+    /// The whole of what makes notices safe to add: a guest meeting one from a
+    /// newer host gets nothing, rather than an error that ends its session.
+    #[test]
+    fn a_notice_from_a_newer_host_is_none_rather_than_an_error() {
+        // What bincode would write for a variant past the last one this build
+        // has, carrying a string.
+        let mut future = bincode::serialize(&99u32).unwrap();
+        future.extend(bincode::serialize("something new").unwrap());
+        assert_eq!(Notice::decode(&future), None);
+
+        // Nor does an `AudioSource` this build has not heard of take the notice
+        // around it down with anything worse.
+        let mut future_source = bincode::serialize(&0u32).unwrap();
+        future_source.extend(bincode::serialize(&42u32).unwrap());
+        assert_eq!(Notice::decode(&future_source), None);
+    }
+
+    #[test]
+    fn a_device_name_from_the_host_is_cleaned_before_it_is_shown() {
+        let source = AudioSource::Device("FxSound Speakers\u{7}\n (FxSound Audio Enhancer)".into());
+        assert_eq!(
+            source.sanitized(),
+            Some(AudioSource::Device("FxSound Speakers (FxSound Audio Enhancer)".into())),
+            "control characters go; the name is longer than a machine name may be, and stays whole"
+        );
+        let long = "x".repeat(500);
+        let Some(AudioSource::Device(kept)) = AudioSource::Device(long).sanitized() else {
+            panic!("a long name is shortened, not dropped");
+        };
+        assert_eq!(kept.chars().count(), MAX_AUDIO_DEVICE_NAME);
+        assert_eq!(AudioSource::Device(" \u{1} ".into()).sanitized(), None, "nothing left to show");
+        assert_eq!(AudioSource::NoDevice.sanitized(), Some(AudioSource::NoDevice));
     }
 
     #[test]

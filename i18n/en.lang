@@ -982,6 +982,36 @@ One app is removed by Windows itself, inside the audio engine. Choosing more
 than one switches to mixing the apps that are left, which is exact but only sees
 what was already playing when the session started.
 
+[settings.audio.capture_device]
+Stream sound from
+
+[settings.audio.capture_device_hint]
+Which of this computer's playback devices guests hear. System default follows
+Windows when the default changes. Changes reach sessions already running.
+
+[settings.audio.capture_device_excluding]
+While apps are excluded, their sound is taken from the apps themselves rather
+than from a device, so this is set aside.
+
+[settings.audio.output_device]
+Play host sound on
+
+[settings.audio.output_device_hint]
+Where the sound of computers you connect to plays. System default follows
+Windows when the default changes. Changes reach sessions already playing.
+
+[settings.audio.system_default]
+System default ({name})
+
+[settings.audio.system_default_none]
+System default (no device)
+
+[settings.audio.not_connected]
+{name} (not connected)
+
+[settings.audio.not_connected_hint]
+Not connected. The system default is used until it's back.
+
 
 # ── Settings: virtual display ─────────────────────────────────
 
@@ -1350,6 +1380,24 @@ Host sound muted — click to play it
 
 [session.volume]
 Host volume {percent}%
+
+[session.play_on]
+Play on
+
+[session.host_source.device]
+The host is sending the sound of {name}
+
+[session.host_source.applications]
+The host is sending its apps' sound, with some left out
+
+[session.host_source.no_device]
+The host has no playback device, so it's sending silence
+
+[session.host_source.unavailable]
+The host isn't sending any sound
+
+[session.no_output_device]
+No playback device on this computer. The sound starts as soon as there is one.
 
 [session.screen_virtual]
 Virtual {w}×{h}

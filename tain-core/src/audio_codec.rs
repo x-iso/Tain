@@ -428,6 +428,18 @@ mod tests {
         assert!(encoder.encode(&[0.0, 0.0, 0.0]).is_err());
     }
 
+    /// Opus has no 44.1 kHz, so a host whose device ran at it sent no sound at
+    /// all. Which is why capture asks the audio engine for 48 kHz whatever the
+    /// device runs at — see `audio_capture::STREAM_FORMAT`.
+    #[test]
+    fn opus_will_not_encode_at_44_1_khz() {
+        if OpusEncoder::new(SAMPLE_RATE, 2, DEFAULT_BITRATE).is_err() {
+            eprintln!("no libopus in this build — skipping");
+            return;
+        }
+        assert!(OpusEncoder::new(44_100, 2, DEFAULT_BITRATE).is_err());
+    }
+
     #[test]
     fn a_truncated_blob_is_an_error_rather_than_a_read_past_the_end() {
         let Ok(mut decoder) = OpusDecoder::new(SAMPLE_RATE, 2) else { return };

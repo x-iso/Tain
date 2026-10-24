@@ -1,7 +1,8 @@
 //! System audio capture via WASAPI loopback.
 //!
-//! Captures what the machine is playing, from the default render endpoint, on
-//! its own thread and its own clock.
+//! Captures what the machine is playing, on its own thread and its own clock,
+//! from the default playback device or the one chosen in settings — and keeps
+//! up when either changes or the device goes away. See [`super::audio_device`].
 //!
 //! ## The clock is not the video clock
 //!
@@ -39,11 +40,15 @@
 //!
 //! ## Format
 //!
-//! The endpoint's mix format is whatever the user's device is running at, which
-//! is usually 48 kHz float32 stereo and is never safe to assume — plenty of
-//! machines run 44.1 kHz, and studio interfaces run 96. It is read and reported,
-//! and conversion is the encoder's problem rather than something done blindly
-//! here.
+//! Always [`STREAM_FORMAT`], whatever the device runs at. The audio engine
+//! converts, because it is asked to: see [`open_endpoint_loopback`].
+//!
+//! It used to be the endpoint's own mix format, read and passed on. That is
+//! usually 48 kHz stereo and never safe to assume — plenty of machines run
+//! 44.1 kHz, and Opus does not take 44.1 kHz at all, so on those machines the
+//! encoder refused to start and every session was silent. And a format that
+//! belongs to the device cannot survive changing device: the encoder and the
+//! guest's decoder were both built for the first one.
 
 #![cfg(target_os = "windows")]
 
@@ -54,10 +59,11 @@ use tracing::*;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE,
+    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
@@ -89,6 +95,15 @@ impl AudioFormat {
     }
 }
 
+/// What every capture delivers, whatever the device underneath runs at.
+///
+/// Fixed so that a session can move from one device to another without the
+/// stream changing under the encoder and the guest's decoder. 48 kHz because it
+/// is Opus's own rate and what almost every device mixes at anyway; stereo
+/// because Opus takes no more, and the engine's downmix of a surround device is
+/// a better one than taking the front pair.
+pub const STREAM_FORMAT: AudioFormat = AudioFormat { sample_rate: 48_000, channels: 2 };
+
 /// One block of captured audio, interleaved float32.
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
@@ -106,16 +121,21 @@ pub struct AudioChunk {
 /// A running loopback capture, stopped when dropped.
 pub struct LoopbackCapture {
     format: AudioFormat,
+    /// The device being captured, while there is one. Always `None` for a
+    /// capture that excludes applications, which taps them rather than a device.
+    device: Arc<std::sync::Mutex<Option<crate::AudioDevice>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LoopbackCapture {
-    /// Start capturing the default render endpoint.
+    /// Start capturing a playback device: the one chosen with
+    /// [`super::audio_device::set_capture_device`], or the default.
     ///
-    /// Blocks only long enough for the thread to open the device and report the
-    /// format, so a failure to start is returned here rather than surfacing
-    /// later as silence nobody can explain.
+    /// Follows the choice, and the default, for as long as it runs. With no
+    /// device at all it still starts, and sends silence until one appears —
+    /// a machine whose headphones are unplugged at the moment a guest connects
+    /// is not a machine without sound for the whole session.
     pub fn start() -> Result<(Self, std::sync::mpsc::Receiver<AudioChunk>)> {
         Self::open(Excluding::Nothing)
     }
@@ -173,12 +193,16 @@ impl LoopbackCapture {
         let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<AudioChunk>(200);
 
         let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
+        let device = Arc::new(std::sync::Mutex::new(None));
         // The thread takes ownership; this copy is only for the log line below.
         let describe = exclude.clone();
         let thread = std::thread::Builder::new()
             .name("audio-loopback".into())
-            .spawn(move || capture_thread(exclude, ready_tx, chunk_tx, thread_stop))
+            .spawn({
+                let stop = Arc::clone(&stop);
+                let device = Arc::clone(&device);
+                move || capture_thread(exclude, ready_tx, chunk_tx, device, stop)
+            })
             .context("could not start the audio capture thread")?;
 
         let format = ready_rx
@@ -201,11 +225,16 @@ impl LoopbackCapture {
                 format.sample_rate, format.channels
             ),
         }
-        Ok((Self { format, stop, thread: Some(thread) }, chunk_rx))
+        Ok((Self { format, device, stop, thread: Some(thread) }, chunk_rx))
     }
 
     pub fn format(&self) -> AudioFormat {
         self.format
+    }
+
+    /// The device being captured right now, if any.
+    pub fn device(&self) -> Option<crate::AudioDevice> {
+        self.device.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -533,9 +562,9 @@ fn run_mixed(
     chunks: &std::sync::mpsc::SyncSender<AudioChunk>,
     stop: &AtomicBool,
 ) {
-    const RATE: u32 = 48_000;
-    const CHANNELS: u16 = 2;
-    let format = AudioFormat { sample_rate: RATE, channels: CHANNELS };
+    const RATE: u32 = STREAM_FORMAT.sample_rate;
+    const CHANNELS: u16 = STREAM_FORMAT.channels;
+    let format = STREAM_FORMAT;
 
     // Started before the first scan, so the audio thread never enumerates.
     let watcher = SessionWatcher::start(excluded.to_vec());
@@ -825,6 +854,7 @@ fn capture_thread(
     exclude: Excluding,
     ready: std::sync::mpsc::Sender<Result<AudioFormat>>,
     chunks: std::sync::mpsc::SyncSender<AudioChunk>,
+    device: Arc<std::sync::Mutex<Option<crate::AudioDevice>>>,
     stop: Arc<AtomicBool>,
 ) {
     // SAFETY: paired with CoUninitialize at the end of this function, and every
@@ -835,93 +865,322 @@ fn capture_thread(
         return;
     }
 
-    // Per-process capture has a fixed format because there is no endpoint to
-    // ask; 48 kHz stereo is what Opus wants anyway.
-    // Mixing several included applications is a different loop entirely; it
-    // owns N clients rather than one and never reaches the code below.
-    if let Excluding::AllBut(pids) = &exclude {
-        run_mixed(pids, &ready, &chunks, &stop);
-        // SAFETY: balances the CoInitializeEx above.
-        unsafe { CoUninitialize() };
-        return;
-    }
-
-    let opened = match exclude {
-        Excluding::One(pid) => open_process_loopback(pid, false, 48_000, 2),
-        _ => open_loopback(),
-    };
-    match opened {
-        Ok((client, capture, format, event)) => {
-            if ready.send(Ok(format)).is_err() {
-                // Nobody is waiting for this any more.
-                // SAFETY: balances the CoInitializeEx above.
-                unsafe { CoUninitialize() };
-                return;
-            }
-            run(&client, &capture, format, event, &chunks, &stop);
-            // SAFETY: the event was created here and is not used again.
-            unsafe {
-                let _ = client.Stop();
-                let _ = CloseHandle(event);
-            }
-        }
-        Err(e) => {
-            let _ = ready.send(Err(e));
-        }
+    // Each of these owns its clients and reports its own format. Mixing several
+    // included applications is a different loop entirely, because it holds N
+    // clients rather than one.
+    match &exclude {
+        Excluding::AllBut(pids) => run_mixed(pids, &ready, &chunks, &stop),
+        Excluding::One(pid) => run_excluding_one(*pid, &ready, &chunks, &stop),
+        Excluding::Nothing => run_following(&ready, &chunks, &device, &stop),
     }
 
     // SAFETY: balances the CoInitializeEx above.
     unsafe { CoUninitialize() };
 }
 
-/// Open the default render endpoint for loopback capture.
-fn open_loopback() -> Result<(IAudioClient, IAudioCaptureClient, AudioFormat, HANDLE)> {
-    // SAFETY: standard WASAPI activation. Every pointer the API hands back is
-    // checked, and the mix format is freed before returning.
+/// Everything but one process tree, left out by the audio engine itself.
+///
+/// Not tied to a playback device — the engine taps the applications' own
+/// streams — so there is nothing here to follow when the default changes.
+fn run_excluding_one(
+    pid: u32,
+    ready: &std::sync::mpsc::Sender<Result<AudioFormat>>,
+    chunks: &std::sync::mpsc::SyncSender<AudioChunk>,
+    stop: &AtomicBool,
+) {
+    let opened =
+        open_process_loopback(pid, false, STREAM_FORMAT.sample_rate, STREAM_FORMAT.channels);
+    let (client, capture, format, event) = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    // Nobody is waiting for this any more if the send fails, and the stream is
+    // closed below either way.
+    if ready.send(Ok(format)).is_ok() {
+        let mut position = 0u64;
+        run(&capture, format.channels as usize, event, &mut position, chunks, stop, &|| false);
+    }
+    // SAFETY: the event was created for this client and is not used again.
     unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .context("could not create the audio device enumerator")?;
-        let device = enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .context("no default playback device to capture from")?;
+        let _ = client.Stop();
+        let _ = CloseHandle(event);
+    }
+}
+
+/// Capture whichever playback device is right, for as long as the capture runs.
+///
+/// The one chosen in settings while it is plugged in, the default otherwise —
+/// and when the default changes, the device goes away, or the choice is
+/// changed, the stream moves. See [`super::audio_device`].
+///
+/// # One stream, however many devices
+///
+/// Every move opens a new client, but the guest hears a single stream: the
+/// frame position carries on from where the last device left off, and time
+/// spent with no device at all is filled with silence. A jump in the position
+/// would be concealed as lost packets on the far side, and one that went back
+/// to zero would be dropped there as late, for the rest of the session.
+fn run_following(
+    ready: &std::sync::mpsc::Sender<Result<AudioFormat>>,
+    chunks: &std::sync::mpsc::SyncSender<AudioChunk>,
+    device: &std::sync::Mutex<Option<crate::AudioDevice>>,
+    stop: &AtomicBool,
+) {
+    use super::audio_device::{resolve, should_move, DeviceWatch, CAPTURE};
+
+    let in_use = |about: Option<crate::AudioDevice>| {
+        *device.lock().unwrap_or_else(|e| e.into_inner()) = about;
+    };
+    let enumerator = match super::audio_device::enumerator() {
+        Ok(enumerator) => enumerator,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    // Without notifications a lost device is still noticed — the stream fails —
+    // but a new default would not be followed until then.
+    let watch = DeviceWatch::register(&enumerator)
+        .map_err(|e| warn!("Audio capture will not follow device changes: {e:#}"))
+        .ok();
+    let changed = || watch.as_ref().is_some_and(DeviceWatch::take);
+
+    // Ready after the first attempt to open a device, whichever way it goes:
+    // the format does not depend on one, but `LoopbackCapture::device` should
+    // be right by the time `start` returns. Answering before the attempt had
+    // the session tell its guest "no device" for the few hundred milliseconds
+    // the first open takes.
+    let mut ready = Some(ready);
+    let mut announce = || ready.take().is_none_or(|ready| ready.send(Ok(STREAM_FORMAT)).is_ok());
+
+    let mut position = 0u64;
+    let mut said_missing = false;
+    while !stop.load(Ordering::Relaxed) {
+        let seen = CAPTURE.generation();
+        let chosen = CAPTURE.chosen();
+        let opened = resolve(&enumerator, chosen.as_deref()).and_then(|(device, about, how)| {
+            open_endpoint_loopback(&device, &about.name).map(|opened| (opened, about, how))
+        });
+
+        let ((client, capture, channels, event), about, how) = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                if !said_missing {
+                    info!("No system audio to capture ({e:#}) — sending silence until there is");
+                    said_missing = true;
+                }
+                in_use(None);
+                if !announce() {
+                    return;
+                }
+                // Anything happening to any device is worth another look, and
+                // so is time passing, in case a notification went astray.
+                let retry = || changed() || CAPTURE.generation() != seen;
+                fill_silence(&mut position, chunks, stop, RETRY_EVERY, &retry);
+                continue;
+            }
+        };
+
+        info!("Capturing system audio from {} — {}", about.name, how.describe());
+        said_missing = false;
+        in_use(Some(about.clone()));
+        let generation = std::cell::Cell::new(seen);
+        let moved = || should_move(&enumerator, changed(), &CAPTURE, &generation, &about.id);
+        let opened_at = std::time::Instant::now();
+        // Nobody is waiting for this any more if the announcement fails, and
+        // the stream is closed below either way.
+        let ended = if announce() {
+            run(&capture, channels as usize, event, &mut position, chunks, stop, &moved)
+        } else {
+            Ended::Stopped
+        };
+        // SAFETY: the event was created for this client and is not used again.
+        unsafe {
+            let _ = client.Stop();
+            let _ = CloseHandle(event);
+        }
+
+        match ended {
+            Ended::Stopped => break,
+            Ended::Moved => {}
+            Ended::Lost => {
+                info!("Stopped capturing {} — looking for another device", about.name);
+                // A device that fails as soon as it opens would otherwise be
+                // reopened as fast as the loop can turn.
+                if opened_at.elapsed() < std::time::Duration::from_secs(1) {
+                    fill_silence(&mut position, chunks, stop, LOST_PAUSE, &|| false);
+                }
+            }
+        }
+    }
+}
+
+/// How long to send silence before looking for a device again, when there was
+/// none and nothing has said one arrived.
+const RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long to wait before reopening a device that failed straight away.
+const LOST_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Send silence in real time, until `until` says otherwise or `limit` passes.
+///
+/// What keeps the guest's timeline moving while there is nothing to capture.
+/// Paced by the clock rather than by counting sleeps, so a late wake-up sends
+/// more rather than letting the stream fall behind real time.
+fn fill_silence(
+    position: &mut u64,
+    chunks: &std::sync::mpsc::SyncSender<AudioChunk>,
+    stop: &AtomicBool,
+    limit: std::time::Duration,
+    until: &dyn Fn() -> bool,
+) {
+    let channels = STREAM_FORMAT.channels as usize;
+    let started = std::time::Instant::now();
+    let mut sent = 0u64;
+    while !stop.load(Ordering::Relaxed) && started.elapsed() < limit && !until() {
+        std::thread::sleep(std::time::Duration::from_millis(WAIT_TIMEOUT_MS as u64));
+        let due = STREAM_FORMAT.frames(started.elapsed()) as u64;
+        let frames = due.saturating_sub(sent) as usize;
+        if frames == 0 {
+            continue;
+        }
+        let chunk = AudioChunk { samples: vec![0.0; frames * channels], position: *position, silent: true };
+        *position += frames as u64;
+        sent += frames as u64;
+        let _ = chunks.try_send(chunk);
+    }
+}
+
+/// Open a playback device for loopback capture, delivering [`STREAM_FORMAT`].
+///
+/// Returns how many channels the client delivers, which is two unless the
+/// fallback below was needed.
+///
+/// # The engine converts, because it is asked to
+///
+/// `AUTOCONVERTPCM` puts the audio engine's own resampler and channel mixer
+/// between the device and this client, so whatever the device runs at, what
+/// comes out is 48 kHz stereo. That is what lets a session change device
+/// without the stream changing format, and what lets a 44.1 kHz device be heard
+/// at all.
+///
+/// # And when it will not
+///
+/// Should the engine refuse, the device's own mix format is used instead,
+/// provided it already runs at the stream's rate; its channels are folded to
+/// stereo on the way out by [`to_stereo`]. A device at any other rate cannot be
+/// streamed without a resampler of our own, and is reported rather than sent at
+/// the wrong speed.
+fn open_endpoint_loopback(
+    device: &IMMDevice,
+    name: &str,
+) -> Result<(IAudioClient, IAudioCaptureClient, u16, HANDLE)> {
+    // SAFETY: standard WASAPI activation. Every pointer the API hands back is
+    // checked, the mix format is freed before returning, and the event is
+    // closed on every path that does not hand it back.
+    unsafe {
         let client: IAudioClient = device
             .Activate(CLSCTX_ALL, None)
             .context("could not activate an audio client on the playback device")?;
 
-        let mix = client.GetMixFormat().context("could not read the endpoint mix format")?;
-        anyhow::ensure!(!mix.is_null(), "GetMixFormat returned nothing");
-        let format = read_format(mix);
-
-        // The event has to exist before Initialize, which stores it.
-        let event = CreateEventW(None, false, false, None)
-            .context("could not create the audio capture event")?;
-
-        let result = client.Initialize(
+        let wanted = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+            nChannels: STREAM_FORMAT.channels,
+            nSamplesPerSec: STREAM_FORMAT.sample_rate,
+            nAvgBytesPerSec: STREAM_FORMAT.sample_rate * STREAM_FORMAT.channels as u32 * 4,
+            nBlockAlign: STREAM_FORMAT.channels * 4,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        let converted = client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             // Loopback captures the render stream; the event makes the wait
-            // below cheap instead of a poll.
-            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            // in `run` cheap instead of a poll.
+            AUDCLNT_STREAMFLAGS_LOOPBACK
+                | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
             BUFFER_DURATION,
             0,
-            mix,
+            &wanted,
             None,
         );
-        // Owned by us the moment GetMixFormat returned, and not referenced
-        // after Initialize has copied what it needs.
-        CoTaskMemFree(Some(mix as *const _));
-        result.context("the audio engine refused a loopback client")?;
 
-        client
-            .SetEventHandle(event)
-            .context("could not attach the event to the audio client")?;
-        let capture: IAudioCaptureClient = client
-            .GetService()
-            .context("could not get a capture client for the loopback stream")?;
-        client.Start().context("could not start the loopback stream")?;
+        let (client, channels) = match converted {
+            Ok(()) => (client, STREAM_FORMAT.channels),
+            Err(e) => {
+                debug!("The audio engine would not convert {name} for capture ({e}) — trying its own format");
+                // A client whose Initialize failed is not tried again; a fresh
+                // one is the documented way to have another go.
+                let client: IAudioClient = device
+                    .Activate(CLSCTX_ALL, None)
+                    .context("could not activate an audio client on the playback device")?;
+                let mix = client.GetMixFormat().context("could not read the device's mix format")?;
+                anyhow::ensure!(!mix.is_null(), "GetMixFormat returned nothing");
+                let native = read_format(mix);
+                let initialized = match &native {
+                    Ok(native) if native.sample_rate == STREAM_FORMAT.sample_rate => client
+                        .Initialize(
+                            AUDCLNT_SHAREMODE_SHARED,
+                            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                            BUFFER_DURATION,
+                            0,
+                            mix,
+                            None,
+                        )
+                        .context("the audio engine refused a loopback client"),
+                    Ok(native) => Err(anyhow::anyhow!(
+                        "{name} runs at {} Hz, and the audio engine would not convert it",
+                        native.sample_rate
+                    )),
+                    // Reported by `native?` below.
+                    Err(_) => Ok(()),
+                };
+                // Owned by us the moment GetMixFormat returned, and not
+                // referenced after Initialize has copied what it needs.
+                CoTaskMemFree(Some(mix as *const _));
+                let native = native?;
+                initialized?;
+                (client, native.channels)
+            }
+        };
 
-        let format = format?;
-        Ok((client, capture, format, event))
+        let event = CreateEventW(None, false, false, None)
+            .context("could not create the audio capture event")?;
+        let started = (|| -> Result<IAudioCaptureClient> {
+            client
+                .SetEventHandle(event)
+                .context("could not attach the event to the audio client")?;
+            let capture: IAudioCaptureClient = client
+                .GetService()
+                .context("could not get a capture client for the loopback stream")?;
+            client.Start().context("could not start the loopback stream")?;
+            Ok(capture)
+        })();
+        match started {
+            Ok(capture) => Ok((client, capture, channels, event)),
+            Err(e) => {
+                let _ = CloseHandle(event);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Interleaved samples with `from` channels, as stereo.
+///
+/// Only needed when the engine would not convert — see
+/// [`open_endpoint_loopback`]. Mono is doubled; anything wider keeps its front
+/// pair, which is where a desktop puts what matters.
+fn to_stereo(samples: &[f32], from: usize) -> Vec<f32> {
+    match from {
+        2 => samples.to_vec(),
+        1 => samples.iter().flat_map(|&s| [s, s]).collect(),
+        // Zero is refused when the format is read, so this is never `chunks_exact(0)`.
+        _ => samples.chunks_exact(from.max(2)).flat_map(|frame| [frame[0], frame[1]]).collect(),
     }
 }
 
@@ -975,34 +1234,63 @@ const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: windows::core::GUID =
     windows::core::GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
+/// Why [`run`] returned.
+enum Ended {
+    /// The capture is being shut down.
+    Stopped,
+    /// A different device should be captured now.
+    Moved,
+    /// The device stopped working: unplugged, disabled, or its format changed
+    /// under the stream.
+    Lost,
+}
+
+/// Move a running client's audio into `chunks` until told otherwise.
+///
+/// `channels` is what the client delivers, and `position` is the stream's,
+/// carried in and out so that a stream that moves device keeps its timeline.
+/// Whatever comes in, what goes out is [`STREAM_FORMAT`].
 fn run(
-    client: &IAudioClient,
     capture: &IAudioCaptureClient,
-    format: AudioFormat,
+    channels: usize,
     event: HANDLE,
+    position: &mut u64,
     chunks: &std::sync::mpsc::SyncSender<AudioChunk>,
     stop: &AtomicBool,
-) {
-    let channels = format.channels as usize;
-    let mut position = 0u64;
+    moved: &dyn Fn() -> bool,
+) -> Ended {
+    let format = STREAM_FORMAT;
+    let out_channels = format.channels as usize;
     let mut dropped = 0u32;
     let mut reported = std::time::Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
+        // Once a period: two atomic loads unless something has happened.
+        if moved() {
+            return Ended::Moved;
+        }
+
         // SAFETY: waiting on an event this thread owns.
         let signalled = unsafe { WaitForSingleObject(event, WAIT_TIMEOUT_MS) } == WAIT_OBJECT_0;
 
         if !signalled {
+            // Also what a device that has gone away looks like: no events.
+            // Asking is what tells the two apart.
+            // SAFETY: a plain query on a client this thread owns.
+            if let Err(e) = unsafe { capture.GetNextPacketSize() } {
+                info!("Audio capture lost its device: {e}");
+                return Ended::Lost;
+            }
             // Nothing is playing, and on some Windows versions that means no
             // buffers at all rather than silent ones. Manufacture the silence
             // so the stream stays gapless; see the module header.
             let frames = format.frames(std::time::Duration::from_millis(WAIT_TIMEOUT_MS as u64));
             let chunk = AudioChunk {
-                samples: vec![0.0; frames * channels],
-                position,
+                samples: vec![0.0; frames * out_channels],
+                position: *position,
                 silent: true,
             };
-            position += frames as u64;
+            *position += frames as u64;
             if chunks.try_send(chunk).is_err() {
                 dropped += 1;
             }
@@ -1016,8 +1304,9 @@ fn run(
                 Ok(frames) if frames > 0 => frames,
                 Ok(_) => break,
                 Err(e) => {
-                    warn!("Audio capture stopped: {e}");
-                    return;
+                    // Not a warning any more: the caller finds another device.
+                    info!("Audio capture lost its device: {e}");
+                    return Ended::Lost;
                 }
             };
 
@@ -1030,8 +1319,8 @@ fn run(
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)
             };
             if let Err(e) = got {
-                warn!("Audio capture stopped: {e}");
-                return;
+                info!("Audio capture lost its device: {e}");
+                return Ended::Lost;
             }
             let _ = available;
 
@@ -1043,24 +1332,26 @@ fn run(
                 debug!("Audio capture reported a discontinuity");
             }
 
-            let count = frames as usize * channels;
             let samples = if silent || data.is_null() {
                 // A silent buffer's memory is documented as not worth reading.
-                vec![0.0; count]
+                vec![0.0; frames as usize * out_channels]
             } else {
                 // SAFETY: the engine guarantees `frames * channels` floats at
                 // `data`, valid until ReleaseBuffer below.
-                unsafe { std::slice::from_raw_parts(data as *const f32, count) }.to_vec()
+                let raw = unsafe {
+                    std::slice::from_raw_parts(data as *const f32, frames as usize * channels)
+                };
+                to_stereo(raw, channels)
             };
 
             // SAFETY: balances the GetBuffer above, exactly once.
             if let Err(e) = unsafe { capture.ReleaseBuffer(frames) } {
-                warn!("Audio capture could not release a buffer: {e}");
-                return;
+                info!("Audio capture could not release a buffer: {e}");
+                return Ended::Lost;
             }
 
-            let chunk = AudioChunk { samples, position, silent };
-            position += frames as u64;
+            let chunk = AudioChunk { samples, position: *position, silent };
+            *position += frames as u64;
             if chunks.try_send(chunk).is_err() {
                 dropped += 1;
             }
@@ -1072,7 +1363,7 @@ fn run(
             reported = std::time::Instant::now();
         }
     }
-    let _ = client;
+    Ended::Stopped
 }
 
 #[cfg(test)]
@@ -1087,6 +1378,129 @@ mod tests {
 
         let odd = AudioFormat { sample_rate: 44_100, channels: 2 };
         assert_eq!(odd.frames(std::time::Duration::from_millis(10)), 441);
+    }
+
+    #[test]
+    fn whatever_the_device_has_comes_out_as_stereo() {
+        assert_eq!(to_stereo(&[0.1, 0.2, 0.3, 0.4], 2), vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(to_stereo(&[0.1, 0.2], 1), vec![0.1, 0.1, 0.2, 0.2], "mono is doubled");
+        // 5.1: front left, front right, centre, LFE, back left, back right.
+        let surround = [0.1, 0.2, 0.9, 0.9, 0.9, 0.9, 0.3, 0.4, 0.9, 0.9, 0.9, 0.9];
+        assert_eq!(to_stereo(&surround, 6), vec![0.1, 0.2, 0.3, 0.4], "the front pair is kept");
+    }
+
+    /// The engine converts a loopback stream, which is the whole of how a device
+    /// at 44.1 kHz — or anything but 48 — is heard, and how a session keeps one
+    /// format across devices.
+    #[test]
+    #[ignore = "touches the real default playback device"]
+    fn the_engine_converts_a_loopback_stream_to_what_it_is_asked_for() {
+        // SAFETY: COM has to be up; this is a test thread.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let enumerator = crate::audio_device::enumerator().expect("enumerator");
+        let Ok((device, about, _)) = crate::audio_device::resolve(&enumerator, None) else {
+            eprintln!("no playback device — skipping");
+            return;
+        };
+
+        let (client, _capture, channels, event) =
+            open_endpoint_loopback(&device, &about.name).expect("loopback on the default device");
+        // SAFETY: the client and event were opened just above.
+        unsafe {
+            let _ = client.Stop();
+            let _ = CloseHandle(event);
+        }
+        assert_eq!(channels, 2, "the engine refused to convert {} and the fallback was used", about.name);
+
+        // And at a rate no device here is likely to be running at, which is
+        // the case that actually matters.
+        // SAFETY: an ordinary activation and initialise on a fresh client.
+        let odd = unsafe {
+            let client: IAudioClient = device.Activate(CLSCTX_ALL, None).expect("activate");
+            let format = WAVEFORMATEX {
+                wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+                nChannels: 1,
+                nSamplesPerSec: 44_100,
+                nAvgBytesPerSec: 44_100 * 4,
+                nBlockAlign: 4,
+                wBitsPerSample: 32,
+                cbSize: 0,
+            };
+            client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK
+                    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                    | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                BUFFER_DURATION,
+                0,
+                &format,
+                None,
+            )
+        };
+        assert!(odd.is_ok(), "{} would not convert a loopback stream to 44.1 kHz mono: {odd:?}", about.name);
+    }
+
+    /// Choosing another device mid-capture moves the capture, and the timeline
+    /// runs straight on — a guest must hear one stream, not two.
+    ///
+    /// Needs two playback devices, and leaves the system default alone: the
+    /// move is made by choosing, which is Tain's own setting.
+    #[test]
+    #[ignore = "touches the real playback devices"]
+    fn choosing_another_device_moves_the_capture_without_a_gap() {
+        // The capture thread says which device it opened, and why not.
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        // SAFETY: COM has to be up for the enumeration; this is a test thread.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let devices = crate::audio_device::playback_devices();
+        let Some(other) = devices.iter().find(|d| !d.default).cloned() else {
+            eprintln!("only one playback device — skipping");
+            return;
+        };
+        crate::audio_device::set_capture_device(None);
+        let (capture, chunks) = LoopbackCapture::start().expect("capture");
+        assert_eq!(capture.format(), STREAM_FORMAT);
+
+        // Frames received in each phase. Opening the first device takes a few
+        // hundred milliseconds, so only what follows a move is held to a rate.
+        let mut next_position = 0u64;
+        let mut drain = |for_ms: u64| {
+            let from = next_position;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(for_ms);
+            while std::time::Instant::now() < deadline {
+                let Ok(chunk) = chunks.recv_timeout(std::time::Duration::from_millis(200)) else {
+                    continue;
+                };
+                assert_eq!(chunk.position, next_position, "gap in the capture position");
+                assert_eq!(chunk.samples.len() % 2, 0, "not stereo");
+                next_position += (chunk.samples.len() / 2) as u64;
+            }
+            next_position - from
+        };
+
+        drain(800);
+        let before = capture.device().expect("capturing the default");
+        assert!(before.default, "started on {} rather than the default", before.name);
+
+        crate::audio_device::set_capture_device(Some(other.id.clone()));
+        let after_move = drain(600);
+        let moved = capture.device();
+        // Put back before asserting, so a failure does not leave the choice set.
+        crate::audio_device::set_capture_device(None);
+        let after_return = drain(600);
+        let back = capture.device();
+
+        assert_eq!(moved.as_ref().map(|d| &d.id), Some(&other.id), "did not move to {}", other.name);
+        assert_eq!(back.map(|d| d.id), Some(before.id), "did not come back to the default");
+        // A move costs a reopen, not the stream: most of each phase still arrives.
+        let half = STREAM_FORMAT.frames(std::time::Duration::from_millis(300)) as u64;
+        assert!(after_move >= half, "only {after_move} frames in the 600 ms after moving");
+        assert!(after_return >= half, "only {after_return} frames in the 600 ms after coming back");
+        println!("moved {} -> {} -> {}, {next_position} frames", before.name, other.name, before.name);
     }
 
     /// What the exclusion picker will actually offer.

@@ -8,8 +8,8 @@
 use egui::{Context, RichText};
 
 use super::settings::{
-    BackendSetting, CodecSetting, DeviceNameMode, ProfileSetting, RateControlSetting,
-    ResolutionSetting, ScalingMode, Settings,
+    BackendSetting, ChosenDevice, CodecSetting, DeviceNameMode, ProfileSetting,
+    RateControlSetting, ResolutionSetting, ScalingMode, Settings,
 };
 use super::shortcuts::{Shortcut, ShortcutAction};
 use super::theme::*;
@@ -29,6 +29,12 @@ pub struct PanelState {
     /// Cached because enumerating them is a COM round trip and the settings
     /// window redraws continuously while it is open.
     pub audio_apps: Vec<tain_core::AudioSession>,
+    /// Playback devices, for the two device pickers, and when they were listed.
+    ///
+    /// Listed again every couple of seconds while the window is in use, so a
+    /// device plugged in while it is open turns up without a button to press.
+    pub audio_devices: Vec<tain_core::AudioDevice>,
+    pub audio_devices_at: Option<std::time::Instant>,
     /// The interface scale being edited, and the saved value it started from.
     ///
     /// # Why this one setting is not applied as it is edited
@@ -668,6 +674,12 @@ fn codec_text(choice: CodecSetting) -> String {
 fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelState) {
     heading(ui, i18n::text("settings.audio"));
 
+    const RELIST: std::time::Duration = std::time::Duration::from_secs(2);
+    if panel.audio_devices_at.is_none_or(|at| at.elapsed() >= RELIST) {
+        panel.audio_devices = tain_core::playback_devices();
+        panel.audio_devices_at = Some(std::time::Instant::now());
+    }
+
     egui::Grid::new("audio").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         ui.label(i18n::text("settings.audio.quality"))
             .on_hover_text(i18n::text("settings.audio.quality_hint"));
@@ -689,6 +701,31 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
             ui.label(
                 RichText::new(i18n::text("settings.audio.kbits")).size(11.0).color(TEXT_DIM),
             );
+        });
+        ui.end_row();
+
+        ui.label(i18n::text("settings.audio.capture_device"))
+            .on_hover_text(i18n::text("settings.audio.capture_device_hint"));
+        ui.vertical(|ui| {
+            // Excluding apps taps them one by one, with no device in between,
+            // so a device chosen here would do nothing. Disabled and said so,
+            // rather than looking like it works.
+            let excluding = !settings.exclude_audio_processes.is_empty();
+            ui.add_enabled_ui(!excluding, |ui| {
+                device_picker(
+                    ui,
+                    "capture_device",
+                    &mut settings.audio_capture_device,
+                    &panel.audio_devices,
+                );
+            });
+            if excluding {
+                ui.label(
+                    RichText::new(i18n::text("settings.audio.capture_device_excluding"))
+                        .size(11.0)
+                        .color(TEXT_DIM),
+                );
+            }
         });
         ui.end_row();
 
@@ -752,7 +789,76 @@ fn audio_section(ui: &mut egui::Ui, settings: &mut Settings, panel: &mut PanelSt
             ui.label(RichText::new(note).size(11.0).color(TEXT_DIM));
         });
         ui.end_row();
+
+        // This machine's speakers, for the sound of hosts it connects to — the
+        // one row here that is about the other direction.
+        ui.label(i18n::text("settings.audio.output_device"))
+            .on_hover_text(i18n::text("settings.audio.output_device_hint"));
+        device_picker(ui, "output_device", &mut settings.audio_output_device, &panel.audio_devices);
+        ui.end_row();
     });
+}
+
+/// What following the default is called in a device picker.
+///
+/// With the default's own name beside it, so that choosing it says where the
+/// sound will actually go — the question a silent session comes down to.
+pub fn system_default_label(devices: &[tain_core::AudioDevice]) -> String {
+    match devices.iter().find(|d| d.default) {
+        Some(device) => i18n::format("settings.audio.system_default", &[("name", &device.name)]),
+        None => i18n::text("settings.audio.system_default_none").to_string(),
+    }
+}
+
+/// The system default, then every playback device that is plugged in.
+///
+/// A chosen device that is unplugged stays on the list, marked, rather than
+/// disappearing from it: otherwise the setting would read as the default while
+/// quietly waiting for something else to come back.
+fn device_picker(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    chosen: &mut Option<ChosenDevice>,
+    devices: &[tain_core::AudioDevice],
+) {
+    let missing = chosen.clone().filter(|c| !devices.iter().any(|d| d.id == c.id));
+    let selected = match (&chosen, &missing) {
+        (None, _) => system_default_label(devices),
+        (Some(_), Some(missing)) => {
+            i18n::format("settings.audio.not_connected", &[("name", &missing.name)])
+        }
+        // Today's name, which a driver update may have changed since it was chosen.
+        (Some(c), None) => devices
+            .iter()
+            .find(|d| d.id == c.id)
+            .map_or_else(|| c.name.clone(), |d| d.name.clone()),
+    };
+
+    let response = egui::ComboBox::from_id_salt(id_salt)
+        .width(220.0)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(chosen.is_none(), system_default_label(devices)).clicked() {
+                *chosen = None;
+            }
+            for device in devices {
+                let on = chosen.as_ref().is_some_and(|c| c.id == device.id);
+                if ui.selectable_label(on, &device.name).clicked() {
+                    *chosen = Some(device.into());
+                }
+            }
+            if let Some(missing) = &missing {
+                ui.selectable_label(
+                    true,
+                    i18n::format("settings.audio.not_connected", &[("name", &missing.name)]),
+                )
+                .on_hover_text(i18n::text("settings.audio.not_connected_hint"));
+            }
+        })
+        .response;
+    if missing.is_some() {
+        response.on_hover_text(i18n::text("settings.audio.not_connected_hint"));
+    }
 }
 
 /// Installing and removing the virtual display driver.
