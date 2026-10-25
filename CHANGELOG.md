@@ -3,6 +3,40 @@
 All notable changes to Tain are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-10-24
+
+### Added
+
+- **Choose where sound comes from and where it plays.** Settings → Audio has
+  *Stream sound from*, the playback device guests hear, and *Play host sound
+  on*, the device a host's sound plays on here. The volume control in a
+  session lists the same devices, so you can move the sound while you listen.
+  Both default to the system default and change sessions that are already
+  running. A chosen device that's unplugged shows as not connected, the system
+  default plays meanwhile, and the sound goes back to it when it returns. While
+  apps are excluded from the stream, *Stream sound from* is set aside, since
+  their sound is taken from the apps rather than from a device.
+
+- **See where the host's sound comes from.** The volume control in a session
+  names the device the host is sending the sound of, or says that the host has
+  no playback device, is sending its apps' sound with some left out, or isn't
+  sending any. Hosts on earlier versions don't say, and nothing is shown. Guests
+  on earlier versions still connect to this version as before.
+
+### Fixed
+
+- **Sound follows the default device.** Both ends used to keep whichever
+  device was the default when sound started, so plugging in headphones left
+  the sound on the speakers, and unplugging the device in use silenced the
+  session for good. Sound now moves when the default changes and comes back
+  when a device is plugged in again. A session that starts with no playback
+  device at all waits for one, and the volume control says when there isn't
+  one.
+
+- **Hosts whose speakers run at 44.1 kHz send sound.** Opus has no 44.1 kHz,
+  so those hosts sent nothing at all. Tain now asks Windows for the sound at
+  48 kHz, whatever the device runs at.
+
 ## [0.4.0] - 2026-10-20
 
 ### Added
@@ -54,22 +88,6 @@ All notable changes to Tain are documented here. This project adheres to
   next mini view opens wherever you left the last one. Immersive mode ends on
   the way in, since it would keep the pointer in the corner.
 
-- **Choose where sound comes from and where it plays.** Settings → Audio has
-  *Stream sound from*, the playback device guests hear, and *Play host sound
-  on*, the device a host's sound plays on here. The volume control in a
-  session lists the same devices, so you can move the sound while you listen.
-  Both default to the system default and change sessions that are already
-  running. A chosen device that's unplugged shows as not connected, the system
-  default plays meanwhile, and the sound goes back to it when it returns. While
-  apps are excluded from the stream, *Stream sound from* is set aside, since
-  their sound is taken from the apps rather than from a device.
-
-- **See where the host's sound comes from.** The volume control in a session
-  names the device the host is sending the sound of, or says that the host has
-  no playback device, is sending its apps' sound with some left out, or isn't
-  sending any. Hosts on earlier versions don't say, and nothing is shown. Guests
-  on earlier versions still connect to this version as before.
-
 ### Changed
 
 - **One row of chrome in the session window.** It used to spend three:
@@ -101,18 +119,6 @@ All notable changes to Tain are documented here. This project adheres to
   given its pointer back from the keyboard until immersive mode was left. They
   all work there now. Settings → Shortcuts has *In immersive mode* beside each
   one, to send that combination to the host instead while immersed.
-
-- **Sound follows the default device.** Both ends used to keep whichever
-  device was the default when sound started, so plugging in headphones left
-  the sound on the speakers, and unplugging the device in use silenced the
-  session for good. Sound now moves when the default changes and comes back
-  when a device is plugged in again. A session that starts with no playback
-  device at all waits for one, and the volume control says when there isn't
-  one.
-
-- **Hosts whose speakers run at 44.1 kHz send sound.** Opus has no 44.1 kHz,
-  so those hosts sent nothing at all. Tain now asks Windows for the sound at
-  48 kHz, whatever the device runs at.
 
 ## [0.3.0] - 2026-10-19
 
@@ -204,5 +210,6 @@ path or not at all. Versions before this one were never released.
 - **Release builds.** Each release on GitHub has tain.exe attached, built from
   the tagged commit, with its SHA-256 beside it.
 
+[0.4.1]: https://github.com/x-iso/Tain/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/x-iso/Tain/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/x-iso/Tain/releases/tag/v0.3.0
