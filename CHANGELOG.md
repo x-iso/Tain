@@ -3,6 +3,32 @@
 All notable changes to Tain are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] - 2026-10-31
+
+### Fixed
+
+- **Excluded apps stay out from the first connection.** The first guest to
+  connect after Tain started heard the apps excluded in Settings → Audio, and
+  only reconnecting left them out.
+
+- **Every guest hears the host while apps are excluded.** With apps excluded,
+  a guest who connected while another was already watching could get no sound
+  for the whole session, and one who connected while nothing else was making
+  sound got none either. Every guest now hears the same capture of the host's
+  sound, taken once, and it starts silent and picks up apps as they play.
+
+- **Sound no longer crackles when the host is busy.** When Windows was late to
+  say the host's sound was ready, Tain took the wait for silence and sent both
+  the silence and the sound, so the stream ran ahead and the guest had to
+  throw some of it away. It was heard as sound that crackled or skipped, more
+  often with two guests connected.
+
+- **Excluding one app keeps Windows' own sounds.** An app that makes sound from
+  several processes, as Discord does, counted as several exclusions, so the
+  stream was mixed from the other apps and Windows' own sounds were missing
+  from it. Its processes are now left out together, by Windows itself, the way
+  an app with one process always was.
+
 ## [0.4.1] - 2026-10-24
 
 ### Added
@@ -210,6 +236,7 @@ path or not at all. Versions before this one were never released.
 - **Release builds.** Each release on GitHub has tain.exe attached, built from
   the tagged commit, with its SHA-256 beside it.
 
+[0.4.2]: https://github.com/x-iso/Tain/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/x-iso/Tain/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/x-iso/Tain/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/x-iso/Tain/releases/tag/v0.3.0

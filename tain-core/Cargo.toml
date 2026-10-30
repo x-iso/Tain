@@ -90,6 +90,9 @@ windows = { version = "0.58", features = [
     # IMMNotificationClient and a device's friendly name, for following the
     # default playback device and naming it. See `audio_device`.
     "Win32_UI_Shell_PropertiesSystem",
+    # A snapshot of every process's parent, for excluding an application's
+    # whole process tree at once. See `audio_capture::exclusion_targets`.
+    "Win32_System_Diagnostics_ToolHelp",
     # CreateEventW lives behind Threading but is typed against SECURITY_ATTRIBUTES.
     "Win32_System_Threading",
     "Win32_Security",

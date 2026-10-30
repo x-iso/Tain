@@ -2291,7 +2291,7 @@ fn spawn_audio_pipeline(
     exclude: &[String],
     bitrate_kbps: u32,
 ) -> Option<AudioPipeline> {
-    use super::audio_capture::{audio_sessions, LoopbackCapture};
+    use super::audio_capture::{audio_sessions, SharedCapture};
     use super::audio_codec::{OpusEncoder, DEFAULT_BITRATE};
     use super::protocol::{AudioSource, Notice};
 
@@ -2313,9 +2313,17 @@ fn spawn_audio_pipeline(
         }
     }
 
-    let started = LoopbackCapture::start_excluding_many(&pids);
-    let (capture, chunks) = match started {
-        Ok(pair) => pair,
+    // An application's several processes become its one process tree where
+    // they share one, so a single app is excluded by the audio engine itself
+    // rather than by mixing everything else. See `exclusion_targets`.
+    let targets = super::audio_capture::exclusion_targets(&pids);
+    if targets.len() < pids.len() {
+        debug!("Session #{session_id}: excluding the tree of process {targets:?} for {pids:?}");
+    }
+    // Shared with any other session leaving out the same processes: see
+    // `SharedCapture` for the host whose second guest heard nothing.
+    let capture = match SharedCapture::join(&targets) {
+        Ok(capture) => capture,
         Err(e) => {
             info!("Session #{session_id}: no system audio to send ({e})");
             return None;
@@ -2337,7 +2345,7 @@ fn spawn_audio_pipeline(
     // Applications are captured one by one, with no device in between, so
     // there is nothing to follow and this is said once. Otherwise the device is
     // watched below, because it changes under a running session.
-    let follows_device = pids.is_empty();
+    let follows_device = targets.is_empty();
     if !follows_device {
         let _ = notices.send(Notice::AudioSource(AudioSource::Applications));
     }
@@ -2347,7 +2355,8 @@ fn spawn_audio_pipeline(
     let thread = std::thread::Builder::new()
         .name(format!("audio-send-{session_id}"))
         .spawn(move || {
-            // Held for the life of the thread: dropping it stops the capture.
+            // Held for the life of the thread: dropping it leaves the capture,
+            // which stops when no session is left listening.
             let capture = capture;
             let src = format.channels as usize;
             let dst = channels as usize;
@@ -2372,7 +2381,7 @@ fn spawn_audio_pipeline(
                     }
                 }
 
-                let chunk = match chunks.recv_timeout(std::time::Duration::from_millis(500)) {
+                let chunk = match capture.chunks().recv_timeout(std::time::Duration::from_millis(500)) {
                     Ok(chunk) => chunk,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     // The capture has finished for good. Waiting on a channel
@@ -5914,6 +5923,42 @@ mod tests {
         println!("the host reports {source:?}");
 
         handle.abort();
+    }
+
+    /// Every guest hears the host, not only the first to connect.
+    ///
+    /// Each session captures for itself, and the second used to be told the
+    /// host was sending nothing while the first was hearing it.
+    #[tokio::test]
+    async fn a_second_guest_is_sent_sound_as_well() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let sessions = Arc::new(SessionManager::new());
+        let mut heard = Vec::new();
+        let mut handles = Vec::new();
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let id = sessions.add_session([0u8; 32], ControlGrants::ALL, PasscodeType::Master);
+            let (host_notices, guest_notices) = duplex(1 << 16);
+            let (guest_w, guest_r, handle) =
+                spawn_session_with_notices(Arc::clone(&sessions), id, Some(host_notices));
+            handles.push(handle);
+            readers.push((guest_w, guest_r, guest_notices));
+            // One after the other, as two people connecting would.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        for (_, _, notices) in readers.iter_mut() {
+            let bytes = tokio::time::timeout(Duration::from_secs(10), read_stream_message(notices))
+                .await
+                .expect("no notice arrived")
+                .unwrap()
+                .expect("the notices stream closed without one");
+            heard.push(crate::protocol::Notice::decode(&bytes));
+        }
+        println!("guests were told {heard:?}");
+        for handle in handles {
+            handle.abort();
+        }
+        assert_eq!(heard[0], heard[1], "the second guest was told something the first was not");
     }
 
     /// A guest from before notices stops the stream without reading it. The

@@ -969,8 +969,8 @@ Refresh list
 Clear
 
 [settings.audio.several_excluded]
-Several excluded — the stream is mixed from the remaining apps, so anything that
-starts playing later will be missing until you reconnect.
+Several excluded — the stream is mixed from the remaining apps, so Windows' own
+sounds aren't in it. Apps that start playing later join within a second.
 
 [settings.audio.only_playing_listed]
 Only applications currently playing sound are listed.
@@ -979,8 +979,8 @@ Only applications currently playing sound are listed.
 Keep applications out of the streamed sound — a voice chat, say.
 
 One app is removed by Windows itself, inside the audio engine. Choosing more
-than one switches to mixing the apps that are left, which is exact but only sees
-what was already playing when the session started.
+than one switches to mixing the apps that are left, which is exact but leaves
+out Windows' own sounds.
 
 [settings.audio.capture_device]
 Stream sound from

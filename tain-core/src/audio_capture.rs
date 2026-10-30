@@ -249,6 +249,123 @@ impl Drop for LoopbackCapture {
     }
 }
 
+/// One capture, heard by every session that wants the same sound.
+///
+/// # Why sessions share
+///
+/// Each session used to open a capture of its own. On a real host, with
+/// applications excluded, the second session's capture opened none of the
+/// applications it was meant to mix while the first session's was running —
+/// so the guest who connected second heard silence for the whole session,
+/// three times in a row, and nothing here could say why: Windows only says
+/// no. Sharing does not need to know why. The second session hears the capture
+/// the first already has working, and the same sound is captured once rather
+/// than once per guest.
+///
+/// # What makes two captures the same
+///
+/// What they leave out — the process ids a session resolved its exclusions
+/// to. Sessions that resolved the same ones share; one that resolved others
+/// (an excluded application restarted in between) gets a capture of its own.
+/// The device needs no key: every capture follows the one setting.
+///
+/// The capture stops when the last session listening to it lets go.
+pub struct SharedCapture {
+    feed: Arc<Feed>,
+    chunks: std::sync::mpsc::Receiver<AudioChunk>,
+}
+
+/// A capture and everyone listening to it.
+struct Feed {
+    excluding: Vec<u32>,
+    capture: LoopbackCapture,
+    listeners: Arc<std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>>,
+}
+
+/// Every capture that is running, by what it excludes.
+static FEEDS: std::sync::Mutex<Vec<std::sync::Weak<Feed>>> = std::sync::Mutex::new(Vec::new());
+
+impl SharedCapture {
+    /// Listen to the capture that leaves out `excluding`, starting it if no
+    /// session has.
+    ///
+    /// Takes what [`LoopbackCapture::start_excluding_many`] takes, and fails
+    /// when that does — but only for the first session to ask.
+    pub fn join(excluding: &[u32]) -> Result<Self> {
+        // Held while a capture starts, so two sessions arriving together get
+        // one capture between them rather than one each.
+        let mut feeds = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
+        feeds.retain(|feed| feed.strong_count() > 0);
+        let running = feeds
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|feed| feed.excluding == excluding);
+        let feed = match running {
+            Some(feed) => {
+                info!(
+                    "Sharing the audio capture already running for {} other session(s)",
+                    Arc::strong_count(&feed) - 1
+                );
+                feed
+            }
+            None => {
+                let feed = Arc::new(Feed::start(excluding)?);
+                feeds.push(Arc::downgrade(&feed));
+                feed
+            }
+        };
+        // As deep as a capture's own queue, for the same reason: a listener
+        // that falls behind must not become unbounded memory.
+        let (tx, chunks) = std::sync::mpsc::sync_channel(200);
+        feed.listeners.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        Ok(Self { feed, chunks })
+    }
+
+    pub fn format(&self) -> AudioFormat {
+        self.feed.capture.format()
+    }
+
+    /// The device being captured right now, if any. See
+    /// [`LoopbackCapture::device`].
+    pub fn device(&self) -> Option<crate::AudioDevice> {
+        self.feed.capture.device()
+    }
+
+    /// The captured blocks, in order. Closed when the capture ends for good.
+    pub fn chunks(&self) -> &std::sync::mpsc::Receiver<AudioChunk> {
+        &self.chunks
+    }
+}
+
+impl Feed {
+    fn start(excluding: &[u32]) -> Result<Self> {
+        let (capture, source) = LoopbackCapture::start_excluding_many(excluding)?;
+        let listeners: Arc<std::sync::Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>> =
+            Arc::default();
+        std::thread::Builder::new()
+            .name("audio-share".into())
+            .spawn({
+                let listeners = Arc::clone(&listeners);
+                // Ends with the capture: the last session to let go drops the
+                // `Feed`, which stops the capture and closes `source`.
+                move || {
+                    while let Ok(chunk) = source.recv() {
+                        let mut listeners = listeners.lock().unwrap_or_else(|e| e.into_inner());
+                        listeners.retain(|listener| match listener.try_send(chunk.clone()) {
+                            // A listener that has fallen behind loses this
+                            // block, as it would have from a capture of its own.
+                            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+                            // Its session has ended.
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+                        });
+                    }
+                }
+            })
+            .context("could not start the audio sharing thread")?;
+        Ok(Self { excluding: excluding.to_vec(), capture, listeners })
+    }
+}
+
 /// What a capture should leave out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Excluding {
@@ -283,7 +400,14 @@ pub struct AudioSession {
 /// Returns an empty list rather than failing — a picker with nothing in it is a
 /// fine outcome, and the caller has no better answer to a COM error than the
 /// user does.
+///
+/// Which is exactly why it makes sure COM is there first. Called from a
+/// session's async worker with nothing in the process having started COM yet,
+/// it returned an empty list, the session excluded nothing, and the first guest
+/// after launch heard the apps it was meant not to. See
+/// [`super::audio_device::ensure_mta`].
 pub fn audio_sessions() -> Vec<AudioSession> {
+    super::audio_device::ensure_mta();
     // SAFETY: ordinary WASAPI session enumeration; every pointer is checked and
     // nothing outlives this function.
     unsafe {
@@ -359,6 +483,100 @@ fn process_name(pid: u32) -> String {
             .unwrap_or_default()
             .to_string()
     }
+}
+
+/// What to hand [`LoopbackCapture::start_excluding_many`] to leave these
+/// processes out of the stream.
+///
+/// # One application, one exclusion
+///
+/// An application is often several processes, and the ones with an audio
+/// session are usually not the one that started it: Discord's sound comes from
+/// two children of its main process. Each used to count as an exclusion of its
+/// own, and more than one cannot be done natively — so excluding Discord alone
+/// took the path that mixes every *other* application, which leaves Windows'
+/// own sounds out and has more to go wrong.
+///
+/// The native exclusion takes a process *tree*. So when every process here
+/// descends from one root of the same name, that root is excluded instead, once,
+/// by the audio engine. Anything else comes back as it went in.
+pub fn exclusion_targets(pids: &[u32]) -> Vec<u32> {
+    if pids.len() < 2 {
+        return pids.to_vec();
+    }
+    let roots = tree_roots(pids, &process_table());
+    if roots.len() == 1 { roots } else { pids.to_vec() }
+}
+
+/// For each of `pids`, the topmost process it descends from through processes
+/// of its own name, each root once.
+///
+/// # Only through its own name
+///
+/// A parent id is the number the process was given when it started, and that
+/// process may have exited and the number gone to something else. Discord's
+/// main process names a parent that no longer exists — its launcher, gone once
+/// it had started it. Following a parent id into a different executable could
+/// exclude whatever inherited the number, and everything that one ever started.
+fn tree_roots(pids: &[u32], table: &std::collections::HashMap<u32, (u32, String)>) -> Vec<u32> {
+    let mut roots: Vec<u32> = Vec::new();
+    for &pid in pids {
+        let mut root = pid;
+        if let Some((_, name)) = table.get(&pid) {
+            // Bounded, against two reused ids that name each other as parent.
+            for _ in 0..64 {
+                let Some(&(parent, _)) = table.get(&root) else { break };
+                match table.get(&parent) {
+                    Some((_, parent_name))
+                        if parent != root && parent_name.eq_ignore_ascii_case(name) =>
+                    {
+                        root = parent
+                    }
+                    _ => break,
+                }
+            }
+        }
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Every running process's parent and executable name, from one snapshot.
+///
+/// Empty if the snapshot cannot be taken, which leaves every process its own
+/// root — exactly how exclusion worked before roots were looked for.
+fn process_table() -> std::collections::HashMap<u32, (u32, String)> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut table = std::collections::HashMap::new();
+    // SAFETY: the snapshot is closed on the one path that opens it, and every
+    // entry is filled in by the API with `dwSize` set as it requires.
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return table;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            let name = &entry.szExeFile;
+            let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            table.insert(
+                entry.th32ProcessID,
+                (entry.th32ParentProcessID, String::from_utf16_lossy(&name[..end])),
+            );
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    table
 }
 
 /// A `PROPVARIANT` holding a blob, which is how activation parameters travel.
@@ -570,9 +788,15 @@ fn run_mixed(
     let watcher = SessionWatcher::start(excluded.to_vec());
     let mut streams: Vec<MixedStream> = Vec::new();
     rescan(&watcher.playing(), &mut streams, RATE, CHANNELS);
+    // # Nothing to mix yet is not a failure
+    //
+    // It used to be: with every application that had a session excluded, or
+    // none open, the capture refused to start and the session had no sound for
+    // its whole length — while a guest who had connected a moment earlier, or
+    // later, heard everything. The loop below already sends silence while no
+    // stream has anything, and the rescan adds applications as they start.
     if streams.is_empty() {
-        let _ = ready.send(Err(anyhow::anyhow!("no application could be captured")));
-        return;
+        info!("Nothing to mix yet — sending silence until an application plays");
     }
     if ready.send(Ok(format)).is_err() {
         return;
@@ -857,6 +1081,10 @@ fn capture_thread(
     device: Arc<std::sync::Mutex<Option<crate::AudioDevice>>>,
     stop: Arc<AtomicBool>,
 ) {
+    // First, so the CoUninitialize at the end of this thread can never be the
+    // one that takes the process's apartment away from a session still using
+    // it. See `audio_device::ensure_mta`.
+    super::audio_device::ensure_mta();
     // SAFETY: paired with CoUninitialize at the end of this function, and every
     // COM object created here is confined to this thread.
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -1273,28 +1501,45 @@ fn run(
         // SAFETY: waiting on an event this thread owns.
         let signalled = unsafe { WaitForSingleObject(event, WAIT_TIMEOUT_MS) } == WAIT_OBJECT_0;
 
-        if !signalled {
+        // A wait that runs out is not proof that nothing is playing. The event
+        // can be late — more so with several clients on one stream, as two
+        // guests have — while a packet sits ready behind it.
+        // SAFETY: a plain query on a client this thread owns.
+        let waiting = if signalled { None } else { Some(unsafe { capture.GetNextPacketSize() }) };
+        match waiting {
             // Also what a device that has gone away looks like: no events.
             // Asking is what tells the two apart.
-            // SAFETY: a plain query on a client this thread owns.
-            if let Err(e) = unsafe { capture.GetNextPacketSize() } {
+            Some(Err(e)) => {
                 info!("Audio capture lost its device: {e}");
                 return Ended::Lost;
             }
-            // Nothing is playing, and on some Windows versions that means no
-            // buffers at all rather than silent ones. Manufacture the silence
-            // so the stream stays gapless; see the module header.
-            let frames = format.frames(std::time::Duration::from_millis(WAIT_TIMEOUT_MS as u64));
-            let chunk = AudioChunk {
-                samples: vec![0.0; frames * out_channels],
-                position: *position,
-                silent: true,
-            };
-            *position += frames as u64;
-            if chunks.try_send(chunk).is_err() {
-                dropped += 1;
+            // # Sound was there all along
+            //
+            // Read it, rather than inventing silence in front of it. Both used
+            // to go into the stream: forty milliseconds that never happened,
+            // then the sound they stood in for. The stream ran ahead of the
+            // clock, and the guest's buffer, which only ever sees too much
+            // arriving, shed the excess — audible as sound that skipped and
+            // crackled, on whichever guest's capture the late events landed.
+            Some(Ok(frames)) if frames > 0 => {}
+            Some(Ok(_)) => {
+                // Nothing is playing, and on some Windows versions that means
+                // no buffers at all rather than silent ones. Manufacture the
+                // silence so the stream stays gapless; see the module header.
+                let frames =
+                    format.frames(std::time::Duration::from_millis(WAIT_TIMEOUT_MS as u64));
+                let chunk = AudioChunk {
+                    samples: vec![0.0; frames * out_channels],
+                    position: *position,
+                    silent: true,
+                };
+                *position += frames as u64;
+                if chunks.try_send(chunk).is_err() {
+                    dropped += 1;
+                }
+                continue;
             }
-            continue;
+            None => {}
         }
 
         loop {
@@ -1378,6 +1623,127 @@ mod tests {
 
         let odd = AudioFormat { sample_rate: 44_100, channels: 2 };
         assert_eq!(odd.frames(std::time::Duration::from_millis(10)), 441);
+    }
+
+    /// Sessions leaving out the same processes hear one capture; a session
+    /// leaving out others gets its own; and a capture nobody hears stops.
+    ///
+    /// The ids are ones no process has, so these keys are this test's alone
+    /// even with other tests' sessions sharing captures of their own.
+    #[test]
+    fn sessions_that_exclude_the_same_processes_share_one_capture() {
+        let same = [u32::MAX - 7, u32::MAX - 8];
+        let first = SharedCapture::join(&same).expect("the first session");
+        let second = SharedCapture::join(&same).expect("the second session");
+        assert!(Arc::ptr_eq(&first.feed, &second.feed), "the second session started a capture of its own");
+
+        let other = SharedCapture::join(&[u32::MAX - 9, u32::MAX - 10]).expect("another key");
+        assert!(!Arc::ptr_eq(&first.feed, &other.feed), "different exclusions shared a capture");
+
+        // Both hear it, from the same timeline: the second joined a moment
+        // after the first, so their blocks are moments apart, not from two
+        // counts that each started at zero.
+        let a = first.chunks().recv_timeout(std::time::Duration::from_secs(2)).expect("first hears");
+        let b = second.chunks().recv_timeout(std::time::Duration::from_secs(2)).expect("second hears");
+        assert!(
+            a.position.abs_diff(b.position) < 48_000,
+            "the two sessions are on different timelines: {} and {}",
+            a.position,
+            b.position
+        );
+
+        let feed = Arc::downgrade(&first.feed);
+        drop(first);
+        assert!(feed.upgrade().is_some(), "the capture stopped while a session still listened");
+        drop(second);
+        assert!(feed.upgrade().is_none(), "nobody listens, and the capture is still running");
+        drop(other);
+    }
+
+    /// A process table as `process_table` would build it, from
+    /// `(pid, parent, name)`.
+    fn table(rows: &[(u32, u32, &str)]) -> std::collections::HashMap<u32, (u32, String)> {
+        rows.iter().map(|&(pid, parent, name)| (pid, (parent, name.to_string()))).collect()
+    }
+
+    /// Discord as it actually runs: sound from two children of a main process
+    /// whose own parent has exited.
+    #[test]
+    fn an_applications_processes_share_the_root_they_started_from() {
+        let discord = table(&[
+            (31932, 31916, "Discord.exe"),
+            (31844, 31932, "Discord.exe"),
+            (34760, 31932, "Discord.exe"),
+            // A grandchild, for depth.
+            (40000, 34760, "discord.EXE"),
+        ]);
+        assert_eq!(tree_roots(&[31844, 34760], &discord), vec![31932]);
+        assert_eq!(tree_roots(&[40000, 31844], &discord), vec![31932], "case and depth do not matter");
+        assert_eq!(tree_roots(&[31932], &discord), vec![31932], "a root is its own");
+    }
+
+    /// The walk stops at a parent of another name, which may be an unrelated
+    /// process that inherited a dead parent's id.
+    #[test]
+    fn a_root_is_never_a_different_application() {
+        let rows = table(&[
+            (10, 1, "explorer.exe"),
+            (20, 10, "Update.exe"),
+            (30, 20, "Discord.exe"),
+            (31, 30, "Discord.exe"),
+        ]);
+        assert_eq!(tree_roots(&[31], &rows), vec![30], "not Update.exe, and never explorer.exe");
+    }
+
+    #[test]
+    fn two_instances_of_an_application_are_two_trees() {
+        let rows = table(&[
+            (100, 1, "app.exe"),
+            (101, 100, "app.exe"),
+            (200, 1, "app.exe"),
+            (201, 200, "app.exe"),
+        ]);
+        assert_eq!(tree_roots(&[101, 201], &rows), vec![100, 200]);
+    }
+
+    /// Ids reused into each other's parents, or a process missing from the
+    /// snapshot because it exited in between: neither may hang or lose a pid.
+    #[test]
+    fn a_strange_table_still_gives_an_answer() {
+        let looped = table(&[(10, 11, "a.exe"), (11, 10, "a.exe")]);
+        assert_eq!(tree_roots(&[10], &looped).len(), 1);
+        let missing = table(&[]);
+        assert_eq!(tree_roots(&[5, 6], &missing), vec![5, 6], "unknown processes are their own roots");
+    }
+
+    /// On this machine: an application with several processes making sound is
+    /// left out by one native exclusion of its tree, and that opens.
+    #[test]
+    #[ignore = "touches the real audio engine"]
+    fn a_multi_process_application_is_excluded_natively() {
+        let sessions = audio_sessions();
+        let mut tried = 0;
+        let mut names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            let pids: Vec<u32> =
+                sessions.iter().filter(|s| s.name == name).map(|s| s.pid).collect();
+            if pids.len() < 2 {
+                continue;
+            }
+            tried += 1;
+            let targets = exclusion_targets(&pids);
+            println!("{name}: {pids:?} -> {targets:?}");
+            if let [root] = targets[..] {
+                let (_capture, chunks) =
+                    LoopbackCapture::start_excluding_many(&[root]).expect("native exclusion");
+                assert!(chunks.recv_timeout(std::time::Duration::from_millis(500)).is_ok());
+            }
+        }
+        if tried == 0 {
+            eprintln!("no application here has several processes making sound — skipping");
+        }
     }
 
     #[test]
@@ -1574,6 +1940,372 @@ mod tests {
         }
         assert!(blocks > 0, "no audio blocks from the per-process client");
         println!("{blocks} blocks, {frames} frames excluding pid {pid}");
+    }
+
+    /// What two captures running at once actually hear, while this process
+    /// plays a quiet tone.
+    ///
+    /// Opening is not hearing: a capture that is fed nothing still produces a
+    /// stream, of silence it makes up itself. So this counts the frames that
+    /// carry sound, for each kind of capture a session can use, with two of
+    /// them open at once as two guests would have.
+    #[cfg(db_ffmpeg)]
+    #[test]
+    #[ignore = "plays a quiet tone on the real default device"]
+    fn two_captures_at_once_both_hear_what_is_playing() {
+        use crate::audio_codec::{OpusEncoder, DEFAULT_BITRATE, SAMPLE_RATE};
+        use crate::audio_output::AudioOutput;
+        use crate::encoder::LatencyPriority;
+
+        // A process to exclude that is neither this one nor anything this one
+        // descends from — excluding an ancestor's tree would exclude the tone.
+        let table = process_table();
+        let mut ancestors = vec![std::process::id()];
+        while let Some(&(parent, _)) = table.get(ancestors.last().unwrap()) {
+            if parent == 0 || ancestors.contains(&parent) {
+                break;
+            }
+            ancestors.push(parent);
+        }
+        let stranger = *table
+            .iter()
+            .find(|(pid, (_, name))| {
+                name.eq_ignore_ascii_case("svchost.exe") && !ancestors.contains(pid)
+            })
+            .expect("a process to exclude")
+            .0;
+
+        // The tone, fed in real time for as long as the captures listen.
+        let stop = Arc::new(AtomicBool::new(false));
+        let player = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                let mut encoder = OpusEncoder::new(SAMPLE_RATE, 2, DEFAULT_BITRATE).unwrap();
+                let output = AudioOutput::start(SAMPLE_RATE, 2, LatencyPriority::BALANCED).unwrap();
+                let mut frame = 0u64;
+                let started = std::time::Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    // Paced by the clock with a little lead, not by counting
+                    // sleeps: a sleep that overruns would leave gaps in the
+                    // tone, and those would be counted against the captures.
+                    let due = (started.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as u64 + 2400;
+                    while frame < due {
+                        let pcm: Vec<f32> = (0..480)
+                            .flat_map(|i| {
+                                let t = (frame as usize + i) as f32 / SAMPLE_RATE as f32;
+                                let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.03;
+                                [v, v]
+                            })
+                            .collect();
+                        let blob = encoder.encode(&pcm).unwrap().to_vec();
+                        if !blob.is_empty() {
+                            output.push(&blob, frame, 480).unwrap();
+                        }
+                        frame += 480;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Share of each capture's frames, over two seconds, that carry sound —
+        // and how many frames it produced per second of wall clock, and how
+        // many blocks it made up as silence while the tone never stopped.
+        let listen = |pair: [(LoopbackCapture, std::sync::mpsc::Receiver<AudioChunk>); 2]| {
+            // Whatever queued while opening is not what is being measured.
+            for (_, chunks) in &pair {
+                while chunks.try_recv().is_ok() {}
+            }
+            let started = std::time::Instant::now();
+            let deadline = started + std::time::Duration::from_secs(2);
+            let mut heard = [(0u64, 0u64, 0u32); 2];
+            while std::time::Instant::now() < deadline {
+                for (i, (_, chunks)) in pair.iter().enumerate() {
+                    while let Ok(chunk) = chunks.try_recv() {
+                        if chunk.silent {
+                            heard[i].2 += 1;
+                        }
+                        for frame in chunk.samples.chunks_exact(2) {
+                            heard[i].1 += 1;
+                            if frame[0].abs() > 1e-3 {
+                                heard[i].0 += 1;
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let seconds = started.elapsed().as_secs_f64();
+            heard.map(|(loud, all, made_up)| {
+                (loud as f64 / all.max(1) as f64, all as f64 / seconds, made_up)
+            })
+        };
+
+        let device = listen([LoopbackCapture::start().unwrap(), LoopbackCapture::start().unwrap()]);
+        let excluding = listen([
+            LoopbackCapture::start_excluding(stranger).unwrap(),
+            LoopbackCapture::start_excluding(stranger).unwrap(),
+        ]);
+        let including = {
+            let me = std::process::id();
+            let open = || {
+                let (client, capture, format, event) =
+                    open_process_loopback(me, true, 48_000, 2).expect("include this process");
+                (client, capture, format, event)
+            };
+            // Driven by hand, as `run_mixed` drives them.
+            let streams = [open(), open()];
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let mut heard = [(0u64, 0u64); 2];
+            while std::time::Instant::now() < deadline {
+                for (i, (_, capture, _, _)) in streams.iter().enumerate() {
+                    let mut pending = std::collections::VecDeque::new();
+                    drain_into(capture, 2, &mut pending);
+                    for pair in pending.make_contiguous().chunks_exact(2) {
+                        heard[i].1 += 1;
+                        if pair[0].abs() > 1e-3 {
+                            heard[i].0 += 1;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            for (client, _, _, event) in streams {
+                // SAFETY: each was opened just above and is closed once.
+                unsafe {
+                    let _ = client.Stop();
+                    let _ = CloseHandle(event);
+                }
+            }
+            heard.map(|(loud, all)| loud as f64 / all.max(1) as f64)
+        };
+
+        stop.store(true, Ordering::Relaxed);
+        player.join().unwrap();
+
+        println!("(share of frames with sound, frames per second, blocks made up as silence)");
+        println!("device loopback, two at once:   {device:.2?}");
+        println!("excluding {stranger}, two at once: {excluding:.2?}");
+        println!("including this process, two:    {including:.2?}");
+        for (what, results) in [("device", device), ("excluding", excluding)] {
+            for (i, (share, rate, made_up)) in results.iter().enumerate() {
+                assert!(*share > 0.9, "{what} capture {i} heard sound in only {share:.2} of its frames");
+                // Silence made up while sound was waiting to be read is time
+                // added to the stream that never happened: it runs faster
+                // than the clock, and the guest has to throw the excess away.
+                assert!(
+                    (*rate - 48_000.0).abs() < 48_000.0 * 0.05,
+                    "{what} capture {i} produced {rate:.0} frames a second"
+                );
+                assert_eq!(*made_up, 0, "{what} capture {i} made up silence while sound was playing");
+            }
+        }
+        for (i, share) in including.iter().enumerate() {
+            assert!(*share > 0.9, "including capture {i} heard sound in only {share:.2} of its frames");
+        }
+    }
+
+    /// How fast each kind of capture delivers against the clock, alone and in
+    /// pairs, while this process plays a steady tone. Prints, asserts nothing.
+    ///
+    /// Written while chasing distorted sound with two guests connected. On the
+    /// machine it was written on, every kind ran within about half a percent
+    /// of 48 000 a second, alone or paired — so a capture falling behind was
+    /// not the cause; silence made up in front of waiting sound was.
+    #[cfg(db_ffmpeg)]
+    #[test]
+    #[ignore = "diagnostic — plays a quiet tone on the real default device"]
+    fn how_fast_each_kind_of_capture_delivers() {
+        use crate::audio_codec::{OpusEncoder, DEFAULT_BITRATE, SAMPLE_RATE};
+        use crate::audio_output::AudioOutput;
+        use crate::encoder::LatencyPriority;
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+
+        let table = process_table();
+        let mut ancestors = vec![std::process::id()];
+        while let Some(&(parent, _)) = table.get(ancestors.last().unwrap()) {
+            if parent == 0 || ancestors.contains(&parent) {
+                break;
+            }
+            ancestors.push(parent);
+        }
+        let stranger = *table
+            .iter()
+            .find(|(pid, (_, name))| name.eq_ignore_ascii_case("svchost.exe") && !ancestors.contains(pid))
+            .unwrap()
+            .0;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let player = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                let mut encoder = OpusEncoder::new(SAMPLE_RATE, 2, DEFAULT_BITRATE).unwrap();
+                let output = AudioOutput::start(SAMPLE_RATE, 2, LatencyPriority::BALANCED).unwrap();
+                let mut frame = 0u64;
+                let started = std::time::Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    let due = (started.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as u64 + 2400;
+                    while frame < due {
+                        let pcm: Vec<f32> = (0..480)
+                            .flat_map(|i| {
+                                let t = (frame as usize + i) as f32 / SAMPLE_RATE as f32;
+                                let v = (t * 440.0 * std::f32::consts::TAU).sin() * 0.03;
+                                [v, v]
+                            })
+                            .collect();
+                        let blob = encoder.encode(&pcm).unwrap().to_vec();
+                        if !blob.is_empty() {
+                            output.push(&blob, frame, 480).unwrap();
+                        }
+                        frame += 480;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Frames a second for each of several captures listened to at once,
+        // over four seconds, all counted the same way.
+        let rates = |captures: Vec<(LoopbackCapture, std::sync::mpsc::Receiver<AudioChunk>)>| {
+            for (_, chunks) in &captures {
+                while chunks.try_recv().is_ok() {}
+            }
+            let started = std::time::Instant::now();
+            let mut frames = vec![0u64; captures.len()];
+            while started.elapsed() < std::time::Duration::from_secs(4) {
+                for (i, (_, chunks)) in captures.iter().enumerate() {
+                    while let Ok(chunk) = chunks.try_recv() {
+                        frames[i] += (chunk.samples.len() / 2) as u64;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let seconds = started.elapsed().as_secs_f64();
+            frames.iter().map(|f| (*f as f64 / seconds).round()).collect::<Vec<_>>()
+        };
+        let device = || LoopbackCapture::start().unwrap();
+        let excluding = || LoopbackCapture::start_excluding(stranger).unwrap();
+        println!("frames a second:");
+        println!("  one device capture      {:?}", rates(vec![device()]));
+        println!("  two device captures     {:?}", rates(vec![device(), device()]));
+        println!("  one excluding capture   {:?}", rates(vec![excluding()]));
+        println!("  two excluding captures  {:?}", rates(vec![excluding(), excluding()]));
+        stop.store(true, Ordering::Relaxed);
+        player.join().unwrap();
+    }
+
+    /// Whether a second include-mode capture of *another* application opens
+    /// while a first is still running — two guests mixing the same apps.
+    #[test]
+    #[ignore = "diagnostic — run explicitly, with some other application playing"]
+    fn a_second_capture_of_another_application() {
+        let me = std::process::id();
+        let sessions = audio_sessions();
+        let mut tried = 0;
+        for session in sessions.iter().filter(|s| s.pid != me) {
+            tried += 1;
+            let first = open_process_loopback(session.pid, true, 48_000, 2);
+            let second = open_process_loopback(session.pid, true, 48_000, 2);
+            println!(
+                "{} ({}): first {}, second {}",
+                session.name,
+                session.pid,
+                if first.is_ok() { "opened".to_string() } else { format!("{:#}", first.as_ref().err().unwrap()) },
+                if second.is_ok() { "opened".to_string() } else { format!("{:#}", second.as_ref().err().unwrap()) },
+            );
+            for (client, _, _, event) in [first, second].into_iter().flatten() {
+                // SAFETY: opened just above, closed once.
+                unsafe {
+                    let _ = client.Stop();
+                    let _ = CloseHandle(event);
+                }
+            }
+        }
+        if tried == 0 {
+            eprintln!("no other application has an audio session — skipping");
+        }
+    }
+
+    /// How many include-mode captures one process can hold open at once:
+    /// every application with a session, several times over, all kept open.
+    #[test]
+    #[ignore = "diagnostic — run explicitly"]
+    fn how_many_application_captures_one_process_can_hold() {
+        let me = std::process::id();
+        let pids: Vec<u32> =
+            audio_sessions().iter().map(|s| s.pid).filter(|pid| *pid != me).collect();
+        let mut open = Vec::new();
+        'rounds: for round in 1..=4 {
+            for &pid in &pids {
+                match open_process_loopback(pid, true, 48_000, 2) {
+                    Ok(opened) => open.push(opened),
+                    Err(e) => {
+                        println!("round {round}: capture {} refused ({pid}): {e:#}", open.len() + 1);
+                        break 'rounds;
+                    }
+                }
+            }
+            println!("round {round}: {} open", open.len());
+        }
+        for (client, _, _, event) in open {
+            // SAFETY: opened above, closed once.
+            unsafe {
+                let _ = client.Stop();
+                let _ = CloseHandle(event);
+            }
+        }
+    }
+
+    /// Two sessions can each leave the same application out at once.
+    ///
+    /// Every guest gets a capture of its own, and the second must not be
+    /// refused because the first already holds one for the same process.
+    #[test]
+    #[ignore = "touches the real audio engine"]
+    fn two_captures_can_exclude_the_same_process_at_once() {
+        let pid = std::process::id();
+        let (first, first_chunks) = LoopbackCapture::start_excluding(pid).expect("the first");
+        let (second, second_chunks) =
+            LoopbackCapture::start_excluding(pid).expect("the second, beside the first");
+        for chunks in [&first_chunks, &second_chunks] {
+            let got = chunks.recv_timeout(std::time::Duration::from_millis(500));
+            assert!(got.is_ok(), "a capture produced nothing");
+        }
+        drop((first, second));
+    }
+
+    /// A mix of the remaining applications starts even with nothing to mix.
+    ///
+    /// It used to refuse, and the session it belonged to had no sound for its
+    /// whole length. Every application with a session right now is excluded,
+    /// so there is nothing left to mix — plus two ids no process has, so there
+    /// are always several and this is the mix rather than the single exclusion.
+    #[test]
+    #[ignore = "touches the real audio engine"]
+    fn a_mix_starts_with_nothing_to_mix_and_stays_gapless() {
+        let mut everything: Vec<u32> = audio_sessions().iter().map(|s| s.pid).collect();
+        everything.extend([u32::MAX - 1, u32::MAX - 2]);
+        let (capture, chunks) = LoopbackCapture::start_excluding_many(&everything)
+            .expect("a mix with nothing in it must still start");
+        assert_eq!(capture.format(), STREAM_FORMAT);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        let mut next_position = 0u64;
+        let mut frames = 0u64;
+        while std::time::Instant::now() < deadline {
+            let Ok(chunk) = chunks.recv_timeout(std::time::Duration::from_millis(200)) else {
+                continue;
+            };
+            assert_eq!(chunk.position, next_position, "gap in the mix position");
+            next_position += (chunk.samples.len() / 2) as u64;
+            frames += (chunk.samples.len() / 2) as u64;
+        }
+        assert!(frames > 0, "no audio at all from the mix");
     }
 
     /// Captures real system audio. Passes whether or not anything is playing —

@@ -34,7 +34,9 @@ use windows::Win32::Media::Audio::{
     eConsole, eRender, EDataFlow, ERole, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
     IMMNotificationClient_Impl, MMDeviceEnumerator, DEVICE_STATE, DEVICE_STATE_ACTIVE,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoIncrementMTAUsage, CoTaskMemFree, CLSCTX_ALL, STGM_READ,
+};
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 
 use crate::AudioDevice;
@@ -104,13 +106,46 @@ pub fn set_playback_device(id: Option<String>) {
     PLAYBACK.set(id);
 }
 
+/// Make sure this process has a multithreaded COM apartment, for good.
+///
+/// # Why the callers cannot assume one
+///
+/// The lists here are asked for from the UI thread, which has an apartment of
+/// its own, and from whichever async worker a session runs on, which has none.
+/// A thread with none can still use COM — through the process's multithreaded
+/// apartment — but only once something has created that apartment. Until then
+/// every call fails, and these functions turn failure into an empty list: the
+/// first session after launch found no applications to exclude and sent the
+/// sound of every one of them. Later sessions worked only because the first
+/// one's media threads had created the apartment by then.
+///
+/// # Why not initialise the calling thread and undo it after
+///
+/// That was the first fix, and it crashed the test suite on every parallel run.
+/// When the thread doing it held the process's only claim on the apartment,
+/// undoing it tore the apartment down under every thread using COM without
+/// having initialised it — Windows.Graphics.Capture's, Media Foundation's —
+/// which is an access violation in somebody else's code, some time later.
+/// `CoIncrementMTAUsage` exists for exactly this: it keeps the apartment up
+/// without touching the calling thread. The claim is never given back.
+pub(crate) fn ensure_mta() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: no preconditions. The cookie is dropped without
+        // `CoDecrementMTAUsage` on purpose: the apartment is for the life of
+        // the process.
+        if let Err(e) = unsafe { CoIncrementMTAUsage() } {
+            warn!("Could not keep COM's multithreaded apartment up: {e}");
+        }
+    });
+}
+
 /// Every playback device that is plugged in and enabled, the default first.
 ///
 /// What the device pickers offer. Empty rather than failing — the caller has no
 /// better answer to a COM error than the user does.
-///
-/// Expects COM to be up on the calling thread, which the UI thread's is.
 pub fn playback_devices() -> Vec<AudioDevice> {
+    ensure_mta();
     // SAFETY: ordinary endpoint enumeration; every pointer is checked and
     // nothing outlives this function.
     unsafe {
@@ -373,6 +408,42 @@ mod tests {
         preference.set(None);
         assert_eq!(preference.generation(), start + 2);
         assert_eq!(preference.chosen(), None);
+    }
+
+    /// The lists work from a thread nobody started COM on.
+    ///
+    /// The host looks up which apps to exclude on whichever async worker the
+    /// session happens to run on. Before the first session's media threads
+    /// existed, nothing in the process had started COM, every lookup failed
+    /// quietly, and the first guest after launch heard the apps it was meant
+    /// not to. Run alone, in a fresh process, to see it fail without
+    /// `ensure_mta`: in a full run some other test has usually started COM
+    /// already.
+    #[test]
+    fn the_lists_work_on_a_thread_without_com() {
+        let bare = std::thread::spawn(|| {
+            (playback_devices().len(), crate::audio_capture::audio_sessions().len())
+        })
+        .join()
+        .unwrap();
+
+        let prepared = std::thread::spawn(|| {
+            // SAFETY: balanced below; this thread does nothing else.
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                );
+            }
+            let devices = playback_devices().len();
+            // SAFETY: balances the CoInitializeEx above.
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+            devices
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(bare.0, prepared, "devices listed without COM: {} of {prepared}", bare.0);
     }
 
     /// What the pickers will offer on this machine.

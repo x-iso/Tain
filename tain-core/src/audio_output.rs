@@ -212,6 +212,10 @@ impl Stream {
 }
 
 fn render_thread(stream: Stream, ready: std::sync::mpsc::Sender<Result<()>>) {
+    // First, so the CoUninitialize below can never be the one that takes the
+    // process's apartment away from a session still using it. See
+    // `audio_device::ensure_mta`.
+    super::audio_device::ensure_mta();
     // SAFETY: paired with CoUninitialize below; every COM object stays on this
     // thread, and `play` has dropped all of them by the time it returns.
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
