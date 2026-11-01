@@ -42,6 +42,13 @@ pub mod preview;
 pub mod wallpaper;
 #[cfg(target_os = "windows")]
 pub mod audio_capture;
+// The default output's monitor, through PulseAudio's API; the same interface
+// the host's audio pipeline uses on Windows.
+#[cfg(target_os = "linux")]
+#[path = "audio_capture_linux.rs"]
+pub mod audio_capture;
+#[cfg(target_os = "linux")]
+pub mod pulse;
 #[cfg(target_os = "windows")]
 pub mod audio_device;
 #[cfg(target_os = "windows")]
@@ -97,6 +104,9 @@ pub mod audio_codec;
 #[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
 pub mod audio_render;
 #[cfg(all(target_os = "windows", db_ffmpeg))]
+pub mod audio_output;
+#[cfg(target_os = "linux")]
+#[path = "audio_output_linux.rs"]
 pub mod audio_output;
 pub mod agent_pipe;
 pub mod capture_follow;

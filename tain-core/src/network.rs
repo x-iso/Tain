@@ -2294,7 +2294,7 @@ impl HostTally {
 /// Returns `None` when there is nothing to send with — no capture device, no
 /// Opus encoder, or a build without ffmpeg. A session without sound is a
 /// working session, so none of those are errors.
-#[cfg(all(target_os = "windows", db_ffmpeg))]
+#[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
 fn spawn_audio_pipeline(
     session_id: u32,
     out_tx: mpsc::UnboundedSender<Message>,
@@ -2454,7 +2454,7 @@ fn spawn_audio_pipeline(
     Some(AudioPipeline { stop, thread: Some(thread) })
 }
 
-#[cfg(not(all(target_os = "windows", db_ffmpeg)))]
+#[cfg(not(any(all(target_os = "windows", db_ffmpeg), target_os = "linux")))]
 fn spawn_audio_pipeline(
     _session_id: u32,
     _out_tx: mpsc::UnboundedSender<Message>,

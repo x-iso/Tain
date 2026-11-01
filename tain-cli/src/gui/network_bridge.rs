@@ -567,7 +567,7 @@ pub struct GuestSessionState {
     /// starts. Kept against this host's saved connection when it closes.
     pub host_preview: Arc<Mutex<Option<Vec<u8>>>>,
     /// Playback for this session, opened when the first audio block arrives.
-    #[cfg(all(target_os = "windows", db_ffmpeg))]
+    #[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
     pub audio: Arc<Mutex<Option<tain_core::audio_output::AudioOutput>>>,
     /// Set once opening a playback device has failed, so it is tried once.
     pub audio_failed: Arc<std::sync::atomic::AtomicBool>,
@@ -664,7 +664,7 @@ impl GuestSessionState {
             control: Arc::new(Mutex::new(None)),
             cursor: Arc::new(Mutex::new(CursorState::default())),
             host_preview: Arc::new(Mutex::new(None)),
-            #[cfg(all(target_os = "windows", db_ffmpeg))]
+            #[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
             audio: Arc::new(Mutex::new(None)),
             audio_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host_audio: Arc::new(Mutex::new(None)),
@@ -1844,7 +1844,7 @@ where
                 );
                 *shared.grants.lock().unwrap() = cs.grants;
             }
-            #[cfg(all(target_os = "windows", db_ffmpeg))]
+            #[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
             Message::Audio(audio) => {
                 // Opened on the first block rather than at connect: a host with
                 // nothing to send should not make the guest seize a playback

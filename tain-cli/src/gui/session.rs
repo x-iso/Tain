@@ -444,7 +444,7 @@ impl GuestSession {
     /// unmuting resumes at the live position instead of replaying whatever
     /// accumulated while it was off.
     pub fn apply_sound_preference(&self) {
-        #[cfg(all(target_os = "windows", db_ffmpeg))]
+        #[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
         if let Some(output) = self.shared.audio.lock().unwrap().as_ref() {
             output.set_muted(!self.want_sound);
             output.set_volume(self.volume);
@@ -458,7 +458,7 @@ impl GuestSession {
     /// between "the sound is late" and "the sound is late *because it had to
     /// be*".
     pub fn audio_target_ms(&self) -> Option<u32> {
-        #[cfg(all(target_os = "windows", db_ffmpeg))]
+        #[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
         {
             return self.shared.audio.lock().unwrap().as_ref().map(|o| o.target_ms());
         }
@@ -475,7 +475,7 @@ impl GuestSession {
     /// Where this session's sound is playing: `None` before any has arrived,
     /// `Some(None)` while there is no device to play it on.
     pub fn playback_device(&self) -> Option<Option<tain_core::AudioDevice>> {
-        #[cfg(all(target_os = "windows", db_ffmpeg))]
+        #[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
         {
             return self.shared.audio.lock().unwrap().as_ref().map(|o| o.device());
         }
@@ -485,7 +485,7 @@ impl GuestSession {
 
     /// Milliseconds of audio buffered, for the stats row.
     pub fn audio_buffered_ms(&self) -> Option<u32> {
-        #[cfg(all(target_os = "windows", db_ffmpeg))]
+        #[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
         {
             return self.shared.audio.lock().unwrap().as_ref().map(|o| o.buffered_ms());
         }
