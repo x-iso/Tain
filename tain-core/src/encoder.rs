@@ -86,7 +86,12 @@ impl VideoCodec {
             //
             // AV1 encoders are newer hardware still — Arc, Ada, RDNA3 and up —
             // so most machines will answer no and advertise H.264 instead.
-            Self::H265 | Self::Av1 => Availability::Available,
+            //
+            // Windows only: Media Foundation encodes them and D3D11VA decodes
+            // them, and a build anywhere else has neither. Offering them there
+            // let a Linux guest's settings pick a codec it could not show, and
+            // VA-API is what would make them real — see docs/linux.md.
+            Self::H265 | Self::Av1 if cfg!(target_os = "windows") => Availability::Available,
             _ => Availability::Planned,
         }
     }
@@ -1092,6 +1097,11 @@ pub fn create_encoder(config: EncodeConfig) -> Result<Box<dyn VideoEncoder>> {
         // and tear the connection down — 418 ms after the session started, with
         // nothing on either side naming the codec as the reason. Mid-session
         // switches to AV1 failed through the same bail.
+        //
+        // Windows only, because Media Foundation is. Elsewhere neither codec is
+        // ever available, so effective_codec() never resolves to one and the
+        // catch-all below is the honest answer if something asks anyway.
+        #[cfg(target_os = "windows")]
         VideoCodec::H265 | VideoCodec::Av1 => {
             let encoder = super::codec_mf::HardwareH264Encoder::new(&config, false)
                 .with_context(|| {
@@ -1114,6 +1124,16 @@ pub fn create_encoder(config: EncodeConfig) -> Result<Box<dyn VideoEncoder>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What this build implements: everything on Windows, and the codecs with
+    /// a software path everywhere else.
+    fn implemented_here() -> Vec<VideoCodec> {
+        let mut codecs = vec![VideoCodec::DeltaZstd, VideoCodec::Raw, VideoCodec::H264];
+        if cfg!(target_os = "windows") {
+            codecs.extend([VideoCodec::H265, VideoCodec::Av1]);
+        }
+        codecs
+    }
 
     fn bgra(width: u16, height: u16) -> Vec<u8> {
         vec![0x7f; width as usize * height as usize * 4]
@@ -1282,16 +1302,7 @@ mod tests {
     fn the_implemented_codecs_are_the_documented_ones() {
         // A reminder to update the docs and UI when this changes.
         let available: Vec<_> = VideoCodec::ALL.into_iter().filter(|c| c.is_available()).collect();
-        assert_eq!(
-            available,
-            vec![
-                VideoCodec::DeltaZstd,
-                VideoCodec::Raw,
-                VideoCodec::H264,
-                VideoCodec::H265,
-                VideoCodec::Av1,
-            ]
-        );
+        assert_eq!(available, implemented_here());
     }
 
     /// Every codec the app offers must have an encoder behind it.

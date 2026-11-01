@@ -131,7 +131,12 @@ windows = { version = "0.58", features = [
 
 # The libavcodec shim is compiled by build.rs with the same MSVC toolchain Rust
 # already needs, which keeps LLVM/bindgen out of the prerequisites.
-[target.'cfg(windows)'.build-dependencies]
+#
+# Not under `cfg(windows)`: build.rs is one file that has to compile for every
+# target, and it names both crates even where it returns before using them.
+# Neither adds anything to the graph — openh264-sys2 and zstd-sys already build
+# with cc, and zstd is a normal dependency above.
+[build-dependencies]
 cc = "1"
 # Compressing the ffmpeg runtime into the binary, so a single exe is portable.
 zstd = "0.13"

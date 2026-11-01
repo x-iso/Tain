@@ -942,6 +942,7 @@ mod tests {
     /// Run with `cargo test -p tain-core -- --ignored --nocapture what_virtual_displays`.
     /// Prints nothing on a machine with no such driver, which is the answer.
     #[test]
+    #[cfg(target_os = "windows")]
     #[ignore = "diagnostic — run explicitly"]
     fn what_virtual_displays_this_machine_has() {
         let found = available();

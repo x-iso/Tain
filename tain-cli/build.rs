@@ -14,9 +14,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     println!("cargo:rustc-check-cfg=cfg(db_ffmpeg)");
 
-    embed_display_driver();
+    // The target's OS, not the host's: `cfg!` in a build script describes the
+    // machine running it, which is wrong as soon as anyone cross-compiles.
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
-    if !cfg!(target_os = "windows") {
+    embed_display_driver(windows);
+
+    if !windows {
         return;
     }
 
@@ -114,13 +118,17 @@ fn main() {
 /// whose driver section says it ships no driver — the same
 /// arrangement ffmpeg has, and for the same reason: a missing optional
 /// dependency should cost the feature, not the build.
-fn embed_display_driver() {
+///
+/// Only into a Windows build. Anywhere else the package is a Windows driver
+/// nothing can install, and the empty list is the state `display_driver`
+/// already handles.
+fn embed_display_driver(windows: bool) {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets this");
     let vendored = Path::new(&manifest).parent().map(|p| p.join(DRIVER_DIR));
     println!("cargo:rerun-if-changed=../{DRIVER_DIR}");
 
     let mut entries = Vec::new();
-    if let Some(dir) = vendored.as_ref().filter(|d| d.is_dir()) {
+    if let Some(dir) = vendored.as_ref().filter(|d| windows && d.is_dir()) {
         // Flat, and one level only. A driver package is a handful of files in
         // one directory; walking deeper would be inventing a layout rather than
         // reading one.

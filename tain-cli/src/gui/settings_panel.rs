@@ -1817,16 +1817,12 @@ mod tests {
     fn only_implemented_codecs_are_selectable() {
         let selectable: Vec<_> =
             VideoCodec::ALL.into_iter().filter(|c| c.is_available()).collect();
-        assert_eq!(
-            selectable,
-            vec![
-                VideoCodec::DeltaZstd,
-                VideoCodec::Raw,
-                VideoCodec::H264,
-                VideoCodec::H265,
-                VideoCodec::Av1,
-            ]
-        );
+        let mut implemented = vec![VideoCodec::DeltaZstd, VideoCodec::Raw, VideoCodec::H264];
+        // The hardware codecs exist only where Media Foundation and D3D11VA do.
+        if cfg!(target_os = "windows") {
+            implemented.extend([VideoCodec::H265, VideoCodec::Av1]);
+        }
+        assert_eq!(selectable, implemented);
     }
 
     /// H.265 is selectable but not necessarily *usable* on this machine.
@@ -1836,6 +1832,7 @@ mod tests {
     /// Offering it and falling back to H.264 is the honest arrangement — see
     /// `VideoCodec::is_encodable_here`.
     #[test]
+    #[cfg(target_os = "windows")]
     fn a_codec_this_machine_cannot_encode_is_still_offered() {
         assert!(VideoCodec::H265.is_available(), "the build implements it");
         // And whichever way this machine answers, the two questions are asked
@@ -1848,19 +1845,29 @@ mod tests {
         assert_eq!(codec_text(CodecSetting::Raw), "Raw BGRA");
         assert!(!codec_text(CodecSetting::DeltaZstd).contains("planned"));
         assert!(!codec_text(CodecSetting::H264).contains("planned"), "H.264 works now");
-        // H.265 is implemented, so it is never "planned" — but on a machine
-        // with no HEVC encoder it says so instead, which is a different claim.
-        assert!(!codec_text(CodecSetting::H265).contains("planned"), "H.265 works now");
-        if !VideoCodec::H265.is_encodable_here() {
-            assert!(codec_text(CodecSetting::H265).contains("no encoder"));
+        // H.265 is implemented on Windows, so it is never "planned" there — but
+        // on a machine with no HEVC encoder it says so instead, which is a
+        // different claim. Elsewhere there is no code for it yet, and "planned"
+        // is the true one.
+        if cfg!(target_os = "windows") {
+            assert!(!codec_text(CodecSetting::H265).contains("planned"), "H.265 works now");
+            if !VideoCodec::H265.is_encodable_here() {
+                assert!(codec_text(CodecSetting::H265).contains("no encoder"));
+            }
+        } else {
+            assert!(codec_text(CodecSetting::H265).contains("planned"));
         }
         // AV1 joined H.265: implemented, and gated on the machine rather than
         // on the build. Its encoders are newer hardware still, so most machines
         // will say "no encoder on this PC" — which is a claim about them, not
         // about whether the code exists.
-        assert!(!codec_text(CodecSetting::Av1).contains("planned"), "AV1 works now");
-        if !VideoCodec::Av1.is_encodable_here() {
-            assert!(codec_text(CodecSetting::Av1).contains("no encoder"));
+        if cfg!(target_os = "windows") {
+            assert!(!codec_text(CodecSetting::Av1).contains("planned"), "AV1 works now");
+            if !VideoCodec::Av1.is_encodable_here() {
+                assert!(codec_text(CodecSetting::Av1).contains("no encoder"));
+            }
+        } else {
+            assert!(codec_text(CodecSetting::Av1).contains("planned"));
         }
         assert!(codec_text(CodecSetting::Vp9).contains("planned"));
     }

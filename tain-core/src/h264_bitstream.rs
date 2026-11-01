@@ -900,6 +900,7 @@ mod tests {
     /// the first cannot catch a field read in the wrong order if the writer
     /// makes the same mistake, and the second cannot run everywhere.
     #[test]
+    #[cfg(target_os = "windows")]
     #[ignore = "requires a hardware H.264 encoder"]
     fn the_encoder_this_ships_with_produces_a_stream_this_parses() {
         use crate::codec_mf::MediaFoundationEncoder;

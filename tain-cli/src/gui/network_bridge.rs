@@ -127,8 +127,21 @@ pub struct FrameBuffer {
     /// the decoder behind it can be dropped — by a resolution change, or by the
     /// session ending — while the render thread is still drawing the last frame
     /// it was handed. See `tain_core::decode_ffmpeg::GpuPicture`.
-    pub gpu: Option<tain_core::decode_ffmpeg::GpuPicture>,
+    pub gpu: Option<GpuPicture>,
 }
+
+/// A decoded frame that stayed on the GPU.
+#[cfg(all(target_os = "windows", db_ffmpeg))]
+pub use tain_core::decode_ffmpeg::GpuPicture;
+
+/// A decoded frame that stayed on the GPU, in a build that has no decoder able
+/// to leave one there.
+///
+/// Only the libavcodec D3D11VA decoder produces one, so anywhere else — Linux,
+/// or Windows without the ffmpeg tree — this has no values at all and
+/// [`FrameBuffer::gpu`] is `None` by construction rather than by convention.
+#[cfg(not(all(target_os = "windows", db_ffmpeg)))]
+pub enum GpuPicture {}
 
 /// How the stream is doing, from both ends.
 ///
@@ -1432,7 +1445,6 @@ impl FrameDecoder {
                 rgba: picture.rgba,
                 gpu: None,
             })),
-            #[cfg(target_os = "windows")]
             #[cfg(all(target_os = "windows", db_ffmpeg))]
             Self::H264Ffmpeg(decoder) | Self::Hevc(decoder) => {
                 let Some(picture) = decoder.decode(data)? else { return Ok(None) };
@@ -1446,6 +1458,7 @@ impl FrameDecoder {
                     gpu,
                 }))
             }
+            #[cfg(target_os = "windows")]
             Self::H264Hardware(decoder) => Ok(decoder.decode(data)?.map(|picture| FrameBuffer {
                 width: picture.width,
                 height: picture.height,
@@ -1469,11 +1482,11 @@ impl FrameDecoder {
             Self::Raw => "raw".to_string(),
             Self::Delta(_) => "delta-zstd".to_string(),
             Self::H264(_) => tain_core::i18n::text("decoder.h264_cpu").to_string(),
-            #[cfg(target_os = "windows")]
             #[cfg(all(target_os = "windows", db_ffmpeg))]
             Self::H264Ffmpeg(decoder) => {
                 tain_core::i18n::format("decoder.gpu", &[("name", &decoder.name)])
             }
+            #[cfg(target_os = "windows")]
             Self::H264Hardware(_) => {
                 tain_core::i18n::text("decoder.h264_media_foundation").to_string()
             }

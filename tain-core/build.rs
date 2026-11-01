@@ -32,7 +32,9 @@ fn main() {
     // to be a typo.
     println!("cargo:rustc-check-cfg=cfg(db_ffmpeg)");
 
-    if !cfg!(target_os = "windows") {
+    // The target's OS, not the host's: `cfg!` in a build script describes the
+    // machine running it, which is wrong as soon as anyone cross-compiles.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
 
@@ -426,12 +428,13 @@ fn check_nasm() {
     if std::env::var("OPENH264_NO_ASM").is_ok() {
         return;
     }
-    // openh264-sys2 only has assembly for x86 and x86-64, and Windows is the
-    // platform the trap was found and measured on. The target's, not the
-    // host's: `cfg!` in a build script describes the machine running it.
+    // openh264-sys2 only has assembly for x86 and x86-64. The trap was found
+    // and measured on Windows, but nothing about it is Windows-specific: a
+    // Linux build without nasm falls back to plain C the same silent way. The
+    // target's arch, not the host's: `cfg!` in a build script describes the
+    // machine running it.
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if os != "windows" || !matches!(arch.as_str(), "x86_64" | "x86") {
+    if !matches!(arch.as_str(), "x86_64" | "x86") {
         return;
     }
 
