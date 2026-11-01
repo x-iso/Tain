@@ -1359,6 +1359,10 @@ enum FrameDecoder {
     /// session with a reason rather than showing nothing.
     #[cfg(all(target_os = "windows", db_ffmpeg))]
     Hevc(Box<tain_core::decode_ffmpeg::FfmpegDecoder>),
+    /// H.264, H.265 or AV1 on the GPU through VA-API, read back to the
+    /// processor. The only way a Linux guest decodes H.265 and AV1.
+    #[cfg(target_os = "linux")]
+    Vaapi(Box<tain_core::vaapi::VaapiDecoder>),
 }
 
 impl FrameDecoder {
@@ -1379,6 +1383,15 @@ impl FrameDecoder {
         match tain_core::codec_mf_decode::MediaFoundationDecoder::new() {
             Ok(decoder) => return Self::H264Hardware(Box::new(decoder)),
             Err(e) => info!("No Media Foundation decoder ({e}) — decoding on the CPU"),
+        }
+        // Asked of the driver first, so a GPU without H.264 decode does not
+        // cost a device opened and refused on every session.
+        #[cfg(target_os = "linux")]
+        if tain_core::vaapi::can_decode(VideoCodec::H264) {
+            match tain_core::vaapi::VaapiDecoder::for_codec(VideoCodec::H264) {
+                Ok(decoder) => return Self::Vaapi(Box::new(decoder)),
+                Err(e) => info!("No VA-API H.264 decoder ({e:#}) — decoding on the CPU"),
+            }
         }
         // Construction cannot fail in practice, and a decoder that refuses to
         // exist should not stop the session from reporting why.
@@ -1413,6 +1426,15 @@ impl FrameDecoder {
                     )?;
                 info!("{} decoding on the GPU via {}", codec.label(), decoder.name);
                 Self::Hevc(Box::new(decoder))
+            }
+            // VA-API or nothing: there is no software HEVC or AV1 decoder in
+            // this build, for the reason given on `Hevc`.
+            #[cfg(target_os = "linux")]
+            VideoCodec::H265 | VideoCodec::Av1 => {
+                let decoder = tain_core::vaapi::VaapiDecoder::for_codec(codec).with_context(|| {
+                    tain_core::i18n::format("decoder.cannot_decode", &[("codec", codec.label())])
+                })?;
+                Self::Vaapi(Box::new(decoder))
             }
             other => anyhow::bail!("this build has no decoder for {}", other.label()),
         })
@@ -1458,6 +1480,13 @@ impl FrameDecoder {
                     gpu,
                 }))
             }
+            #[cfg(target_os = "linux")]
+            Self::Vaapi(decoder) => Ok(decoder.decode(data)?.map(|picture| FrameBuffer {
+                width: picture.width,
+                height: picture.height,
+                rgba: picture.rgba,
+                gpu: None,
+            })),
             #[cfg(target_os = "windows")]
             Self::H264Hardware(decoder) => Ok(decoder.decode(data)?.map(|picture| FrameBuffer {
                 width: picture.width,
@@ -1492,6 +1521,10 @@ impl FrameDecoder {
             }
             #[cfg(all(target_os = "windows", db_ffmpeg))]
             Self::Hevc(decoder) => {
+                tain_core::i18n::format("decoder.gpu", &[("name", &decoder.name)])
+            }
+            #[cfg(target_os = "linux")]
+            Self::Vaapi(decoder) => {
                 tain_core::i18n::format("decoder.gpu", &[("name", &decoder.name)])
             }
         }
@@ -2467,13 +2500,22 @@ mod tests {
         assert!(health.latency_ms.is_empty(), "kept a multi-second latency");
     }
 
+    /// Every codec a host can choose has a decoder arm here.
+    ///
+    /// A decoder may still fail to open on a machine whose GPU lacks the codec
+    /// — that is the machine's answer and is reported to the user. What must
+    /// never happen is the build having no arm for it, which is the failure
+    /// this catches: AV1 once shipped selectable with no decoder behind it.
     #[test]
     fn every_available_codec_has_a_decoder() {
         for codec in VideoCodec::ALL.into_iter().filter(|c| c.is_available()) {
-            assert!(
-                FrameDecoder::for_codec(codec).is_ok(),
-                "{codec:?} is selectable on the host but undecodable here"
-            );
+            if let Err(e) = FrameDecoder::for_codec(codec) {
+                let reported = format!("{e:#}");
+                assert!(
+                    !reported.contains("this build has no decoder"),
+                    "{codec:?} is selectable on the host but undecodable here: {reported}"
+                );
+            }
         }
     }
 

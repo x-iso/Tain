@@ -120,43 +120,79 @@ fn convert_band(bgra: &[u8], w: usize, first_row_pair: usize, y_plane: &mut [u8]
 pub fn nv12_to_rgba(nv12: &[u8], width: u16, height: u16, out: &mut [u8]) {
     let (w, h) = (width as usize, height as usize);
     debug_assert!(nv12.len() >= nv12_len(width, height));
+    let (y_plane, uv_plane) = nv12.split_at(w * h);
+    nv12_planes_to_rgba(y_plane, w, uv_plane, w, width, height, out);
+}
+
+/// As [`nv12_to_rgba`], from planes whose rows are `y_stride` and `uv_stride`
+/// bytes apart rather than packed.
+///
+/// What a decoder hands back: VA-API pads every row of a surface to the
+/// driver's alignment, and repacking it first would be a copy of the whole
+/// frame for no other reason.
+pub fn nv12_planes_to_rgba(
+    y_plane: &[u8],
+    y_stride: usize,
+    uv_plane: &[u8],
+    uv_stride: usize,
+    width: u16,
+    height: u16,
+    out: &mut [u8],
+) {
+    let (w, h) = (width as usize, height as usize);
+    debug_assert!(y_stride >= w && uv_stride >= w);
+    debug_assert!(y_plane.len() >= y_stride * (h.max(1) - 1) + w);
+    debug_assert!(uv_plane.len() >= uv_stride * (h / 2).saturating_sub(1) + w);
     debug_assert!(out.len() >= w * h * 4);
 
-    let (y_plane, uv_plane) = nv12.split_at(w * h);
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .min(h.div_ceil(ROWS_PER_WORKER))
         .max(1);
     let band = h.div_ceil(workers);
+    let planes = Planes { y: y_plane, y_stride, uv: uv_plane, uv_stride, width: w };
 
     let bands = out[..w * h * 4].chunks_mut(band * w * 4).enumerate();
     if workers == 1 {
         for (index, dst) in bands {
-            rgba_band(y_plane, uv_plane, w, index * band, dst);
+            rgba_band(&planes, index * band, dst);
         }
         return;
     }
     std::thread::scope(|scope| {
+        let planes = &planes;
         for (index, dst) in bands {
-            scope.spawn(move || rgba_band(y_plane, uv_plane, w, index * band, dst));
+            scope.spawn(move || rgba_band(planes, index * band, dst));
         }
     });
 }
 
+/// The two planes of an NV12 picture and how far apart their rows are.
+struct Planes<'a> {
+    y: &'a [u8],
+    y_stride: usize,
+    uv: &'a [u8],
+    uv_stride: usize,
+    width: usize,
+}
+
 /// Convert one horizontal band of NV12 into RGBA.
-fn rgba_band(y_plane: &[u8], uv_plane: &[u8], w: usize, first_row: usize, out: &mut [u8]) {
+fn rgba_band(planes: &Planes, first_row: usize, out: &mut [u8]) {
+    let w = planes.width;
     for local in 0..out.len() / (w * 4) {
         let y_row = first_row + local;
-        let uv_row = (y_row / 2) * w;
+        let luma = &planes.y[y_row * planes.y_stride..y_row * planes.y_stride + w];
+        let uv_start = (y_row / 2) * planes.uv_stride;
+        let chroma_row = &planes.uv[uv_start..uv_start + w];
         for x in 0..w {
             // BT.601 limited range — the inverse of the coefficients the encoder
             // side uses. The two must agree or the picture shifts colour
             // depending on which decoder happened to run.
-            let y = (y_plane[y_row * w + x] as i32 - 16) * 298;
-            let chroma = uv_row + (x & !1);
-            let u = uv_plane[chroma] as i32 - 128;
-            let v = uv_plane[chroma + 1] as i32 - 128;
+            let y = (luma[x] as i32 - 16) * 298;
+            let chroma = x & !1;
+            let u = chroma_row[chroma] as i32 - 128;
+            let v = chroma_row[chroma + 1] as i32 - 128;
 
             let i = (local * w + x) * 4;
             out[i] = ((y + 409 * v + 128) >> 8).clamp(0, 255) as u8;
@@ -230,6 +266,32 @@ mod tests {
             assert!((125..=135).contains(&px[0]), "{px:?}");
             assert_eq!(px[3], 255);
         }
+    }
+
+    #[test]
+    fn padded_rows_convert_like_packed_ones() {
+        // A decoder's surface pads each row; the converter must skip the
+        // padding rather than read it as picture.
+        let (w, h) = (130u16, 66u16);
+        let mut packed = Vec::new();
+        bgra_to_nv12(&pattern(w, h), w, h, &mut packed);
+        let (wu, hu) = (w as usize, h as usize);
+        let stride = 192;
+        let mut y = vec![0xAAu8; stride * hu];
+        let mut uv = vec![0x55u8; stride * hu / 2];
+        for row in 0..hu {
+            y[row * stride..row * stride + wu].copy_from_slice(&packed[row * wu..(row + 1) * wu]);
+        }
+        for row in 0..hu / 2 {
+            let src = wu * hu + row * wu;
+            uv[row * stride..row * stride + wu].copy_from_slice(&packed[src..src + wu]);
+        }
+
+        let mut from_packed = vec![0u8; wu * hu * 4];
+        nv12_to_rgba(&packed, w, h, &mut from_packed);
+        let mut from_padded = vec![0u8; wu * hu * 4];
+        nv12_planes_to_rgba(&y, stride, &uv, stride, w, h, &mut from_padded);
+        assert!(from_packed == from_padded, "padding leaked into the picture");
     }
 
     #[test]

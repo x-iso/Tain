@@ -62,6 +62,8 @@ pub mod codec_delta;
 pub mod codec_h264;
 pub mod h264_bitstream;
 pub mod yuv;
+#[cfg(target_os = "linux")]
+pub mod vaapi;
 /// A time limit for tests that call into a graphics driver. Tests only — it
 /// bounds a stall in somebody else's code, which is not a thing to do to a
 /// running application.

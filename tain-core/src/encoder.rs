@@ -27,6 +27,27 @@ pub enum Availability {
     Planned,
 }
 
+/// Whether this build has a hardware path for H.265 and AV1 at all.
+///
+/// Media Foundation on Windows, always. On Linux, VA-API through the media
+/// library — so a Linux build made without FFmpeg offers neither, and one made
+/// with it offers both and leaves whether this GPU can encode them to
+/// [`VideoCodec::is_encodable_here`], exactly as Windows does.
+pub fn hardware_codecs_in_this_build() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::ffmpeg_runtime::built_in()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        false
+    }
+}
+
 /// Video codecs the pipeline knows about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoCodec {
@@ -91,7 +112,7 @@ impl VideoCodec {
             // them, and a build anywhere else has neither. Offering them there
             // let a Linux guest's settings pick a codec it could not show, and
             // VA-API is what would make them real — see docs/linux.md.
-            Self::H265 | Self::Av1 if cfg!(target_os = "windows") => Availability::Available,
+            Self::H265 | Self::Av1 if hardware_codecs_in_this_build() => Availability::Available,
             _ => Availability::Planned,
         }
     }
@@ -134,7 +155,13 @@ impl VideoCodec {
             debug!("{label} hardware encoder present: {found}");
             found
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
+        {
+            let found = super::vaapi::can_encode(self);
+            debug!("{label} VA-API encoder present: {found}");
+            found
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             let _ = label;
             false
@@ -940,10 +967,16 @@ pub fn hardware_encoder_name() -> Option<String> {
     {
         super::codec_mf::probe().map(|info| info.name)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
-        // VideoToolbox and VA-API are the equivalents elsewhere; neither is
-        // wired up, and claiming otherwise would make the UI lie.
+        super::vaapi::can_encode(VideoCodec::H264)
+            .then(super::vaapi::driver_name)
+            .flatten()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        // VideoToolbox is the equivalent on macOS; it is not wired up, and
+        // claiming otherwise would make the UI lie.
         None
     }
 }
@@ -1039,10 +1072,25 @@ fn create_h264(config: &EncodeConfig) -> Result<Box<dyn VideoEncoder>> {
         }
     }
 
+    // VA-API, which falls back to OpenH264 by itself under `Auto`.
+    #[cfg(target_os = "linux")]
+    if config.backend != EncoderBackend::Software && super::ffmpeg_runtime::available() {
+        match super::vaapi::create(config) {
+            Ok(encoder) => return Ok(encoder),
+            Err(e) if config.backend == EncoderBackend::Hardware => {
+                return Err(e.context(
+                    "the Hardware encoder backend was requested but is unavailable — \
+                     switch to Automatic to allow the software encoder",
+                ));
+            }
+            Err(e) => info!("No hardware encoder ({e}) — using the software encoder"),
+        }
+    }
+
     #[cfg(not(target_os = "windows"))]
     if config.backend == EncoderBackend::Hardware {
         anyhow::bail!(
-            "hardware encoding is only implemented on Windows — \
+            "this machine has no hardware H.264 encoder — \
              switch to Automatic to allow the software encoder"
         );
     }
@@ -1098,9 +1146,17 @@ pub fn create_encoder(config: EncodeConfig) -> Result<Box<dyn VideoEncoder>> {
         // nothing on either side naming the codec as the reason. Mid-session
         // switches to AV1 failed through the same bail.
         //
-        // Windows only, because Media Foundation is. Elsewhere neither codec is
-        // ever available, so effective_codec() never resolves to one and the
-        // catch-all below is the honest answer if something asks anyway.
+        // Media Foundation on Windows and VA-API on Linux. Elsewhere neither
+        // codec is ever available, so effective_codec() never resolves to one
+        // and the catch-all below is the honest answer if something asks.
+        #[cfg(target_os = "linux")]
+        VideoCodec::H265 | VideoCodec::Av1 => {
+            let config = EncodeConfig { codec: effective, ..config };
+            let encoder = super::vaapi::VaapiEncoder::new(&config, false).with_context(|| {
+                format!("{} needs a hardware encoder and this machine has none", effective.label())
+            })?;
+            Ok(Box::new(encoder))
+        }
         #[cfg(target_os = "windows")]
         VideoCodec::H265 | VideoCodec::Av1 => {
             let encoder = super::codec_mf::HardwareH264Encoder::new(&config, false)
@@ -1125,11 +1181,11 @@ pub fn create_encoder(config: EncodeConfig) -> Result<Box<dyn VideoEncoder>> {
 mod tests {
     use super::*;
 
-    /// What this build implements: everything on Windows, and the codecs with
-    /// a software path everywhere else.
+    /// What this build implements: the codecs with a software path, and the
+    /// hardware ones where this build has Media Foundation or VA-API.
     fn implemented_here() -> Vec<VideoCodec> {
         let mut codecs = vec![VideoCodec::DeltaZstd, VideoCodec::Raw, VideoCodec::H264];
-        if cfg!(target_os = "windows") {
+        if hardware_codecs_in_this_build() {
             codecs.extend([VideoCodec::H265, VideoCodec::Av1]);
         }
         codecs

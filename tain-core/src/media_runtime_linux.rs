@@ -35,7 +35,16 @@ use std::path::PathBuf;
 use tracing::*;
 
 /// The compressed library, or empty in a build without one.
-static EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libtain-media.so.zst"));
+const EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libtain-media.so.zst"));
+
+/// Whether this build carries a media library at all.
+///
+/// A property of the build, not of the machine: [`available`] says whether it
+/// actually loaded. What decides whether H.265 and AV1 are offered, the way
+/// `db_ffmpeg` does on Windows.
+pub const fn built_in() -> bool {
+    !EMBEDDED.is_empty()
+}
 
 /// Identifies this exact library, for the cache-directory fallback.
 const RUNTIME_ID: &str = env!("DB_MEDIA_ID");
