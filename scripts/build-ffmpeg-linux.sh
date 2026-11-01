@@ -58,8 +58,10 @@ die() {
 for tool in gcc make nasm pkg-config curl tar sha256sum; do
     command -v "$tool" >/dev/null || die "$tool is missing; see the install line at the top of this script"
 done
+# pkg-config reports libva's VA-API version: libva 2.14 is VA-API 1.14, the
+# first with the AV1 encoding interface av1_vaapi is built on.
 pkg-config --exists 'libva >= 1.14' libva-drm ||
-    die "the libva development headers are missing, or older than 2.14 (libva-dev, libva-devel)"
+    die "the libva development headers are missing, or older than libva 2.14 (libva-dev, libva-devel)"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=${1:-${TMPDIR:-/tmp}/tain-ffmpeg-linux-build}

@@ -2954,8 +2954,9 @@ and SteamOS. RHEL 9 (2.34) is the notable exclusion.
 `main`, with a message nobody launching from a menu sees — the Linux form of the
 missing-DLL error box `ffmpeg_runtime` exists to prevent. A library opened at
 run time fails as an error the program can report. That is the same reason
-FFmpeg is delay-loaded on Windows, and Linux has no delay loading, so the FFmpeg
-work for Linux will have to resolve its functions by name.
+FFmpeg is delay-loaded on Windows, and Linux has no delay loading, so the Linux
+FFmpeg is opened by name instead — see "The Linux Media Library Leaves libva
+Undefined".
 
 **Gotcha — a build script's `cfg!` is the wrong machine**: `tain-core/build.rs`
 skipped ffmpeg with `if !cfg!(target_os = "windows")`, which describes the
@@ -2988,3 +2989,102 @@ Wayland, X11, D-Bus and netlink crates it actually contains.
 `list-crate-licences.ps1` writes both lists in one run, so the Windows job
 checks both with the same shell, and `licenses.rs` compiles the FFmpeg, Opus,
 driver and `windows-rs` entries into the Windows build only.
+
+## The Linux Media Library Leaves libva Undefined
+
+**Decision**: on Linux, the two shims (`db_vaapi.c`, `db_audio.c`) and a static
+FFmpeg are linked into `libtain-media.so`, compressed into the binary, and
+opened at run time from an anonymous memory file (`memfd_create`, then
+`dlopen` on `/proc/self/fd/N`; a cache file where the kernel refuses). Rust
+calls it through function pointers resolved once and checked at load
+(`media_runtime_linux.rs`, compiled as `ffmpeg_runtime`). The library is linked
+with libva's symbols *undefined* and opened with lazy binding, after
+`libva.so.2` and `libva-drm.so.2` are opened with `RTLD_GLOBAL` if they exist.
+
+**Why a library the binary opens**: FFmpeg's VA-API code calls libva
+directly, so FFmpeg linked into the executable makes libva a load-time
+dependency, and a machine without it would not start Tain at all. Opening the
+library at run time turns that into an error the program can report, which is
+what delay loading does on Windows.
+
+**Why libva is left undefined rather than linked into the library**: linked,
+it would be a dependency of the library, and a machine without libva — no GPU
+driver installed, a minimal system — would fail to open it and lose Opus too,
+because the audio codec is in the same FFmpeg. Undefined and lazily bound, the
+VA-API functions are only resolved when called, and they are only called when
+libva was found. Checked by hiding libva from a machine: the library opened and
+the Opus tests passed. `LD_BIND_NOW` set in the environment would defeat this
+and cost the sound on such a machine, which is the only case it costs anything.
+
+**Why from memory**: nothing is written to disk, so there is no cache to go
+stale or be tampered with, and two instances never race to write it. A library
+beside the binary still wins, for FFmpeg's LGPL.
+
+**Why static FFmpeg built in the release job rather than committed**: static
+archives carry the glibc they were compiled against into whatever links them,
+so they have to be built where the release is linked. The Windows DLLs carry
+no such thing and are committed. `scripts/build-ffmpeg-linux.sh` uses the
+Windows build's pins; the release job caches its output on the script's hash.
+
+**Gotcha — exported symbols**: linked naively, the library exports all of
+FFmpeg's symbols, and any other FFmpeg in the process — a GTK media widget, a
+plugin — could bind to the wrong copy. A version script exports `db_*` alone,
+`-Bsymbolic` binds the library's internal calls to itself, and the release job
+fails if anything else is exported.
+
+## Linux Captures Through the Portal and Sounds Through PulseAudio's API
+
+**Decision**: Linux hosts share the screen and take input through one
+xdg-desktop-portal RemoteDesktop session with screen casting attached
+(`portal.rs`), read its PipeWire stream through a C shim that opens libpipewire
+at run time (`linux/db_pipewire.c`), and play and capture sound through
+PulseAudio's simple API, also opened at run time (`pulse.rs`).
+
+**Why the portal**: on Wayland no application may read another's pixels or
+synthesise its input. The portal is the one way in that GNOME, KDE and the
+others agree on, and it puts the person at the host in charge of what is
+shared, which is the same promise Tain makes with approval. One RemoteDesktop
+session rather than a ScreenCast session and a RemoteDesktop one, so a single
+dialog grants both, and absolute pointer positions are in the shared stream's
+own coordinate space.
+
+**Why the choice is remembered in a file**: the portal hands back a single-use
+restore token, and passing it to the next session skips the dialog. It is not a
+connection secret — it skips a dialog for this application on this machine —
+so it sits in the state directory, readable only by the user, rather than the
+credential store. Persistence belongs on the RemoteDesktop half
+(`SelectDevices`, interface version 2); the ScreenCast half of a remote desktop
+session must not carry it, and an older portal that refuses it is asked again
+without.
+
+**Why a C shim for PipeWire**: SPA pods, which PipeWire negotiates formats
+with, are inline C in the headers. From Rust they need bindgen and libclang,
+which the FFmpeg shims avoid for the same reason. The shim calls libpipewire
+only through `dlsym`'d pointers, so the binary links nothing new, and it takes
+shared memory rather than DMA-BUF so that every compositor will give it frames
+the processor can read.
+
+**Why PulseAudio's API on PipeWire desktops**: every Linux desktop of the last
+decade answers it — PulseAudio, or PipeWire through `pipewire-pulse` — so one
+backend covers them all. The *simple* API's blocking read and write are the
+shape of a capture thread and a render thread, and the blocking write paces
+playback at the device's rate as the WASAPI event does.
+
+**Gotcha — portal arguments are typed**: the first draft built each call's
+arguments as a list of `zvariant::Value`s, which serialise as D-Bus variants:
+the portal would have received `(v a{sv})` where it requires `(o a{sv})` and
+refused every request. Each call is spelled out with its real types, and
+`scripts/mock-portal.py` — a stand-in portal that enforces the signatures —
+is what the end-to-end test runs against.
+
+**Gotcha — a request's response can arrive before the call returns**: the
+portal answers on a Request object whose path it derives from the caller's bus
+name and a token. The response is subscribed to at that predicted path before
+the method is called, or a fast answer is lost.
+
+**Gotcha — PulseAudio's null sink idles in two-second blocks**: the playback
+test fed one second of sound into a null sink and heard nothing, because an
+idle null sink takes until its next wake-up, up to two seconds, to drop to the
+latency a new stream asks for, and every write blocked meanwhile. Real sound
+cards and PipeWire re-schedule promptly, and the jitter buffer's trimming
+absorbs the stall if one happens; the test lets the sink settle first.

@@ -7,14 +7,17 @@ All notable changes to Tain are documented here. This project adheres to
 
 ### Added
 
-- **A Linux build, as a preview.** Each release now has
-  `tain-x86_64-linux.tar.gz` beside `tain.exe`, for 64-bit Intel and AMD PCs
-  running a distribution from 2022 or later: Ubuntu 22.04, Debian 12, Fedora,
-  Bazzite, Arch and SteamOS among them. For now it is a guest. It connects to a
-  Windows host and shows its screen, with mouse, keyboard and touch. The host's
-  codec has to be H.264, and there is no sound yet. Hosting from Linux only
-  shows a test pattern. [docs/linux.md](docs/linux.md) says how to install it
-  and what it needs.
+- **Tain for Linux.** Each release now has `tain-x86_64-linux.tar.gz` beside
+  `tain.exe`, for 64-bit PCs running a distribution from 2022 or later: Ubuntu
+  22.04, Debian 12, Fedora, Bazzite, Arch and SteamOS among them. It hosts and
+  connects, with sound both ways. Video is decoded and encoded on the GPU on
+  Intel and AMD graphics, in H.264, H.265 and AV1 where the GPU has them, and
+  on the processor in H.264 where it does not. The first time a guest connects
+  to a Linux PC, the desktop asks the person there which screen or window to
+  share and whether to allow control, and remembers the answer. Not on Linux
+  yet: leaving apps out of the sound, choosing the sound device, immersive
+  mode, unattended access and virtual displays. [docs/linux.md](docs/linux.md)
+  says how to install it and what it needs.
 
 - **Choose whether Windows outlines what you share.** Windows draws a yellow
   border on the host's screen around a window being shared, and around a whole

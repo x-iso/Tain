@@ -304,18 +304,23 @@ jobs:
     steps:
       # git before checkout, or the checkout action falls back to downloading a
       # tarball with no repository in it, and the byte-for-byte check below has
-      # nothing to compare against. No -dev packages: every desktop library the
-      # binary uses (Wayland, X11, xkbcommon, EGL, GL) is opened at run time,
-      # not linked, so none of them is needed to build it. nasm for OpenH264's
-      # assembly; see the Windows job for what happens without it.
+      # nothing to compare against. nasm for OpenH264's assembly and FFmpeg's;
+      # see the Windows job for what happens without it.
+      #
+      # Headers only, for libraries opened at run time and never linked: libva
+      # for FFmpeg's VA-API code, PipeWire's for the screen capture shim. The
+      # desktop libraries (Wayland, X11, xkbcommon, EGL, GL, PulseAudio) need
+      # not even that — their crates declare what they call.
       - name: Install the build tools
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get -o Acquire::Retries=3 update
           apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-            build-essential binutils nasm git curl ca-certificates
+            build-essential binutils nasm git curl ca-certificates xz-utils \
+            pkg-config libva-dev libpipewire-0.3-dev
           nasm -v
+          pkg-config --modversion libva libpipewire-0.3
           gcc --version | head -1
           ldd --version | head -1
 
@@ -366,14 +371,34 @@ jobs:
       - name: Fetch crates as Cargo.lock pins them
         run: cargo fetch --locked --target x86_64-unknown-linux-gnu
 
+      # The static FFmpeg the media library links: the Windows build's pinned
+      # sources, built here because static archives carry the glibc they were
+      # compiled against. Cached on the script, which holds the pins and the
+      # configure line, and on this job's container, whose glibc it is built
+      # for; either changing rebuilds it. A few minutes cold.
+      - name: Restore the Linux FFmpeg
+        id: ffmpeg
+        uses: actions/cache@v6
+        with:
+          path: third_party/ffmpeg-linux
+          key: ffmpeg-linux-ubuntu22.04-${{ hashFiles('scripts/build-ffmpeg-linux.sh') }}
+
+      - name: Build the Linux FFmpeg
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: ./scripts/build-ffmpeg-linux.sh "$RUNNER_TEMP/ffmpeg-build"
+
+      - name: Say which FFmpeg this is
+        run: cat third_party/ffmpeg-linux/BUILD.txt
+
       - name: Build tain
         run: |
           set -o pipefail
           cargo build --release --locked -p tain-cli 2>&1 | tee "$RUNNER_TEMP/build.log"
 
-      # The same two checks as the Windows job. There is no ffmpeg in the Linux
-      # build yet, so tain-core's build script has nothing to warn about there,
-      # and any warning it does print is something missing.
+      # The same two checks as the Windows job. tain-core's build script warns
+      # about anything it had to leave out — the FFmpeg tree, the PipeWire
+      # headers — or settle for, like the system's shared FFmpeg, and each of
+      # those is a binary that only looks complete.
       - name: Check nothing was left out of the build
         run: |
           failed=0
@@ -397,6 +422,32 @@ jobs:
               failed=1
             fi
           done
+          exit "$failed"
+
+      # The media library is what the binary opens at run time, so it is held
+      # to the binary's own rule and one of its own: nothing linked beyond libc
+      # and libm (libva in particular, which it calls but must not need), and
+      # nothing exported but the shims' functions, so FFmpeg's symbols cannot
+      # collide with any other FFmpeg in the process.
+      - name: Check the media library
+        run: |
+          library=$(ls -t target/release/build/tain-core-*/out/libtain-media.so | head -1)
+          failed=0
+          needed=$(readelf -d "$library" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+          for lib in $needed; do
+            case " libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 " in
+              *" $lib "*) ;;
+              *) echo "::error::libtain-media.so links $lib, which a machine without it could not open."; failed=1 ;;
+            esac
+          done
+          exported=$(nm -D --defined-only "$library" | awk '$2 == "T" {print $3}' | grep -v '^db_' || true)
+          if [ -n "$exported" ]; then
+            echo "::error::libtain-media.so exports more than the shims: $(echo $exported | head -c 200)"
+            failed=1
+          fi
+          packed=$(stat -c %s "${library}.zst")
+          echo "libtain-media.so: $(stat -c %s "$library") bytes, $packed in the binary; links $(echo $needed)"
+          echo "Media library: $(stat -c %s "$library") bytes, $packed compressed in the binary" >> "$GITHUB_STEP_SUMMARY"
           exit "$failed"
 
       # # What the binary may need from the machine it runs on

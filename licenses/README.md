@@ -12,7 +12,7 @@ instead, so it cannot drift:
 |---|---|
 | Tain (GPL-3.0-or-later) | [`LICENSE`](../LICENSE) — also the GPL text the LGPL builds on, so FFmpeg's entry uses it too |
 | Virtual Display Driver | [`third_party/VirtualDisplayDriver/LICENSE`](../third_party/VirtualDisplayDriver/LICENSE) |
-| FFmpeg (LGPL-3.0-or-later) | [`third_party/ffmpeg/COPYING.LGPLv3`](../third_party/ffmpeg/COPYING.LGPLv3), from the FFmpeg 7.1.5 release the DLLs are built from |
+| FFmpeg (LGPL-3.0-or-later) | [`third_party/ffmpeg/COPYING.LGPLv3`](../third_party/ffmpeg/COPYING.LGPLv3), from the FFmpeg 7.1.5 release the DLLs are built from — and the static Linux build, from the same release, which `licenses.rs` gives an entry of its own |
 | Opus | [`third_party/ffmpeg/COPYING.libopus`](../third_party/ffmpeg/COPYING.libopus), from the libopus 1.6.1 release compiled into them |
 
 ## Where each copy came from
@@ -79,6 +79,8 @@ upstream, or a new dependency nobody added. So:
 - **Changing the FFmpeg build**, regenerate `ffmpeg-configuration.txt` from the
   configure line `scripts/build-ffmpeg.sh` prints, and update the versions in
   the FFmpeg and Opus entries' notes and in `third_party/ffmpeg/PROVENANCE.md`.
+  `scripts/build-ffmpeg-linux.sh` carries the same pins, and the Linux FFmpeg
+  entry's note names the version too: change all of them together.
   The licence texts are copied in by the script, so they follow the build. A
   build without `--enable-version3` is LGPL-2.1-or-later and needs that text
   instead; one with `--enable-gpl` is compatible with Tain's licence but

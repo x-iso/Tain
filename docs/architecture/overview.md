@@ -365,7 +365,8 @@ required, and approval still applies.
 | Software video (OpenH264), lossless and raw | ✅ | ✅ |
 | Networking, protocol, adaptive control, localisation | ✅ | ✅ |
 
-Linux is built and released, as a guest of Windows hosts; macOS is not built at
-all. What the Linux build needs, and the choice of technology for each missing
-row above (portals and PipeWire, VA-API, libei), are in
-[../linux.md](../linux.md).
+The right-hand column is macOS, which is not built at all. Linux is built and
+released, and has its own answers: the screen cast and RemoteDesktop portals
+with PipeWire for capture, window sharing and input, VA-API through FFmpeg for
+hardware decode and encode, and PulseAudio's API (answered by PipeWire too) for
+sound. [../linux.md](../linux.md) has what it does and does not do yet.

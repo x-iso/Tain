@@ -6,10 +6,11 @@ the unattended host that service starts, and a per-desktop agent. Beside them,
 `i18n/` holds the string catalogues and `third_party/` the virtual display
 driver, and both are compiled into the binary.
 
-Most of `tain-core` is Windows-only and gated as such. The parts that are not —
+Much of `tain-core` is per platform and gated as such: Windows modules, and
+their Linux counterparts listed under "Linux" below. The parts that are not —
 protocol, passcodes, sessions, connection codes, the adaptive controller,
-discovery, the string catalogues — build anywhere, which is what keeps them
-testable without a GPU.
+discovery, the string catalogues, colour conversion — build anywhere, which is
+what keeps them testable without a GPU.
 
 ## `tain-core`
 
@@ -60,8 +61,24 @@ testable without a GPU.
 | `decode_ffmpeg.rs` | Hardware decode through libavcodec's D3D11VA path — the guest's fast route. |
 | `decode_rgba.rs` | NV12 to RGBA on the GPU, so a decoded frame never has to touch the CPU. |
 | `h264_bitstream.rs` | Just enough bitstream parsing to drive a DXVA decoder. |
-| `ffmpeg_runtime.rs` | Loads the ffmpeg DLLs: those beside the exe if there are any, otherwise the copies embedded in it, unpacked on first use. |
+| `ffmpeg_runtime.rs` | Loads the ffmpeg DLLs: those beside the exe if there are any, otherwise the copies embedded in it, unpacked on first use. On Linux the same module is `media_runtime_linux.rs`. |
+| `yuv.rs` | BGRA to NV12 and NV12 to RGBA on the processor, BT.601 limited range, threaded. One copy shared by the Windows and Linux encoders and decoders. |
 | `adaptive.rs` | Measures the pipeline and decides what to give up when it cannot keep up. |
+
+### Linux
+
+The Linux counterparts, compiled only there. Each takes the API its Windows
+twin has, so the host and guest code above them is the same on both.
+
+| Module | What it does |
+|--------|--------------|
+| `media_runtime_linux.rs` | Compiled as `ffmpeg_runtime`. Opens `libtain-media.so` — the shims and a static FFmpeg, built by `build.rs` and embedded — from an anonymous memory file, after opening libva globally if it is installed, so the library's lazily bound VA-API calls resolve to it. Without libva it still opens and Opus still works. |
+| `vaapi.rs` | GPU decode and encode through VA-API, over `ffmpeg/db_vaapi.c`, and what this GPU can do. |
+| `portal.rs` | The RemoteDesktop portal session, with screen casting attached, that every capture and the input injector share: the request/response dance over D-Bus, the remembered choice, the PipeWire descriptor. |
+| `capture_portal.rs` | `ScreenCaptureBackend` over the portal's PipeWire stream, through `linux/db_pipewire.c`. |
+| `input_portal.rs` | `InputInjector` over the portal, with scancode and virtual-key tables to Linux key codes. |
+| `pulse.rs` | PulseAudio's simple API, opened at run time. |
+| `audio_capture_linux.rs`, `audio_output_linux.rs` | Compiled as `audio_capture` and `audio_output`: the default output's monitor, and playback from the jitter buffer. |
 
 ### Audio, input, and the service
 
@@ -125,6 +142,7 @@ testable without a GPU.
 | `third_party/VirtualDisplayDriver/` | The virtual display driver, vendored unmodified with its licence and a provenance record, and compiled into the binary by `tain-cli/build.rs` so installing it works offline. Signed by its author, so nothing in the folder may be edited — an edit voids the signature. See `PROVENANCE.md`. |
 | `third_party/ffmpeg/` | The ffmpeg Tain embeds: avcodec, avutil and swresample built with only what the shim calls, their headers, and the FFmpeg and libopus licences. Built by `scripts/build-ffmpeg.sh`; `PROVENANCE.md` records the sources, toolchain and configure line, and each DLL's SHA-256. |
 | `licenses/` | Verbatim licence texts for what Tain redistributes, and `rust-crates.txt` and `rust-crates-linux.txt`, every crate in each platform's build with its licence, both written by `scripts/list-crate-licences.ps1`. `licenses/README.md` says where each text came from and when to refresh them. |
+| `tain-core/linux/` | `db_pipewire.c`, the PipeWire half of Linux screen capture, compiled into the crate when PipeWire's headers are there. libpipewire is opened at run time, never linked. |
 | `packaging/linux/` | `tain.desktop`, which goes in the Linux tarball with the logo as `tain.svg`. Its name has to match `gui::APP_ID`, because that is how a Wayland desktop finds the window's icon. See `docs/linux.md`. |
 | `tain-core/ffmpeg/` | The libavcodec shim, compiled only when ffmpeg is present. |
 

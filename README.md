@@ -4,8 +4,8 @@ A peer-to-peer remote desktop application built in Rust, using [iroh](https://ir
 
 Tain runs on Windows. The protocol, networking, passcodes and adaptive controller
 build anywhere, but capture, encoding, audio and input injection are Windows-only
-for now. A **Linux build** ships with each release as a preview: a guest that
-connects to Windows hosts. What it needs and what it lacks are in
+for now. **Linux** hosts and views too, with sound and GPU video through
+VA-API, and ships with each release; what it needs and what it lacks are in
 [docs/linux.md](docs/linux.md).
 
 ## Features
@@ -278,12 +278,14 @@ D3D11VA, but has no audio.
 
 ### On Linux
 
-The same `cargo build`, with a C and C++ compiler and `nasm`, and no `-dev`
-packages: the binary links only the C and C++ runtimes and opens every desktop
-library at run time. There is no ffmpeg in a Linux build yet, so it decodes on
-the processor and has no sound. [docs/linux.md](docs/linux.md) has the
-per-distribution commands, how to build on an immutable system like Bazzite,
-and what the binary needs from the machine it runs on.
+The same `cargo build`, with a C and C++ compiler, `nasm`, `pkg-config`, and
+the libva and PipeWire headers. The binary links only the C and C++ runtimes
+and opens everything else at run time. FFmpeg comes from
+`scripts/build-ffmpeg-linux.sh`, which builds the static one a release
+carries, or from your distribution's development packages for working on
+Tain. [docs/linux.md](docs/linux.md) has the per-distribution commands, how
+to build on an immutable system like Bazzite, and what the binary needs from
+the machine it runs on.
 
 ### Tests
 
@@ -345,7 +347,8 @@ numbers are dominated by unoptimised pixel loops.
 A release is a pushed `v*` tag, and nothing is built locally.
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds `tain.exe`
 on GitHub's Windows runner and `tain-x86_64-linux.tar.gz` in an Ubuntu 22.04
-container, and once both have succeeded attaches them, each with its SHA-256
+container (building the static Linux FFmpeg there, cached between runs), and
+once both have succeeded attaches them, each with its SHA-256
 beside it, to that tag's release. If there is no release yet, it creates one.
 
 1. Bump `version` under `[workspace.package]` in `Cargo.toml`. That is the number
@@ -374,8 +377,10 @@ beside it, to that tag's release. If there is no release yet, it creates one.
 The job stops rather than ship an exe that only looks complete. It fails without
 `nasm`, without ffmpeg in the checkout, with any file checked out differently
 from how it was committed, or on any warning from `tain-core`'s build script.
-The Linux job also fails if the binary links any library beyond the C and C++
-runtimes, or asks for a glibc newer than 2.35. A release published by hand
+The Linux job also fails without the Linux FFmpeg or the PipeWire headers, if
+the binary links any library beyond the C and C++ runtimes or asks for a glibc
+newer than 2.35, or if the media library links anything beyond libc and libm or
+exports more than its own functions. A release published by hand
 before the tag keeps its notes, and only the binaries on it are replaced.
 
 To try it without cutting a tag, run **Release** from the Actions tab with **Run
@@ -761,7 +766,8 @@ this is ever shipped commercially.
 ## Input Injection
 
 - **Windows**: `SendInput` for mouse and keyboard, and `InjectTouchInput` for touch
-- **macOS and Linux**: log-only stubs
+- **Linux**: the RemoteDesktop portal, in the session that shares the screen
+- **macOS**: log-only stubs
 
 The `input_inject.rs` module provides a trait-based abstraction so the actual injection logic can be swapped per platform without touching protocol code.
 
@@ -805,7 +811,7 @@ decode and display-driver paths are tested on the hardware that has them.
 | Guest connect from GUI | ✅ Works | Paste a code, the host is checked, then connect |
 | Saved connections | ✅ Works | Names in JSON, codes in the credential store; reconnect, rename, forget |
 | Mouse, keyboard, touch (guest) | ✅ Works | Sent on change only, gated on grants |
-| Input injection (host) | ✅ Windows | `SendInput` and touch injection. macOS/Linux are log-only stubs |
+| Input injection (host) | ✅ Windows, Linux | `SendInput` and touch injection; the RemoteDesktop portal on Linux. macOS is a log-only stub |
 | Local input priority | ✅ Windows | Guest input yields to the host's own; releases always delivered |
 | Pointer capture | ✅ Works | Relative movement for games; automatic or by shortcut |
 | Immersive mode | ✅ Windows | Win key forwarded via a keyboard hook, pointer confined to the window |
@@ -829,16 +835,16 @@ decode and display-driver paths are tested on the hardware that has them.
 | Localisation | ✅ Works | English and Russian; a test fails on any key the catalogue lacks |
 | Settings | ✅ Works | Persisted to JSON; unknown or bad fields fall back without losing the rest |
 | CLI subcommands | ❌ Not wired | `host.rs` / `guest.rs` are not compiled in |
-| Linux | 🧪 Preview | A guest of Windows hosts on H.264, decoded on the processor, no sound. Hosting streams a test pattern. See [docs/linux.md](docs/linux.md) |
+| Linux | ✅ Works | Hosting through the screen cast and remote desktop portals, VA-API decode and encode, PulseAudio sound. No unattended access, virtual displays or per-app sound exclusion yet. See [docs/linux.md](docs/linux.md) |
 
 ## Roadmap / Next Steps
 
 1. **Dirty-rectangle capture** — DXGI reports which regions changed; sending only
    those would cut both encode cost and bandwidth further.
-2. **Capture on macOS and Linux** — ScreenCaptureKit and PipeWire; both are stubs today
-3. **Input injection on macOS and Linux** — `CGEventPost` and XTest
-4. **Hardware encode off Windows** — VideoToolbox and VAAPI, once there is
-   anything to capture on those platforms
+2. **macOS** — ScreenCaptureKit, `CGEventPost` and VideoToolbox; a stub today
+3. **Linux without copies** — DMA-BUF from VA-API into GL and from PipeWire
+   into VA-API; see [docs/linux.md](docs/linux.md) for the rest of what Linux
+   lacks
 5. **Clipboard sync**
 6. **VP9** — declared, not implemented
 7. **H.265 colour** — a round-trip test in `codec_mf.rs`, committed failing on
