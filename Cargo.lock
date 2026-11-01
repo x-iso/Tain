@@ -5682,6 +5682,7 @@ dependencies = [
  "tracing-subscriber",
  "windows 0.58.0",
  "windows-core 0.58.0",
+ "zbus 5.18.0",
  "zstd",
 ]
 

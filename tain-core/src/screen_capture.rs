@@ -1404,9 +1404,19 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
                 Err(e) => return Err(e),
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        // The screen cast portal and PipeWire: the desktop asks the person at
+        // this machine what to share. A refusal ends the session with that
+        // reason rather than streaming something that is not their screen.
+        #[cfg(all(target_os = "linux", db_pipewire))]
         {
-            warn!("No screen capture backend on this platform — streaming the test pattern");
+            Box::new(
+                super::capture_portal::PortalCapturer::new(&config)
+                    .map_err(|e| e.context("could not share this screen"))?,
+            )
+        }
+        #[cfg(not(any(target_os = "windows", all(target_os = "linux", db_pipewire))))]
+        {
+            warn!("No screen capture backend in this build — streaming the test pattern");
             Box::new(StubCapturer::new(&config))
         }
     };

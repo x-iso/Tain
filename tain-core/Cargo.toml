@@ -133,6 +133,9 @@ windows = { version = "0.58", features = [
 # through tokio and others; see media_runtime_linux.rs.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+# The screen sharing and remote input portals, over D-Bus. Already in the tree
+# with these features, through the credential store; see portal.rs.
+zbus = "5"
 
 # The libavcodec shim is compiled by build.rs with the same MSVC toolchain Rust
 # already needs, which keeps LLVM/bindgen out of the prerequisites.

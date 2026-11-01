@@ -31,12 +31,14 @@ fn main() {
     // Declared so `cfg(db_ffmpeg)` in the crate is checked rather than assumed
     // to be a typo.
     println!("cargo:rustc-check-cfg=cfg(db_ffmpeg)");
+    println!("cargo:rustc-check-cfg=cfg(db_pipewire)");
 
     // The target's OS, not the host's: `cfg!` in a build script describes the
     // machine running it, which is wrong as soon as anyone cross-compiles.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "linux" {
         linux::build_media_library();
+        linux::build_pipewire_shim();
         return;
     }
     if target_os != "windows" {
@@ -519,6 +521,47 @@ mod linux {
         Static(PathBuf),
         /// The system's FFmpeg, as pkg-config describes it.
         System { cflags: Vec<String>, libs: Vec<String> },
+    }
+
+    /// The PipeWire half of screen capture: `linux/db_pipewire.c`, compiled
+    /// into this crate.
+    ///
+    /// It needs PipeWire's headers to build and nothing at all to link —
+    /// libpipewire is opened at run time — so it goes into the crate like an
+    /// ordinary static object. Without the headers there is no screen capture
+    /// on Linux, which is a warning, and the release job fails on warnings.
+    pub fn build_pipewire_shim() {
+        println!("cargo:rerun-if-changed=linux/db_pipewire.c");
+        let cflags = Command::new("pkg-config")
+            .args(["--cflags", "libpipewire-0.3"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
+        let Some(cflags) = cflags else {
+            println!(
+                "cargo:warning=no PipeWire headers — building without screen capture. Install \
+                 libpipewire-0.3-dev (Debian, Ubuntu) or pipewire-devel (Fedora)."
+            );
+            return;
+        };
+        let mut shim = cc::Build::new();
+        shim.file("linux/db_pipewire.c").warnings(false);
+        for flag in &cflags {
+            shim.flag(flag);
+        }
+        match shim.try_compile("db_pipewire") {
+            Ok(()) => println!("cargo:rustc-cfg=db_pipewire"),
+            Err(e) => println!(
+                "cargo:warning=could not compile the PipeWire shim ({e}) — building without \
+                 screen capture"
+            ),
+        }
     }
 
     pub fn build_media_library() {

@@ -49,6 +49,10 @@ pub mod audio_capture;
 pub mod audio_capture;
 #[cfg(target_os = "linux")]
 pub mod pulse;
+#[cfg(target_os = "linux")]
+pub mod portal;
+#[cfg(all(target_os = "linux", db_pipewire))]
+pub mod capture_portal;
 #[cfg(target_os = "windows")]
 pub mod audio_device;
 #[cfg(target_os = "windows")]
