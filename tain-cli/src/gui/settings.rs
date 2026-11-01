@@ -179,9 +179,9 @@ mirror_enum!(ResolutionSetting, QualityScale, {
 }, Native);
 
 mirror_enum!(CaptureBorderSetting, CaptureBorder, {
-    HideWhenFullscreen => HideWhenFullscreen,
+    Show => Show,
     Hide => Hide,
-}, Show);
+}, HideWhenFullscreen);
 
 /// Deserialize one field, falling back to its default rather than failing.
 ///
@@ -373,9 +373,10 @@ pub struct Settings {
     /// Where Windows draws its yellow border around what this machine is
     /// sharing, on this machine's own screen.
     ///
-    /// Windows' own behaviour by default, which is the border around
-    /// everything. See [`tain_core::CaptureBorder`] for the choices and for
-    /// the two cases where Windows draws it whatever this says.
+    /// By default around ordinary windows and not over a game or video that
+    /// fills the screen. See [`tain_core::CaptureBorder`] for the choices, why
+    /// that one is the default, and the two cases where Windows draws the
+    /// border whatever this says.
     #[serde(default, deserialize_with = "lenient")]
     pub capture_border: CaptureBorderSetting,
     /// Executables to keep out of the streamed audio, e.g. "Discord.exe".
@@ -1143,15 +1144,23 @@ mod tests {
         }
     }
 
-    /// A file written before the border was a choice gets Windows' own
-    /// behaviour, which is what that build showed; and a choice, once made,
-    /// is read back as itself.
+    /// A file written before the border was a choice gets the default, which
+    /// hides it only over fullscreen apps; and a choice, once made, is read
+    /// back as itself.
     #[test]
-    fn the_capture_border_choice_loads_and_defaults_to_windows_own() {
+    fn the_capture_border_choice_loads_and_defaults_to_hiding_it_for_fullscreen() {
         let old = r#"{ "target_fps": 45 }"#;
         let loaded: Settings = serde_json::from_str(old).unwrap();
-        assert_eq!(loaded.capture_border, CaptureBorderSetting::Show);
-        assert_eq!(loaded.to_session_config().capture_border, CaptureBorder::Show);
+        assert_eq!(loaded.capture_border, CaptureBorderSetting::HideWhenFullscreen);
+        assert_eq!(
+            loaded.to_session_config().capture_border,
+            CaptureBorder::HideWhenFullscreen
+        );
+
+        // The two defaults are declared in two crates and must agree, or a
+        // fresh settings file and a host that never received one would
+        // disagree about the border.
+        assert_eq!(CaptureBorderSetting::default().to_core(), CaptureBorder::default());
 
         for chosen in CaptureBorder::ALL {
             let settings = Settings {
@@ -1489,7 +1498,7 @@ mod tests {
             }),
             codec: CodecSetting::H264,
             local_input_wins_ms: 1234,
-            capture_border: CaptureBorderSetting::HideWhenFullscreen,
+            capture_border: CaptureBorderSetting::Hide,
             approval_timeout_secs: 42,
             device_name_mode: DeviceNameMode::Custom,
             custom_device_name: "the study machine".into(),

@@ -125,19 +125,27 @@ const BORDER_RECHECK: std::time::Duration = std::time::Duration::from_millis(250
 /// is shared: two guests watching one window are watching one capture, and it
 /// has one border. Every capture reads it again each [`BORDER_RECHECK`], so a
 /// change reaches the ones already running.
-static BORDER: AtomicU8 = AtomicU8::new(0);
+///
+/// Starts at the default rather than at whichever choice happens to be zero,
+/// so a capture made before the host's settings arrive behaves as they would
+/// have said.
+static BORDER: AtomicU8 = AtomicU8::new(border_code(CaptureBorder::DEFAULT));
+
+/// How [`BORDER`] stores each choice.
+const fn border_code(policy: CaptureBorder) -> u8 {
+    match policy {
+        CaptureBorder::Show => 0,
+        CaptureBorder::HideWhenFullscreen => 1,
+        CaptureBorder::Hide => 2,
+    }
+}
 
 /// Choose where captures through the compositor draw the border.
 ///
 /// Called by [`super::network::HostServer::set_session_config`] with the rest
 /// of the host's settings.
 pub fn set_border(policy: CaptureBorder) {
-    let value = match policy {
-        CaptureBorder::Show => 0,
-        CaptureBorder::HideWhenFullscreen => 1,
-        CaptureBorder::Hide => 2,
-    };
-    BORDER.store(value, Ordering::Relaxed);
+    BORDER.store(border_code(policy), Ordering::Relaxed);
 }
 
 /// The choice last made with [`set_border`].

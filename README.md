@@ -618,10 +618,11 @@ picture.
 
 Windows outlines a shared window in yellow on the host's screen. Guests never
 see it, and the host chooses whether it shows, in Settings → Hosting → *Capture
-border*: always, which is Windows' own behaviour; around ordinary windows but not
-a game or video filling the screen, borderless or exclusive; or never. Turning it
-off needs Windows 11, and Windows can forbid it under Privacy & security →
-Screenshot borders. The choice reaches sessions already running.
+border*. By default it is shown around ordinary windows and not over a game or
+video filling the screen, borderless or exclusive. It can also be shown always,
+which is Windows' own behaviour, or never. Turning it off needs Windows 11, and
+Windows can forbid it under Privacy & security → Screenshot borders. The choice
+reaches sessions already running.
 
 The host can change what a guest sees in the middle of a session, from the
 guest's card, without the guest reconnecting.

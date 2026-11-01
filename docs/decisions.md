@@ -2885,9 +2885,17 @@ fullscreen and back without the capture being rebuilt.
 being captured, on the screen of the person it is being captured from. Around a
 window on an ordinary desktop that is a fair thing to say; around a game filling
 the screen it is a yellow line across the edge of the picture somebody is
-playing. Neither answer is right for every host, and only the person at that
-machine can decide to take the operating system's signal away, so the default
-is Windows' own: shown.
+playing. Neither answer is right for every host.
+
+**Why "hide for fullscreen apps" is the default**: it keeps the border where it
+says something and removes it only where it is in the way. Around an ordinary
+window it still tells the person at the host which program somebody else can
+see. Over a fullscreen game they already know what is on their screen, and the
+outline is drawn across it. *Always show*, Windows' own behaviour, is one click
+away for a host that wants the signal everywhere. The default is declared once
+in each crate — `CaptureBorder::DEFAULT`, and the settings mirror's — and a test
+holds the two together, because a host that has not been sent its settings yet
+starts from the core one.
 
 **What "fullscreen" means here**: there is no flag for it. Exclusive and
 borderless fullscreen are both, from outside the program, a window exactly as

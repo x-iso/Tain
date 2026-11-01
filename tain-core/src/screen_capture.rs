@@ -532,26 +532,38 @@ pub fn displays() -> Vec<super::protocol::DisplayInfo> {
 /// Applied to the whole process rather than to one session, because a capture
 /// is shared by every session watching it. See
 /// [`super::capture_wgc::set_border`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureBorder {
-    /// Windows' own default: drawn around everything captured through the
+    /// Windows' own behaviour: drawn around everything captured through the
     /// compositor.
-    ///
-    /// The default because it is what a host showed before this was a
-    /// choice, and taking away the operating system's sign that something is
-    /// being captured is a decision for the person at that machine to make.
-    #[default]
     Show,
     /// Drawn around a window, and not around one that fills its screen: a game
     /// or a video playing fullscreen, exclusively or as a borderless window
     /// the size of the monitor. A whole screen fills itself, so it gets none.
+    ///
+    /// The default, because it keeps the border where it says something and
+    /// takes it away only where it is in the way. Around an ordinary window it
+    /// still tells the person at the host which program somebody else can see;
+    /// over a fullscreen game it would be a yellow line across the picture
+    /// they are playing, saying what they already know.
     HideWhenFullscreen,
     /// Never drawn.
     Hide,
 }
 
+impl Default for CaptureBorder {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl CaptureBorder {
     pub const ALL: [Self; 3] = [Self::Show, Self::HideWhenFullscreen, Self::Hide];
+
+    /// What a host that has not chosen gets; see [`Self::HideWhenFullscreen`]
+    /// for why. A constant as well as `Default`, because the process-wide
+    /// copy in `capture_wgc` is a static and has to start somewhere.
+    pub const DEFAULT: Self = Self::HideWhenFullscreen;
 
     /// Whether the border should be drawn around something that does, or does
     /// not, fill the screen it is on.
@@ -1477,8 +1489,9 @@ mod tests {
         assert!(!CaptureBorder::Hide.wanted(false));
         assert!(!CaptureBorder::Hide.wanted(true));
 
-        // Windows' own behaviour is what somebody who has not chosen gets.
-        assert_eq!(CaptureBorder::default(), CaptureBorder::Show);
+        // Somebody who has not chosen keeps the border around windows and
+        // loses it over fullscreen games and videos.
+        assert_eq!(CaptureBorder::default(), CaptureBorder::HideWhenFullscreen);
     }
 
     /// Every format survives the trip between processes as itself.
