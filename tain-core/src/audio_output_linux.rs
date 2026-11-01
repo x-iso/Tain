@@ -71,7 +71,15 @@ impl AudioOutput {
         let buffer = Arc::new(Mutex::new(JitterBuffer::new(sample_rate, channels, priority)?));
         let muted = Arc::new(AtomicBool::new(false));
         let volume = Arc::new(AtomicU32::new(FULL_VOLUME));
-        let device = Arc::new(Mutex::new(None));
+        // Opened here rather than on the thread, so `device()` answers
+        // truthfully from the moment this returns, as on Windows. A server
+        // that is not there yet is retried on the thread.
+        let first = open_playback(sample_rate, channels);
+        let device = Arc::new(Mutex::new(first.as_ref().ok().map(|_| default_device())));
+        match &first {
+            Ok(_) => info!("Playing on the default output"),
+            Err(e) => warn!("No sound output yet ({e:#}) — trying again shortly"),
+        }
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread = std::thread::Builder::new()
@@ -82,7 +90,8 @@ impl AudioOutput {
                 let volume = Arc::clone(&volume);
                 let device = Arc::clone(&device);
                 let stop = Arc::clone(&stop);
-                move || render(sample_rate, channels, buffer, muted, volume, device, stop)
+                let first = first.ok();
+                move || render(first, sample_rate, channels, buffer, muted, volume, device, stop)
             })
             .context("could not start the audio render thread")?;
 
@@ -137,7 +146,13 @@ impl Drop for AudioOutput {
     }
 }
 
+fn open_playback(sample_rate: u32, channels: u16) -> Result<pulse::Stream> {
+    pulse::Stream::playback("Remote desktop sound", sample_rate, channels, DEVICE_TARGET_MS, PERIOD_MS)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render(
+    mut stream: Option<pulse::Stream>,
     sample_rate: u32,
     channels: u16,
     buffer: Arc<Mutex<JitterBuffer>>,
@@ -151,8 +166,8 @@ fn render(
     };
     let period = (sample_rate * PERIOD_MS / 1000) as usize;
     let mut samples = Vec::with_capacity(period * channels as usize);
-    let mut stream: Option<pulse::Stream> = None;
-    let mut retry_at = std::time::Instant::now();
+    // `start` has just tried; wait before the first retry if it failed.
+    let mut retry_at = std::time::Instant::now() + if stream.is_some() { std::time::Duration::ZERO } else { RETRY_EVERY };
 
     while !stop.load(Ordering::Relaxed) {
         if stream.is_none() {
@@ -160,7 +175,7 @@ fn render(
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
-            match pulse::Stream::playback("Remote desktop sound", sample_rate, channels, DEVICE_TARGET_MS, PERIOD_MS) {
+            match open_playback(sample_rate, channels) {
                 Ok(opened) => {
                     info!("Playing on the default output");
                     set_device(Some(default_device()));

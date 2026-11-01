@@ -105,14 +105,23 @@ impl SharedCapture {
             info!("Leaving applications out of the sound is not supported on Linux yet — sending everything");
         }
         let (tx, chunks) = std::sync::mpsc::sync_channel(200);
-        let device = Arc::new(Mutex::new(None));
+        // Opened here rather than on the thread, so the device is known the
+        // moment this returns, as it is on Windows. The host tells the guest
+        // where the sound comes from straight away, and a stream still opening
+        // read as "no device" — to whichever guest the timing picked.
+        let first = open_monitor();
+        let device = Arc::new(Mutex::new(first.as_ref().ok().map(|_| crate::audio_output::default_device())));
+        match &first {
+            Ok(_) => info!("Capturing what the default output plays"),
+            Err(e) => warn!("No sound to capture yet ({e:#}) — trying again shortly"),
+        }
         let stop = Arc::new(AtomicBool::new(false));
         std::thread::Builder::new()
             .name("audio-capture".into())
             .spawn({
                 let device = Arc::clone(&device);
                 let stop = Arc::clone(&stop);
-                move || capture(tx, device, stop)
+                move || capture(first.ok(), tx, device, stop)
             })
             .context("could not start the audio capture thread")?;
         Ok(Self { chunks, device, stop })
@@ -142,7 +151,19 @@ impl Drop for SharedCapture {
     }
 }
 
+/// A record stream on the default output's monitor.
+fn open_monitor() -> Result<pulse::Stream> {
+    pulse::Stream::record(
+        "Sound for remote guests",
+        "@DEFAULT_MONITOR@",
+        STREAM_FORMAT.sample_rate,
+        STREAM_FORMAT.channels,
+        BLOCK_MS,
+    )
+}
+
 fn capture(
+    mut stream: Option<pulse::Stream>,
     tx: std::sync::mpsc::SyncSender<AudioChunk>,
     device: Arc<Mutex<Option<AudioDevice>>>,
     stop: Arc<AtomicBool>,
@@ -153,18 +174,15 @@ fn capture(
     let format = STREAM_FORMAT;
     let block = (format.sample_rate * BLOCK_MS / 1000) as usize * format.channels as usize;
     let mut position: u64 = 0;
-    let mut stream: Option<pulse::Stream> = None;
+    // Waited out before the first retry, since `join` has just tried.
+    if stream.is_none() {
+        std::thread::sleep(RETRY_EVERY);
+    }
 
     while !stop.load(Ordering::Relaxed) {
         let open = match stream.as_mut() {
             Some(open) => open,
-            None => match pulse::Stream::record(
-                "Sound for remote guests",
-                "@DEFAULT_MONITOR@",
-                format.sample_rate,
-                format.channels,
-                BLOCK_MS,
-            ) {
+            None => match open_monitor() {
                 Ok(opened) => {
                     info!("Capturing what the default output plays");
                     set_device(Some(crate::audio_output::default_device()));
