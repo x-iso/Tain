@@ -588,6 +588,11 @@ This application.
 Hardware video decoding, and Opus audio in both directions. The FFmpeg
 libraries are embedded in tain.exe and unpacked on first use.
 
+[licences.ffmpeg_linux]
+Hardware video decoding and encoding through VA-API, and Opus audio in both
+directions. FFmpeg is compiled into a library inside this binary, opened when
+Tain starts.
+
 [licences.opus]
 Encodes the host's sound for the stream.
 

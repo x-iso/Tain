@@ -16,10 +16,10 @@
 //! libraries and the driver package embedded in it, and the icons and fonts it
 //! draws with. Build tools are not redistributed and are not listed.
 //!
-//! Per platform, because what is redistributed differs. The Linux binary has
-//! no FFmpeg, no driver package and no windows-rs, so those entries are only
-//! compiled into a Windows build, and each platform shows the crate list
-//! resolved for its own target.
+//! Per platform, because what is redistributed differs. The Linux binary
+//! carries FFmpeg as a static library rather than DLLs, and no driver package
+//! or windows-rs, so it has its own FFmpeg entry and none of the others, and
+//! each platform shows the crate list resolved for its own target.
 //!
 //! # What is translated
 //!
@@ -97,7 +97,36 @@ pub const LICENSES: &[License] = &[
             include_str!("../../../licenses/ffmpeg-configuration.txt"),
         ),
     },
-    #[cfg(target_os = "windows")]
+    // The same FFmpeg 7.1.5, built for Linux: static, with VA-API in place of
+    // D3D11VA, inside libtain-media.so. Shown in a Linux build only, since
+    // that is the one carrying it.
+    #[cfg(target_os = "linux")]
+    License {
+        name: "FFmpeg",
+        what: "licences.ffmpeg_linux",
+        spdx: "LGPL-3.0-or-later",
+        url: "https://ffmpeg.org",
+        note: Some(
+            "libavcodec, libavutil and libswresample from FFmpeg 7.1.5, built for Tain \
+             with only what it calls: the H.264, HEVC and AV1 decoders and encoders \
+             with VA-API, the Opus decoder, and the libopus encoder. Source: \
+             https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz, which is tag n7.1.5 \
+             (commit 3a0867c2bf) of https://git.ffmpeg.org/ffmpeg.git, built by \
+             scripts/build-ffmpeg-linux.sh in Tain's repository, which records the \
+             configure line.\n\
+             They are linked into libtain-media.so, which this binary carries and opens \
+             at run time. A libtain-media.so placed beside the binary is opened instead, \
+             so a modified FFmpeg can be substituted by building that library from \
+             Tain's source against it.\n\
+             Below: the LGPL, and the GPL it builds on.",
+        ),
+        text: concat!(
+            include_str!("../../../third_party/ffmpeg/COPYING.LGPLv3"),
+            "\n\n",
+            include_str!("../../../LICENSE"),
+        ),
+    },
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     License {
         name: "Opus",
         what: "licences.opus",
