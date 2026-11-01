@@ -23,7 +23,7 @@
 //! has to say where each ends; doing it here means the transport moves one
 //! opaque blob per capture buffer instead of negotiating packet boundaries.
 
-#![cfg(all(target_os = "windows", db_ffmpeg))]
+#![cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
 
 use anyhow::Result;
 use tracing::*;
@@ -38,6 +38,7 @@ struct DbOpusDecoder {
     _private: [u8; 0],
 }
 
+#[cfg(target_os = "windows")]
 unsafe extern "C" {
     fn db_opus_encoder_new(
         sample_rate: i32,
@@ -56,6 +57,42 @@ unsafe extern "C" {
     ) -> i32;
     fn db_opus_encoder_free(e: *mut DbOpusEncoder);
 
+    fn db_opus_decoder_new(
+        sample_rate: i32,
+        channels: i32,
+        err: *mut u8,
+        err_len: i32,
+    ) -> *mut DbOpusDecoder;
+    fn db_opus_decode(
+        d: *mut DbOpusDecoder,
+        data: *const u8,
+        len: i32,
+        out: *mut f32,
+        out_cap_frames: i32,
+    ) -> i32;
+    fn db_opus_decoder_free(d: *mut DbOpusDecoder);
+}
+
+// The same functions on Linux, resolved from libtain-media.so when first
+// called. Must match the block above and the prototypes in db_audio.c.
+#[cfg(target_os = "linux")]
+super::ffmpeg_runtime::media_functions! {
+    fn db_opus_encoder_new(
+        sample_rate: i32,
+        channels: i32,
+        bitrate: i32,
+        err: *mut u8,
+        err_len: i32,
+    ) -> *mut DbOpusEncoder;
+    fn db_opus_frame_size(e: *mut DbOpusEncoder) -> i32;
+    fn db_opus_encode(
+        e: *mut DbOpusEncoder,
+        samples: *const f32,
+        frames: i32,
+        out: *mut u8,
+        out_cap: i32,
+    ) -> i32;
+    fn db_opus_encoder_free(e: *mut DbOpusEncoder);
     fn db_opus_decoder_new(
         sample_rate: i32,
         channels: i32,

@@ -79,7 +79,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 
 use super::codec_h264::DecodedPicture;
-use super::codec_mf::{ensure_mf_started, friendly_name, nv12_len, ROWS_PER_WORKER};
+use super::codec_mf::{ensure_mf_started, friendly_name, nv12_len};
 
 /// H.264 decoding on the GPU.
 pub struct MediaFoundationDecoder {
@@ -994,61 +994,8 @@ impl Drop for MediaFoundationDecoder {
     }
 }
 
-/// NV12 to RGBA, split across threads.
-///
-/// The inverse of the encoder's converter and threaded for the same reason: at
-/// 1600p it is four million pixels of scalar arithmetic sitting on the guest's
-/// critical path, and leaving it on one core is how a fast machine still reports
-/// as "slow decoding".
-pub fn nv12_to_rgba(nv12: &[u8], width: u16, height: u16, out: &mut [u8]) {
-    let (w, h) = (width as usize, height as usize);
-    debug_assert!(nv12.len() >= nv12_len(width, height));
-    debug_assert!(out.len() >= w * h * 4);
-
-    let (y_plane, uv_plane) = nv12.split_at(w * h);
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(h.div_ceil(ROWS_PER_WORKER))
-        .max(1);
-    let band = h.div_ceil(workers);
-
-    let bands = out[..w * h * 4].chunks_mut(band * w * 4).enumerate();
-    if workers == 1 {
-        for (index, dst) in bands {
-            rgba_band(y_plane, uv_plane, w, index * band, dst);
-        }
-        return;
-    }
-    std::thread::scope(|scope| {
-        for (index, dst) in bands {
-            scope.spawn(move || rgba_band(y_plane, uv_plane, w, index * band, dst));
-        }
-    });
-}
-
-/// Convert one horizontal band of NV12 into RGBA.
-fn rgba_band(y_plane: &[u8], uv_plane: &[u8], w: usize, first_row: usize, out: &mut [u8]) {
-    for local in 0..out.len() / (w * 4) {
-        let y_row = first_row + local;
-        let uv_row = (y_row / 2) * w;
-        for x in 0..w {
-            // BT.601 limited range — the inverse of the coefficients the encoder
-            // side uses. The two must agree or the picture shifts colour
-            // depending on which decoder happened to run.
-            let y = (y_plane[y_row * w + x] as i32 - 16) * 298;
-            let chroma = uv_row + (x & !1);
-            let u = uv_plane[chroma] as i32 - 128;
-            let v = uv_plane[chroma + 1] as i32 - 128;
-
-            let i = (local * w + x) * 4;
-            out[i] = ((y + 409 * v + 128) >> 8).clamp(0, 255) as u8;
-            out[i + 1] = ((y - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
-            out[i + 2] = ((y + 516 * u + 128) >> 8).clamp(0, 255) as u8;
-            out[i + 3] = 255;
-        }
-    }
-}
+// The converter lives in `crate::yuv`, which the Linux decoder shares.
+pub use crate::yuv::nv12_to_rgba;
 
 #[cfg(test)]
 mod tests {

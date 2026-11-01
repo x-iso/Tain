@@ -17,3 +17,7 @@ Thumbs.db
 
 # Local tooling state, specific to one machine.
 /.claude/settings.local.json
+
+# The static FFmpeg for Linux, built by scripts/build-ffmpeg-linux.sh. Built
+# where the release is linked rather than committed; see that script.
+/third_party/ffmpeg-linux/

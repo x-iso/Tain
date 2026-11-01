@@ -30,7 +30,7 @@
 //! faded. Handing the device a short buffer instead would make it repeat
 //! whatever was there before, which is the loudest possible way to fail.
 
-#![cfg(all(target_os = "windows", db_ffmpeg))]
+#![cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
 
 use anyhow::{Context, Result};
 use std::collections::VecDeque;

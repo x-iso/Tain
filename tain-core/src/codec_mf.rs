@@ -1534,11 +1534,8 @@ fn annex_b_units(stream: &[u8]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Bytes in an NV12 frame: full-size luma plus half-size interleaved chroma.
-pub(crate) fn nv12_len(width: u16, height: u16) -> usize {
-    let (w, h) = (width as usize, height as usize);
-    w * h + w * (h / 2)
-}
+// Moved to `crate::yuv`, which Linux shares; re-exported for this module.
+pub(crate) use crate::yuv::nv12_len;
 
 /// Pack a ratio into the 64-bit attribute Media Foundation expects.
 fn set_ratio(
@@ -1560,101 +1557,9 @@ fn bitrate_bps(config: &EncodeConfig, width: u16, height: u16) -> u32 {
     }
 }
 
-/// BGRA to NV12: luma plane, then interleaved U/V at half resolution.
-///
-/// Same BT.601 coefficients as the I420 converter — the two must agree, or the
-/// picture shifts colour depending on which encoder happens to be in use.
-pub fn bgra_to_nv12(bgra: &[u8], width: u16, height: u16, out: &mut Vec<u8>) {
-    out.resize(nv12_len(width, height), 0);
-    bgra_to_nv12_into(bgra, width, height, out);
-}
-
-/// How many row-pairs one worker converts before the split stops paying.
-///
-/// Below roughly this much work per thread the spawn costs more than it saves,
-/// so small frames stay on one thread.
-pub(crate) const ROWS_PER_WORKER: usize = 64;
-
-/// As [`bgra_to_nv12`], but into a caller-owned buffer — which is what lets the
-/// encoder convert straight into the media buffer the transform will read,
-/// rather than into a staging `Vec` that then has to be copied.
-///
-/// Split across threads because at 2560x1600 this is 4.1 million pixels of
-/// scalar arithmetic per frame, measured at ~7 ms — nearly half the hardware
-/// encoder's entire frame time, and pure waste on a machine with idle cores.
-/// The bands are disjoint slices of the output, so no synchronisation is needed
-/// beyond the scope's join.
-pub fn bgra_to_nv12_into(bgra: &[u8], width: u16, height: u16, out: &mut [u8]) {
-    let (w, h) = (width as usize, height as usize);
-    debug_assert!(bgra.len() >= w * h * 4);
-    debug_assert!(out.len() >= nv12_len(width, height));
-
-    let row_pairs = h / 2;
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(row_pairs.div_ceil(ROWS_PER_WORKER))
-        .max(1);
-    let band = row_pairs.div_ceil(workers);
-
-    let (y_plane, uv_plane) = out.split_at_mut(w * h);
-    // One band is `band` row-pairs: 2*band luma rows and `band` chroma rows.
-    let bands = y_plane
-        .chunks_mut(band * 2 * w)
-        .zip(uv_plane.chunks_mut(band * w))
-        .enumerate();
-
-    if workers == 1 {
-        for (index, (y, uv)) in bands {
-            convert_band(bgra, w, index * band, y, uv);
-        }
-        return;
-    }
-
-    std::thread::scope(|scope| {
-        for (index, (y, uv)) in bands {
-            scope.spawn(move || convert_band(bgra, w, index * band, y, uv));
-        }
-    });
-}
-
-/// Convert one horizontal band, starting at `first_row_pair` of the source.
-fn convert_band(bgra: &[u8], w: usize, first_row_pair: usize, y_plane: &mut [u8], uv_plane: &mut [u8]) {
-    for local in 0..y_plane.len() / (2 * w) {
-        let y0 = (first_row_pair + local) * 2;
-        let top = &bgra[y0 * w * 4..(y0 + 1) * w * 4];
-        let bottom = &bgra[(y0 + 1) * w * 4..(y0 + 2) * w * 4];
-        let (y_top, y_bottom) = y_plane[local * 2 * w..(local + 1) * 2 * w].split_at_mut(w);
-        let uv_row = local * w;
-
-        for col_pair in 0..w / 2 {
-            let x0 = col_pair * 8;
-            let px = [
-                (top[x0] as i32, top[x0 + 1] as i32, top[x0 + 2] as i32),
-                (top[x0 + 4] as i32, top[x0 + 5] as i32, top[x0 + 6] as i32),
-                (bottom[x0] as i32, bottom[x0 + 1] as i32, bottom[x0 + 2] as i32),
-                (bottom[x0 + 4] as i32, bottom[x0 + 5] as i32, bottom[x0 + 6] as i32),
-            ];
-            let luma =
-                |(b, g, r): (i32, i32, i32)| (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
-            y_top[col_pair * 2] = luma(px[0]);
-            y_top[col_pair * 2 + 1] = luma(px[1]);
-            y_bottom[col_pair * 2] = luma(px[2]);
-            y_bottom[col_pair * 2 + 1] = luma(px[3]);
-
-            let (b, g, r) = (
-                (px[0].0 + px[1].0 + px[2].0 + px[3].0) / 4,
-                (px[0].1 + px[1].1 + px[2].1 + px[3].1) / 4,
-                (px[0].2 + px[1].2 + px[2].2 + px[3].2) / 4,
-            );
-            // NV12 interleaves U then V, unlike I420's separate planes.
-            uv_plane[uv_row + col_pair * 2] =
-                (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
-            uv_plane[uv_row + col_pair * 2 + 1] =
-                (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
-        }
-    }
-}
+// The converter lives in `crate::yuv`, which the Linux encoder shares, so
+// there is one copy of the coefficients rather than two that must agree.
+pub use crate::yuv::{bgra_to_nv12, bgra_to_nv12_into};
 
 #[cfg(test)]
 mod tests {

@@ -34,7 +34,12 @@ fn main() {
 
     // The target's OS, not the host's: `cfg!` in a build script describes the
     // machine running it, which is wrong as soon as anyone cross-compiles.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "linux" {
+        linux::build_media_library();
+        return;
+    }
+    if target_os != "windows" {
         return;
     }
 
@@ -477,4 +482,196 @@ fn check_nasm() {
          (see .cargo/config.toml.example), then run `cargo clean -p openh264-sys2 -p tain-core`: \
          a plain-C OpenH264 stays cached otherwise, and so does this warning."
     );
+}
+
+/// The Linux media library: the shims and FFmpeg as one shared object.
+///
+/// # Why a shared object the binary opens, rather than linking FFmpeg in
+///
+/// FFmpeg's VA-API code calls libva directly. Linked into the executable, that
+/// makes libva a load-time dependency, and a machine without it would not start
+/// Tain at all — the Linux form of the missing-DLL error box the Windows build
+/// delay-loads its way around. So the shims and a static FFmpeg are linked into
+/// `libtain-media.so` with libva's symbols left undefined, and the binary opens
+/// it at run time with lazy binding, after opening libva globally if it is
+/// there. Without libva the library still loads, and Opus still works; only the
+/// VA-API functions are never called. See `media_runtime_linux.rs`.
+///
+/// # Where FFmpeg comes from
+///
+/// In order: `FFMPEG_DIR`, then `third_party/ffmpeg-linux`, each a static
+/// build as `scripts/build-ffmpeg-linux.sh` makes it — what a release ships.
+/// Failing both, the system's own FFmpeg through pkg-config, linked as shared
+/// libraries: fine for working on Tain, and said so, because the result only
+/// runs where that FFmpeg is installed. Failing that too, no library at all,
+/// and the binary has no GPU video and no sound.
+mod linux {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// Every function the Rust side resolves. The runtime refuses a library
+    /// missing any of them, so this list and `media_runtime_linux::SYMBOLS`
+    /// have to agree.
+    const EXPORTS: &str = "{ global: db_*; local: *; };\n";
+
+    enum Source {
+        /// A static tree: `include/` and `lib/*.a`, libopus beside the rest.
+        Static(PathBuf),
+        /// The system's FFmpeg, as pkg-config describes it.
+        System { cflags: Vec<String>, libs: Vec<String> },
+    }
+
+    pub fn build_media_library() {
+        println!("cargo:rerun-if-changed=ffmpeg/db_vaapi.c");
+        println!("cargo:rerun-if-changed=ffmpeg/db_audio.c");
+        println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+
+        let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
+        let embedded = out.join("libtain-media.so.zst");
+
+        let built = match find_ffmpeg() {
+            Some(source) => match build(&source, &out) {
+                Ok(library) => Some(library),
+                Err(e) => {
+                    println!(
+                        "cargo:warning=could not build libtain-media.so ({e}) — building \
+                         without GPU video or sound"
+                    );
+                    None
+                }
+            },
+            None => {
+                println!(
+                    "cargo:warning=no ffmpeg for Linux found — building without GPU video or \
+                     sound. scripts/build-ffmpeg-linux.sh builds it into third_party/ffmpeg-linux, \
+                     or install your distribution's FFmpeg and libva development packages."
+                );
+                None
+            }
+        };
+
+        // Written either way, so the `include_bytes!` in the runtime never has
+        // to be conditional. Empty means "no library in this build".
+        let packed = built
+            .and_then(|library| std::fs::read(library).ok())
+            .map(|bytes| zstd::encode_all(&bytes[..], 19).unwrap_or_default())
+            .unwrap_or_default();
+        std::fs::write(&embedded, &packed).expect("could not write the embedded media library");
+
+        // Tells one build's library from another's, for the cache directory it
+        // is unpacked into when memory-backed loading is unavailable.
+        let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in packed.len().to_le_bytes().iter().chain(packed.iter().take(4096)) {
+            fingerprint ^= *byte as u64;
+            fingerprint = fingerprint.wrapping_mul(0x100_0000_01b3);
+        }
+        println!("cargo:rustc-env=DB_MEDIA_ID={fingerprint:016x}");
+    }
+
+    fn find_ffmpeg() -> Option<Source> {
+        let explicit = std::env::var_os("FFMPEG_DIR").map(PathBuf::from);
+        let vendored = std::env::var("CARGO_MANIFEST_DIR")
+            .ok()
+            .and_then(|dir| Path::new(&dir).parent().map(|p| p.join("third_party/ffmpeg-linux")));
+        for dir in explicit.iter().chain(vendored.iter()) {
+            if dir.join("include/libavcodec/avcodec.h").exists()
+                && dir.join("lib/libavcodec.a").exists()
+            {
+                return Some(Source::Static(dir.clone()));
+            }
+        }
+        if explicit.is_some() {
+            println!(
+                "cargo:warning=FFMPEG_DIR does not hold a static Linux build (include/ and \
+                 lib/libavcodec.a) — looking for the system's FFmpeg instead"
+            );
+        }
+
+        let packages = ["libavcodec", "libavutil", "libswresample", "libva"];
+        let query = |flag: &str| -> Option<Vec<String>> {
+            let output = Command::new("pkg-config").arg(flag).args(packages).output().ok()?;
+            output.status.success().then(|| {
+                String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            })
+        };
+        let cflags = query("--cflags")?;
+        let libs = query("--libs")?;
+        println!(
+            "cargo:warning=building libtain-media.so against this system's shared FFmpeg — fine \
+             for development, but the result only runs where that FFmpeg is installed. A release \
+             builds a static one with scripts/build-ffmpeg-linux.sh."
+        );
+        Some(Source::System { cflags, libs })
+    }
+
+    fn build(source: &Source, out: &Path) -> Result<PathBuf, String> {
+        let mut shim = cc::Build::new();
+        shim.file("ffmpeg/db_vaapi.c")
+            .file("ffmpeg/db_audio.c")
+            .pic(true)
+            .warnings(false)
+            // Linked into the shared object below, never into the crate.
+            .cargo_metadata(false);
+        match source {
+            Source::Static(dir) => {
+                shim.include(dir.join("include"));
+            }
+            Source::System { cflags, .. } => {
+                for flag in cflags {
+                    shim.flag(flag);
+                }
+            }
+        }
+        shim.try_compile("db_media").map_err(|e| e.to_string())?;
+
+        let exports = out.join("libtain-media.map");
+        std::fs::write(&exports, EXPORTS).map_err(|e| e.to_string())?;
+        let library = out.join("libtain-media.so");
+
+        let mut link = cc::Build::new().get_compiler().to_command();
+        link.arg("-shared")
+            .arg("-o")
+            .arg(&library)
+            .arg("-Wl,-soname,libtain-media.so")
+            .arg("-Wl,--whole-archive")
+            .arg(out.join("libdb_media.a"))
+            .arg("-Wl,--no-whole-archive");
+        match source {
+            Source::Static(dir) => {
+                // Dependency order: each archive before the ones it needs.
+                for archive in ["libavcodec.a", "libswresample.a", "libavutil.a", "libopus.a"] {
+                    link.arg(dir.join("lib").join(archive));
+                }
+                // libva and libva-drm are deliberately not named: the runtime
+                // opens them globally first when they exist. See the module
+                // docs above.
+                link.arg("-Wl,-z,undefs");
+            }
+            Source::System { libs, .. } => {
+                link.args(libs);
+            }
+        }
+        link.arg("-lm")
+            .arg("-lpthread")
+            // Resolve VA-API calls when they are made, not when the library is
+            // opened, so a machine without libva can still use the rest.
+            .arg("-Wl,-z,lazy")
+            // FFmpeg's own symbols stay inside: nothing outside calls them,
+            // and anything else in the process with its own FFmpeg must not
+            // resolve to ours.
+            .arg(format!("-Wl,--version-script={}", exports.display()))
+            .arg("-Wl,-Bsymbolic")
+            .arg("-s");
+        let output = link.output().map_err(|e| format!("could not run the linker: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "linking failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(library)
+    }
 }

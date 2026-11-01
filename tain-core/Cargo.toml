@@ -129,6 +129,11 @@ windows = { version = "0.58", features = [
     "Security_Authorization_AppCapabilityAccess",
 ] }
 
+# Opening the media library and libva at run time on Linux. Already in the tree
+# through tokio and others; see media_runtime_linux.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # The libavcodec shim is compiled by build.rs with the same MSVC toolchain Rust
 # already needs, which keeps LLVM/bindgen out of the prerequisites.
 #

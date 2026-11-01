@@ -61,6 +61,7 @@ pub mod adaptive;
 pub mod codec_delta;
 pub mod codec_h264;
 pub mod h264_bitstream;
+pub mod yuv;
 /// A time limit for tests that call into a graphics driver. Tests only — it
 /// bounds a stall in somebody else's code, which is not a thing to do to a
 /// running application.
@@ -78,13 +79,20 @@ pub mod decode_rgba;
 // with video.
 pub mod dns_cache;
 pub mod discovery;
+#[cfg(not(target_os = "linux"))]
+pub mod ffmpeg_runtime;
+// The same module on Linux, where it opens libtain-media.so instead of
+// unpacking DLLs. Always compiled there: whether the library exists is a
+// run-time answer, so nothing downstream needs a cfg for it.
+#[cfg(target_os = "linux")]
+#[path = "media_runtime_linux.rs"]
 pub mod ffmpeg_runtime;
 // Gated on the build script finding an ffmpeg tree; see tain-core/build.rs.
 #[cfg(all(target_os = "windows", db_ffmpeg))]
 pub mod decode_ffmpeg;
-#[cfg(all(target_os = "windows", db_ffmpeg))]
+#[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
 pub mod audio_codec;
-#[cfg(all(target_os = "windows", db_ffmpeg))]
+#[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
 pub mod audio_render;
 #[cfg(all(target_os = "windows", db_ffmpeg))]
 pub mod audio_output;
@@ -108,7 +116,7 @@ pub mod session;
 /// On a background thread because it writes tens of megabytes on first run and
 /// the window should open regardless.
 pub fn warm_up_ffmpeg() {
-    #[cfg(all(target_os = "windows", db_ffmpeg))]
+    #[cfg(any(all(target_os = "windows", db_ffmpeg), target_os = "linux"))]
     std::thread::spawn(|| {
         let started = std::time::Instant::now();
         if ffmpeg_runtime::available() {
