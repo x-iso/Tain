@@ -124,7 +124,8 @@ testable without a GPU.
 | `i18n/` | One `.lang` file per language — English and Russian today — compiled into the binary by `tain-core/build.rs`. Adding a language is dropping a file in, with no list to join and no Rust to edit. The format is a key in brackets and then its text, because the text is full of the apostrophes and quotation marks every other format would make a translator escape. `i18n/README.md` is written for the person adding one. |
 | `third_party/VirtualDisplayDriver/` | The virtual display driver, vendored unmodified with its licence and a provenance record, and compiled into the binary by `tain-cli/build.rs` so installing it works offline. Signed by its author, so nothing in the folder may be edited — an edit voids the signature. See `PROVENANCE.md`. |
 | `third_party/ffmpeg/` | The ffmpeg Tain embeds: avcodec, avutil and swresample built with only what the shim calls, their headers, and the FFmpeg and libopus licences. Built by `scripts/build-ffmpeg.sh`; `PROVENANCE.md` records the sources, toolchain and configure line, and each DLL's SHA-256. |
-| `licenses/` | Verbatim licence texts for what Tain redistributes, and `rust-crates.txt`, every crate in the build with its licence, written by `scripts/list-crate-licences.ps1`. `licenses/README.md` says where each text came from and when to refresh them. |
+| `licenses/` | Verbatim licence texts for what Tain redistributes, and `rust-crates.txt` and `rust-crates-linux.txt`, every crate in each platform's build with its licence, both written by `scripts/list-crate-licences.ps1`. `licenses/README.md` says where each text came from and when to refresh them. |
+| `packaging/linux/` | `tain.desktop`, which goes in the Linux tarball with the logo as `tain.svg`. Its name has to match `gui::APP_ID`, because that is how a Wayland desktop finds the window's icon. See `docs/linux.md`. |
 | `tain-core/ffmpeg/` | The libavcodec shim, compiled only when ffmpeg is present. |
 
 ## Dependencies

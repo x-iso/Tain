@@ -1,12 +1,19 @@
-# Builds tain.exe for a `v*` tag and attaches it, with its SHA-256, to that
-# tag's GitHub Release. Pushing the tag runs it; so does running it by hand
-# (Actions → Release → Run workflow) with the tag chosen, which is how to redo
-# a release's exe. Run by hand on a branch instead, it builds the same exe and
-# keeps it as a workflow artifact, so all of this can be tried without a tag.
+# Builds tain.exe and the Linux tarball for a `v*` tag and attaches both, with
+# their SHA-256s, to that tag's GitHub Release. Pushing the tag runs it; so does
+# running it by hand (Actions → Release → Run workflow) with the tag chosen,
+# which is how to redo a release's binaries. Run by hand on a branch instead, it
+# builds the same files and keeps them as workflow artifacts, so all of this can
+# be tried without a tag.
 #
 # What decides it is the ref, not the event: a manual run is never a push,
 # even when started from a tag, and the first version keyed on the event and
 # so would not attach a manual run's exe to anything.
+#
+# Three jobs. `windows` and `linux` build side by side and each keeps what it
+# built as an artifact of the run; `publish` waits for both and is the only one
+# that touches the release. One job attaching, rather than each attaching its
+# own, is what stops two of them racing to create the same release — and it
+# means a release never goes out with one platform missing.
 #
 # A local build is allowed to be incomplete: without nasm, without ffmpeg or
 # with a stale licence list it still succeeds, and the exe still starts. That
@@ -24,7 +31,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  windows:
     runs-on: windows-latest
     # Free on a public repository; a private one pays for Windows minutes at
     # twice the Linux rate. A cold build fits well inside this either way, and
@@ -178,18 +185,26 @@ jobs:
         run: cargo fetch --locked --target x86_64-pc-windows-msvc
 
       # licenses/rust-crates.txt is compiled into the exe and shown under
-      # Settings → About. Regenerated from this Cargo.lock it has to come out
-      # unchanged, or the release lists crates other than the ones it contains.
-      # Windows PowerShell, which is what made the committed copy, so that a
-      # difference means Cargo.lock and never the shell's sort rules.
-      - name: Check the crate licence list is current
+      # Settings → About, and licenses/rust-crates-linux.txt into the Linux
+      # binary. Regenerated from this Cargo.lock they have to come out
+      # unchanged, or a release lists crates other than the ones it contains.
+      # Windows PowerShell, which is what made the committed copies, so that a
+      # difference means Cargo.lock and never the shell's sort rules. Both are
+      # checked here, so the Linux job needs no PowerShell.
+      - name: Check the crate licence lists are current
         shell: powershell
         run: |
           & .\scripts\list-crate-licences.ps1
-          $changed = git status --porcelain -- licenses/rust-crates.txt Cargo.lock
-          if ($changed) {
-            Write-Output '::error file=licenses/rust-crates.txt::licenses/rust-crates.txt does not match Cargo.lock. Run scripts/list-crate-licences.ps1 and commit what it writes.'
-            git --no-pager diff -- licenses/rust-crates.txt Cargo.lock
+          $lists = @('licenses/rust-crates.txt', 'licenses/rust-crates-linux.txt')
+          $failed = $false
+          foreach ($path in ($lists + 'Cargo.lock')) {
+            if (git status --porcelain -- $path) {
+              Write-Output "::error file=$path::$path does not match Cargo.lock. Run scripts/list-crate-licences.ps1 and commit what it writes."
+              $failed = $true
+            }
+          }
+          if ($failed) {
+            git --no-pager diff -- $lists Cargo.lock
             exit 1
           }
 
@@ -247,40 +262,257 @@ jobs:
           $hash = (Get-FileHash dist\tain.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           # The format `sha256sum -c` reads.
           [IO.File]::WriteAllText("$PWD\dist\tain.exe.sha256", "$hash  tain.exe`n")
-          Add-Content -Path $env:GITHUB_ENV -Value "TAIN_SHA256=$hash"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "``tain.exe`` SHA-256: ``$hash``"
           Write-Output "tain.exe, $((Get-Item dist\tain.exe).Length) bytes, SHA-256 $hash"
 
-      - name: Keep the exe from a branch build
-        if: github.ref_type != 'tag'
+      # Kept from every run, a tag's included: `publish` picks it up from here.
+      # A branch build's is the deliverable itself.
+      - name: Keep the exe
         uses: actions/upload-artifact@v7
         with:
-          name: tain-${{ github.sha }}
+          name: tain-windows-${{ github.sha }}
           path: dist/
           if-no-files-found: error
           retention-days: 7
 
+  linux:
+    # # Why a container, and why this one
+    #
+    # A Linux binary runs on any glibc at least as new as the one it was linked
+    # against, and on nothing older. So the glibc it is built with is the
+    # oldest distribution it supports, and that has to be chosen rather than
+    # inherited from whatever the runner image happens to be. GitHub's own
+    # ubuntu-22.04 image began its deprecation in September 2026; the
+    # ubuntu:22.04 container does not go away with it.
+    #
+    # Ubuntu 22.04 is glibc 2.35, which covers Ubuntu 22.04 and later, Debian
+    # 12 and later, every supported Fedora (and so Bazzite), current Arch and
+    # SteamOS, openSUSE Tumbleweed and Leap 16, and RHEL 10. It leaves out
+    # RHEL 9 and its rebuilds (2.34). docs/linux.md has the reasoning; raising
+    # this is a decision, so GLIBC_FLOOR below must move with it.
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    timeout-minutes: 60
+    env:
+      # The newest glibc symbol version the binary may ask for. Checked after
+      # the build, so a change of container cannot quietly raise it.
+      GLIBC_FLOOR: '2.35'
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # git before checkout, or the checkout action falls back to downloading a
+      # tarball with no repository in it, and the byte-for-byte check below has
+      # nothing to compare against. No -dev packages: every desktop library the
+      # binary uses (Wayland, X11, xkbcommon, EGL, GL) is opened at run time,
+      # not linked, so none of them is needed to build it. nasm for OpenH264's
+      # assembly; see the Windows job for what happens without it.
+      - name: Install the build tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get -o Acquire::Retries=3 update
+          apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+            build-essential binutils nasm git curl ca-certificates
+          nasm -v
+          gcc --version | head -1
+          ldd --version | head -1
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The workspace belongs to the runner's user and this container runs as
+      # root, which git refuses to work in without being told it is expected.
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Nothing configures a conversion here, so this is expected to pass. It
+      # is the same promise as the Windows job's, checked the same way, so both
+      # binaries are known to be built from exactly the committed bytes.
+      - name: Check the checkout is byte-for-byte the commit
+        run: |
+          changed=0
+          count=0
+          while IFS= read -r -d '' entry; do
+            read -r mode blob _ <<< "${entry%%$'\t'*}"
+            path=${entry#*$'\t'}
+            case "$mode" in 100644|100755) ;; *) continue ;; esac
+            count=$((count + 1))
+            if [ "$(git hash-object --no-filters -- "$path")" != "$blob" ]; then
+              echo "::error::$path differs from the commit after checkout."
+              changed=1
+            fi
+          done < <(git ls-files --stage -z)
+          [ "$changed" -eq 0 ] || exit 1
+          echo "$count files match the commit byte for byte."
+
+      - name: Install stable Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf --retry 3 https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustc" --version
+          "$HOME/.cargo/bin/cargo" --version
+
+      # The tag is checked against Cargo.toml by the Windows job, and `publish`
+      # waits for it, so a mismatch stops the release without a second check.
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Fetch crates as Cargo.lock pins them
+        run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+
+      - name: Build tain
+        run: |
+          set -o pipefail
+          cargo build --release --locked -p tain-cli 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # The same two checks as the Windows job. There is no ffmpeg in the Linux
+      # build yet, so tain-core's build script has nothing to warn about there,
+      # and any warning it does print is something missing.
+      - name: Check nothing was left out of the build
+        run: |
+          failed=0
+          while IFS= read -r line; do
+            echo "::error::$line"
+            failed=1
+          done < <(grep '^warning: tain-core@' "$RUNNER_TEMP/build.log")
+
+          runs=()
+          for dir in target/release/build/openh264-sys2-*/; do
+            [ -f "$dir/output" ] && runs+=("$dir")
+          done
+          if [ "${#runs[@]}" -eq 0 ]; then
+            echo '::error::Found no OpenH264 build output to check for nasm.'
+            failed=1
+          fi
+          for dir in "${runs[@]}"; do
+            if grep -qF -e 'not using any assembly' -e 'NASM compilation disabled' "$dir/output" \
+              || [ ! -f "$dir/out/cpuid.o" ]; then
+              echo "::error::OpenH264 ($(basename "$dir")) was built without nasm: no SIMD kernels, about 17x slower encoding."
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      # # What the binary may need from the machine it runs on
+      #
+      # Linked: the C and C++ runtimes, which every distribution has. Anything
+      # else in NEEDED is a library somebody's machine might not have, and it
+      # would stop the binary before main() with a loader error rather than a
+      # message. The desktop libraries are opened at run time instead, so a
+      # missing one is an error the program can report.
+      #
+      # And no glibc symbol newer than GLIBC_FLOOR, weak ones included: the
+      # loader refuses a missing version whether or not the symbol is used.
+      - name: Check what the binary needs at run time
+        run: |
+          bin=target/release/tain
+          failed=0
+          allowed=' libc.so.6 libm.so.6 libgcc_s.so.1 libstdc++.so.6 ld-linux-x86-64.so.2 libdl.so.2 libpthread.so.0 librt.so.1 '
+          needed=$(readelf -d "$bin" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+          for lib in $needed; do
+            case "$allowed" in
+              *" $lib "*) ;;
+              *) echo "::error::tain links $lib, which is not in every distribution. Open it at run time instead."; failed=1 ;;
+            esac
+          done
+          newest=$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -V | tail -1)
+          if [ "$(printf '%s\n' "$GLIBC_FLOOR" "$newest" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::tain asks for glibc $newest, newer than the $GLIBC_FLOOR it promises."
+            failed=1
+          fi
+          {
+            echo "Linux \`tain\`: $(stat -c %s "$bin") bytes, glibc $newest or later"
+            echo
+            echo "Linked: $(echo $needed | sed 's/ /, /g')"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "NEEDED: $needed"
+          echo "Newest glibc symbol version: $newest"
+          exit "$failed"
+
+      # A tarball rather than the bare binary: it keeps the executable bit
+      # through a browser download, and carries the .desktop file and icon a
+      # desktop needs to show the window as Tain. docs/linux.md has the three
+      # commands that install it under ~/.local.
+      #
+      # Ordered, owned by nobody in particular and dated to the commit, so the
+      # same binary makes the same archive.
+      - name: Package and hash the tarball
+        run: |
+          stage="$RUNNER_TEMP/stage/tain"
+          mkdir -p "$stage" dist
+          install -m 755 target/release/tain "$stage/tain"
+          install -m 644 packaging/linux/tain.desktop "$stage/tain.desktop"
+          install -m 644 tain-cli/assets/logo.svg "$stage/tain.svg"
+          install -m 644 LICENSE "$stage/LICENSE"
+          epoch=$(git log -1 --format=%ct)
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
+            -C "$RUNNER_TEMP/stage" -cf - tain | gzip -9n > dist/tain-x86_64-linux.tar.gz
+          (cd dist && sha256sum tain-x86_64-linux.tar.gz > tain-x86_64-linux.tar.gz.sha256)
+          hash=$(cut -d' ' -f1 dist/tain-x86_64-linux.tar.gz.sha256)
+          bin_hash=$(sha256sum target/release/tain | cut -d' ' -f1)
+          {
+            echo
+            echo "\`tain-x86_64-linux.tar.gz\` SHA-256: \`$hash\`"
+            echo
+            echo "\`tain\` inside it SHA-256: \`$bin_hash\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          tar -tvzf dist/tain-x86_64-linux.tar.gz
+          echo "SHA-256 $hash"
+
+      - name: Keep the tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: tain-linux-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: tain-*-${{ github.sha }}
+          merge-multiple: true
+          path: dist
+
       # A release published by hand before the tag was pushed keeps its notes;
-      # only the exe is replaced, and the hash goes beside it as a file. One
-      # this creates gets the hash in its notes as well.
+      # only the binaries are replaced, and the hashes go beside them as files.
+      # One this creates gets the hashes in its notes as well.
       - name: Attach to the release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          $ErrorActionPreference = 'Continue'
-          $tag = $env:GITHUB_REF_NAME
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag dist\tain.exe dist\tain.exe.sha256 --clobber
-          } else {
-            $notes = Join-Path $env:RUNNER_TEMP 'notes.md'
-            @(
-              "SHA-256 of ``tain.exe``: ``$env:TAIN_SHA256``"
-              ''
-              "Built from $env:GITHUB_SHA by $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
-            ) | Set-Content -Path $notes -Encoding utf8
-            gh release create $tag dist\tain.exe dist\tain.exe.sha256 --verify-tag --title "Tain $($tag.TrimStart('v'))" --notes-file $notes
-          }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          tag="$GITHUB_REF_NAME"
+          files=(
+            dist/tain.exe dist/tain.exe.sha256
+            dist/tain-x86_64-linux.tar.gz dist/tain-x86_64-linux.tar.gz.sha256
+          )
+          ls -l "${files[@]}"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            notes="$RUNNER_TEMP/notes.md"
+            {
+              echo "SHA-256 of \`tain.exe\`: \`$(cut -d' ' -f1 dist/tain.exe.sha256)\`"
+              echo
+              echo "SHA-256 of \`tain-x86_64-linux.tar.gz\`: \`$(cut -d' ' -f1 dist/tain-x86_64-linux.tar.gz.sha256)\`"
+              echo
+              echo "Built from $GITHUB_SHA by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            } > "$notes"
+            gh release create "$tag" "${files[@]}" --verify-tag --title "Tain ${tag#v}" --notes-file "$notes"
+          fi

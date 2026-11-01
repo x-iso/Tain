@@ -2932,3 +2932,59 @@ when the answer changes. A new session draws the border already, which means a
 host that keeps it never calls the setter at all — on Windows 10, where calling
 it always fails, that is the difference between saying nothing and logging a
 refusal four times a second.
+
+## The Linux Build Links Nothing It Cannot Count On
+
+**Decision**: the release builds the Linux binary in an `ubuntu:22.04`
+container, and refuses one that links anything beyond the C and C++ runtimes or
+asks for a glibc newer than 2.35 (`GLIBC_FLOOR` in the workflow). Every desktop
+library — Wayland, X11, xkbcommon, EGL, GL — is opened at run time by the crates
+that use it, and anything Linux gains later (VA-API, PulseAudio, PipeWire,
+FFmpeg) has to be opened the same way.
+
+**Why the container**: a Linux binary runs on the glibc it was linked against
+and newer, never older, so the build machine's glibc *is* the support floor.
+Inheriting it from GitHub's runner image would raise the floor whenever GitHub
+moved the image — and `ubuntu-22.04` began its deprecation in September 2026.
+The container is a choice written down; the runner is not. 2.35 covers Ubuntu
+22.04, Debian 12, every supported Fedora and its derivatives, and current Arch
+and SteamOS. RHEL 9 (2.34) is the notable exclusion.
+
+**Why nothing linked**: a missing linked library fails in the loader, before
+`main`, with a message nobody launching from a menu sees — the Linux form of the
+missing-DLL error box `ffmpeg_runtime` exists to prevent. A library opened at
+run time fails as an error the program can report. That is the same reason
+FFmpeg is delay-loaded on Windows, and Linux has no delay loading, so the FFmpeg
+work for Linux will have to resolve its functions by name.
+
+**Gotcha — a build script's `cfg!` is the wrong machine**: `tain-core/build.rs`
+skipped ffmpeg with `if !cfg!(target_os = "windows")`, which describes the
+machine running the build script, not the target. It worked for native builds
+and was wrong for cross-compiles, and it hid a second bug: `cc` and `zstd` were
+`cfg(windows)` build-dependencies, so on Linux the build script itself did not
+compile. Both build scripts now read `CARGO_CFG_TARGET_OS`, and the two crates
+are ordinary build-dependencies — already in the tree through `openh264-sys2`
+and `zstd-sys`, so nothing new is downloaded.
+
+**Gotcha — a Windows-only build stops compiling for anything else, silently**:
+nothing had built for Linux in a while, and three things had broken without
+anyone seeing: `capture_nv12` was compiled everywhere though it is D3D11
+throughout, two `cfg` attributes in `network_bridge` had slid onto the wrong
+match arms, and `FrameBuffer::gpu` named a type that exists only with ffmpeg on
+Windows (now `GpuPicture`, which has no values elsewhere). The release job
+building Linux on every run is what keeps it from drifting again.
+
+**Gotcha — "implemented" meant "implemented on Windows"**: H.265 and AV1 were
+`Availability::Available` everywhere, so a Linux guest's settings offered codecs
+it could neither encode nor decode, and `every_available_codec_has_a_decoder`
+failed the first time the suite ran on Linux. They are available on Windows
+only now. The deeper gap is that the host picks the codec without asking the
+guest; see "The codec gap" in `docs/linux.md`.
+
+**Gotcha — the licence list is per platform**: `--filter-platform` was always
+the right walk, but for one target. A Linux build showing the Windows list would
+have listed `windows-rs` and 46 other Windows-only crates, and left out the 105
+Wayland, X11, D-Bus and netlink crates it actually contains.
+`list-crate-licences.ps1` writes both lists in one run, so the Windows job
+checks both with the same shell, and `licenses.rs` compiles the FFmpeg, Opus,
+driver and `windows-rs` entries into the Windows build only.

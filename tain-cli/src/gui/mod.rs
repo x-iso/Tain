@@ -26,3 +26,12 @@ pub mod title_bar;
 pub mod touch;
 
 pub use app::{init_host_server, init_prober, AppState, GuestApp};
+
+/// The application id every Tain window carries.
+///
+/// A Wayland desktop finds a window's icon and taskbar entry by matching this
+/// against the name of an installed `.desktop` file, because the icon
+/// `with_icon` sets is X11 and Windows only — winit has no Wayland way to hand
+/// one over. So this has to stay the same as `packaging/linux/tain.desktop`.
+/// Read on Linux only; Windows ignores it.
+pub const APP_ID: &str = "tain";

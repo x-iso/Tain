@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Tain
+GenericName=Remote Desktop
+Comment=Peer-to-peer remote desktop
+Exec=tain
+Icon=tain
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;p2p;screen;share;
+StartupNotify=true
+StartupWMClass=tain

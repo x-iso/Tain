@@ -10,6 +10,7 @@ the code and the tests win.
 | [structure.md](structure.md) | Every module, what it is for, and where to look first |
 | [architecture/overview.md](architecture/overview.md) | How a connection is made and approved, what crosses the wire, how quality is decided, what is captured, and what answers with the app closed |
 | [decisions.md](decisions.md) | Why things are the way they are, and what each change cost to learn |
+| [linux.md](linux.md) | What the Linux build does and needs, how to test it, and what matching Windows would take |
 
 ## How to use it
 

@@ -362,4 +362,10 @@ required, and approval still applies.
 | Zero-copy display | `WGL_NV_DX_interop2`, opt-in | — |
 | Audio | WASAPI loopback + Opus | — |
 | Input injection | `SendInput`, `InjectTouchInput` | log-only stubs |
+| Software video (OpenH264), lossless and raw | ✅ | ✅ |
 | Networking, protocol, adaptive control, localisation | ✅ | ✅ |
+
+Linux is built and released, as a guest of Windows hosts; macOS is not built at
+all. What the Linux build needs, and the choice of technology for each missing
+row above (portals and PipeWire, VA-API, libei), are in
+[../linux.md](../linux.md).

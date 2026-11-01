@@ -317,6 +317,7 @@ async fn main() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Tain")
+            .with_app_id(gui::APP_ID)
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size(gui::theme::MIN_WINDOW_SIZE)
             // The mark identifies the app in the native title bar and taskbar,

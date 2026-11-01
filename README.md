@@ -4,7 +4,9 @@ A peer-to-peer remote desktop application built in Rust, using [iroh](https://ir
 
 Tain runs on Windows. The protocol, networking, passcodes and adaptive controller
 build anywhere, but capture, encoding, audio and input injection are Windows-only
-for now.
+for now. A **Linux build** ships with each release as a preview: a guest that
+connects to Windows hosts. What it needs and what it lacks are in
+[docs/linux.md](docs/linux.md).
 
 ## Features
 
@@ -244,7 +246,8 @@ work and is unusable, and the symptoms all point at the network.
 winget install NASM.NASM
 ```
 
-(`brew install nasm` on macOS, `apt install nasm` on Debian/Ubuntu.)
+(`brew install nasm` on macOS, `apt install nasm` on Debian/Ubuntu,
+`dnf install nasm` on Fedora.)
 
 The winget package does not add itself to `PATH`. Either put `nasm` on `PATH`, or
 copy `.cargo/config.toml.example` to `.cargo/config.toml` and point it at your
@@ -272,6 +275,15 @@ first use.
 Set `FFMPEG_DIR` to build against a different shared build. Without one at all
 the build still succeeds and still decodes, through Media Foundation instead of
 D3D11VA, but has no audio.
+
+### On Linux
+
+The same `cargo build`, with a C and C++ compiler and `nasm`, and no `-dev`
+packages: the binary links only the C and C++ runtimes and opens every desktop
+library at run time. There is no ffmpeg in a Linux build yet, so it decodes on
+the processor and has no sound. [docs/linux.md](docs/linux.md) has the
+per-distribution commands, how to build on an immutable system like Bazzite,
+and what the binary needs from the machine it runs on.
 
 ### Tests
 
@@ -332,8 +344,9 @@ numbers are dominated by unoptimised pixel loops.
 
 A release is a pushed `v*` tag, and nothing is built locally.
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds `tain.exe`
-on GitHub's Windows runner and attaches it, with its SHA-256 beside it, to that
-tag's release. If there is no release yet, it creates one.
+on GitHub's Windows runner and `tain-x86_64-linux.tar.gz` in an Ubuntu 22.04
+container, and once both have succeeded attaches them, each with its SHA-256
+beside it, to that tag's release. If there is no release yet, it creates one.
 
 1. Bump `version` under `[workspace.package]` in `Cargo.toml`. That is the number
    Settings shows, and the workflow refuses a tag that disagrees with it.
@@ -341,16 +354,16 @@ tag's release. If there is no release yet, it creates one.
    today. Every change adds its own entry as it is committed, under the version
    in `Cargo.toml` until that version is tagged, so the section should already
    cover everything since the last release.
-3. Regenerate the crate licence list. It is compiled into the binary, and the
-   workflow fails if it does not match `Cargo.lock`:
+3. Regenerate the crate licence lists, one per platform. They are compiled into
+   the binaries, and the workflow fails if either does not match `Cargo.lock`:
 
    ```powershell
    .\scripts\list-crate-licences.ps1
    ```
 
-4. Commit `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md` and
-   `licenses/rust-crates.txt` on `main`. The version is in `Cargo.lock` too, and
-   the release builds with `--locked`.
+4. Commit `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`,
+   `licenses/rust-crates.txt` and `licenses/rust-crates-linux.txt` on `main`.
+   The version is in `Cargo.lock` too, and the release builds with `--locked`.
 5. Tag that commit and push the tag:
 
    ```bash
@@ -360,13 +373,14 @@ tag's release. If there is no release yet, it creates one.
 
 The job stops rather than ship an exe that only looks complete. It fails without
 `nasm`, without ffmpeg in the checkout, with any file checked out differently
-from how it was committed, or on any warning from `tain-core`'s build script. A
-release published by hand before the tag keeps its notes, and only the exe on it
-is replaced.
+from how it was committed, or on any warning from `tain-core`'s build script.
+The Linux job also fails if the binary links any library beyond the C and C++
+runtimes, or asks for a glibc newer than 2.35. A release published by hand
+before the tag keeps its notes, and only the binaries on it are replaced.
 
 To try it without cutting a tag, run **Release** from the Actions tab with **Run
-workflow**, on `main`. The exe comes back as a workflow artifact, kept for a
-week, and no release is touched. A run on `main` is also the only kind that
+workflow**, on `main`. The exe and the tarball come back as workflow artifacts,
+kept for a week, and no release is touched. A run on `main` is also the only kind that
 saves the build cache, which is what the next tag's build starts from.
 
 ## Usage
@@ -815,6 +829,7 @@ decode and display-driver paths are tested on the hardware that has them.
 | Localisation | ✅ Works | English and Russian; a test fails on any key the catalogue lacks |
 | Settings | ✅ Works | Persisted to JSON; unknown or bad fields fall back without losing the rest |
 | CLI subcommands | ❌ Not wired | `host.rs` / `guest.rs` are not compiled in |
+| Linux | 🧪 Preview | A guest of Windows hosts on H.264, decoded on the processor, no sound. Hosting streams a test pattern. See [docs/linux.md](docs/linux.md) |
 
 ## Roadmap / Next Steps
 

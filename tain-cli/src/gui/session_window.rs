@@ -393,6 +393,7 @@ impl SessionWindow {
         let builder = self.title_bar.builder(
             egui::ViewportBuilder::default()
                 .with_title(title.clone())
+                .with_app_id(super::APP_ID)
                 .with_inner_size([1280.0, 760.0])
                 .with_min_inner_size([480.0, 320.0]),
         );
