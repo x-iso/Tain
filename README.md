@@ -586,7 +586,7 @@ edge. The middle 60% is a dead zone so the view does not drift while you work.
 | Section | What is in it |
 |---------|---------------|
 | This PC | The name shown to the other machine: anonymous, your user name, the network name, or one you choose |
-| Hosting | Codec, encoder backend, which GPU encodes, H.264 profile, resolution and frame-rate ceilings, what to give up when behind, rate control, bitrate limit, whether the pointer is drawn into frames |
+| Hosting | Codec, encoder backend, which GPU encodes, H.264 profile, resolution and frame-rate ceilings, what to give up when behind, rate control, bitrate limit, whether the pointer is drawn into frames, and where Windows draws its yellow capture border |
 | Audio | Opus bitrate, and applications to leave out of the stream — a voice chat, say |
 | Virtual display | Installing the driver, adding and removing displays, their size, and whether one follows the guest's resolution |
 | Unattended access | Installing the service, and whether it answers when nobody is signed in |
@@ -615,6 +615,13 @@ with thumbnails. The guest sees one at a time, can switch between them, or can
 see them all tiled. The pointer maps through the window, and the guest is told
 when a window is minimised or closed instead of being left looking at a frozen
 picture.
+
+Windows outlines a shared window in yellow on the host's screen. Guests never
+see it, and the host chooses whether it shows, in Settings → Hosting → *Capture
+border*: always, which is Windows' own behaviour; around ordinary windows but not
+a game or video filling the screen, borderless or exclusive; or never. Turning it
+off needs Windows 11, and Windows can forbid it under Privacy & security →
+Screenshot borders. The choice reaches sessions already running.
 
 The host can change what a guest sees in the middle of a session, from the
 guest's card, without the guest reconnecting.

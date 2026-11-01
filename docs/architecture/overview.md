@@ -195,9 +195,11 @@ nothing inside the process can move it.
 
 The compositor delivers frames onto whichever device it is given, so it has no
 such rule, and it is what those machines fall back to. It is not the only path
-because it costs something everywhere else: a yellow capture border on Windows
-10, and frames on the compositor's schedule rather than the moment the desktop
-changes. `TAIN_CAPTURE=wgc` forces it, to compare the two on a machine where
+because it costs something everywhere else: a yellow capture border on the
+host's screen, and frames on the compositor's schedule rather than the moment the
+desktop changes. Windows 11 can leave the border off, and the host chooses
+whether it does — always, for windows that fill their screen, or never. See
+`screen_capture::CaptureBorder`. `TAIN_CAPTURE=wgc` forces it, to compare the two on a machine where
 duplication works.
 
 An earlier version answered the two-chip case by writing a per-application

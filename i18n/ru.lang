@@ -812,6 +812,25 @@ VP9
 [rate.quality_detail]
 Задайте качество, а канал подстроится — возможны всплески
 
+[border.show]
+Всегда показывать
+
+[border.show_detail]
+Как делает сама Windows: жёлтая рамка вокруг всего, что транслируется
+
+[border.hide_fullscreen]
+Скрывать для полноэкранных приложений
+
+[border.hide_fullscreen_detail]
+Без рамки поверх игры или видео на весь экран, в том числе в окне без рамок.
+Вокруг обычного окна она остаётся.
+
+[border.hide]
+Никогда не показывать
+
+[border.hide_detail]
+Без рамки вокруг всего, что транслирует этот ПК
+
 [profile.baseline]
 Baseline
 
@@ -930,6 +949,22 @@ High
 
 [settings.video.include_pointer]
 Включать указатель в кадры
+
+[settings.video.capture_border]
+Рамка захвата
+
+[settings.video.capture_border_hint]
+Жёлтая рамка, которую Windows рисует на этом ПК вокруг транслируемого окна, а на
+немногих ПК, где экран нельзя передать обычным способом, — и вокруг всего экрана.
+Гости её не видят.
+
+[settings.video.border_needs_windows_11]
+Эта версия Windows рисует рамку при любом выборе. Чтобы её отключить, нужна
+Windows 11.
+
+[settings.video.border_refused]
+Windows не разрешает Tain отключить рамку. Это разрешается в параметрах Windows,
+в разделе «Конфиденциальность и защита».
 
 [settings.video.summary_full]
 Экран хоста {w}×{h} — вплоть до полного разрешения при {fps} к/с

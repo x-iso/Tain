@@ -1111,8 +1111,8 @@ changes, draws no capture border, and reports the pointer separately so the
 guest can draw it locally at its own frame rate. WGC gives up all three:
 
 - **The capture border.** A yellow rectangle around the captured screen.
-  `SetIsBorderRequired(false)` removes it, and only on Windows 11 21H2 and
-  later.
+  Windows 11 can leave it off, and whether it does is now the host's choice —
+  see **The Capture Border Is the Host's Choice**.
 - **The compositor's schedule**, not the desktop's — one more hop and one more
   buffer.
 - **No pointer metadata.** WGC can bake the cursor in or leave it out and offers
@@ -2870,3 +2870,57 @@ never recorded as held. Otherwise it is Windows', `GetAsyncKeyState`, because
 egui's flag in this immediate viewport is not dependable — see `key_is_down`.
 The reminder also asks Windows whether the session window is in front, so a
 modifier held in another application brings up nothing.
+
+## The Capture Border Is the Host's Choice
+
+**Decision**: Settings → Hosting has *Capture border*: *Always show*, *Hide for
+fullscreen apps*, or *Never show* (`screen_capture::CaptureBorder`). It is
+applied to the whole process with the rest of the host's settings, through
+`HostServer::set_session_config` into `capture_wgc::set_border`, and every
+compositor capture looks at it again four times a second — so a change reaches
+sessions already running, and "hide for fullscreen" follows a window going
+fullscreen and back without the capture being rebuilt.
+
+**Why a choice and not a fix**: the border is Windows saying that something is
+being captured, on the screen of the person it is being captured from. Around a
+window on an ordinary desktop that is a fair thing to say; around a game filling
+the screen it is a yellow line across the edge of the picture somebody is
+playing. Neither answer is right for every host, and only the person at that
+machine can decide to take the operating system's signal away, so the default
+is Windows' own: shown.
+
+**What "fullscreen" means here**: there is no flag for it. Exclusive and
+borderless fullscreen are both, from outside the program, a window exactly as
+large as a monitor. So a window counts when its visible extent
+(`DWMWA_EXTENDED_FRAME_BOUNDS`, the same rectangle the compositor captures)
+covers the whole of the monitor `MonitorFromWindow` says it is on — covers
+rather than equals, for games that oversize their window by a pixel. A
+maximised window stops at the taskbar and does not count; over a taskbar that
+hides itself it covers the screen and does. A whole screen captured through the
+compositor fills itself, so it never gets the border under that choice.
+
+**Gotcha — the property alone does nothing**: the code this replaced called
+`SetIsBorderRequired(false)` on every capture, and Windows 11 hosts showed the
+border anyway. Windows only honours that property for an application that
+has first called `GraphicsCaptureAccess::RequestAccessAsync` with
+`Borderless`. Without the request the setter succeeds, nothing is logged, and
+the border stays — so the failure was invisible from inside. OBS and the
+Win32CaptureSample both ask first; `ask_to_capture_without_border` does too,
+once per process. For an unpackaged application the answer comes back
+without a prompt, and is decided by Windows 11's Privacy & security → Screenshot
+borders. Windows honours the property from then on whenever that page allows it,
+so asking once is enough.
+
+**What Windows still overrules**: Windows 10 has no `IsBorderRequired` and draws
+the border whatever is asked; Windows 11 draws it when that privacy page forbids
+desktop apps from turning it off. In both cases asking appears to work. So the
+settings window says so under the choice whenever it is set to hide the border
+and Windows will not — the first from the type's metadata
+(`ApiInformation::IsPropertyPresent`), the second from the answer the capture
+received.
+
+**Why each capture remembers what it asked for**: so the property is set only
+when the answer changes. A new session draws the border already, which means a
+host that keeps it never calls the setter at all — on Windows 10, where calling
+it always fails, that is the difference between saying nothing and logging a
+refusal four times a second.

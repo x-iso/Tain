@@ -791,6 +791,25 @@ Constant quality
 [rate.quality_detail]
 Pick a quality and let bandwidth follow — can spike
 
+[border.show]
+Always show
+
+[border.show_detail]
+What Windows does on its own: a yellow outline around everything shared
+
+[border.hide_fullscreen]
+Hide for fullscreen apps
+
+[border.hide_fullscreen_detail]
+No outline over a game or video filling the screen, borderless or exclusive.
+Shown around an ordinary window.
+
+[border.hide]
+Never show
+
+[border.hide_detail]
+No outline around anything this PC shares
+
 [profile.baseline]
 Baseline
 
@@ -909,6 +928,22 @@ Capture cursor
 
 [settings.video.include_pointer]
 Include the pointer in frames
+
+[settings.video.capture_border]
+Capture border
+
+[settings.video.capture_border_hint]
+The yellow outline Windows draws on this PC around a window being shared — and
+around a whole screen, on the few PCs that cannot share one the usual way.
+Guests never see it.
+
+[settings.video.border_needs_windows_11]
+This version of Windows draws the outline whatever is chosen here. Turning it
+off needs Windows 11.
+
+[settings.video.border_refused]
+Windows is not letting Tain turn the outline off. Allow it in Windows Settings,
+under Privacy & security > Screenshot borders.
 
 [settings.video.summary_full]
 Host display {w}×{h} — up to full resolution at {fps} fps

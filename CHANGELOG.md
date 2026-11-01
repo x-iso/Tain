@@ -5,6 +5,19 @@ All notable changes to Tain are documented here. This project adheres to
 
 ## [0.4.2] - 2026-10-31
 
+### Added
+
+- **Choose whether Windows outlines what you share.** Windows draws a yellow
+  border on the host's screen around a window being shared, and around a whole
+  screen on the few PCs that can't share one the usual way. Guests never see
+  it. Settings → Hosting has *Capture border*: *Always show*, as before; *Hide
+  for fullscreen apps*, which leaves it off a game or video filling the screen,
+  borderless or exclusive, and keeps it around ordinary windows; or *Never
+  show*. It changes sessions that are already running, and follows a window
+  going fullscreen and back. Turning the border off needs Windows 11, and
+  Windows lets you forbid it under Privacy & security → Screenshot borders;
+  Settings says when either is keeping it on.
+
 ### Fixed
 
 - **Excluded apps stay out from the first connection.** The first guest to

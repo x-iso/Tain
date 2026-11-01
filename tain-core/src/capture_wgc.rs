@@ -27,10 +27,10 @@
 //! Two costs, both real:
 //!
 //! - **The capture border.** WGC draws a yellow rectangle around what it
-//!   captures. [`GraphicsCaptureSession::SetIsBorderRequired`] removes it, and
-//!   only on Windows 11 21H2 and later — on Windows 10 the person being
-//!   streamed watches a yellow box around their screen for as long as the
-//!   session lasts.
+//!   captures. Whether it does is the host's choice — see
+//!   [`super::screen_capture::CaptureBorder`] and [`set_border`] — but only on
+//!   Windows 11 and later. On Windows 10 the person being streamed watches a
+//!   yellow box around their screen for as long as the session lasts.
 //! - **It is DWM's schedule, not ours.** Duplication hands over a frame the
 //!   moment the desktop changes; a frame pool delivers what the compositor
 //!   produced, which is one more hop and one more buffer.
@@ -51,16 +51,35 @@
 //!
 //! A frame must be closed before the next one is asked for, or the pool runs
 //! out of buffers and stops delivering. That is what [`Frame`] is for.
+//!
+//! # Turning the border off takes two steps, not one
+//!
+//! `SetIsBorderRequired(false)` on its own *succeeds and does nothing*.
+//! Windows only honours it for an application that has first asked for
+//! borderless capture with `GraphicsCaptureAccess::RequestAccessAsync` — and
+//! without that it accepts the value, returns success, and carries on drawing
+//! the border. That is what this module did until the host was given a choice
+//! about it: it set the property on every capture, logged nothing, and Windows
+//! 11 hosts showed the border anyway. OBS and the Win32CaptureSample both ask
+//! first; see [`ask_to_capture_without_border`].
+//!
+//! The property can also be changed while a capture runs, and takes effect
+//! immediately. That is what lets "hide when fullscreen" follow a window that
+//! goes fullscreen and back without the capture being rebuilt.
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::{debug, info, warn};
 use windows::core::Interface;
 
-use super::screen_capture::{PixelFormat, QualityScale, ScreenCaptureBackend, ScreenFrame};
+use super::screen_capture::{
+    CaptureBorder, PixelFormat, QualityScale, ScreenCaptureBackend, ScreenFrame,
+};
 
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    Direct3D11CaptureFramePool, GraphicsCaptureAccess, GraphicsCaptureAccessKind,
+    GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
@@ -77,6 +96,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
 
 /// How many buffers the compositor may queue for us.
 ///
@@ -91,6 +111,155 @@ const BUFFERS: i32 = 2;
 /// has nothing to draw until something moves, so the picture is re-sent
 /// occasionally to cover a lost frame or a late arrival.
 const REFRESH_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How often a capture looks again at whether its border should be showing.
+///
+/// Often enough that a game going fullscreen loses its border by the time
+/// anybody looks for it, and rarely enough to cost nothing: the look is a few
+/// window-manager queries, in a loop that asks for frames far more often.
+const BORDER_RECHECK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The host's [`CaptureBorder`], for every capture in the process.
+///
+/// One value for the process rather than one per session, because a capture
+/// is shared: two guests watching one window are watching one capture, and it
+/// has one border. Every capture reads it again each [`BORDER_RECHECK`], so a
+/// change reaches the ones already running.
+static BORDER: AtomicU8 = AtomicU8::new(0);
+
+/// Choose where captures through the compositor draw the border.
+///
+/// Called by [`super::network::HostServer::set_session_config`] with the rest
+/// of the host's settings.
+pub fn set_border(policy: CaptureBorder) {
+    let value = match policy {
+        CaptureBorder::Show => 0,
+        CaptureBorder::HideWhenFullscreen => 1,
+        CaptureBorder::Hide => 2,
+    };
+    BORDER.store(value, Ordering::Relaxed);
+}
+
+/// The choice last made with [`set_border`].
+pub fn border() -> CaptureBorder {
+    match BORDER.load(Ordering::Relaxed) {
+        1 => CaptureBorder::HideWhenFullscreen,
+        2 => CaptureBorder::Hide,
+        _ => CaptureBorder::Show,
+    }
+}
+
+/// What Windows said when asked whether this process may capture without the
+/// border.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderConsent {
+    /// Not asked yet, because nothing in this process has wanted it off.
+    NotAsked,
+    /// Allowed: a border turned off stays off.
+    Allowed,
+    /// Refused, by the user or by policy. The border is drawn whatever a
+    /// capture asks for, until that changes in Windows' own settings.
+    Refused,
+}
+
+static CONSENT: AtomicU8 = AtomicU8::new(0);
+
+/// What Windows answered the last time it was asked; see [`BorderConsent`].
+///
+/// For the settings window, which would otherwise offer a choice that Windows
+/// is quietly overruling.
+pub fn border_consent() -> BorderConsent {
+    match CONSENT.load(Ordering::Relaxed) {
+        1 => BorderConsent::Allowed,
+        2 => BorderConsent::Refused,
+        _ => BorderConsent::NotAsked,
+    }
+}
+
+/// Whether this Windows can turn the border off at all.
+///
+/// False on Windows 10, which has no `IsBorderRequired` and draws the border
+/// whatever it is asked. Looked up in the type's own metadata rather than
+/// inferred from a build number, which is what OBS does too.
+pub fn border_can_be_turned_off() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        use windows::core::HSTRING;
+        windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
+            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
+            &HSTRING::from("IsBorderRequired"),
+        )
+        .unwrap_or(false)
+    })
+}
+
+/// Ask Windows, once per process, to let this one capture without a border.
+///
+/// # Why setting the property is not enough
+///
+/// Because Windows ignores it otherwise. `SetIsBorderRequired(false)` from an
+/// application that has not asked first *succeeds* — no error, nothing logged
+/// — and the border stays. See the module note.
+///
+/// For an application that is not packaged, as Tain is not, the answer comes
+/// back at once and without a prompt; what decides it is the Screenshot
+/// borders page in Windows 11's privacy settings. Once is enough, because
+/// Windows honours the property from then on whenever that page allows it,
+/// including when somebody changes the page while a capture is running.
+///
+/// Blocking, once per process, when the first capture wants the border off —
+/// and for an unpackaged application the answer is already there. Every
+/// caller is a capture being built or run, on a thread `WgcCapturer::of` has
+/// put in the multithreaded apartment, where waiting on a WinRT operation is
+/// allowed.
+fn ask_to_capture_without_border() {
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    ASKED.call_once(|| {
+        let answer =
+            GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
+                .and_then(|asking| asking.get());
+        match answer {
+            Ok(status) if status == AppCapabilityAccessStatus::Allowed => {
+                CONSENT.store(1, Ordering::Relaxed);
+                info!("Windows allows this process to capture without a border");
+            }
+            Ok(status) => {
+                CONSENT.store(2, Ordering::Relaxed);
+                warn!(
+                    "Windows will not let this process turn the capture border off \
+                     (status {}). On Windows 11 that is decided under Settings > \
+                     Privacy & security > Screenshot borders.",
+                    status.0
+                );
+            }
+            // Windows 10, which has no such request to make. Said once, when
+            // the property itself is refused — see `require_border`.
+            Err(e) => debug!("Could not ask Windows to capture without a border: {e}"),
+        }
+    });
+}
+
+/// Ask a capture for the border, or for none.
+///
+/// On Windows 10 the request is always refused, and that is said once per
+/// process rather than once per change, since it is the same fact every time.
+fn require_border(session: &GraphicsCaptureSession, wanted: bool, label: &str) {
+    if !wanted {
+        ask_to_capture_without_border();
+    }
+    match session.SetIsBorderRequired(wanted) {
+        Ok(()) => info!("{label}: capture border {}", if wanted { "on" } else { "off" }),
+        Err(e) => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                info!(
+                    "This Windows draws a capture border around everything it captures \
+                     ({e}). Turning it off needs Windows 11."
+                )
+            });
+        }
+    }
+}
 
 /// Whether this machine can capture this way at all.
 ///
@@ -187,6 +356,19 @@ pub struct WgcCapturer {
     last_emitted: Option<std::time::Instant>,
     /// The display this is for, for the log line and for rebuilding.
     label: String,
+
+    /// The window being captured, or `None` for a whole display — which is
+    /// all the border needs to know, since a display always fills its screen.
+    window: Option<u64>,
+    /// Whether the session was last asked to draw the border.
+    ///
+    /// Starts true, because that is what a new session does. Kept so the
+    /// property is set only when the answer changes, which on Windows 10 —
+    /// where setting it always fails — means never for a host that has left
+    /// the border on.
+    border: bool,
+    /// When [`Self::follow_border`] last looked.
+    border_checked: Option<std::time::Instant>,
 }
 
 // SAFETY: every WinRT and D3D object here is agile or free-threaded — the pool
@@ -319,19 +501,10 @@ impl WgcCapturer {
         // it goes in.
         let _ = session.SetIsCursorCaptureEnabled(true);
 
-        // Windows 11 21H2 and later. On anything older this fails and the
-        // yellow rectangle stays, which is a cost worth paying on a machine
-        // whose alternative is not capturing at all — see the module note.
-        if session.SetIsBorderRequired(false).is_err() {
-            info!(
-                "This Windows draws a capture border around {label}. \
-                 It cannot be turned off before Windows 11 21H2."
-            );
-        }
-
-        session.StartCapture().context("the compositor refused to start capturing")?;
-        info!("Capturing {label} through the compositor at {width}x{height}");
-
+        let window = match target {
+            Target::Window(id) => Some(id),
+            Target::Monitor(_) => None,
+        };
         let mut capturer = Self {
             device,
             context,
@@ -353,9 +526,60 @@ impl WgcCapturer {
             last_frame: None,
             last_emitted: None,
             label,
+            window,
+            border: true,
+            border_checked: None,
         };
         capturer.recompute_output();
+
+        // Settled before the capture starts rather than on its first frame,
+        // or a host that has turned the border off would watch it flash on at
+        // the start of every share.
+        capturer.follow_border();
+
+        capturer
+            .session
+            .StartCapture()
+            .context("the compositor refused to start capturing")?;
+        info!("Capturing {} through the compositor at {width}x{height}", capturer.label);
         Ok(capturer)
+    }
+
+    /// Keep the border the way the host asked for it.
+    ///
+    /// Looked at again every [`BORDER_RECHECK`] rather than only when the
+    /// capture starts, for two reasons: the host can change its mind while
+    /// sessions are running, and under "hide when fullscreen" the answer
+    /// changes whenever the window does — a game switched between a window
+    /// and fullscreen, a video player double-clicked.
+    ///
+    /// Recorded as asked even when Windows refuses, which only Windows 10
+    /// does. Asking again would be refused again, every quarter of a second.
+    fn follow_border(&mut self) {
+        let now = std::time::Instant::now();
+        if self.border_checked.is_some_and(|at| now.duration_since(at) < BORDER_RECHECK) {
+            return;
+        }
+        self.border_checked = Some(now);
+
+        let policy = border();
+        // Measured only when the answer depends on it: under the other two
+        // choices, whether the window fills its screen changes nothing.
+        let fills_screen = policy == CaptureBorder::HideWhenFullscreen && self.fills_screen();
+        let wanted = policy.wanted(fills_screen);
+        if wanted == self.border {
+            return;
+        }
+        require_border(&self.session, wanted, &self.label);
+        self.border = wanted;
+    }
+
+    /// Whether what is captured fills the screen it is on.
+    fn fills_screen(&self) -> bool {
+        match self.window {
+            Some(id) => super::window_capture::fills_its_screen(id),
+            None => true,
+        }
     }
 
     /// Work out what size to emit, from the scale, the ceiling and the encoder.
@@ -543,6 +767,10 @@ impl WgcCapturer {
 
 impl ScreenCaptureBackend for WgcCapturer {
     fn capture_next(&mut self) -> Result<Option<ScreenFrame>> {
+        // Here because this is the one call a running capture is certain to
+        // keep making, frame or no frame.
+        self.follow_border();
+
         // Null rather than an error is how the pool says "nothing yet", and it
         // is the ordinary answer on a still desktop.
         let Ok(raw) = self.pool.TryGetNextFrame() else {

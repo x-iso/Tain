@@ -45,6 +45,7 @@ fn test_config() -> SessionConfig {
         // Off: nobody is sitting at the machine running these, and a developer
         // brushing the mouse would otherwise start dropping the input under test.
         local_input_wins_for: Duration::ZERO,
+        capture_border: Default::default(),
     }
 }
 

@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use tracing::*;
 
 use tain_core::{
-    CaptureConfig, EncodeConfig, EncoderBackend, H264Profile, LatencyPriority, QualityScale,
-    RateControl, SessionConfig, VideoCodec,
+    CaptureBorder, CaptureConfig, EncodeConfig, EncoderBackend, H264Profile, LatencyPriority,
+    QualityScale, RateControl, SessionConfig, VideoCodec,
 };
 
 use super::shortcuts::ShortcutBindings;
@@ -177,6 +177,11 @@ mirror_enum!(ResolutionSetting, QualityScale, {
     Medium => Medium,
     Low => Low,
 }, Native);
+
+mirror_enum!(CaptureBorderSetting, CaptureBorder, {
+    HideWhenFullscreen => HideWhenFullscreen,
+    Hide => Hide,
+}, Show);
 
 /// Deserialize one field, falling back to its default rather than failing.
 ///
@@ -365,6 +370,14 @@ pub struct Settings {
     /// Frames between keyframes. 0 means "only when asked".
     pub keyframe_interval: u32,
     pub show_cursor: bool,
+    /// Where Windows draws its yellow border around what this machine is
+    /// sharing, on this machine's own screen.
+    ///
+    /// Windows' own behaviour by default, which is the border around
+    /// everything. See [`tain_core::CaptureBorder`] for the choices and for
+    /// the two cases where Windows draws it whatever this says.
+    #[serde(default, deserialize_with = "lenient")]
+    pub capture_border: CaptureBorderSetting,
     /// Executables to keep out of the streamed audio, e.g. "Discord.exe".
     ///
     /// Several are supported, but not for free: one exclusion is done by the
@@ -512,6 +525,7 @@ impl Default for Settings {
             encode_quality: 70,
             keyframe_interval: tain_core::KEYFRAME_SECONDS * 60,
             show_cursor: true,
+            capture_border: CaptureBorderSetting::default(),
             exclude_audio_processes: Vec::new(),
             exclude_audio_process: String::new(),
             audio_bitrate_kbps: 160,
@@ -765,6 +779,7 @@ impl Settings {
             virtual_display_follows_guest: self.virtual_display_follows_guest,
             trusted_admins: self.trusted_admins(),
             local_input_wins_for: std::time::Duration::from_millis(self.local_input_wins_ms),
+            capture_border: self.capture_border.to_core(),
         }
     }
 
@@ -1118,12 +1133,34 @@ mod tests {
             r#""device_name_mode": "Nonsense""#,
             r#""scaling_mode": "Nonsense""#,
             r#""shortcuts": "Nonsense""#,
+            r#""capture_border": "Nonsense""#,
         ] {
             let text = format!("{{ {field}, \"target_fps\": 120, \"encode_quality\": 88 }}");
             let loaded: Settings = serde_json::from_str(&text)
                 .unwrap_or_else(|e| panic!("{field} must not fail the file: {e}"));
             assert_eq!(loaded.target_fps, 120, "{field} lost an unrelated setting");
             assert_eq!(loaded.encode_quality, 88, "{field} lost an unrelated setting");
+        }
+    }
+
+    /// A file written before the border was a choice gets Windows' own
+    /// behaviour, which is what that build showed; and a choice, once made,
+    /// is read back as itself.
+    #[test]
+    fn the_capture_border_choice_loads_and_defaults_to_windows_own() {
+        let old = r#"{ "target_fps": 45 }"#;
+        let loaded: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(loaded.capture_border, CaptureBorderSetting::Show);
+        assert_eq!(loaded.to_session_config().capture_border, CaptureBorder::Show);
+
+        for chosen in CaptureBorder::ALL {
+            let settings = Settings {
+                capture_border: CaptureBorderSetting::from_core(chosen),
+                ..Settings::default()
+            };
+            let text = serde_json::to_string(&settings).unwrap();
+            let back: Settings = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.to_session_config().capture_border, chosen);
         }
     }
 
@@ -1452,6 +1489,7 @@ mod tests {
             }),
             codec: CodecSetting::H264,
             local_input_wins_ms: 1234,
+            capture_border: CaptureBorderSetting::HideWhenFullscreen,
             approval_timeout_secs: 42,
             device_name_mode: DeviceNameMode::Custom,
             custom_device_name: "the study machine".into(),
@@ -1476,6 +1514,7 @@ mod tests {
         assert_eq!(got.local_input_wins_for, sent.local_input_wins_for);
         assert_eq!(got.approval_timeout, sent.approval_timeout);
         assert_eq!(got.trusted_admins, sent.trusted_admins);
+        assert_eq!(got.capture_border, sent.capture_border);
         assert_eq!(got, sent, "something in the settings does not survive the pipe");
 
         // And the values are the chosen ones, not defaults that happen to match
@@ -1485,6 +1524,7 @@ mod tests {
         assert_ne!(got.encode.fps, defaults.encode.fps);
         assert!(!got.exclude_audio_processes.is_empty());
         assert!(got.audio_capture_device.is_some());
+        assert_ne!(got.capture_border, defaults.capture_border);
     }
 
     /// A device choice with nothing to find a device by is no choice at all.

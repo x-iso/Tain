@@ -121,6 +121,12 @@ windows = { version = "0.58", features = [
     "Graphics_DirectX_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_System_WinRT_Direct3D11",
+    # Asking to capture without the yellow border, which is an asynchronous
+    # request answered with an access status — and finding out whether this
+    # Windows can turn the border off at all. See `capture_wgc::set_border`.
+    "Foundation",
+    "Foundation_Metadata",
+    "Security_Authorization_AppCapabilityAccess",
 ] }
 
 # The libavcodec shim is compiled by build.rs with the same MSVC toolchain Rust

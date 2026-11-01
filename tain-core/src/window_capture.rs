@@ -188,6 +188,22 @@ pub struct OnScreen {
     pub height: u16,
 }
 
+impl OnScreen {
+    /// Whether this rectangle covers every pixel of `other`.
+    ///
+    /// Covering rather than equalling, because a window that fills a screen
+    /// need not be exactly its size: some games make theirs a pixel larger
+    /// than the monitor on every side, which is still nothing but the game.
+    pub fn covers(self, other: OnScreen) -> bool {
+        let right = |r: OnScreen| r.x + i32::from(r.width);
+        let bottom = |r: OnScreen| r.y + i32::from(r.height);
+        self.x <= other.x
+            && self.y <= other.y
+            && right(self) >= right(other)
+            && bottom(self) >= bottom(other)
+    }
+}
+
 /// The rectangle a shared window actually occupies, or `None` if it has gone or
 /// is not on screen.
 ///
@@ -209,6 +225,48 @@ pub fn on_screen(id: u64) -> Option<OnScreen> {
     {
         let _ = id;
         None
+    }
+}
+
+/// The whole of the monitor a window is on, in physical pixels, or `None` if
+/// the window has gone.
+///
+/// The monitor Windows says the window is on: for one that spans two, the
+/// one holding most of it. The whole monitor and not its work area, because
+/// a window that fills a screen covers the taskbar's strip as well.
+pub fn screen_of(id: u64) -> Option<OnScreen> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::screen_of(id)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// Whether a window fills the screen it is on: a game or a video playing
+/// fullscreen, exclusively or as a borderless window the size of the monitor.
+///
+/// # Measured, because there is nothing to ask
+///
+/// Windows has no "fullscreen" flag on a window. A game in exclusive mode and
+/// one in a borderless window are, to everything outside them, a top-level
+/// window that happens to be exactly as large as a monitor. So that is the
+/// test: the window's visible extent (see [`on_screen`]) covers the whole of
+/// its monitor.
+///
+/// A maximised window stops at the taskbar, so it does not count. One
+/// maximised over a taskbar that hides itself does, and that is right: it
+/// covers the screen exactly as a fullscreen one does.
+///
+/// False for a window that is minimised or gone, which has no extent to
+/// measure.
+pub fn fills_its_screen(id: u64) -> bool {
+    match (on_screen(id), screen_of(id)) {
+        (Some(window), Some(screen)) => window.covers(screen),
+        _ => false,
     }
 }
 
@@ -525,6 +583,50 @@ mod windows_impl {
         }
     }
 
+    pub(super) fn screen_of(id: u64) -> Option<super::OnScreen> {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
+        };
+
+        let window = HWND(id as isize as *mut std::ffi::c_void);
+        // SAFETY: guarded by `IsWindow`; `info` is sized as the call requires
+        // and outlives it.
+        unsafe {
+            if !IsWindow(window).as_bool() {
+                return None;
+            }
+            // NULL rather than the nearest monitor: a window on no monitor at
+            // all is off every screen, and so fills none of them.
+            let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
+            if monitor.is_invalid() {
+                return None;
+            }
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                return None;
+            }
+
+            // Physical pixels, the same as `on_screen`'s, because the process
+            // is per-monitor DPI aware from its first line — see `main.rs`.
+            // A process that was not would be told a scaled rectangle here and
+            // a physical one there, and no window would ever fill its screen.
+            let rect = info.rcMonitor;
+            let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+            Some(super::OnScreen {
+                x: rect.left,
+                y: rect.top,
+                width: width.clamp(0, u16::MAX as i32) as u16,
+                height: height.clamp(0, u16::MAX as i32) as u16,
+            })
+        }
+    }
+
     pub(super) fn info_of(id: u64) -> Option<WindowInfo> {
         let window = HWND(id as isize as *mut std::ffi::c_void);
         // SAFETY: every call below is a read guarded by `IsWindow`.
@@ -795,6 +897,41 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rect(x: i32, y: i32, width: u16, height: u16) -> OnScreen {
+        OnScreen { x, y, width, height }
+    }
+
+    /// What counts as filling a screen, measured the way [`fills_its_screen`]
+    /// measures it, on the shapes windows actually come in.
+    #[test]
+    fn a_window_fills_its_screen_only_when_it_covers_all_of_it() {
+        let screen = rect(0, 0, 2560, 1440);
+
+        // Borderless fullscreen, and exclusive: exactly the monitor.
+        assert!(rect(0, 0, 2560, 1440).covers(screen));
+        // A game that oversizes its window by a pixel on every side.
+        assert!(rect(-1, -1, 2562, 1442).covers(screen));
+
+        // Maximised over a 48-pixel taskbar along the bottom.
+        assert!(!rect(0, 0, 2560, 1392).covers(screen));
+        // Snapped to one half.
+        assert!(!rect(0, 0, 1280, 1440).covers(screen));
+        // The size of the screen, but dragged a little way off it.
+        assert!(!rect(10, 0, 2560, 1440).covers(screen));
+    }
+
+    /// A monitor left of, or above, the primary one has negative coordinates,
+    /// and a fullscreen window on it has the same ones.
+    #[test]
+    fn filling_is_measured_on_whichever_screen_the_window_is_on() {
+        let left = rect(-1920, 0, 1920, 1080);
+        assert!(rect(-1920, 0, 1920, 1080).covers(left));
+        assert!(!rect(0, 0, 1920, 1080).covers(left), "the same size on another screen");
+
+        let above = rect(0, -1080, 1920, 1080);
+        assert!(rect(0, -1080, 1920, 1080).covers(above));
+    }
 
     /// Whatever this machine is running, the list has to be self-consistent.
     ///

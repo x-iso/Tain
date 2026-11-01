@@ -2672,6 +2672,7 @@ mod tests {
             virtual_display_follows_guest: false,
             trusted_admins: Default::default(),
             local_input_wins_for: std::time::Duration::ZERO,
+            capture_border: Default::default(),
         };
 
         let server = Arc::new(HostServer::bind().await.unwrap().with_config(config));

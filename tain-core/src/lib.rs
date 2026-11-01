@@ -214,5 +214,5 @@ pub use protocol::{
     sanitize_device_name, ControlGrants, ControlStateMessage, FrameMessage, InputDevice,
     InputEvent, Message, MAX_DEVICE_NAME, MAX_MESSAGE_SIZE,
 };
-pub use screen_capture::{CaptureConfig, PixelFormat, QualityScale};
+pub use screen_capture::{CaptureBorder, CaptureConfig, PixelFormat, QualityScale};
 pub use session::{SessionInfo, SessionManager};

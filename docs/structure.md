@@ -31,7 +31,7 @@ testable without a GPU.
 |--------|--------------|
 | `screen_capture.rs` | The capture trait, the pixel formats everything else agrees on, the host's list of displays, and what a session is pointed at (`DisplayTarget`). |
 | `capture_dxgi.rs` | DXGI Desktop Duplication — the first choice on Windows: no capture border, the pointer reported separately, and a frame the moment the desktop changes. |
-| `capture_wgc.rs` | Windows.Graphics.Capture, which asks the compositor for frames. The fallback where duplication will not start — typically a laptop whose desktop is drawn by the other graphics chip — and the only way to capture a single window. |
+| `capture_wgc.rs` | Windows.Graphics.Capture, which asks the compositor for frames. The fallback where duplication will not start — typically a laptop whose desktop is drawn by the other graphics chip — and the only way to capture a single window. Also the yellow border Windows draws around what it captures, and the host's choice of where it shows. |
 | `capture_shared.rs` | One capture per display, shared by every session, because Windows grants a process one duplication of an output. Also where duplication is tried first and the compositor second. |
 | `capture_wall.rs` | Every display composed into one picture laid out as the host has them, or several shared windows tiled into a grid. One stream rather than one per display, with a thread per display because each one blocks. |
 | `capture_nv12.rs` | BGRA to NV12 on the GPU, so the encoder is handed what it wants. |
@@ -45,7 +45,7 @@ testable without a GPU.
 
 | Module | What it does |
 |--------|--------------|
-| `window_capture.rs` | Which application windows can be shared, their thumbnails for the picker, and whether a shared one is showing, minimised or closed — states a monitor does not have. |
+| `window_capture.rs` | Which application windows can be shared, their thumbnails for the picker, and whether a shared one is showing, minimised or closed — states a monitor does not have. Also whether one fills its screen, which is what "fullscreen" means to the capture border. |
 | `virtual_display.rs` | Putting a virtual display on the desktop, sizing it, and taking it off again. Works with any driver that has presented a monitor, and installs nothing: that is `tain-cli`'s `display_driver.rs`. |
 
 ### Video

@@ -414,6 +414,12 @@ pub struct SessionConfig {
     /// Carried here so it reaches the host from the settings panel, and applied
     /// to the process rather than to the session — one keyboard, one answer.
     pub local_input_wins_for: Duration,
+    /// Where Windows draws its yellow border around what is being captured.
+    ///
+    /// See [`super::screen_capture::CaptureBorder`]. Applied to the process,
+    /// like the two above it: a capture is shared by every session watching
+    /// it, and has one border.
+    pub capture_border: super::screen_capture::CaptureBorder,
 }
 
 impl Default for SessionConfig {
@@ -437,6 +443,7 @@ impl Default for SessionConfig {
             local_input_wins_for: Duration::from_millis(
                 super::local_input::DEFAULT_WINDOW_MS,
             ),
+            capture_border: Default::default(),
         }
     }
 }
@@ -585,6 +592,10 @@ impl HostServer {
         // of speakers, and every running capture follows it.
         #[cfg(target_os = "windows")]
         super::audio_device::set_capture_device(config.audio_capture_device.clone());
+        // And the capture border: one capture per window or screen, shared by
+        // every session watching it, each looking again a few times a second.
+        #[cfg(target_os = "windows")]
+        super::capture_wgc::set_border(config.capture_border);
         *self.config.lock().unwrap() = config;
     }
 
@@ -5816,6 +5827,7 @@ mod tests {
             // and a developer's own mouse moving past would otherwise start
             // dropping the input a test had just sent.
             local_input_wins_for: Duration::ZERO,
+            capture_border: Default::default(),
         }
     }
 

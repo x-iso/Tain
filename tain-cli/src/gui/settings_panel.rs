@@ -8,15 +8,17 @@
 use egui::{Context, RichText};
 
 use super::settings::{
-    BackendSetting, ChosenDevice, CodecSetting, DeviceNameMode, ProfileSetting,
-    RateControlSetting, ResolutionSetting, ScalingMode, Settings,
+    BackendSetting, CaptureBorderSetting, ChosenDevice, CodecSetting, DeviceNameMode,
+    ProfileSetting, RateControlSetting, ResolutionSetting, ScalingMode, Settings,
 };
 use super::shortcuts::{Shortcut, ShortcutAction};
 use super::theme::*;
 // Every section in this window draws text, so the catalogue is reached for
 // here rather than in each of them.
 use tain_core::i18n;
-use tain_core::{EncoderBackend, H264Profile, QualityScale, RateControl, VideoCodec};
+use tain_core::{
+    CaptureBorder, EncoderBackend, H264Profile, QualityScale, RateControl, VideoCodec,
+};
 
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x9B, 0x2E);
 
@@ -535,10 +537,64 @@ fn video_section(ui: &mut egui::Ui, settings: &mut Settings) {
         ui.label(i18n::text("settings.video.capture_cursor"));
         ui.checkbox(&mut settings.show_cursor, i18n::text("settings.video.include_pointer"));
         ui.end_row();
+
+        ui.label(i18n::text("settings.video.capture_border"))
+            .on_hover_text(i18n::text("settings.video.capture_border_hint"));
+        egui::ComboBox::from_id_salt("capture_border")
+            .width(220.0)
+            .selected_text(settings.capture_border.to_core().label())
+            .show_ui(ui, |ui| {
+                for core in CaptureBorder::ALL {
+                    ui.selectable_value(
+                        &mut settings.capture_border,
+                        CaptureBorderSetting::from_core(core),
+                        core.label(),
+                    )
+                    .on_hover_text(core.description());
+                }
+            })
+            .response
+            .on_hover_text(i18n::text("settings.video.capture_border_hint"));
+        ui.end_row();
+
+        if let Some(why) = border_overruled(settings.capture_border.to_core()) {
+            ui.label("");
+            ui.label(RichText::new(why).size(10.0).color(AMBER));
+            ui.end_row();
+        }
     });
 
     ui.add_space(6.0);
     bandwidth_note(ui, settings);
+}
+
+/// Why Windows will draw the capture border whatever was chosen, if it will.
+///
+/// # Why this is said at all
+///
+/// Because otherwise the choice looks broken. Windows 10 cannot turn the
+/// border off, and Windows 11 lets its user forbid it for every desktop app;
+/// in both cases asking succeeds and the border stays, and the only place that
+/// would say so is a log nobody is reading.
+///
+/// Said only when the choice is to hide it somewhere: keeping the border has
+/// nothing to be overruled. The refusal is only known once a capture has
+/// asked, which is the first time it matters.
+fn border_overruled(choice: CaptureBorder) -> Option<&'static str> {
+    if choice == CaptureBorder::Show {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use tain_core::capture_wgc::{border_can_be_turned_off, border_consent, BorderConsent};
+        if !border_can_be_turned_off() {
+            return Some(i18n::text("settings.video.border_needs_windows_11"));
+        }
+        if border_consent() == BorderConsent::Refused {
+            return Some(i18n::text("settings.video.border_refused"));
+        }
+    }
+    None
 }
 
 /// Show what this configuration will actually cost and what it will actually run.

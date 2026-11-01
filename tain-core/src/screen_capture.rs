@@ -504,6 +504,82 @@ pub fn displays() -> Vec<super::protocol::DisplayInfo> {
     }
 }
 
+/// Whether Windows draws its yellow capture border on the host's own screen.
+///
+/// # What the border is
+///
+/// Windows.Graphics.Capture outlines whatever it captures in yellow, on the
+/// host's screen, for as long as the capture lasts: the operating system's own
+/// "this is being recorded". Desktop Duplication draws nothing, so a screen
+/// shared the usual way never has one. A shared window always goes through the
+/// compositor, and so does a screen on a machine where duplication will not
+/// start. See [`super::capture_wgc`].
+///
+/// # Why it is a choice
+///
+/// Around a window on an ordinary desktop the border is a fair signal: it says
+/// which program somebody else can see. Around a game or a video playing
+/// fullscreen it is a yellow line across the edge of the very picture somebody
+/// is looking at, and it tells them nothing they do not already know.
+///
+/// # What else decides it
+///
+/// Windows. Turning the border off needs Windows 11 or Server 2022; Windows 10
+/// draws it whatever this says. Windows 11 also lets the user forbid it for
+/// every desktop app, under Privacy & security > Screenshot borders, and then
+/// it is drawn whatever this says too.
+///
+/// Applied to the whole process rather than to one session, because a capture
+/// is shared by every session watching it. See
+/// [`super::capture_wgc::set_border`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureBorder {
+    /// Windows' own default: drawn around everything captured through the
+    /// compositor.
+    ///
+    /// The default because it is what a host showed before this was a
+    /// choice, and taking away the operating system's sign that something is
+    /// being captured is a decision for the person at that machine to make.
+    #[default]
+    Show,
+    /// Drawn around a window, and not around one that fills its screen: a game
+    /// or a video playing fullscreen, exclusively or as a borderless window
+    /// the size of the monitor. A whole screen fills itself, so it gets none.
+    HideWhenFullscreen,
+    /// Never drawn.
+    Hide,
+}
+
+impl CaptureBorder {
+    pub const ALL: [Self; 3] = [Self::Show, Self::HideWhenFullscreen, Self::Hide];
+
+    /// Whether the border should be drawn around something that does, or does
+    /// not, fill the screen it is on.
+    pub fn wanted(self, fills_screen: bool) -> bool {
+        match self {
+            Self::Show => true,
+            Self::HideWhenFullscreen => !fills_screen,
+            Self::Hide => false,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        crate::i18n::text(match self {
+            Self::Show => "border.show",
+            Self::HideWhenFullscreen => "border.hide_fullscreen",
+            Self::Hide => "border.hide",
+        })
+    }
+
+    pub fn description(self) -> &'static str {
+        crate::i18n::text(match self {
+            Self::Show => "border.show_detail",
+            Self::HideWhenFullscreen => "border.hide_fullscreen_detail",
+            Self::Hide => "border.hide_detail",
+        })
+    }
+}
+
 /// Configuration for screen capture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureConfig {
@@ -1383,6 +1459,27 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each choice draws the border exactly where it says it does.
+    ///
+    /// "Hide when fullscreen" is the one that can go wrong in the subtle
+    /// direction: inverted, it would hide the border around ordinary windows
+    /// and draw it over the game, which is the opposite of the reason it
+    /// exists.
+    #[test]
+    fn capture_border_is_drawn_where_each_choice_says() {
+        assert!(CaptureBorder::Show.wanted(false));
+        assert!(CaptureBorder::Show.wanted(true));
+
+        assert!(CaptureBorder::HideWhenFullscreen.wanted(false), "an ordinary window keeps it");
+        assert!(!CaptureBorder::HideWhenFullscreen.wanted(true), "a fullscreen one does not");
+
+        assert!(!CaptureBorder::Hide.wanted(false));
+        assert!(!CaptureBorder::Hide.wanted(true));
+
+        // Windows' own behaviour is what somebody who has not chosen gets.
+        assert_eq!(CaptureBorder::default(), CaptureBorder::Show);
+    }
 
     /// Every format survives the trip between processes as itself.
     ///
