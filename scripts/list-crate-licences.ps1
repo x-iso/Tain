@@ -1,16 +1,22 @@
 <#
 .SYNOPSIS
-  Write licenses/rust-crates.txt: every Rust crate compiled into tain.exe, and
-  the licence it declares.
+  Write licenses/rust-crates.txt and licenses/rust-crates-linux.txt: every Rust
+  crate compiled into tain.exe and into the Linux tain, and the licence each
+  declares.
 .DESCRIPTION
   The entries in tain-cli/src/gui/licenses.rs carry full licence texts for the
   components worth naming. This is the rest: the whole dependency graph, so that
   "everything Tain ships" is a list somebody can read rather than a claim.
 
-  Walked from tain-cli through normal dependencies only, for the Windows target.
+  Walked from tain-cli through normal dependencies only, once per target.
   Build scripts and dev-dependencies are left out because none of their code
   ends up in the executable; a crate needed only on another platform is left
-  out by --filter-platform for the same reason.
+  out by --filter-platform for the same reason. That is also why there are two
+  lists: the Linux binary carries Wayland, X11 and D-Bus crates the Windows one
+  does not, and the reverse.
+
+  Both are written by one run, from Windows PowerShell, so that a difference in
+  either file means Cargo.lock and never the shell's sort rules.
 
   Run it after anything changes Cargo.lock, and commit the result with the
   change. The file is embedded in the binary, so a stale one ships.
@@ -19,80 +25,92 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Target = 'x86_64-pc-windows-msvc'
+    [string[]]$Target = @('x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu')
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$out = Join-Path $root 'licenses\rust-crates.txt'
 
-$json = & cargo metadata --format-version 1 --filter-platform $Target --manifest-path (Join-Path $root 'Cargo.toml')
-if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
-$json = $json -join "`n"
-
-# Windows PowerShell's ConvertFrom-Json refuses anything over 2 MB, and the
-# metadata for this workspace is past that. The serializer underneath takes a
-# limit; PowerShell 7 has no limit and no such serializer.
-if ($PSVersionTable.PSVersion.Major -ge 6) {
-    $meta = $json | ConvertFrom-Json -AsHashtable
-} else {
-    Add-Type -AssemblyName System.Web.Extensions
-    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-    $serializer.MaxJsonLength = [int]::MaxValue
-    $meta = $serializer.DeserializeObject($json)
+# Each target's list and the name of the binary it describes. The Windows file
+# keeps the name it has always had.
+$outputs = @{
+    'x86_64-pc-windows-msvc'   = @{ File = 'rust-crates.txt';       Binary = 'tain.exe' }
+    'x86_64-unknown-linux-gnu' = @{ File = 'rust-crates-linux.txt'; Binary = 'tain' }
 }
 
-$packages = @{}
-foreach ($p in $meta['packages']) { $packages[$p['id']] = $p }
-$nodes = @{}
-foreach ($n in $meta['resolve']['nodes']) { $nodes[$n['id']] = $n }
+foreach ($t in $Target) {
+    if (-not $outputs.ContainsKey($t)) { throw "No licence list is defined for $t" }
+    $out = Join-Path $root "licenses\$($outputs[$t].File)"
+    $binary = $outputs[$t].Binary
 
-$rootId = $null
-foreach ($p in $meta['packages']) { if ($p['name'] -eq 'tain-cli') { $rootId = $p['id'] } }
-if ($null -eq $rootId) { throw 'tain-cli is not in the workspace metadata' }
+    $json = & cargo metadata --format-version 1 --filter-platform $t --manifest-path (Join-Path $root 'Cargo.toml')
+    if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    $json = $json -join "`n"
 
-$seen = @{}
-$stack = New-Object System.Collections.Stack
-$stack.Push($rootId)
-while ($stack.Count -gt 0) {
-    $id = $stack.Pop()
-    if ($seen.ContainsKey($id)) { continue }
-    $seen[$id] = $true
-    foreach ($dep in $nodes[$id]['deps']) {
-        # A null kind is a normal dependency; "build" and "dev" never ship.
-        $normal = $false
-        foreach ($k in $dep['dep_kinds']) { if ($null -eq $k['kind']) { $normal = $true } }
-        if ($normal) { $stack.Push($dep['pkg']) }
+    # Windows PowerShell's ConvertFrom-Json refuses anything over 2 MB, and the
+    # metadata for this workspace is past that. The serializer underneath takes a
+    # limit; PowerShell 7 has no limit and no such serializer.
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        $meta = $json | ConvertFrom-Json -AsHashtable
+    } else {
+        Add-Type -AssemblyName System.Web.Extensions
+        $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $serializer.MaxJsonLength = [int]::MaxValue
+        $meta = $serializer.DeserializeObject($json)
     }
+
+    $packages = @{}
+    foreach ($p in $meta['packages']) { $packages[$p['id']] = $p }
+    $nodes = @{}
+    foreach ($n in $meta['resolve']['nodes']) { $nodes[$n['id']] = $n }
+
+    $rootId = $null
+    foreach ($p in $meta['packages']) { if ($p['name'] -eq 'tain-cli') { $rootId = $p['id'] } }
+    if ($null -eq $rootId) { throw 'tain-cli is not in the workspace metadata' }
+
+    $seen = @{}
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($rootId)
+    while ($stack.Count -gt 0) {
+        $id = $stack.Pop()
+        if ($seen.ContainsKey($id)) { continue }
+        $seen[$id] = $true
+        foreach ($dep in $nodes[$id]['deps']) {
+            # A null kind is a normal dependency; "build" and "dev" never ship.
+            $normal = $false
+            foreach ($k in $dep['dep_kinds']) { if ($null -eq $k['kind']) { $normal = $true } }
+            if ($normal) { $stack.Push($dep['pkg']) }
+        }
+    }
+
+    $rows = foreach ($id in $seen.Keys) {
+        $p = $packages[$id]
+        if ($p['name'] -in @('tain-cli', 'tain-core')) { continue }
+        $licence = $p['license']
+        if ([string]::IsNullOrWhiteSpace($licence)) { $licence = "see $($p['license_file'])" }
+        [pscustomobject]@{ Name = $p['name']; Version = $p['version']; Licence = $licence }
+    }
+    $rows = @($rows | Sort-Object Name, Version)
+
+    $nameWidth = ($rows | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum
+    $versionWidth = ($rows | ForEach-Object { $_.Version.Length } | Measure-Object -Maximum).Maximum
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("Every Rust crate compiled into $binary ($($rows.Count) crates), as resolved by")
+    $lines.Add("Cargo.lock for $t, with the licence each one declares.")
+    $lines.Add('')
+    $lines.Add('Generated by scripts/list-crate-licences.ps1. Do not edit by hand.')
+    $lines.Add('')
+    $lines.Add('Each crate''s licence text is in its source as published on crates.io:')
+    $lines.Add('https://crates.io/crates/<name>/<version>. The ones with a full entry of')
+    $lines.Add('their own in this list of licences are reproduced there verbatim.')
+    $lines.Add('')
+    foreach ($r in $rows) {
+        $lines.Add(('{0}  {1}  {2}' -f $r.Name.PadRight($nameWidth), $r.Version.PadRight($versionWidth), $r.Licence).TrimEnd())
+    }
+
+    # LF and no byte-order mark, like every other text file in the repository.
+    $text = ($lines -join "`n") + "`n"
+    [System.IO.File]::WriteAllText($out, $text, (New-Object System.Text.UTF8Encoding $false))
+    Write-Host "Wrote $($rows.Count) crates to $out"
 }
-
-$rows = foreach ($id in $seen.Keys) {
-    $p = $packages[$id]
-    if ($p['name'] -in @('tain-cli', 'tain-core')) { continue }
-    $licence = $p['license']
-    if ([string]::IsNullOrWhiteSpace($licence)) { $licence = "see $($p['license_file'])" }
-    [pscustomobject]@{ Name = $p['name']; Version = $p['version']; Licence = $licence }
-}
-$rows = @($rows | Sort-Object Name, Version)
-
-$nameWidth = ($rows | ForEach-Object { $_.Name.Length } | Measure-Object -Maximum).Maximum
-$versionWidth = ($rows | ForEach-Object { $_.Version.Length } | Measure-Object -Maximum).Maximum
-
-$lines = New-Object System.Collections.Generic.List[string]
-$lines.Add("Every Rust crate compiled into tain.exe ($($rows.Count) crates), as resolved by")
-$lines.Add("Cargo.lock for $Target, with the licence each one declares.")
-$lines.Add('')
-$lines.Add('Generated by scripts/list-crate-licences.ps1. Do not edit by hand.')
-$lines.Add('')
-$lines.Add('Each crate''s licence text is in its source as published on crates.io:')
-$lines.Add('https://crates.io/crates/<name>/<version>. The ones with a full entry of')
-$lines.Add('their own in this list of licences are reproduced there verbatim.')
-$lines.Add('')
-foreach ($r in $rows) {
-    $lines.Add(('{0}  {1}  {2}' -f $r.Name.PadRight($nameWidth), $r.Version.PadRight($versionWidth), $r.Licence).TrimEnd())
-}
-
-# LF and no byte-order mark, like every other text file in the repository.
-$text = ($lines -join "`n") + "`n"
-[System.IO.File]::WriteAllText($out, $text, (New-Object System.Text.UTF8Encoding $false))
-Write-Host "Wrote $($rows.Count) crates to $out"

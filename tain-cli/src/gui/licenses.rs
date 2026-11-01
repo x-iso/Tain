@@ -16,6 +16,11 @@
 //! libraries and the driver package embedded in it, and the icons and fonts it
 //! draws with. Build tools are not redistributed and are not listed.
 //!
+//! Per platform, because what is redistributed differs. The Linux binary has
+//! no FFmpeg, no driver package and no windows-rs, so those entries are only
+//! compiled into a Windows build, and each platform shows the crate list
+//! resolved for its own target.
+//!
 //! # What is translated
 //!
 //! The one-line description of each entry is interface text, so it is a
@@ -65,6 +70,7 @@ pub const LICENSES: &[License] = &[
         ),
         text: include_str!("../../../LICENSE"),
     },
+    #[cfg(target_os = "windows")]
     License {
         name: "FFmpeg",
         what: "licences.ffmpeg",
@@ -91,6 +97,7 @@ pub const LICENSES: &[License] = &[
             include_str!("../../../licenses/ffmpeg-configuration.txt"),
         ),
     },
+    #[cfg(target_os = "windows")]
     License {
         name: "Opus",
         what: "licences.opus",
@@ -112,6 +119,7 @@ pub const LICENSES: &[License] = &[
         ),
         text: include_str!("../../../licenses/openh264.txt"),
     },
+    #[cfg(target_os = "windows")]
     License {
         name: "Virtual Display Driver",
         what: "licences.vdd",
@@ -284,6 +292,7 @@ pub const LICENSES: &[License] = &[
             include_str!("../../../licenses/zstd-rs.txt"),
         ),
     },
+    #[cfg(target_os = "windows")]
     License {
         name: "windows-rs",
         what: "licences.windows",
@@ -322,7 +331,10 @@ pub const LICENSES: &[License] = &[
         spdx: "various",
         url: "https://crates.io",
         note: Some("Generated from Cargo.lock by scripts/list-crate-licences.ps1."),
+        #[cfg(target_os = "windows")]
         text: include_str!("../../../licenses/rust-crates.txt"),
+        #[cfg(not(target_os = "windows"))]
+        text: include_str!("../../../licenses/rust-crates-linux.txt"),
     },
 ];
 
