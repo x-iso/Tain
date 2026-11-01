@@ -53,6 +53,8 @@ pub mod pulse;
 pub mod portal;
 #[cfg(all(target_os = "linux", db_pipewire))]
 pub mod capture_portal;
+#[cfg(target_os = "linux")]
+pub mod input_portal;
 #[cfg(target_os = "windows")]
 pub mod audio_device;
 #[cfg(target_os = "windows")]

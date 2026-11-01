@@ -1230,11 +1230,21 @@ pub fn create_injector() -> Box<dyn InputInjector> {
         }
     }
 
-    warn!(
-        "Input injection is not implemented on this platform — events will be \
-         logged but not delivered."
-    );
-    Box::new(StubInjector)
+    // The RemoteDesktop portal, through the session a screen capture opens.
+    #[cfg(target_os = "linux")]
+    {
+        info!("Input injection: the RemoteDesktop portal");
+        return Box::new(super::input_portal::PortalInjector::new());
+    }
+
+    #[allow(unreachable_code)]
+    {
+        warn!(
+            "Input injection is not implemented on this platform — events will be \
+             logged but not delivered."
+        );
+        Box::new(StubInjector)
+    }
 }
 
 #[cfg(test)]

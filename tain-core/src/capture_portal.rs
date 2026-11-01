@@ -228,6 +228,96 @@ impl Drop for PortalCapturer {
 mod tests {
     use super::*;
 
+    /// The whole host path against a stand-in portal: the portal conversation,
+    /// the PipeWire stream it hands over, input sent back through it, the
+    /// session closing, and the restore token carried into the next session.
+    ///
+    /// Needs a session bus with a mock `org.freedesktop.portal.Desktop` that
+    /// logs each call as a JSON line to `TAIN_TEST_MOCK_PORTAL_LOG` and hands
+    /// out a PipeWire video node that is 640x360 and claims a logical size of
+    /// 1280x720 — see docs/linux.md for running it.
+    #[test]
+    #[ignore = "needs a mock screen cast portal and PipeWire"]
+    fn the_host_path_against_a_stand_in_portal() {
+        use crate::input_inject::{create_injector, KeyInput, MouseButtonInput, MousePosition, ScrollInput};
+        let log = std::path::PathBuf::from(
+            std::env::var("TAIN_TEST_MOCK_PORTAL_LOG").expect("TAIN_TEST_MOCK_PORTAL_LOG"),
+        );
+        let state = std::env::temp_dir().join(format!("tain-portal-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        // SAFETY: set before anything reads it, in a test run on its own.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+        let calls = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        };
+        let named = |name: &str| -> Vec<serde_json::Value> {
+            calls().into_iter().filter(|c| c[0] == name).collect()
+        };
+
+        let config = CaptureConfig { fps: 30, ..CaptureConfig::default() };
+        let mut capturer = PortalCapturer::new(&config).expect("the portal session and stream");
+        assert_eq!(capturer.frame_size(), (640, 360));
+        assert_eq!(capturer.logical_size(), Some((1280, 720)));
+        let mut frames = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while frames < 3 && std::time::Instant::now() < deadline {
+            if capturer.capture_next().unwrap().is_some() {
+                frames += 1;
+            }
+        }
+        assert_eq!(frames, 3, "frames from the portal's stream");
+
+        let devices = named("RemoteDesktop.SelectDevices");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0][2]["types"], 7, "keyboard, pointer and touch were asked for");
+        assert_eq!(devices[0][2]["persist_mode"], 2, "the choice is asked to be remembered");
+        assert!(devices[0][2].get("restore_token").is_none(), "nothing to restore the first time");
+        let sources = named("ScreenCast.SelectSources");
+        assert_eq!(sources[0][2]["cursor_mode"], 2, "the pointer drawn into the picture");
+        assert!(sources[0][2].get("persist_mode").is_none(), "not allowed on a remote desktop session");
+
+        let injector = create_injector();
+        injector.move_mouse(MousePosition { x: 32768, y: 16384 }).unwrap();
+        injector.mouse_button(MouseButtonInput { button: 0, pressed: true }).unwrap();
+        injector.mouse_button(MouseButtonInput { button: 0, pressed: false }).unwrap();
+        injector.key(KeyInput { keycode: 0x41, pressed: true, scancode: 0, extended: false }).unwrap();
+        injector.key(KeyInput { keycode: 0x41, pressed: false, scancode: 0x1e, extended: false }).unwrap();
+        injector.scroll(ScrollInput { dx: 0, dy: 60 }).unwrap();
+        injector.scroll(ScrollInput { dx: 0, dy: 60 }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let motion = named("NotifyPointerMotionAbsolute");
+        assert_eq!(motion.len(), 1);
+        assert!(motion[0][1].as_u64().is_some_and(|node| node > 0), "on the shared stream's node");
+        let (x, y) = (motion[0][2].as_f64().unwrap(), motion[0][3].as_f64().unwrap());
+        assert!((x - 640.0).abs() < 1.0 && (y - 180.0).abs() < 1.0, "logical coordinates, got {x},{y}");
+        let buttons: Vec<_> = named("NotifyPointerButton").iter().map(|c| (c[1].clone(), c[2].clone())).collect();
+        assert_eq!(buttons, vec![(272.into(), 1.into()), (272.into(), 0.into())], "BTN_LEFT down and up");
+        let keys: Vec<_> = named("NotifyKeyboardKeycode").iter().map(|c| (c[1].clone(), c[2].clone())).collect();
+        assert_eq!(keys, vec![(30.into(), 1.into()), (30.into(), 0.into())], "KEY_A from a virtual key and a scancode");
+        let scrolls = named("NotifyPointerAxisDiscrete");
+        assert_eq!(scrolls.len(), 1, "two half detents make one step");
+        assert_eq!((scrolls[0][1].clone(), scrolls[0][2].clone()), (0.into(), (-1).into()), "up is a negative step");
+
+        drop(capturer);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(named("Session.Close").len(), 1, "the last capture closes the session");
+        let saved = std::fs::read_to_string(state.join("Tain/screen-sharing-token")).expect("token kept");
+        assert_eq!(saved, "token-1");
+
+        // The next session restores the choice rather than asking again.
+        let again = PortalCapturer::new(&config).expect("a second session");
+        drop(again);
+        let devices = named("RemoteDesktop.SelectDevices");
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[1][2]["restore_token"], "token-1", "the remembered choice is offered back");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
     /// The PipeWire half without a portal: connect to a video node on the
     /// local PipeWire daemon, as a capture does to the portal's, and read
     /// frames from it.
