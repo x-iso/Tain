@@ -75,8 +75,10 @@ twin has, so the host and guest code above them is the same on both.
 | `media_runtime_linux.rs` | Compiled as `ffmpeg_runtime`. Opens `libtain-media.so` — the shims and a static FFmpeg, built by `build.rs` and embedded — from an anonymous memory file, after opening libva globally if it is installed, so the library's lazily bound VA-API calls resolve to it. Without libva it still opens and Opus still works. |
 | `vaapi.rs` | GPU decode and encode through VA-API, over `ffmpeg/db_vaapi.c`, and what this GPU can do. |
 | `portal.rs` | The RemoteDesktop portal session, with screen casting attached, that every capture and the input injector share: the request/response dance over D-Bus, the remembered choice, the PipeWire descriptor. |
-| `capture_portal.rs` | `ScreenCaptureBackend` over the portal's PipeWire stream, through `linux/db_pipewire.c`. |
-| `input_portal.rs` | `InputInjector` over the portal, with scancode and virtual-key tables to Linux key codes. |
+| `capture_portal.rs` | `ScreenCaptureBackend` over the portal's PipeWire stream, through `linux/db_pipewire.c`, and that stream on its own for `capture_kwin`. |
+| `input_portal.rs` | `InputInjector` over the portal, with scancode and virtual-key tables to Linux key codes; for a session sharing windows, over KWin's fake input instead. |
+| `kwin.rs` | On Plasma: KWin's window list, window streams and fake input, which let windows be shared as on Windows — picked in Tain's picker, several at once, and controlled. Needs Tain's `.desktop` file; see `docs/linux.md`. |
+| `capture_kwin.rs` | `ScreenCaptureBackend` over one window's KWin stream, and the picker's thumbnails. `capture_wall` composes several. |
 | `pulse.rs` | PulseAudio's simple API, opened at run time. |
 | `audio_capture_linux.rs`, `audio_output_linux.rs` | Compiled as `audio_capture` and `audio_output`: the default output's monitor, and playback from the jitter buffer. |
 
@@ -120,7 +122,9 @@ twin has, so the host and guest code above them is the same on both.
 | `app.rs` | The application: tabs, host panel, guest panel, the whole main window. |
 | `session.rs` | One guest session and everything the UI needs to drive it, pointer capture included. |
 | `session_window.rs` | A separate window holding one tab per live session, its header of tabs and tools, and the bars that replace it in fullscreen and in the mini view. |
-| `title_bar.rs` | Taking the session window's caption over from Windows while keeping its resize borders, snap and snap layouts; keeping it above the taskbar in fullscreen; putting it in a corner above everything for the mini view, and back exactly as it was. |
+| `title_bar.rs` | Taking the session window's caption over from Windows while keeping its resize borders, snap and snap layouts; keeping it above the taskbar in fullscreen; putting it in a corner above everything for the mini view, and back exactly as it was. On Linux, moving and resizing an undecorated window from its header and edges. |
+| `wayland_keys.rs` | The keyboard as it is, on Wayland: a second `wl_keyboard` beside winit's, and the desktop's shortcuts given up for immersive mode. Linux only. |
+| `../desktop_entry.rs` | Tain's own `.desktop` entry and icon, written at startup with the binary's full path: the taskbar icon, notifications' name and icon, and on Plasma KWin's permission for window sharing all hang off it. Linux only. |
 | `touch.rs` | Telling a finger from a mouse, widening targets for it, and marking where it is. |
 | `network_bridge.rs` | The guest's async half: connect, receive, decode, forward input, report telemetry. |
 | `progress.rs` | How far a connection has got, drawn as the path it took. |
@@ -164,9 +168,8 @@ twin has, so the host and guest code above them is the same on both.
 | `blake3` | Deriving the key this machine dials with from the one it hosts on, so the two are never one endpoint id. Already in the tree under iroh. |
 | `anyhow`, `thiserror`, `tracing` | Errors and logging. |
 | `windows`, `windows-core` 0.58 | DXGI, Windows.Graphics.Capture, D3D11, Media Foundation, WASAPI, `SendInput`, and in `tain-cli` the service, SetupAPI for the display driver, and the firewall rule. Windows only. |
-| `egui` / `eframe` / `egui_extras` 0.29 (glow) | The interface. `tain-cli` only. |
+| `egui` / `eframe` / `egui_extras` 0.29 (glow) | The interface, and through it the clipboard, for copy and paste of codes. `tain-cli` only. |
 | `keyring` 4 | Connection codes and this machine's identity key in the OS credential store, never in a file. |
-| `arboard` 3 | Clipboard, for copy and paste of codes. |
 
 ### Optional
 

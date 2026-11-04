@@ -178,6 +178,7 @@ pub struct Wall {
     /// into them and reports nothing about it — so the wall answers the same
     /// question the same way a single compositor capture does. See
     /// [`Self::take_cursor`].
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     cursor_visible: Option<bool>,
 }
 
@@ -225,6 +226,34 @@ enum Composed {
 /// Name, position and size of every display, in the order they enumerate. Not
 /// a hash: the comparison happens a few times a second at most, and a value
 /// that can be printed is worth more here than one that is small.
+/// One display's capture, for a wall of them.
+///
+/// Windows only. On Linux the portal shares a screen as a whole and lists none
+/// to compose, so nothing asks for a wall of them there.
+#[cfg(target_os = "windows")]
+fn open_screen(name: &str) -> Result<Box<dyn ScreenCaptureBackend>> {
+    super::capture_shared::attach(Some(name.to_string()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_screen(name: &str) -> Result<Box<dyn ScreenCaptureBackend>> {
+    anyhow::bail!("{name} cannot be captured on its own here")
+}
+
+/// One window's capture, for a composite of them: the compositor's own copy of
+/// it, which is whole even where something covers it.
+#[cfg(target_os = "windows")]
+fn open_window(id: u64) -> Result<Box<dyn ScreenCaptureBackend>> {
+    Ok(Box::new(super::capture_wgc::WgcCapturer::for_window(id)?))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_window(id: u64) -> Result<Box<dyn ScreenCaptureBackend>> {
+    /// As often as a pump asks: it waits a frame at most for each.
+    const FPS: u32 = 60;
+    Ok(Box::new(super::capture_kwin::KwinWindowCapturer::for_window(id, FPS)?))
+}
+
 pub fn layout_now() -> Vec<(String, i32, i32, u16, u16)> {
     super::screen_capture::displays()
         .into_iter()
@@ -257,7 +286,7 @@ impl Wall {
         // Named `screen`, not `display`: `use tracing::*` brings a `display`
         // function into scope and the macros below resolve the identifier to it.
         for screen in displays {
-            let capturer = match super::capture_shared::attach(Some(screen.name.clone())) {
+            let capturer = match open_screen(&screen.name) {
                 Ok(capturer) => capturer,
                 Err(e) => {
                     // A hole rather than a failure: the rest of the desk is
@@ -376,9 +405,7 @@ impl Wall {
             let starting: Vec<_> = windows
                 .iter()
                 .map(|window| {
-                    scope.spawn(move || {
-                        (window, super::capture_wgc::WgcCapturer::for_window(window.id))
-                    })
+                    scope.spawn(move || (window, open_window(window.id)))
                 })
                 .collect();
             // In the order they were asked for, not the order they finished:
@@ -406,7 +433,7 @@ impl Wall {
             // the composite is rebuilt without it, which is the next tick.
             let panel = Arc::new(Panel {
                 name: window.title.clone(),
-                capturer: Mutex::new(Box::new(capturer)),
+                capturer: Mutex::new(capturer),
                 at: Mutex::new(places[index]),
                 frame: Mutex::new(None),
                 fitted: Mutex::new(None),
@@ -984,6 +1011,15 @@ impl ScreenCaptureBackend for Wall {
     /// positions, and a position stops at the edge of the picture. See
     /// [`super::capture_wgc::pointer_showing`], which is the same answer for
     /// the same reason, and `GuestSession::wants_relative_pointer`.
+    ///
+    /// Nothing on Linux, where KWin draws the pointer into each window's stream
+    /// and keeps no other account of it that this could read.
+    #[cfg(not(target_os = "windows"))]
+    fn take_cursor(&mut self) -> Option<super::cursor::CursorUpdate> {
+        None
+    }
+
+    #[cfg(target_os = "windows")]
     fn take_cursor(&mut self) -> Option<super::cursor::CursorUpdate> {
         let (showing, at) = super::capture_wgc::pointer_showing()?;
         if self.cursor_visible == Some(showing) {
@@ -1048,7 +1084,9 @@ impl Drop for Wall {
     }
 }
 
-#[cfg(test)]
+// Windows only: most of these capture the desktop, and the layout they also
+// cover is the same code on both.
+#[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
 

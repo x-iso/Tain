@@ -80,12 +80,18 @@ struct Duplication {
     hdr: Option<HdrToSdr>,
     width: u16,
     height: u16,
+    /// Where this display's top-left is on the desktop, which is what
+    /// `GetCursorPos` measures from and the guest's position does not.
+    origin: (i32, i32),
     /// Pointer state since it was last taken. See [`Duplication::read_pointer`].
     cursor_position: Option<super::cursor::CursorPosition>,
     cursor_shape: Option<super::cursor::CursorShape>,
     /// Reused across shape reads, so a pointer crossing windows does not
     /// allocate on every hop.
     pointer_buffer: Vec<u8>,
+    /// Where the pointer was last said to be while touch had Windows hiding it.
+    /// See [`super::cursor::driven_after_touch`].
+    shown_despite_touch: Option<super::cursor::CursorPosition>,
 }
 
 impl Duplication {
@@ -255,10 +261,13 @@ impl Duplication {
         }
 
         // SAFETY: each cast/query is checked; the COM objects outlive the calls.
-        let (output, width, height, hdr) = unsafe {
+        let (output, width, height, hdr, origin) = unsafe {
             let dxgi_device: IDXGIDevice = device.cast().context("device is not a IDXGIDevice")?;
             let adapter = dxgi_device.GetAdapter().context("no DXGI adapter")?;
             let (output, where_) = choose_output(&adapter, want)?;
+            let origin = output.GetDesc().map_or((0, 0), |desc| {
+                (desc.DesktopCoordinates.left, desc.DesktopCoordinates.top)
+            });
             let output1: IDXGIOutput1 = output.cast().context("output is not IDXGIOutput1")?;
 
             let colour = super::capture_hdr::probe(&output);
@@ -315,7 +324,7 @@ impl Duplication {
                 }
             }
 
-            (duplication, size.0, size.1, converter)
+            (duplication, size.0, size.1, converter, origin)
         };
 
         let staging = create_staging_texture(&device, width, height)?;
@@ -330,9 +339,11 @@ impl Duplication {
             converter: None,
             width,
             height,
+            origin,
             cursor_position: None,
             cursor_shape: None,
             pointer_buffer: Vec::new(),
+            shown_despite_touch: None,
         })
     }
 
@@ -460,6 +471,29 @@ impl Duplication {
 
     /// Pointer state since the last call, if anything changed.
     pub fn take_cursor(&mut self) -> Option<super::cursor::CursorUpdate> {
+        if super::cursor::driven_after_touch() {
+            match super::capture_wgc::pointer_showing() {
+                Some((true, _)) => {
+                    super::cursor::pointer_is_back();
+                    self.shown_despite_touch = None;
+                }
+                Some((false, at)) => {
+                    // What the duplication said is what is being overruled.
+                    self.cursor_position = None;
+                    let position =
+                        super::cursor::shown_at(at, self.origin, self.width, self.height);
+                    let shape = self.cursor_shape.take();
+                    if self.shown_despite_touch == Some(position) && shape.is_none() {
+                        return None;
+                    }
+                    self.shown_despite_touch = Some(position);
+                    return Some(super::cursor::CursorUpdate { position, shape });
+                }
+                None => {}
+            }
+        } else {
+            self.shown_despite_touch = None;
+        }
         let position = self.cursor_position.take()?;
         Some(super::cursor::CursorUpdate { position, shape: self.cursor_shape.take() })
     }

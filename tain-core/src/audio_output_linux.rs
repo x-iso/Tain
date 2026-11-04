@@ -14,10 +14,11 @@
 //!
 //! ## Which device
 //!
-//! The default output, followed when it changes: the sound server moves a
-//! stream that was not opened on a named device when the default moves.
-//! Choosing a device in Settings is not wired on Linux yet, so the picker
-//! offers only the default.
+//! The one chosen in Settings, or the default output, followed when it changes:
+//! the sound server moves a stream that was not opened on a named device when
+//! the default moves. A chosen device that is unplugged falls back to the
+//! default until it returns, as on Windows. The render thread looks at this
+//! about once a second, because a write cannot be interrupted to tell it.
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -54,10 +55,46 @@ const PERIOD_MS: u32 = 5;
 /// How long to wait before trying the sound server again.
 const RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The device as the picker and the stats show it. The sound server picks the
-/// real one; this says only that it is the default.
+/// How often the render thread checks which device it should be on.
+const RECHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The device chosen in Settings, by the sound server's name for it.
+static CHOSEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// Play on this device, or on the default with `None`. Reaches sessions that
+/// are already playing within [`RECHECK_EVERY`].
+pub(crate) fn set_playback_device(id: Option<String>) {
+    *CHOSEN.lock().unwrap_or_else(|e| e.into_inner()) = id;
+}
+
+/// The default device as the guest and the stats are told about it: by the name
+/// the desktop's sound settings use. The sound server picks the real one; only
+/// if it cannot be asked does this have to say no more than "the default".
 pub(crate) fn default_device() -> AudioDevice {
-    AudioDevice { id: String::new(), name: "Default output".to_string(), default: true }
+    pulse::devices().into_iter().find(|device| device.default).unwrap_or(AudioDevice {
+        id: String::new(),
+        name: "Default output".to_string(),
+        default: true,
+    })
+}
+
+/// Which of `devices` a stream should open on, given what was chosen: the name
+/// to open it with, or `None` for the default. A choice that is not plugged in
+/// is the default for now.
+pub(crate) fn resolved(chosen: Option<&str>, devices: &[AudioDevice]) -> Option<String> {
+    chosen.filter(|id| devices.iter().any(|device| device.id == *id)).map(str::to_string)
+}
+
+/// Where this should be playing now, as a name to open and as a device to show.
+fn target() -> (Option<String>, AudioDevice) {
+    let chosen = CHOSEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let devices = pulse::devices();
+    let open_on = resolved(chosen.as_deref(), &devices);
+    let device = open_on
+        .as_ref()
+        .and_then(|id| devices.iter().find(|device| device.id == *id).cloned())
+        .unwrap_or_else(default_device);
+    (open_on, device)
 }
 
 impl AudioOutput {
@@ -74,10 +111,11 @@ impl AudioOutput {
         // Opened here rather than on the thread, so `device()` answers
         // truthfully from the moment this returns, as on Windows. A server
         // that is not there yet is retried on the thread.
-        let first = open_playback(sample_rate, channels);
-        let device = Arc::new(Mutex::new(first.as_ref().ok().map(|_| default_device())));
+        let (open_on, on) = target();
+        let first = open_playback(open_on.as_deref(), sample_rate, channels);
+        let device = Arc::new(Mutex::new(first.as_ref().ok().map(|_| on.clone())));
         match &first {
-            Ok(_) => info!("Playing on the default output"),
+            Ok(_) => info!("Playing on {}", on.name),
             Err(e) => warn!("No sound output yet ({e:#}) — trying again shortly"),
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -91,7 +129,7 @@ impl AudioOutput {
                 let device = Arc::clone(&device);
                 let stop = Arc::clone(&stop);
                 let first = first.ok();
-                move || render(first, sample_rate, channels, buffer, muted, volume, device, stop)
+                move || render(first, open_on, sample_rate, channels, buffer, muted, volume, device, stop)
             })
             .context("could not start the audio render thread")?;
 
@@ -146,13 +184,14 @@ impl Drop for AudioOutput {
     }
 }
 
-fn open_playback(sample_rate: u32, channels: u16) -> Result<pulse::Stream> {
-    pulse::Stream::playback("Remote desktop sound", sample_rate, channels, DEVICE_TARGET_MS, PERIOD_MS)
+fn open_playback(device: Option<&str>, sample_rate: u32, channels: u16) -> Result<pulse::Stream> {
+    pulse::Stream::playback("Remote desktop sound", device, sample_rate, channels, DEVICE_TARGET_MS, PERIOD_MS)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn render(
     mut stream: Option<pulse::Stream>,
+    mut opened_on: Option<String>,
     sample_rate: u32,
     channels: u16,
     buffer: Arc<Mutex<JitterBuffer>>,
@@ -168,17 +207,34 @@ fn render(
     let mut samples = Vec::with_capacity(period * channels as usize);
     // `start` has just tried; wait before the first retry if it failed.
     let mut retry_at = std::time::Instant::now() + if stream.is_some() { std::time::Duration::ZERO } else { RETRY_EVERY };
+    let mut recheck_at = std::time::Instant::now() + RECHECK_EVERY;
 
     while !stop.load(Ordering::Relaxed) {
+        // A different device was chosen, or the chosen one came or went. Named
+        // again each time too, because the default can have moved under a
+        // stream that is simply following it.
+        if stream.is_some() && std::time::Instant::now() >= recheck_at {
+            recheck_at = std::time::Instant::now() + RECHECK_EVERY;
+            let (open_on, on) = target();
+            if open_on != opened_on {
+                stream = None;
+                retry_at = std::time::Instant::now();
+            } else {
+                set_device(Some(on));
+            }
+        }
+
         if stream.is_none() {
             if std::time::Instant::now() < retry_at {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
-            match open_playback(sample_rate, channels) {
+            let (open_on, on) = target();
+            match open_playback(open_on.as_deref(), sample_rate, channels) {
                 Ok(opened) => {
-                    info!("Playing on the default output");
-                    set_device(Some(default_device()));
+                    info!("Playing on {}", on.name);
+                    set_device(Some(on));
+                    opened_on = open_on;
                     stream = Some(opened);
                 }
                 Err(e) => {

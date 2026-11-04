@@ -136,6 +136,14 @@ libc = "0.2"
 # The screen sharing and remote input portals, over D-Bus. Already in the tree
 # with these features, through the credential store; see portal.rs.
 zbus = "5"
+# Reading the desktop's wallpaper for a connection's card, where Windows has
+# WIC. The formats wallpapers come in, on every desktop that keeps one in a file;
+# see wallpaper.rs.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# KWin's window list, window capture and fake input, for sharing windows on Plasma
+# as on Windows; see kwin.rs. Already in the tree through winit and the interface.
+wayland-client = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 
 # The libavcodec shim is compiled by build.rs with the same MSVC toolchain Rust
 # already needs, which keeps LLVM/bindgen out of the prerequisites.

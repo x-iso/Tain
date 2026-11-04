@@ -62,6 +62,23 @@ pub enum Mapping {
     },
 }
 
+/// Where a guest's position lands on this machine, through whatever the session
+/// said it is showing. In the same units as that: desktop pixels on Windows, the
+/// desktop's logical coordinates for a window KWin describes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn through_mapping(mapping: &Mapping, x: u16, y: u16) -> Option<(i32, i32)> {
+    match mapping {
+        Mapping::Tiled { size, tiles } => through_tiles(*size, tiles, x, y),
+        Mapping::Whole(shown) => {
+            let scale = |value: u16, size: u16| {
+                (i64::from(value) * i64::from(size.max(1) - 1) / i64::from(crate::protocol::ABSOLUTE_MAX))
+                    as i32
+            };
+            Some((shown.x + scale(x, shown.width), shown.y + scale(y, shown.height)))
+        }
+    }
+}
+
 /// Where a point in a tiled picture lands on this machine, if anywhere.
 ///
 /// `None` for a point in none of the tiles — the space between them. That is a
@@ -194,6 +211,15 @@ pub trait InputInjector: Send + Sync {
     /// making all of them carry a list to describe a rectangle would be paying
     /// for the exception everywhere.
     fn set_mapping(&self, _mapping: Mapping) {}
+
+    /// The windows the session is sharing, or none for a session sharing
+    /// screens.
+    ///
+    /// Only a backend that reaches windows another way than screens has any use
+    /// for it: on Linux a screen is driven through the portal session that shares
+    /// it, and a window through KWin, which also brings the one being clicked to
+    /// the front. See `input_portal`.
+    fn show_windows(&self, _windows: &[u64]) {}
 
     /// Move the pointer to an absolute position on the host display.
     fn move_mouse(&self, pos: MousePosition) -> Result<()>;
@@ -591,6 +617,7 @@ mod windows_impl {
                 return Ok(());
             };
             let (x, y) = Self::to_virtual_desktop(point);
+            super::super::cursor::guest_moved_mouse();
             Self::send(Self::mouse(
                 MOUSEEVENTF_MOVE.0 | MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0,
                 x,
@@ -611,6 +638,7 @@ mod windows_impl {
             if (dx, dy) == (0, 0) {
                 return Ok(());
             }
+            super::super::cursor::guest_moved_mouse();
             Self::send(Self::mouse(MOUSEEVENTF_MOVE.0, dx, dy, 0))
         }
 
@@ -735,6 +763,8 @@ mod windows_impl {
                 // Already reported once. Not an error per finger.
                 return Ok(());
             }
+            // Windows hides the pointer for this. See `cursor`.
+            super::super::cursor::guest_touched();
 
             /// A contact that stays down between updates.
             const HELD: POINTER_FLAGS = POINTER_FLAGS(
@@ -1148,6 +1178,17 @@ impl InputInjector for Deferring {
         self.inner.set_shown(shown);
     }
 
+    // The same, and as easy to miss: this went unforwarded, so a composite of
+    // windows never told the platform injector where its tiles were, and every
+    // click in one was mapped as if the picture were the primary screen.
+    fn set_mapping(&self, mapping: Mapping) {
+        self.inner.set_mapping(mapping);
+    }
+
+    fn show_windows(&self, windows: &[u64]) {
+        self.inner.show_windows(windows);
+    }
+
     fn move_mouse(&self, pos: MousePosition) -> Result<()> {
         if self.giving_way() {
             return Ok(());
@@ -1414,6 +1455,44 @@ mod deferring_tests {
             self.note("release touches");
             Ok(())
         }
+        fn set_mapping(&self, mapping: Mapping) {
+            self.note(match mapping {
+                Mapping::Whole(_) => "mapping whole",
+                Mapping::Tiled { .. } => "mapping tiled",
+            });
+        }
+        fn show_windows(&self, windows: &[u64]) {
+            self.note(if windows.is_empty() { "screens" } else { "windows" });
+        }
+    }
+
+    /// Where a session's picture is has to reach the platform injector whatever
+    /// shape it is, or a composite's clicks land against the primary screen.
+    #[test]
+    fn what_is_shown_reaches_the_injector_underneath() {
+        let recorder = Recorder::default();
+        let seen = recorder.events.clone();
+        let deferring = Deferring::new(Box::new(recorder));
+        deferring.set_shown(Shown { x: 0, y: 0, width: 100, height: 100 });
+        deferring.set_mapping(Mapping::Tiled { size: (100, 100), tiles: Vec::new() });
+        deferring.show_windows(&[7]);
+        assert_eq!(*seen.lock().unwrap(), ["mapping whole", "mapping tiled", "windows"]);
+    }
+
+    #[test]
+    fn a_position_maps_through_a_rectangle_or_a_tile() {
+        let shown = Mapping::Whole(Shown { x: 100, y: 50, width: 201, height: 101 });
+        assert_eq!(through_mapping(&shown, 0, 0), Some((100, 50)));
+        assert_eq!(through_mapping(&shown, u16::MAX, u16::MAX), Some((300, 150)));
+        let tiled = Mapping::Tiled {
+            size: (200, 100),
+            tiles: vec![Tile {
+                picture: (0, 0, 100, 100),
+                desktop: crate::window_capture::OnScreen { x: 500, y: 500, width: 100, height: 100 },
+            }],
+        };
+        assert!(through_mapping(&tiled, u16::MAX, 0).is_none(), "the right half is no tile");
+        assert!(through_mapping(&tiled, 1000, 1000).is_some_and(|(x, y)| x >= 500 && y >= 500));
     }
 
     impl Recorder {

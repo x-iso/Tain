@@ -77,39 +77,31 @@ pub fn available() -> Result<()> {
     Ok(())
 }
 
-/// One shared screen, as frames.
-pub struct PortalCapturer {
-    /// Kept for as long as this captures: dropping the last one ends the
-    /// portal session, and with it the desktop's sharing indicator.
-    session: Arc<RemoteSession>,
+/// One PipeWire video stream, as frames: what the portal hands over, and what
+/// KWin publishes when it is asked for a window directly (see `capture_kwin`).
+pub(crate) struct PwStream {
     stream: *mut DbPwStream,
     size: (u16, u16),
-    /// The screen's size in the desktop's logical coordinates, which on a
-    /// scaled display is smaller than the frames. Input is mapped through it.
-    logical: Option<(i32, i32)>,
     wait_ms: i32,
+    /// What to call it in a log line.
+    what: &'static str,
 }
 
 // SAFETY: the stream handle is owned solely here and used from one thread at a
 // time; the C side locks around everything its own thread shares.
-unsafe impl Send for PortalCapturer {}
-unsafe impl Sync for PortalCapturer {}
+unsafe impl Send for PwStream {}
+unsafe impl Sync for PwStream {}
 
-impl PortalCapturer {
-    /// Share a screen. Shows the desktop's dialog unless a remembered choice
-    /// holds, and blocks until it is answered.
-    pub fn new(config: &CaptureConfig) -> Result<Self> {
+impl PwStream {
+    /// Connect to `node`, through the remote `fd` when there is one and to the
+    /// user's own PipeWire daemon otherwise, and wait until it says its size.
+    pub(crate) fn open(fd: Option<std::os::fd::OwnedFd>, node: u32, fps: u32, what: &'static str) -> Result<Self> {
         available()?;
-        let session = portal::session()?;
-        let info = session.streams().first().cloned().context("the desktop shared no screen")?;
-        let fd = session.pipewire_fd()?;
-
         let mut err = [0u8; 256];
+        let fd = fd.map_or(-1, IntoRawFd::into_raw_fd);
         // SAFETY: the descriptor is handed over (PipeWire closes it), the error
         // buffer is valid for its stated length, and the handle is checked.
-        let stream = unsafe {
-            db_pw_stream_open(fd.into_raw_fd(), info.node_id, err.as_mut_ptr(), err.len() as i32)
-        };
+        let stream = unsafe { db_pw_stream_open(fd, node, err.as_mut_ptr(), err.len() as i32) };
         anyhow::ensure!(!stream.is_null(), "{}", message(&err));
 
         let (mut width, mut height) = (0, 0);
@@ -121,39 +113,28 @@ impl PortalCapturer {
             // SAFETY: a live stream, closed exactly once.
             unsafe { db_pw_stream_close(stream) };
             anyhow::bail!(
-                "the shared screen never said its size ({})",
+                "the {what} never said its size ({})",
                 if rc < 0 { message(&err) } else { "timed out".to_string() }
             );
         }
         let size = (width.clamp(1, u16::MAX as i32) as u16, height.clamp(1, u16::MAX as i32) as u16);
-        info!(
-            "Capturing the shared screen at {}x{} (logical {:?}) through PipeWire node {}",
-            size.0, size.1, info.size, info.node_id
-        );
         Ok(Self {
-            session,
             stream,
             size,
-            logical: info.size,
             // A frame period, so the capture loop's own pacing is not undone
             // by waiting here longer than it would.
-            wait_ms: (1000 / config.fps.max(1)).clamp(1, 100) as i32,
+            wait_ms: (1000 / fps.max(1)).clamp(1, 100) as i32,
+            what,
         })
     }
 
-    /// The screen's size in logical desktop coordinates, when the desktop said.
-    pub fn logical_size(&self) -> Option<(i32, i32)> {
-        self.logical
+    pub(crate) fn size(&self) -> (u16, u16) {
+        self.size
     }
 
-    /// The portal session this capture belongs to.
-    pub fn session(&self) -> &Arc<RemoteSession> {
-        &self.session
-    }
-}
-
-impl ScreenCaptureBackend for PortalCapturer {
-    fn capture_next(&mut self) -> Result<Option<ScreenFrame>> {
+    /// The newest frame, if one arrived within a frame period.
+    pub(crate) fn next(&mut self) -> Result<Option<ScreenFrame>> {
+        let what = self.what;
         let mut err = [0u8; 256];
         let (mut width, mut height) = (0, 0);
         // First only wait: with no room offered, a fresh frame reports its
@@ -174,7 +155,7 @@ impl ScreenCaptureBackend for PortalCapturer {
         };
         match rc {
             0 => return Ok(None),
-            -1 => anyhow::bail!("the shared screen went away: {}", message(&err)),
+            -1 => anyhow::bail!("the {what} went away: {}", message(&err)),
             _ => {}
         }
 
@@ -200,27 +181,77 @@ impl ScreenCaptureBackend for PortalCapturer {
             // A newer frame of another size arrived in between; the next call
             // takes it.
             -2 | 0 => return Ok(None),
-            _ => anyhow::bail!("the shared screen went away: {}", message(&err)),
+            _ => anyhow::bail!("the {what} went away: {}", message(&err)),
         }
         frame.truncate(width as usize * height as usize * 4);
         let (w, h) = (width as u16, height as u16);
         if (w, h) != self.size {
-            info!("The shared screen is now {w}x{h}");
+            info!("The {what} is now {w}x{h}");
             self.size = (w, h);
         }
         Ok(Some(ScreenFrame::new(w, h, Bytes::from(frame), started.elapsed())))
     }
+}
 
-    fn frame_size(&self) -> (u16, u16) {
-        self.size
+impl Drop for PwStream {
+    fn drop(&mut self) {
+        // SAFETY: a live stream, closed exactly once, before whatever it reads
+        // from is let go — its holder's fields drop after this one.
+        unsafe { db_pw_stream_close(self.stream) };
     }
 }
 
-impl Drop for PortalCapturer {
-    fn drop(&mut self) {
-        // SAFETY: a live stream, closed exactly once, before the session it
-        // reads from is let go.
-        unsafe { db_pw_stream_close(self.stream) };
+/// One shared screen, as frames.
+pub struct PortalCapturer {
+    /// First, so it closes before the session it reads from is let go.
+    stream: PwStream,
+    /// Kept for as long as this captures: dropping the last one ends the
+    /// portal session, and with it the desktop's sharing indicator.
+    session: Arc<RemoteSession>,
+    /// The screen's size in the desktop's logical coordinates, which on a
+    /// scaled display is smaller than the frames. Input is mapped through it.
+    logical: Option<(i32, i32)>,
+}
+
+impl PortalCapturer {
+    /// Share a screen. Shows the desktop's dialog unless a remembered choice
+    /// holds, and blocks until it is answered.
+    pub fn new(config: &CaptureConfig) -> Result<Self> {
+        available()?;
+        use crate::screen_capture::DisplayTarget;
+        let session = match config.display {
+            DisplayTarget::Window(_) | DisplayTarget::Windows(_) => portal::window_session()?,
+            _ => portal::session()?,
+        };
+        let info = session.streams().first().cloned().context("the desktop shared no screen")?;
+        let fd = session.pipewire_fd()?;
+        let stream = PwStream::open(Some(fd), info.node_id, config.fps, "shared screen")?;
+        let size = stream.size();
+        info!(
+            "Capturing the shared screen at {}x{} (logical {:?}) through PipeWire node {}",
+            size.0, size.1, info.size, info.node_id
+        );
+        Ok(Self { stream, session, logical: info.size })
+    }
+
+    /// The screen's size in logical desktop coordinates, when the desktop said.
+    pub fn logical_size(&self) -> Option<(i32, i32)> {
+        self.logical
+    }
+
+    /// The portal session this capture belongs to.
+    pub fn session(&self) -> &Arc<RemoteSession> {
+        &self.session
+    }
+}
+
+impl ScreenCaptureBackend for PortalCapturer {
+    fn capture_next(&mut self) -> Result<Option<ScreenFrame>> {
+        self.stream.next()
+    }
+
+    fn frame_size(&self) -> (u16, u16) {
+        self.stream.size()
     }
 }
 

@@ -285,6 +285,17 @@ time and can switch between the ones you choose, but nothing outside them.
 [approval.pick_individual]
 Individual windows…
 
+[approval.desktop_window]
+Share one window…
+
+[approval.desktop_window_on]
+One window, chosen next
+
+[approval.desktop_window_hint]
+Share one application window and nothing else. Your desktop will ask which window
+right after you allow this. The guest can watch it but not control it: this desktop
+takes input for the whole computer, not for a window.
+
 [approval.windows_chosen.zero]
 No windows
 

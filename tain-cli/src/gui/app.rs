@@ -890,6 +890,12 @@ pub async fn init_host_server(state: &AppState) -> anyhow::Result<HostHandles> {
     let (changed_tx, passcode_changed_rx) = mpsc::unbounded_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
+    // Whether windows are listed by Tain or picked in the desktop's dialog is
+    // asked now rather than when somebody first connects: the answer goes in
+    // the log, which is where someone asking why sharing windows looks the way
+    // it does will look, and the first accept dialog should not wait on it.
+    std::thread::spawn(tain_core::window_capture::chosen_by_desktop);
+
     // The identity comes first and is always kept. Every code embeds the
     // endpoint id, which is this key's public half, so a fresh key silently
     // invalidates every code this machine has ever handed out — including the
@@ -1294,20 +1300,21 @@ async fn run_command_loop(
     }
 }
 
-/// Read the system clipboard. egui only surfaces paste as a keyboard event, so
-/// the design's paste *button* needs to go around it.
-fn read_clipboard() -> Option<String> {
-    match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-        Ok(text) => {
-            let trimmed = text.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        }
-        Err(e) => {
-            warn!("Clipboard read failed: {e}");
-            None
-        }
-    }
-}
+/// How many frames the Paste button waits for the clipboard before calling it
+/// empty.
+///
+/// The button does not read the clipboard itself. It asks the window to, with
+/// `ViewportCommand::RequestPaste`, and the text comes back as an ordinary
+/// `Event::Paste`. A separate clipboard client cannot do this job on Wayland:
+/// the compositor only tells a client what is on the clipboard while one of its
+/// own surfaces has keyboard focus, and a client with no window never does. So
+/// `arboard` went through XWayland, which often has not been given the
+/// selection, and a clipboard that was plainly full read as empty.
+///
+/// An empty clipboard sends no event at all, so the only way to tell is to stop
+/// waiting. eframe answers on the second frame after the request; the rest is
+/// margin, and four frames is still too short to see.
+const PASTE_WAIT_FRAMES: u8 = 4;
 
 // ── Application ──────────────────────────────────────────────
 
@@ -1796,6 +1803,9 @@ pub struct GuestApp {
     connect_error: Option<String>,
     /// What the pasted code turned out to be, once the host was asked.
     paste_state: PasteState,
+    /// Frames left for the clipboard to answer the Paste button; zero when
+    /// nothing was asked. See [`PASTE_WAIT_FRAMES`].
+    paste_wait: u8,
     /// The code the pending check is about, so a late answer to a code the user
     /// has already replaced is discarded rather than shown against the new one.
     checking: Option<ConnectionCode>,
@@ -1859,6 +1869,7 @@ impl GuestApp {
             pending_handles: None,
             connect_error: None,
             paste_state: PasteState::default(),
+            paste_wait: 0,
             checking: None,
             check_tx: None,
             resweep_tx: None,
@@ -2368,31 +2379,63 @@ impl GuestApp {
         }
 
         if edits.paste_passcode {
-            // Validate on paste rather than on Connect, so a mangled code is
-            // reported while the user still has the original to hand.
             self.checking = None;
-            match read_clipboard() {
-                None => {
-                    self.paste_state = PasteState::Idle;
-                    self.connect_error = Some(t!("header.clipboard_empty").into());
-                }
-                Some(text) => match ConnectionCode::parse(&text) {
-                    Ok(code) => {
-                        info!("Pasted {}", code.redacted());
-                        *self.state.connect.passcode.lock().unwrap() = text;
-                        self.connect_error = None;
-                        // Parsing only proves the string is well-formed. Whether
-                        // Connect will work is a question for the host, and
-                        // asking it now is cheaper than a failed attempt later.
-                        self.check_pasted(code);
-                    }
-                    Err(e) => {
-                        self.state.connect.passcode.lock().unwrap().clear();
-                        self.paste_state = PasteState::Idle;
-                        self.connect_error = Some(format!("{e}"));
-                    }
-                },
+            self.paste_wait = PASTE_WAIT_FRAMES;
+        }
+    }
+
+    /// Take the answer to the Paste button out of a frame's input, before egui
+    /// sees it, so that it cannot also land in a text field that has focus.
+    ///
+    /// Only the main window's input counts: the button asked that window, and
+    /// a session window's frames must not use up its wait.
+    fn collect_paste(&mut self, raw_input: &mut egui::RawInput) {
+        if self.paste_wait == 0 || raw_input.viewport_id != egui::ViewportId::ROOT {
+            return;
+        }
+        let mut pasted = None;
+        raw_input.events.retain_mut(|event| match event {
+            egui::Event::Paste(text) => {
+                pasted = Some(std::mem::take(text));
+                false
             }
+            _ => true,
+        });
+        self.paste_wait -= 1;
+        if pasted.is_some() {
+            self.paste_wait = 0;
+            self.take_pasted(pasted);
+        } else if self.paste_wait == 0 {
+            self.take_pasted(None);
+        }
+    }
+
+    /// Act on what the clipboard held, if it held anything.
+    fn take_pasted(&mut self, text: Option<String>) {
+        // Validate on paste rather than on Connect, so a mangled code is
+        // reported while the user still has the original to hand.
+        let text = text.map(|text| text.trim().to_string()).filter(|text| !text.is_empty());
+        match text {
+            None => {
+                self.paste_state = PasteState::Idle;
+                self.connect_error = Some(t!("header.clipboard_empty").into());
+            }
+            Some(text) => match ConnectionCode::parse(&text) {
+                Ok(code) => {
+                    info!("Pasted {}", code.redacted());
+                    *self.state.connect.passcode.lock().unwrap() = text;
+                    self.connect_error = None;
+                    // Parsing only proves the string is well-formed. Whether
+                    // Connect will work is a question for the host, and
+                    // asking it now is cheaper than a failed attempt later.
+                    self.check_pasted(code);
+                }
+                Err(e) => {
+                    self.state.connect.passcode.lock().unwrap().clear();
+                    self.paste_state = PasteState::Idle;
+                    self.connect_error = Some(format!("{e}"));
+                }
+            },
         }
     }
 
@@ -2974,16 +3017,25 @@ impl GuestApp {
                     ui.label(
                         egui::RichText::new(t!("approval.remote_inputs")).size(12.0).color(TEXT),
                     );
-                    ui.checkbox(
-                        &mut grants.mouse,
-                        egui::RichText::new(t!("approval.mouse")).color(TEXT),
-                    )
-                    .on_hover_text(t!("approval.mouse_hint"));
-                    ui.checkbox(
-                        &mut grants.keyboard,
-                        egui::RichText::new(t!("approval.keyboard")).color(TEXT),
-                    )
-                    .on_hover_text(t!("approval.keyboard_hint"));
+                    // A window the desktop picks can only be watched: see
+                    // `window_capture::DESKTOP_CHOOSES`.
+                    let view_only =
+                        chosen.contains(&tain_core::window_capture::DESKTOP_CHOOSES);
+                    if view_only {
+                        grants = ControlGrants::NONE;
+                    }
+                    ui.add_enabled_ui(!view_only, |ui| {
+                        ui.checkbox(
+                            &mut grants.mouse,
+                            egui::RichText::new(t!("approval.mouse")).color(TEXT),
+                        )
+                        .on_hover_text(t!("approval.mouse_hint"));
+                        ui.checkbox(
+                            &mut grants.keyboard,
+                            egui::RichText::new(t!("approval.keyboard")).color(TEXT),
+                        )
+                        .on_hover_text(t!("approval.keyboard_hint"));
+                    });
 
                     // # Screens as a row of monitors
                     //
@@ -3098,23 +3150,51 @@ impl GuestApp {
                     // No symbol in front of it. `🗔` (U+1F5D4) has no glyph in
                     // the bundled fonts and drew an empty box — see
                     // `theme::tests::every_symbol_the_ui_draws_has_a_glyph`.
-                    let summary = if count == 0 {
-                        t!("approval.pick_individual").to_string()
+                    //
+                    // # Where the desktop does the choosing, there is no list
+                    //
+                    // A Wayland desktop tells nobody what else is open, so a
+                    // picker here could only ever be empty. This says what will
+                    // happen instead: the desktop's own dialog asks which
+                    // window, once the guest has been let in.
+                    if tain_core::window_capture::chosen_by_desktop() {
+                        let label = if count == 0 {
+                            t!("approval.desktop_window")
+                        } else {
+                            t!("approval.desktop_window_on")
+                        };
+                        let ask =
+                            egui::Button::new(egui::RichText::new(label).size(12.5).color(TEXT))
+                                .selected(count != 0)
+                                .min_size(egui::vec2(theme::PILL_W - 24.0, 24.0));
+                        if ui.add(ask).on_hover_text(t!("approval.desktop_window_hint")).clicked() {
+                            if count == 0 {
+                                chosen.insert(tain_core::window_capture::DESKTOP_CHOOSES);
+                            } else {
+                                chosen.clear();
+                            }
+                        }
                     } else {
-                        tain_core::i18n::plural("approval.windows_chosen", count as u64, &[])
-                    };
-                    let open =
-                        egui::Button::new(egui::RichText::new(summary).size(12.5).color(TEXT))
-                            .min_size(egui::vec2(theme::PILL_W - 24.0, 24.0));
-                    if ui
-                        .add(open)
-                        .on_hover_text(t!("approval.one_window_hint"))
-                        .clicked()
-                    {
-                        picking = !picking;
+                        let summary = if count == 0 {
+                            t!("approval.pick_individual").to_string()
+                        } else {
+                            tain_core::i18n::plural("approval.windows_chosen", count as u64, &[])
+                        };
+                        let open =
+                            egui::Button::new(egui::RichText::new(summary).size(12.5).color(TEXT))
+                                .min_size(egui::vec2(theme::PILL_W - 24.0, 24.0));
+                        if ui
+                            .add(open)
+                            .on_hover_text(t!("approval.one_window_hint"))
+                            .clicked()
+                        {
+                            picking = !picking;
+                        }
                     }
 
-                    if count == 0 && share.is_empty() {
+                    // Not where no screens are listed, as on Linux: then the row
+                    // above can only say "all", and that is what they get.
+                    if count == 0 && share.is_empty() && !screens.is_empty() {
                         ui.add_space(2.0);
                         ui.label(
                             egui::RichText::new(t!("approval.nothing_chosen"))
@@ -3211,6 +3291,9 @@ impl GuestApp {
         // The list is read at the moment it opens rather than when the dialog
         // did: those can be minutes apart while a guest waits, and a picker is
         // asking about the desk as it is now.
+        if chosen.contains(&tain_core::window_capture::DESKTOP_CHOOSES) {
+            confirm.windows = Self::pickable(&chosen);
+        }
         if picking && !confirm.picking {
             confirm.windows = Self::pickable(&chosen);
             shots
@@ -3498,6 +3581,7 @@ impl GuestApp {
                     .clicked()
                     {
                         edits.paste_passcode = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
                     }
 
                     ui.add_space(10.0);
@@ -4641,6 +4725,7 @@ impl eframe::App for GuestApp {
     /// is already measured with a finger's slack — see `touch`.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         super::touch::observe(ctx, &raw_input.events, raw_input.time.unwrap_or(0.0));
+        self.collect_paste(raw_input);
     }
 
     /// Tell every connected guest before the window goes.
@@ -4846,6 +4931,7 @@ impl eframe::App for GuestApp {
         // is still a window nobody can see.
         super::notify::watch(ctx);
         if super::notify::was_clicked() {
+            info!("A notification was clicked — bringing Tain forward");
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
@@ -4885,6 +4971,11 @@ impl eframe::App for GuestApp {
         let connect = edits.connect;
         let reconnect = edits.reconnect.clone();
         self.apply(edits);
+        // The answer only arrives in a later frame, and nothing else is
+        // guaranteed to cause one.
+        if self.paste_wait > 0 {
+            ctx.request_repaint();
+        }
         if connect {
             self.start_session(ctx);
         }
@@ -6393,13 +6484,77 @@ mod tests {
         *app.state.connect.passcode.lock().unwrap() = "GUEST-previous".into();
         app.paste_state = PasteState::Ready { host: None, needs_approval: false };
 
-        // No clipboard access in a test, so drive the branch directly.
-        app.state.connect.passcode.lock().unwrap().clear();
-        app.paste_state = PasteState::Idle;
-        app.connect_error = Some("bad code".into());
+        app.take_pasted(Some("not a code".into()));
 
+        assert!(app.connect_error.is_some());
         assert!(app.state.connect.passcode.lock().unwrap().is_empty());
         assert!(!app.paste_state.is_ready(), "a refused paste must not stay green");
+    }
+
+    /// One frame's input for the main window, or for a window that is not it.
+    fn input_of(viewport: egui::ViewportId, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput { viewport_id: viewport, events, ..Default::default() }
+    }
+
+    #[test]
+    fn the_paste_button_takes_its_answer_out_of_the_input() {
+        let mut app = GuestApp::new(AppState::new());
+        app.paste_wait = PASTE_WAIT_FRAMES;
+
+        let mut empty_frame = input_of(egui::ViewportId::ROOT, vec![]);
+        app.collect_paste(&mut empty_frame);
+        assert!(app.paste_wait > 0, "the answer takes more than a frame to come");
+        assert!(app.connect_error.is_none());
+
+        let mut frame = input_of(
+            egui::ViewportId::ROOT,
+            vec![egui::Event::Copy, egui::Event::Paste("not a code".into())],
+        );
+        app.collect_paste(&mut frame);
+
+        assert_eq!(app.paste_wait, 0);
+        assert_eq!(frame.events, vec![egui::Event::Copy], "a text field must not get it too");
+        assert!(app.connect_error.is_some(), "and the code was read");
+        assert_ne!(
+            app.connect_error.as_deref(),
+            Some(t!("header.clipboard_empty")),
+            "a clipboard that answered is not an empty one",
+        );
+    }
+
+    #[test]
+    fn a_clipboard_that_never_answers_is_called_empty_once() {
+        let mut app = GuestApp::new(AppState::new());
+        app.paste_wait = PASTE_WAIT_FRAMES;
+
+        for _ in 0..PASTE_WAIT_FRAMES - 1 {
+            app.collect_paste(&mut input_of(egui::ViewportId::ROOT, vec![]));
+            assert!(app.connect_error.is_none(), "too soon to say");
+        }
+        app.collect_paste(&mut input_of(egui::ViewportId::ROOT, vec![]));
+        assert_eq!(app.connect_error.as_deref(), Some(t!("header.clipboard_empty")));
+
+        // Nobody is waiting any more, so a later frame says nothing new.
+        app.connect_error = None;
+        app.collect_paste(&mut input_of(egui::ViewportId::ROOT, vec![]));
+        assert!(app.connect_error.is_none());
+    }
+
+    #[test]
+    fn a_paste_nobody_asked_for_is_left_for_the_text_fields() {
+        let mut app = GuestApp::new(AppState::new());
+        let paste = egui::Event::Paste("typed with ctrl+v".into());
+
+        let mut frame = input_of(egui::ViewportId::ROOT, vec![paste.clone()]);
+        app.collect_paste(&mut frame);
+        assert_eq!(frame.events, vec![paste.clone()]);
+
+        // Nor does another window's input answer the button, or use up its wait.
+        app.paste_wait = PASTE_WAIT_FRAMES;
+        let mut frame = input_of(egui::ViewportId::from_hash_of("session"), vec![paste.clone()]);
+        app.collect_paste(&mut frame);
+        assert_eq!(frame.events, vec![paste]);
+        assert_eq!(app.paste_wait, PASTE_WAIT_FRAMES);
     }
 
     #[test]

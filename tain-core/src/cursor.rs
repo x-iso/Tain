@@ -24,6 +24,80 @@
 //! sends the image the first time it sees it and a bare position afterwards.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// # A tap hides the pointer, and only a hand brings it back
+//
+// A touch on Windows, injected or not, hides the mouse pointer: `GetCursorInfo`
+// reports `CURSOR_SUPPRESSED`. That is meant to last until the mouse is next used,
+// and "used" means by hardware. Measured on Windows 11 with a cancelled contact,
+// so that nothing was pressed: after it, `SendInput` moved the pointer but left it
+// hidden, with the flags going from suppressed to none at all, and `SetCursorPos`,
+// reloading the system cursors and `MagShowSystemCursor` changed nothing.
+// `CreateSyntheticPointerDevice` refuses `PT_MOUSE`. Moving the real mouse is what
+// ended it.
+//
+// So a guest that tapped and then went back to its mouse was driving a pointer
+// nobody could see. Desktop Duplication reports it as not visible, the guest
+// rightly draws nothing for that, and it read as the host having stopped
+// responding until somebody at the host touched their mouse.
+//
+// Nothing here can make Windows draw it. But the guest draws this pointer itself,
+// from data, so what can be done is to stop telling the guest it is hidden, for
+// exactly as long as it is hidden for this reason and a guest is driving it. A
+// guest still only tapping sees no pointer, as a touchscreen should.
+
+// Everything below is for a Windows host, and unused elsewhere: no other host
+// hides the pointer for touch, or injects through anything that could.
+
+/// A guest has touched the screen since the pointer was last seen showing.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+static TOUCHED: AtomicBool = AtomicBool::new(false);
+/// And has moved the mouse since that touch.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+static DRIVEN: AtomicBool = AtomicBool::new(false);
+
+/// A guest's touch reached this machine.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn guest_touched() {
+    TOUCHED.store(true, Ordering::Relaxed);
+    DRIVEN.store(false, Ordering::Relaxed);
+}
+
+/// A guest's mouse movement reached this machine.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn guest_moved_mouse() {
+    if TOUCHED.load(Ordering::Relaxed) {
+        DRIVEN.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Whether a guest is driving a pointer that a touch may have hidden.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn driven_after_touch() -> bool {
+    TOUCHED.load(Ordering::Relaxed) && DRIVEN.load(Ordering::Relaxed)
+}
+
+/// Windows is showing the pointer again, so nothing needs overruling.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn pointer_is_back() {
+    TOUCHED.store(false, Ordering::Relaxed);
+    DRIVEN.store(false, Ordering::Relaxed);
+}
+
+/// A pointer at `at` on the desktop, as the display at `origin` shows it to a
+/// guest. Off this display is not shown here: another display's capture has it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn shown_at(at: (i32, i32), origin: (i32, i32), width: u16, height: u16) -> CursorPosition {
+    let (x, y) = (at.0 - origin.0, at.1 - origin.1);
+    CursorPosition {
+        x,
+        y,
+        desktop_width: width,
+        desktop_height: height,
+        visible: x >= 0 && y >= 0 && x < i32::from(width) && y < i32::from(height),
+    }
+}
 
 /// Where the pointer is, and whether it is visible at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +288,37 @@ pub fn to_rgba(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pointer_is_overruled_only_once_a_tap_is_followed_by_the_mouse() {
+        pointer_is_back();
+        guest_moved_mouse();
+        assert!(!driven_after_touch(), "no touch: Windows' own answer stands");
+
+        guest_touched();
+        assert!(!driven_after_touch(), "still tapping: a touchscreen shows no pointer");
+
+        guest_moved_mouse();
+        assert!(driven_after_touch(), "the mouse again, on a pointer Windows has hidden");
+
+        guest_touched();
+        assert!(!driven_after_touch(), "tapping again puts it away again");
+
+        guest_moved_mouse();
+        pointer_is_back();
+        assert!(!driven_after_touch(), "Windows showing it ends all of this");
+    }
+
+    #[test]
+    fn the_pointer_is_placed_on_the_display_it_is_on() {
+        let on_second = shown_at((2000, 100), (1920, 0), 1920, 1080);
+        assert_eq!((on_second.x, on_second.y), (80, 100));
+        assert!(on_second.visible);
+
+        assert!(!shown_at((100, 100), (1920, 0), 1920, 1080).visible, "on the display to its left");
+        assert!(!shown_at((3840, 100), (1920, 0), 1920, 1080).visible, "just past its right edge");
+        assert!(shown_at((-5, 5), (-1920, 0), 1920, 1080).visible, "left of the primary");
+    }
 
     #[test]
     fn every_shape_type_the_driver_can_report_is_recognised() {

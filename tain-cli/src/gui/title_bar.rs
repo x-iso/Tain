@@ -28,8 +28,21 @@
 //!
 //! Having the frame in hand is also what lets the mini view put the window in
 //! a corner and back again exactly — see [`TitleBar::go_small`].
+//!
+//! # On Linux it is switched off after all
+//!
+//! There is no frame to negotiate with. A Wayland window that wants its own
+//! title bar turns decorations off and asks the compositor to start a move or a
+//! resize when the pointer says so, which is the whole of what a desktop offers
+//! and what every GNOME application does. The costs above are paid: the resize
+//! grips are inside the window, so [`TitleBar::over_grip`] tells the picture to
+//! keep its hands off them. The same commands work on X11.
 
 use egui::{Context, Pos2, Rect, Vec2, ViewportBuilder, ViewportCommand, ViewportId};
+
+/// Whether egui handles the maximize button, rather than the frame doing it so
+/// that the desktop can offer snap layouts over it.
+pub const EGUI_MAXIMIZES: bool = !cfg!(target_os = "windows");
 
 /// Width of the minimize, maximize and close buttons: Windows' own.
 pub const BUTTON_W: f32 = 46.0;
@@ -93,6 +106,15 @@ pub struct TitleBar {
     above: bool,
     /// When to next look for a taskbar in front, in egui's seconds.
     recheck_at: f64,
+    /// Where the left button went down on empty header, until it either moves
+    /// far enough to be a drag or comes back up. See [`TitleBar::publish`].
+    caption_press: Option<Pos2>,
+    /// The header's controls as last published, which the grips stay off.
+    controls: Vec<Rect>,
+    /// Whether the pointer is on a resize grip this frame.
+    over_grip: bool,
+    /// Whether the window's edges are for resizing at all right now.
+    grips_on: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,17 +134,109 @@ enum Stage {
 
 impl Default for TitleBar {
     fn default() -> Self {
-        let stage = if cfg!(target_os = "windows") { Stage::Looking(0) } else { Stage::Native };
-        Self { stage, above: false, recheck_at: 0.0 }
+        let stage = if cfg!(target_os = "windows") {
+            Stage::Looking(0)
+        } else if cfg!(target_os = "linux") {
+            Stage::Custom
+        } else {
+            Stage::Native
+        };
+        Self {
+            stage,
+            above: false,
+            recheck_at: 0.0,
+            caption_press: None,
+            controls: Vec::new(),
+            over_grip: false,
+            grips_on: true,
+        }
     }
 }
 
 impl TitleBar {
-    /// The window starts hidden while its caption is being taken over.
+    /// The window starts hidden while its caption is being taken over, or on
+    /// Linux with no decorations to take over in the first place.
     pub fn builder(&self, builder: ViewportBuilder) -> ViewportBuilder {
         match self.stage {
             Stage::Looking(_) => builder.with_visible(false),
+            Stage::Custom if cfg!(target_os = "linux") => builder.with_decorations(false),
             _ => builder,
+        }
+    }
+
+    /// Whether the window's edges resize it. Off while immersive mode is holding
+    /// the pointer inside the window, where the edge is where it stops.
+    pub fn use_grips(&mut self, on: bool) {
+        self.grips_on = on;
+    }
+
+    /// Whether the pointer is on a resize grip, so that the picture under it
+    /// should not hear about it. A press there resizes this window; it is no
+    /// click on the host's screen.
+    pub fn over_grip(&self) -> bool {
+        self.over_grip
+    }
+
+    /// Show the resize cursor on the window's edges, and start a resize from a
+    /// press on one. Only where the desktop has left the edges to this window.
+    fn handle_grips(&mut self, ctx: &Context) {
+        /// How far in from the edge a press resizes, in points.
+        const GRIP: f32 = 5.0;
+
+        self.over_grip = false;
+        if !EGUI_MAXIMIZES || !matches!(self.stage, Stage::Custom) || !self.grips_on {
+            return;
+        }
+        let (whole, press) = ctx.input(|i| {
+            let viewport = i.viewport();
+            let whole = viewport.maximized.unwrap_or(false) || viewport.fullscreen.unwrap_or(false);
+            (whole, i.pointer.primary_pressed())
+        });
+        let Some(point) = ctx.pointer_latest_pos() else { return };
+        if whole || self.controls.iter().any(|control| control.contains(point)) {
+            return;
+        }
+        let Some((direction, cursor)) = grip_at(point, ctx.screen_rect(), GRIP) else { return };
+        self.over_grip = true;
+        ctx.set_cursor_icon(cursor);
+        if press {
+            ctx.send_viewport_cmd(ViewportCommand::BeginResize(direction));
+        }
+    }
+
+    /// Move or maximize the window from a press on empty header, where nothing
+    /// else will: on Windows the frame does this.
+    ///
+    /// A drag only once the pointer has actually moved, because a double click
+    /// on a title bar maximizes, and a move started by the first press of one
+    /// would swallow the second.
+    fn handle_caption(&mut self, ctx: &Context, layout: &Layout) {
+        /// How far the pointer moves before a press is a drag, in points.
+        const DRAG_SLOP: f32 = 3.0;
+
+        let (pressed, down, double, at, maximized) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.button_double_clicked(egui::PointerButton::Primary),
+                i.pointer.interact_pos(),
+                i.viewport().maximized.unwrap_or(false),
+            )
+        });
+        let on_caption = at.is_some_and(|point| layout.hit(point) == Hit::Caption);
+        if pressed && on_caption && !self.over_grip {
+            self.caption_press = at;
+        }
+        if let Some(start) = self.caption_press {
+            if !down {
+                self.caption_press = None;
+            } else if at.is_some_and(|point| point.distance(start) > DRAG_SLOP) {
+                self.caption_press = None;
+                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            }
+        }
+        if double && on_caption {
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
         }
     }
 
@@ -132,6 +246,7 @@ impl TitleBar {
     /// Returns whether this title bar is in charge, which is whether the header
     /// should draw minimize, maximize and close.
     pub fn update(&mut self, ctx: &Context, title: &str) -> bool {
+        self.handle_grips(ctx);
         // The subclass lets go when its window is destroyed. If that happened
         // without the session window closing — egui recreating the window — the
         // new one has to be found and taken over again.
@@ -168,8 +283,13 @@ impl TitleBar {
     }
 
     /// Tell the frame where the header's parts are this frame.
-    pub fn publish(&self, ctx: &Context, layout: Layout) {
+    pub fn publish(&mut self, ctx: &Context, layout: Layout) {
         if matches!(self.stage, Stage::Settling | Stage::Custom) {
+            if EGUI_MAXIMIZES {
+                self.handle_caption(ctx, &layout);
+                self.controls.clone_from(&layout.controls);
+                self.controls.extend(layout.maximize);
+            }
             platform::publish(layout, ctx.pixels_per_point());
         }
     }
@@ -234,8 +354,9 @@ impl TitleBar {
 
     /// Whether the window can be made the mini view: only one whose frame this
     /// has taken over, because that is where the handle to move it comes from.
+    /// Not on Linux, where a Wayland window cannot place itself or stay on top.
     pub fn can_go_small(&self) -> bool {
-        matches!(self.stage, Stage::Settling | Stage::Custom)
+        matches!(self.stage, Stage::Settling | Stage::Custom) && cfg!(target_os = "windows")
     }
 
     /// Shrink the window to a client area of `size` points and keep it above
@@ -275,6 +396,40 @@ impl TitleBar {
     pub fn moving(&self) -> bool {
         platform::moving()
     }
+}
+
+/// Which resize grip, if any, a point in a window of `whole` is on.
+fn grip_at(point: Pos2, whole: Rect, grip: f32) -> Option<(egui::ResizeDirection, egui::CursorIcon)> {
+    use egui::{CursorIcon as Cursor, ResizeDirection as Direction};
+
+    /// The corners are bigger than the edges, as they are on every desktop.
+    const CORNER: f32 = 3.0;
+
+    let near = |distance: f32, reach: f32| distance >= 0.0 && distance < reach;
+    let (left, right) = (point.x - whole.left(), whole.right() - point.x);
+    let (top, bottom) = (point.y - whole.top(), whole.bottom() - point.y);
+    let corner = grip * CORNER;
+    let edge_x = near(left, grip) || near(right, grip);
+    let edge_y = near(top, grip) || near(bottom, grip);
+    Some(match () {
+        _ if near(top, corner) && near(left, corner) && (edge_x || edge_y) => {
+            (Direction::NorthWest, Cursor::ResizeNorthWest)
+        }
+        _ if near(top, corner) && near(right, corner) && (edge_x || edge_y) => {
+            (Direction::NorthEast, Cursor::ResizeNorthEast)
+        }
+        _ if near(bottom, corner) && near(left, corner) && (edge_x || edge_y) => {
+            (Direction::SouthWest, Cursor::ResizeSouthWest)
+        }
+        _ if near(bottom, corner) && near(right, corner) && (edge_x || edge_y) => {
+            (Direction::SouthEast, Cursor::ResizeSouthEast)
+        }
+        _ if near(left, grip) => (Direction::West, Cursor::ResizeWest),
+        _ if near(right, grip) => (Direction::East, Cursor::ResizeEast),
+        _ if near(top, grip) => (Direction::North, Cursor::ResizeNorth),
+        _ if near(bottom, grip) => (Direction::South, Cursor::ResizeSouth),
+        _ => return None,
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -970,13 +1125,14 @@ mod platform {
     }
 }
 
-/// Nothing to take over: elsewhere the window keeps its own decorations.
+/// Nothing to take over. On Linux the window was made without decorations, so
+/// it is simply always attached; elsewhere it keeps its own.
 #[cfg(not(target_os = "windows"))]
 mod platform {
     use super::Layout;
 
     pub fn attached() -> bool {
-        false
+        cfg!(target_os = "linux")
     }
 
     pub fn attach(_ctx: &egui::Context, _title: &str) -> bool {

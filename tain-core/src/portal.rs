@@ -76,6 +76,8 @@ pub struct StreamInfo {
     /// pointer positions are given in. Not the size of the frames, which on a
     /// scaled display is larger.
     pub size: Option<(i32, i32)>,
+    /// A screen or a window, as the portal numbers them, where it says.
+    pub source_type: Option<u32>,
 }
 
 /// A running portal session, closed when the last holder drops it.
@@ -104,6 +106,23 @@ pub fn session() -> Result<Arc<RemoteSession>> {
     let session = Arc::new(RemoteSession::start()?);
     *shared = Arc::downgrade(&session);
     Ok(session)
+}
+
+/// A session sharing one window, which the desktop asks the person here to pick.
+///
+/// A plain ScreenCast session, without input, on purpose: see
+/// [`crate::window_capture::DESKTOP_CHOOSES`]. KDE's RemoteDesktop portal offers
+/// whole screens and nothing else, which is why asking for a window through the
+/// session [`session`] starts would never have worked there.
+///
+/// Its own session and not the shared one, because each guest granted a window
+/// is granted the one picked for it. Asked every time and never remembered:
+/// which window is the question, and it is not the same question twice. Input
+/// never reaches it, because [`current`] does not know about it.
+pub fn window_session() -> Result<Arc<RemoteSession>> {
+    let connection = connection()?;
+    info!("Asking the desktop which window to share");
+    Ok(Arc::new(RemoteSession::start_window_cast(&connection)?))
 }
 
 /// The running session, if a capturer has started one. The input injector
@@ -321,7 +340,7 @@ impl RemoteSession {
 
         // Persistence is not allowed on the ScreenCast half of a remote
         // desktop session; the RemoteDesktop half carries it for both.
-        Self::select_sources(connection, &handle, false)?;
+        Self::select_sources(connection, &handle, SOURCE_MONITOR | SOURCE_WINDOW, false)?;
 
         let started = request(
             connection,
@@ -332,6 +351,7 @@ impl RemoteSession {
             DIALOG_TIMEOUT,
         )?;
         let devices = started.get("devices").and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+        save_token(started.get("restore_token").and_then(|v| <&str>::try_from(v).ok()));
         Self::finish(connection, handle, &started, devices)
     }
 
@@ -340,7 +360,7 @@ impl RemoteSession {
         options.insert("session_handle_token", Value::from(token()));
         let created = request(connection, SCREEN_CAST, "CreateSession", Arguments::None, options, CALL_TIMEOUT)?;
         let handle = session_handle(&created)?;
-        Self::select_sources(connection, &handle, true)?;
+        Self::select_sources(connection, &handle, SOURCE_MONITOR | SOURCE_WINDOW, true)?;
         let started = request(
             connection,
             SCREEN_CAST,
@@ -349,17 +369,52 @@ impl RemoteSession {
             HashMap::new(),
             DIALOG_TIMEOUT,
         )?;
+        save_token(started.get("restore_token").and_then(|v| <&str>::try_from(v).ok()));
         Self::finish(connection, handle, &started, 0)
     }
 
-    fn select_sources(connection: &Connection, handle: &OwnedObjectPath, persist: bool) -> Result<()> {
+    /// A ScreenCast session of one window. See [`window_session`].
+    fn start_window_cast(connection: &Connection) -> Result<Self> {
+        let screen_cast = proxy(connection, PATH, SCREEN_CAST)?;
+        let source_types = screen_cast.get_property::<u32>("AvailableSourceTypes").unwrap_or(0);
+        anyhow::ensure!(
+            source_types & SOURCE_WINDOW != 0,
+            "this desktop cannot share a single window, only whole screens"
+        );
+
+        let mut options = HashMap::new();
+        options.insert("session_handle_token", Value::from(token()));
+        let created = request(connection, SCREEN_CAST, "CreateSession", Arguments::None, options, CALL_TIMEOUT)?;
+        let handle = session_handle(&created)?;
+        Self::select_sources(connection, &handle, SOURCE_WINDOW, false)?;
+        let started = request(
+            connection,
+            SCREEN_CAST,
+            "Start",
+            Arguments::SessionAndParent(&handle),
+            HashMap::new(),
+            DIALOG_TIMEOUT,
+        )?;
+        let session = Self::finish(connection, handle, &started, 0)?;
+        // A share that quietly became a screen would be a promise broken
+        // silently, so a desktop that ignored what it was asked for ends here.
+        for stream in session.streams() {
+            anyhow::ensure!(
+                stream.source_type.is_none_or(|kind| kind == SOURCE_WINDOW),
+                "the desktop offered a whole screen where a window was asked for"
+            );
+        }
+        Ok(session)
+    }
+
+    fn select_sources(connection: &Connection, handle: &OwnedObjectPath, wanted: u32, persist: bool) -> Result<()> {
         let screen_cast = proxy(connection, PATH, SCREEN_CAST)?;
         let source_types = screen_cast.get_property::<u32>("AvailableSourceTypes").unwrap_or(SOURCE_MONITOR);
         let cursor_modes = screen_cast.get_property::<u32>("AvailableCursorModes").unwrap_or(0);
         let mut options = HashMap::new();
-        // A screen or a window: the desktop's own picker offers both, and the
-        // stream looks the same to everything here either way.
-        options.insert("types", Value::from((SOURCE_MONITOR | SOURCE_WINDOW) & source_types));
+        // Whichever of these the desktop has: its own picker offers them, and
+        // the stream looks the same to everything here either way.
+        options.insert("types", Value::from(wanted & source_types));
         options.insert("multiple", Value::from(false));
         // Drawn into the picture by the compositor, so it moves with the
         // stream. Sending it separately, as Windows does, is a later step.
@@ -377,7 +432,6 @@ impl RemoteSession {
     }
 
     fn finish(connection: &Connection, handle: OwnedObjectPath, started: &Results, devices: u32) -> Result<Self> {
-        save_token(started.get("restore_token").and_then(|v| <&str>::try_from(v).ok()));
         let streams = parse_streams(started)?;
         anyhow::ensure!(!streams.is_empty(), "the desktop shared no screen");
 
@@ -464,6 +518,7 @@ fn parse_streams(results: &Results) -> Result<Vec<StreamInfo>> {
             size: properties
                 .get("size")
                 .and_then(|v| <(i32, i32)>::try_from(v.try_clone().ok()?).ok()),
+            source_type: properties.get("source_type").and_then(|v| u32::try_from(v).ok()),
         })
         .collect())
 }

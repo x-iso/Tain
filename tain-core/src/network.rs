@@ -592,6 +592,8 @@ impl HostServer {
         // of speakers, and every running capture follows it.
         #[cfg(target_os = "windows")]
         super::audio_device::set_capture_device(config.audio_capture_device.clone());
+        #[cfg(target_os = "linux")]
+        super::audio_capture::set_capture_device(config.audio_capture_device.clone());
         // And the capture border: one capture per window or screen, shared by
         // every session watching it, each looking again a few times a second.
         #[cfg(target_os = "windows")]
@@ -4061,6 +4063,16 @@ async fn run_reader<R>(
                 // the session, and mouse/keyboard are permitted independently.
                 let device = event.device();
                 let touch = matches!(event, super::protocol::InputEvent::Touch(_));
+                // A window the desktop picked can only be watched: it came
+                // through a session that takes no input, and nothing sent from
+                // here would land in it. See `window_capture::DESKTOP_CHOOSES`.
+                // A window Tain listed itself is driven like any other.
+                let windows = allowed_displays.lock().unwrap().windows().to_vec();
+                if windows.contains(&super::window_capture::DESKTOP_CHOOSES) {
+                    trace!("Session #{session_id}: input dropped — a shared window is view-only here");
+                    continue;
+                }
+                injector.show_windows(&windows);
                 if !sessions.grants(session_id).is_some_and(|g| g.allows(device)) {
                     trace!("Session #{}: {:?} input dropped — not granted", session_id, device);
                     if touch && !touch_refused {

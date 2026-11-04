@@ -27,15 +27,23 @@
 //! than to the application window. It costs one window that never draws, and it
 //! means notifications do not depend on eframe's window existing yet, surviving
 //! a settings change, or being reachable from here at all.
+//!
+//! # On Linux, the desktop's notification service
+//!
+//! `org.freedesktop.Notifications` over D-Bus, which every desktop runs. The
+//! `desktop-entry` hint names Tain's `.desktop` file, which Tain keeps in place
+//! itself (see `desktop_entry`), so the notification carries Tain's name and
+//! icon. A connection waiting for approval is sent as critical, which Plasma and
+//! GNOME keep on screen rather than letting it slide away while a guest waits.
 
 /// Announce that a guest has arrived.
 ///
 /// `needs_approval` decides the wording, not whether anything is shown: a
 /// connection that let itself in is the one most worth mentioning.
 pub fn incoming_connection(name: &str, needs_approval: bool) {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     platform::show(name, needs_approval);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = (name, needs_approval);
     }
@@ -57,11 +65,11 @@ pub fn shut_down() {
 /// window system accepts — see `ViewportCommand::Focus` — so the click is
 /// recorded here and the frame that notices it does the asking.
 pub fn was_clicked() -> bool {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         platform::was_clicked()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         false
     }
@@ -71,9 +79,9 @@ pub fn was_clicked() -> bool {
 ///
 /// Cheap to call every frame; only the first one is kept.
 pub fn watch(ctx: &egui::Context) {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     platform::attach(ctx);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = ctx;
     }
@@ -98,6 +106,110 @@ pub fn wording(name: &str, needs_approval: bool) -> (String, String) {
         tain_core::i18n::format("notify.admin_body", &[("name", name)])
     };
     (title, body)
+}
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use zbus::blocking::{Connection, Proxy};
+    use zbus::zvariant::Value;
+
+    const DESTINATION: &str = "org.freedesktop.Notifications";
+    const PATH: &str = "/org/freedesktop/Notifications";
+
+    /// `urgency` hint values.
+    const NORMAL: u8 = 1;
+    const CRITICAL: u8 = 2;
+
+    static CLICKED: AtomicBool = AtomicBool::new(false);
+    static CONTEXT: OnceLock<egui::Context> = OnceLock::new();
+    /// The notifications this process sent, so another application's clicks
+    /// arriving on the same signal are not taken for ours.
+    static SENT: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
+    /// The session bus, and a thread listening for clicks on it. Made on first
+    /// use, from the thread showing the first notification.
+    fn bus() -> Option<&'static Connection> {
+        static BUS: OnceLock<Option<Connection>> = OnceLock::new();
+        BUS.get_or_init(|| match Connection::session() {
+            Ok(bus) => {
+                listen(bus.clone());
+                Some(bus)
+            }
+            Err(e) => {
+                tracing::warn!("No session bus, so no notifications: {e}");
+                None
+            }
+        })
+        .as_ref()
+    }
+
+    fn proxy(bus: &Connection) -> zbus::Result<Proxy<'static>> {
+        Proxy::new(bus, DESTINATION, PATH, DESTINATION)
+    }
+
+    /// Wait for clicks on what this process sent, for as long as it runs.
+    fn listen(bus: Connection) {
+        std::thread::Builder::new()
+            .name("notifications".into())
+            .spawn(move || {
+                let signals = match proxy(&bus).and_then(|p| p.receive_signal("ActionInvoked")) {
+                    Ok(signals) => signals,
+                    Err(e) => {
+                        tracing::debug!("Not listening for notification clicks: {e}");
+                        return;
+                    }
+                };
+                for signal in signals {
+                    let Ok((id, _action)) = signal.body().deserialize::<(u32, String)>() else {
+                        continue;
+                    };
+                    let ours = SENT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&id));
+                    if ours {
+                        CLICKED.store(true, Ordering::Relaxed);
+                        if let Some(ctx) = CONTEXT.get() {
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// On a thread of its own: the call waits for the desktop to answer, and
+    /// a desktop with no notification service at all can take its time saying so.
+    pub fn show(name: &str, needs_approval: bool) {
+        let (title, body) = super::wording(name, needs_approval);
+        std::thread::spawn(move || {
+            let Some(bus) = bus() else { return };
+            let mut hints: HashMap<&str, Value> = HashMap::new();
+            hints.insert("desktop-entry", Value::from(crate::gui::APP_ID));
+            hints.insert("urgency", Value::from(if needs_approval { CRITICAL } else { NORMAL }));
+            hints.insert("category", Value::from("network.connected"));
+            // The default action is a click on the notification itself; its
+            // label is shown nowhere that matters.
+            let actions = vec!["default", "Tain"];
+            let sent = proxy(bus).and_then(|p| {
+                p.call::<_, _, u32>("Notify", &("Tain", 0u32, "", title.as_str(), body.as_str(), actions, hints, -1i32))
+            });
+            match sent {
+                Ok(id) => {
+                    SENT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert(id);
+                }
+                Err(e) => tracing::warn!("Could not show a notification: {e}"),
+            }
+        });
+    }
+
+    pub fn was_clicked() -> bool {
+        CLICKED.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn attach(ctx: &egui::Context) {
+        let _ = CONTEXT.set(ctx.clone());
+    }
 }
 
 #[cfg(target_os = "windows")]

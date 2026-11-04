@@ -9,6 +9,8 @@
 
 mod agent;
 mod console;
+#[cfg(target_os = "linux")]
+mod desktop_entry;
 mod display_driver;
 mod gui;
 mod links;
@@ -297,6 +299,11 @@ async fn main() -> Result<()> {
     // finishes, however long that takes. The window opens at once; hosting
     // starts working the moment it is available, with no restart and nothing to
     // click.
+    // Before the window and before the host asks KWin anything, because both
+    // read it when they first see this process. See `desktop_entry`.
+    #[cfg(target_os = "linux")]
+    desktop_entry::install();
+
     let prober = gui::init_prober(&state);
 
     let (handles_tx, handles_rx) = tokio::sync::oneshot::channel();
@@ -346,6 +353,15 @@ async fn main() -> Result<()> {
                 // is the only place eframe hands the context over.
                 if let Some(gl) = cc.gl.clone() {
                     gui::gl_interop::remember_context(gl);
+                }
+            }
+            // The connection a second keyboard can be asked for on, which is
+            // only to be had here. See `gui::wayland_keys`.
+            #[cfg(target_os = "linux")]
+            {
+                use raw_window_handle::HasDisplayHandle;
+                if let Ok(display) = cc.display_handle() {
+                    gui::immersive::attach_display(display.as_raw());
                 }
             }
             // Required before any include_image! of the SVGs in assets/.

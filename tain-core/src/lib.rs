@@ -54,6 +54,10 @@ pub mod portal;
 #[cfg(all(target_os = "linux", db_pipewire))]
 pub mod capture_portal;
 #[cfg(target_os = "linux")]
+pub mod kwin;
+#[cfg(all(target_os = "linux", db_pipewire))]
+pub mod capture_kwin;
+#[cfg(target_os = "linux")]
 pub mod input_portal;
 #[cfg(target_os = "windows")]
 pub mod audio_device;
@@ -67,7 +71,7 @@ pub mod capture_nv12;
 pub mod capture_shared;
 #[cfg(target_os = "windows")]
 pub mod capture_wgc;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", all(target_os = "linux", db_pipewire)))]
 pub mod capture_wall;
 pub mod encoder;
 pub mod adaptive;
@@ -201,6 +205,10 @@ pub fn playback_devices() -> Vec<AudioDevice> {
     {
         return audio_device::playback_devices();
     }
+    #[cfg(target_os = "linux")]
+    {
+        return pulse::devices();
+    }
     #[allow(unreachable_code)]
     Vec::new()
 }
@@ -212,7 +220,9 @@ pub fn playback_devices() -> Vec<AudioDevice> {
 pub fn set_playback_device(id: Option<String>) {
     #[cfg(target_os = "windows")]
     audio_device::set_playback_device(id);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    audio_output::set_playback_device(id);
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let _ = id;
 }
 

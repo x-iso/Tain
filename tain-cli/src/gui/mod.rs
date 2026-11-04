@@ -24,6 +24,8 @@ pub mod shortcuts;
 pub mod theme;
 pub mod title_bar;
 pub mod touch;
+#[cfg(target_os = "linux")]
+pub mod wayland_keys;
 
 pub use app::{init_host_server, init_prober, AppState, GuestApp};
 

@@ -24,13 +24,20 @@
 //! Input is never what opens a portal session: that would put the sharing
 //! dialog up for a guest who is not even watching yet. Until a capture has
 //! opened one, events are dropped, and said so once.
+//!
+//! ## Windows go through KWin
+//!
+//! A session showing windows that KWin listed has no portal session at all —
+//! see [`crate::kwin`] — so its input goes to KWin's fake input instead, in the
+//! desktop's logical coordinates, mapped through where each window is the way
+//! Windows maps a click into a shared window.
 
 #![cfg(target_os = "linux")]
 
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::*;
 use zbus::zvariant::Value;
 
@@ -60,11 +67,59 @@ pub struct PortalInjector {
     touches: Mutex<HashMap<u8, u32>>,
     warned_no_session: AtomicBool,
     warned_device: AtomicBool,
+    /// The windows the session shows, which KWin drives rather than the portal.
+    /// Empty for a session showing screens.
+    windows: Mutex<Vec<u64>>,
+    /// Where those windows are, as the session last said.
+    mapping: Mutex<Option<Mapping>>,
+    /// Where KWin was last told to put the pointer, on the desktop: what a
+    /// press is a press on.
+    pointer_at: Mutex<Option<(f64, f64)>>,
 }
 
 impl PortalInjector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// KWin's fake input, for a session showing windows. `Some` with nothing
+    /// in it drops the event: such a session has no portal session to fall
+    /// back on, and nothing else here could put the event in the window.
+    fn kwin(&self) -> Option<Option<crate::kwin::Input<'static>>> {
+        if self.windows.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return None;
+        }
+        Some(crate::kwin::get().and_then(|kwin| kwin.input()))
+    }
+
+    /// Bring the shared window at this point to the front, so that what is
+    /// pressed there lands in it. See `kwin::Kwin::activate`.
+    fn bring_forward(&self, at: Option<(f64, f64)>) {
+        let (Some(kwin), Some((x, y))) = (crate::kwin::get(), at) else { return };
+        let windows = self.windows.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(id) = kwin.window_at(&windows, x, y) {
+            kwin.activate(id);
+        }
+    }
+
+    /// A guest's position on the desktop, through the windows being shown.
+    fn on_desktop(&self, x: u16, y: u16) -> Option<(f64, f64)> {
+        let mapping = self.mapping.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y) = crate::input_inject::through_mapping(mapping.as_ref()?, x, y)?;
+        Some((f64::from(x), f64::from(y)))
+    }
+
+    /// A slot for a new contact, or the one it already has: the lowest free,
+    /// as a touchscreen numbers its fingers.
+    fn slot_for(touches: &mut HashMap<u8, u32>, id: u8) -> (u32, bool) {
+        match touches.get(&id) {
+            Some(&slot) => (slot, false),
+            None => {
+                let slot = (0..).find(|s| !touches.values().any(|v| v == s)).unwrap_or(0);
+                touches.insert(id, slot);
+                (slot, true)
+            }
+        }
     }
 
     /// The portal session, if a capture has opened one and it granted `device`.
@@ -113,29 +168,74 @@ fn options() -> HashMap<&'static str, Value<'static>> {
 
 impl InputInjector for PortalInjector {
     fn set_mapping(&self, mapping: Mapping) {
-        if let Mapping::Whole(shown) = mapping {
-            *self.shown.lock().unwrap_or_else(|e| e.into_inner()) = Some(shown);
+        if let Mapping::Whole(shown) = &mapping {
+            *self.shown.lock().unwrap_or_else(|e| e.into_inner()) = Some(*shown);
+        }
+        *self.mapping.lock().unwrap_or_else(|e| e.into_inner()) = Some(mapping);
+    }
+
+    fn show_windows(&self, windows: &[u64]) {
+        let mut shown = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        if shown.as_slice() != windows {
+            *shown = windows.to_vec();
         }
     }
 
     fn move_mouse(&self, pos: MousePosition) -> Result<()> {
+        if let Some(kwin) = self.kwin() {
+            if let (Some(input), Some((x, y))) = (kwin, self.on_desktop(pos.x, pos.y)) {
+                input.pointer_to(x, y);
+                *self.pointer_at.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y));
+            }
+            return Ok(());
+        }
         let Some(session) = self.session(DEVICE_POINTER) else { return Ok(()) };
         let Some((node, x, y)) = self.place(&session, pos.x, pos.y) else { return Ok(()) };
         session.notify("NotifyPointerMotionAbsolute", &(session.handle(), options(), node, x, y))
     }
 
     fn move_mouse_by(&self, dx: i32, dy: i32) -> Result<()> {
+        if let Some(kwin) = self.kwin() {
+            if let Some(input) = kwin {
+                input.pointer_by(f64::from(dx), f64::from(dy));
+            }
+            return Ok(());
+        }
         let Some(session) = self.session(DEVICE_POINTER) else { return Ok(()) };
         session.notify("NotifyPointerMotion", &(session.handle(), options(), dx as f64, dy as f64))
     }
 
     fn mouse_button(&self, input: MouseButtonInput) -> Result<()> {
         let Some(&button) = BUTTONS.get(input.button as usize) else { return Ok(()) };
+        if let Some(kwin) = self.kwin() {
+            if let Some(kwin) = kwin {
+                if input.pressed {
+                    self.bring_forward(*self.pointer_at.lock().unwrap_or_else(|e| e.into_inner()));
+                }
+                kwin.button(button as u32, input.pressed);
+            }
+            return Ok(());
+        }
         let Some(session) = self.session(DEVICE_POINTER) else { return Ok(()) };
         session.notify("NotifyPointerButton", &(session.handle(), options(), button, input.pressed as u32))
     }
 
     fn scroll(&self, input: ScrollInput) -> Result<()> {
+        if let Some(kwin) = self.kwin() {
+            // A wheel's `wl_pointer.axis` moves about 15 to a detent; up is
+            // negative there and positive on the wire, right positive in both.
+            const PER_DETENT: f64 = 15.0;
+            if let Some(kwin) = kwin {
+                let detents = |delta: i16| f64::from(delta) / f64::from(WHEEL_DELTA) * PER_DETENT;
+                if input.dy != 0 {
+                    kwin.axis(AXIS_VERTICAL, -detents(input.dy));
+                }
+                if input.dx != 0 {
+                    kwin.axis(AXIS_HORIZONTAL, detents(input.dx));
+                }
+            }
+            return Ok(());
+        }
         let Some(session) = self.session(DEVICE_POINTER) else { return Ok(()) };
         let (vertical, horizontal) = {
             let mut remainder = self.scroll_remainder.lock().unwrap_or_else(|e| e.into_inner());
@@ -169,27 +269,45 @@ impl InputInjector for PortalInjector {
             debug!("No Linux key for virtual key {:#x}, scancode {:#x}", input.keycode, input.scancode);
             return Ok(());
         };
+        if let Some(kwin) = self.kwin() {
+            if let Some(kwin) = kwin {
+                kwin.key(code as u32, input.pressed);
+            }
+            return Ok(());
+        }
         let Some(session) = self.session(DEVICE_KEYBOARD) else { return Ok(()) };
         session.notify("NotifyKeyboardKeycode", &(session.handle(), options(), code, input.pressed as u32))
     }
 
     fn touch(&self, input: TouchInput) -> Result<()> {
+        if let Some(kwin) = self.kwin() {
+            let Some(kwin) = kwin else { return Ok(()) };
+            let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
+            match input.phase {
+                TouchPhase::Start | TouchPhase::Move => {
+                    let Some((x, y)) = self.on_desktop(input.x, input.y) else { return Ok(()) };
+                    match Self::slot_for(&mut touches, input.id) {
+                        (slot, true) => {
+                            self.bring_forward(Some((x, y)));
+                            kwin.touch_down(slot, x, y)
+                        }
+                        (slot, false) => kwin.touch_move(slot, x, y),
+                    }
+                }
+                TouchPhase::End | TouchPhase::Cancel => {
+                    if let Some(slot) = touches.remove(&input.id) {
+                        kwin.touch_up(slot);
+                    }
+                }
+            }
+            return Ok(());
+        }
         let Some(session) = self.session(DEVICE_TOUCHSCREEN) else { return Ok(()) };
         let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
         match input.phase {
             TouchPhase::Start | TouchPhase::Move => {
                 let Some((node, x, y)) = self.place(&session, input.x, input.y) else { return Ok(()) };
-                let starting = !touches.contains_key(&input.id);
-                // A slot per contact, the lowest free one, as a touchscreen
-                // numbers its fingers.
-                let slot = match touches.get(&input.id) {
-                    Some(&slot) => slot,
-                    None => {
-                        let slot = (0..).find(|s| !touches.values().any(|v| v == s)).unwrap_or(0);
-                        touches.insert(input.id, slot);
-                        slot
-                    }
-                };
+                let (slot, starting) = Self::slot_for(&mut touches, input.id);
                 let method = if starting { "NotifyTouchDown" } else { "NotifyTouchMotion" };
                 session.notify(method, &(session.handle(), options(), node, slot, x, y))
             }
@@ -203,6 +321,14 @@ impl InputInjector for PortalInjector {
     fn release_touches(&self) -> Result<()> {
         let slots: Vec<u32> = self.touches.lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, s)| s).collect();
         if slots.is_empty() {
+            return Ok(());
+        }
+        if let Some(kwin) = self.kwin() {
+            if let Some(kwin) = kwin {
+                for slot in slots {
+                    kwin.touch_up(slot);
+                }
+            }
             return Ok(());
         }
         let Some(session) = portal::current() else { return Ok(()) };
@@ -270,6 +396,36 @@ pub fn evdev_from_scancode(scancode: u16, extended: bool) -> Option<i32> {
         0x63 => 143, // Wake
         _ => return None,
     })
+}
+
+/// A Linux key code as a guest on this machine sends it to any host: the Windows
+/// virtual-key code, the scancode, and whether that has the `E0` prefix.
+///
+/// The reverse of [`evdev_from_virtual_key`] and [`evdev_from_scancode`], so the
+/// two ends of a session between Linux machines cannot disagree.
+pub fn windows_key_from_evdev(code: u32) -> Option<(u16, u16, bool)> {
+    static TABLE: OnceLock<Vec<Option<(u16, u16, bool)>>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..256)
+            .map(|code: i32| {
+                // Highest first, so Shift, Ctrl and Alt come out as their left
+                // keys' codes, which is what they are, and not the generic ones.
+                let vk = (0u16..=0xff)
+                    .rev()
+                    .find(|vk| evdev_from_virtual_key(*vk) == Some(code))
+                    // Keypad Enter has a scancode of its own and shares Enter's
+                    // virtual key.
+                    .or((code == 96).then_some(0x0d))?;
+                let (scan, extended) = [false, true].into_iter().find_map(|extended| {
+                    (1u16..0x80)
+                        .find(|scan| evdev_from_scancode(*scan, extended) == Some(code))
+                        .map(|scan| (scan, extended))
+                })?;
+                Some((vk, scan, extended))
+            })
+            .collect()
+    });
+    table.get(code as usize).copied().flatten()
 }
 
 /// The Linux key code for a Windows virtual-key code: what a guest without
@@ -350,6 +506,37 @@ pub fn evdev_from_virtual_key(vk: u16) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_read_here_arrives_as_the_same_key_on_a_linux_host() {
+        // Everything a keyboard commonly has: the main block, function keys,
+        // the navigation cluster, the keypad, both sets of modifiers.
+        // Not 84 and 85, which are no key on a PC keyboard or only on a Japanese
+        // one, and which the host has no virtual key for either.
+        let keys = (1..=83)
+            .chain(86..=88)
+            .chain([96, 97, 98, 99, 100, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 125, 126, 127]);
+        for code in keys {
+            let (vk, scan, extended) =
+                windows_key_from_evdev(code).unwrap_or_else(|| panic!("no Windows key for {code}"));
+            assert_eq!(evdev_from_scancode(scan, extended), Some(code as i32), "scancode of {code}");
+            if code != 96 {
+                assert_eq!(evdev_from_virtual_key(vk), Some(code as i32), "virtual key of {code}");
+            }
+        }
+    }
+
+    #[test]
+    fn modifiers_come_out_as_the_left_and_right_keys_they_are() {
+        assert_eq!(windows_key_from_evdev(42).map(|k| k.0), Some(0xa0)); // left Shift
+        assert_eq!(windows_key_from_evdev(54).map(|k| k.0), Some(0xa1)); // right Shift
+        assert_eq!(windows_key_from_evdev(29).map(|k| k.0), Some(0xa2)); // left Ctrl
+        assert_eq!(windows_key_from_evdev(97).map(|k| k.0), Some(0xa3)); // right Ctrl
+        assert_eq!(windows_key_from_evdev(56).map(|k| k.0), Some(0xa4)); // left Alt
+        assert_eq!(windows_key_from_evdev(100).map(|k| k.0), Some(0xa5)); // right Alt
+        assert_eq!(windows_key_from_evdev(125), Some((0x5b, 0x5b, true))); // left Windows
+        assert_eq!(windows_key_from_evdev(9999), None);
+    }
 
     #[test]
     fn the_main_block_maps_straight_across() {

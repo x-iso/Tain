@@ -109,10 +109,11 @@ impl SharedCapture {
         // moment this returns, as it is on Windows. The host tells the guest
         // where the sound comes from straight away, and a stream still opening
         // read as "no device" — to whichever guest the timing picked.
-        let first = open_monitor();
-        let device = Arc::new(Mutex::new(first.as_ref().ok().map(|_| crate::audio_output::default_device())));
+        let (open_on, on) = target();
+        let first = open_monitor(open_on.as_deref());
+        let device = Arc::new(Mutex::new(first.as_ref().ok().map(|_| on.clone())));
         match &first {
-            Ok(_) => info!("Capturing what the default output plays"),
+            Ok(_) => info!("Capturing what {} plays", on.name),
             Err(e) => warn!("No sound to capture yet ({e:#}) — trying again shortly"),
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -121,7 +122,7 @@ impl SharedCapture {
             .spawn({
                 let device = Arc::clone(&device);
                 let stop = Arc::clone(&stop);
-                move || capture(first.ok(), tx, device, stop)
+                move || capture(first.ok(), open_on, tx, device, stop)
             })
             .context("could not start the audio capture thread")?;
         Ok(Self { chunks, device, stop })
@@ -151,11 +152,37 @@ impl Drop for SharedCapture {
     }
 }
 
-/// A record stream on the default output's monitor.
-fn open_monitor() -> Result<pulse::Stream> {
+/// The device chosen in Settings, by the sound server's name for it.
+static CHOSEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// Capture this device, or the default with `None`. Reaches captures already
+/// running within [`RECHECK_EVERY`].
+pub(crate) fn set_capture_device(id: Option<String>) {
+    *CHOSEN.lock().unwrap_or_else(|e| e.into_inner()) = id;
+}
+
+/// How often the capture thread checks which device it should be on.
+const RECHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Where this should be capturing now, as a name to open and a device to show.
+fn target() -> (Option<String>, AudioDevice) {
+    let chosen = CHOSEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let devices = pulse::devices();
+    let open_on = crate::audio_output::resolved(chosen.as_deref(), &devices);
+    let device = open_on
+        .as_ref()
+        .and_then(|id| devices.iter().find(|device| device.id == *id).cloned())
+        .unwrap_or_else(crate::audio_output::default_device);
+    (open_on, device)
+}
+
+/// A record stream on what a device plays: its monitor, which is how both
+/// PulseAudio and PipeWire name it, or the default output's with `None`.
+fn open_monitor(device: Option<&str>) -> Result<pulse::Stream> {
+    let monitor = device.map_or_else(|| "@DEFAULT_MONITOR@".to_string(), |id| format!("{id}.monitor"));
     pulse::Stream::record(
         "Sound for remote guests",
-        "@DEFAULT_MONITOR@",
+        &monitor,
         STREAM_FORMAT.sample_rate,
         STREAM_FORMAT.channels,
         BLOCK_MS,
@@ -164,6 +191,7 @@ fn open_monitor() -> Result<pulse::Stream> {
 
 fn capture(
     mut stream: Option<pulse::Stream>,
+    mut opened_on: Option<String>,
     tx: std::sync::mpsc::SyncSender<AudioChunk>,
     device: Arc<Mutex<Option<AudioDevice>>>,
     stop: Arc<AtomicBool>,
@@ -179,13 +207,31 @@ fn capture(
         std::thread::sleep(RETRY_EVERY);
     }
 
+    let mut recheck_at = std::time::Instant::now() + RECHECK_EVERY;
     while !stop.load(Ordering::Relaxed) {
+        // A different device was chosen, or the chosen one came or went. Named
+        // again each time too, because the default can have moved under a
+        // stream that is simply following it.
+        if stream.is_some() && std::time::Instant::now() >= recheck_at {
+            recheck_at = std::time::Instant::now() + RECHECK_EVERY;
+            let (open_on, on) = target();
+            if open_on != opened_on {
+                stream = None;
+            } else {
+                set_device(Some(on));
+            }
+        }
+
         let open = match stream.as_mut() {
             Some(open) => open,
-            None => match open_monitor() {
-                Ok(opened) => {
-                    info!("Capturing what the default output plays");
-                    set_device(Some(crate::audio_output::default_device()));
+            None => match {
+                let (open_on, on) = target();
+                open_monitor(open_on.as_deref()).map(|opened| (opened, open_on, on))
+            } {
+                Ok((opened, open_on, on)) => {
+                    info!("Capturing what {} plays", on.name);
+                    set_device(Some(on));
+                    opened_on = open_on;
                     stream.insert(opened)
                 }
                 Err(e) => {
@@ -263,7 +309,7 @@ mod tests {
         assert!(capture.device().is_some(), "an open capture names its device");
 
         let player = std::thread::spawn(|| {
-            let mut out = pulse::Stream::playback("test tone", 48_000, 2, 15, 5).expect("playback");
+            let mut out = pulse::Stream::playback("test tone", None, 48_000, 2, 15, 5).expect("playback");
             for block in 0..200 {
                 out.write(&sine(240, block * 240)).expect("write");
             }

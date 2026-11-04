@@ -14,10 +14,14 @@ All notable changes to Tain are documented here. This project adheres to
   Intel and AMD graphics, in H.264, H.265 and AV1 where the GPU has them, and
   on the processor in H.264 where it does not. The first time a guest connects
   to a Linux PC, the desktop asks the person there which screen or window to
-  share and whether to allow control, and remembers the answer. Not on Linux
-  yet: leaving apps out of the sound, choosing the sound device, immersive
-  mode, unattended access and virtual displays. [docs/linux.md](docs/linux.md)
-  says how to install it and what it needs.
+  share and whether to allow control, and remembers the answer. On KDE Plasma,
+  windows are shared as on Windows: picked from pictures of them, several at
+  once, and controlled. On other desktops one window can be shared, picked in
+  the desktop's own dialog, to be watched rather than controlled. Tain adds
+  itself to the application menu the first time it runs, with its icon in the
+  taskbar, and says when a guest is connecting. Not on Linux yet:
+  leaving apps out of the sound, unattended access and virtual displays.
+  [docs/linux.md](docs/linux.md) says how to install it and what it needs.
 
 - **Choose whether Windows outlines what you share.** Windows draws a yellow
   border on the host's screen around a window being shared, and around a whole
@@ -32,6 +36,17 @@ All notable changes to Tain are documented here. This project adheres to
   either is keeping it on.
 
 ### Fixed
+
+- **Clicks land in the right window when several are shared.** With windows
+  tiled into one picture, every click was placed as if that picture were the
+  host's main screen, so it landed somewhere unrelated. Each click now goes into
+  the window it was aimed at.
+
+- **The pointer comes back after a tap.** Touching the screen of a Windows host
+  from a guest hid its pointer, and going back to the mouse moved it with nothing
+  to see until somebody moved the real mouse at the host. The guest now draws it
+  as soon as its mouse moves. Windows keeps it hidden on the host's own screen,
+  and in shared windows, until the real mouse is used.
 
 - **Excluded apps stay out from the first connection.** The first guest to
   connect after Tain started heard the apps excluded in Settings → Audio, and

@@ -15,7 +15,9 @@
  *
  * # What it does
  *
- * Connects to the portal's PipeWire remote, consumes one video node in shared
+ * Connects to the portal's PipeWire remote, or with no remote to the user's
+ * own PipeWire daemon (where KWin publishes the window streams it is asked
+ * for directly), consumes one video node in shared
  * memory (no DMA-BUF modifiers are offered, so every compositor falls back to
  * memory it maps for us), and keeps the newest frame as tightly packed BGRA,
  * converting from whichever of BGRx, BGRA, RGBx or RGBA was negotiated.
@@ -48,6 +50,8 @@ static struct {
     void (*context_destroy)(struct pw_context *context);
     struct pw_core *(*context_connect_fd)(struct pw_context *context, int fd,
                                           struct pw_properties *props, size_t user_data_size);
+    struct pw_core *(*context_connect)(struct pw_context *context, struct pw_properties *props,
+                                       size_t user_data_size);
     int (*core_disconnect)(struct pw_core *core);
     struct pw_properties *(*properties_new)(const char *key, ...);
     struct pw_stream *(*stream_new)(struct pw_core *core, const char *name, struct pw_properties *props);
@@ -92,6 +96,7 @@ static void db_pw_load_once(void)
     LOAD(context_new, "pw_context_new");
     LOAD(context_destroy, "pw_context_destroy");
     LOAD(context_connect_fd, "pw_context_connect_fd");
+    LOAD(context_connect, "pw_context_connect");
     LOAD(core_disconnect, "pw_core_disconnect");
     LOAD(properties_new, "pw_properties_new");
     LOAD(stream_new, "pw_stream_new");
@@ -320,7 +325,8 @@ void db_pw_stream_close(DbPwStream *s);
 
 /*
  * Connect to `node` on the PipeWire remote `fd` (taken over: PipeWire closes
- * it), and start receiving frames.
+ * it), or on the user's own daemon when `fd` is negative, and start receiving
+ * frames.
  */
 DbPwStream *db_pw_stream_open(int fd, unsigned int node, char *err, int err_len)
 {
@@ -358,7 +364,8 @@ DbPwStream *db_pw_stream_open(int fd, unsigned int node, char *err, int err_len)
     }
 
     pw.thread_loop_lock(s->loop);
-    s->core = pw.context_connect_fd(s->context, fd, NULL, 0);
+    s->core = fd < 0 ? pw.context_connect(s->context, NULL, 0)
+                     : pw.context_connect_fd(s->context, fd, NULL, 0);
     if (!s->core) {
         pw.thread_loop_unlock(s->loop);
         db_fail(err, err_len, "could not connect to the screen's PipeWire remote");

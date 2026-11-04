@@ -1407,12 +1407,33 @@ pub fn create_capturer(config: CaptureConfig) -> Result<Box<dyn ScreenCaptureBac
         // The screen cast portal and PipeWire: the desktop asks the person at
         // this machine what to share. A refusal ends the session with that
         // reason rather than streaming something that is not their screen.
+        //
+        // Windows, where KWin lists them for Tain, through KWin, one or a grid
+        // of several, as on Windows — see `kwin`. A window the desktop picked
+        // comes through the portal like a screen.
         #[cfg(all(target_os = "linux", db_pipewire))]
         {
-            Box::new(
-                super::capture_portal::PortalCapturer::new(&config)
-                    .map_err(|e| e.context("could not share this screen"))?,
-            )
+            use super::window_capture::DESKTOP_CHOOSES;
+            use anyhow::Context;
+            match &config.display {
+                DisplayTarget::Window(id) if *id != DESKTOP_CHOOSES => Box::new(
+                    super::capture_kwin::KwinWindowCapturer::for_window(*id, config.fps)
+                        .context("could not capture that window")?,
+                ),
+                DisplayTarget::Windows(ids) if !ids.contains(&DESKTOP_CHOOSES) => {
+                    let known: Vec<_> =
+                        ids.iter().filter_map(|id| super::window_capture::info_of(*id)).collect();
+                    anyhow::ensure!(!known.is_empty(), "none of the shared windows are still open");
+                    Box::new(
+                        super::capture_wall::Wall::of_windows(&known)
+                            .context("could not compose those windows")?,
+                    )
+                }
+                _ => Box::new(
+                    super::capture_portal::PortalCapturer::new(&config)
+                        .map_err(|e| e.context("could not share this screen"))?,
+                ),
+            }
         }
         #[cfg(not(any(target_os = "windows", all(target_os = "linux", db_pipewire))))]
         {

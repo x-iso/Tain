@@ -23,6 +23,49 @@
 //! not a failure: the stream pauses, the guest is told what happened in words,
 //! and it resumes when the window comes back. [`State`] is that distinction.
 
+/// The window a Linux desktop will ask about, as an id in a grant.
+///
+/// # Why there is one id and no list
+///
+/// A Wayland compositor tells an ordinary application nothing about the windows
+/// the others have open, so outside Plasma there is nothing here to list. Only
+/// the desktop knows, and it asks the person at the machine itself, in the screen
+/// cast portal's own dialog. So there a window grant says only "a window,
+/// whichever they pick", and which one it was is known to the desktop alone.
+///
+/// Plasma tells Tain everything, given permission: see [`super::kwin`]. There a
+/// window is listed and chosen in Tain's own picker, as on Windows, and this id
+/// is not used.
+///
+/// # Why it can only be watched
+///
+/// The portal takes input in one session with the picture, and KDE's will not put
+/// a window in that session at all, so a window comes through a plain ScreenCast
+/// session. See `portal::window_session`, and `docs/linux.md`.
+pub const DESKTOP_CHOOSES: u64 = u64::MAX - 1;
+
+/// Whether windows are chosen in the desktop's dialog rather than from a list:
+/// on Linux, unless KWin lets Tain list and capture them itself.
+pub fn chosen_by_desktop() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        !(cfg!(db_pipewire) && super::kwin::get().is_some())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// KWin's description of a window, where that is what lists them.
+#[cfg(target_os = "linux")]
+fn kwin_window(id: u64) -> Option<super::kwin::Window> {
+    if !cfg!(db_pipewire) {
+        return None;
+    }
+    super::kwin::get()?.window(id)
+}
+
 /// What a shared window is doing, as far as the guest needs to know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -84,10 +127,27 @@ pub fn app_of(id: u64) -> Option<String> {
     {
         windows_impl::app_of(id)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        kwin_window(id).map(|window| window.app_name())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = id;
         None
+    }
+}
+
+/// A window KWin describes, as an entry in a list.
+#[cfg(target_os = "linux")]
+fn listed(id: u64, window: &super::kwin::Window) -> super::protocol::WindowInfo {
+    let clamp = |size: u32| size.min(u32::from(u16::MAX)) as u16;
+    super::protocol::WindowInfo {
+        id,
+        app: window.app_name(),
+        title: window.title.clone(),
+        width: clamp(window.geometry.2),
+        height: clamp(window.geometry.3),
     }
 }
 
@@ -105,7 +165,23 @@ pub fn shareable() -> Vec<super::protocol::WindowInfo> {
         });
         found
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let Some(kwin) = super::kwin::get().filter(|_| cfg!(db_pipewire)) else {
+            return Vec::new();
+        };
+        let mut found: Vec<_> = kwin
+            .windows()
+            .iter()
+            .filter(|(_, window)| window.offerable())
+            .map(|(id, window)| listed(*id, window))
+            .collect();
+        found.sort_by(|a, b| {
+            a.app.to_lowercase().cmp(&b.app.to_lowercase()).then(a.title.cmp(&b.title))
+        });
+        found
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         Vec::new()
     }
@@ -119,7 +195,15 @@ pub fn state_of(id: u64) -> State {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = id;
+        // Showing for as long as there is a stream: the desktop that chose it
+        // does not say what it is doing, and the stream ending ends the capture.
+        if id == DESKTOP_CHOOSES && cfg!(target_os = "linux") {
+            return State::Showing;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(window) = kwin_window(id) {
+            return if window.minimized() { State::Minimised } else { State::Showing };
+        }
         State::Closed
     }
 }
@@ -136,7 +220,13 @@ pub fn title_of(id: u64) -> Option<String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = id;
+        if id == DESKTOP_CHOOSES && cfg!(target_os = "linux") {
+            return Some("Shared window".to_string());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(window) = kwin_window(id) {
+            return Some(window.title);
+        }
         None
     }
 }
@@ -155,8 +245,17 @@ pub fn info_of(id: u64) -> Option<super::protocol::WindowInfo> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = id;
-        None
+        #[cfg(target_os = "linux")]
+        if let Some(window) = kwin_window(id) {
+            return Some(listed(id, &window));
+        }
+        title_of(id).map(|title| super::protocol::WindowInfo {
+            id,
+            app: String::new(),
+            title,
+            width: 0,
+            height: 0,
+        })
     }
 }
 
@@ -221,7 +320,24 @@ pub fn on_screen(id: u64) -> Option<OnScreen> {
     {
         windows_impl::on_screen(id)
     }
-    #[cfg(not(target_os = "windows"))]
+    // # In the desktop's logical coordinates, not pixels
+    //
+    // Which is what KWin places the pointer in, and the only thing on Linux that
+    // reads this is the mapping of a click into the window. A scaled display
+    // makes the window's stream larger than this; the click is a fraction of the
+    // picture either way, so the two never have to agree.
+    #[cfg(target_os = "linux")]
+    {
+        let window = kwin_window(id).filter(|window| !window.minimized())?;
+        let (x, y, width, height) = window.geometry;
+        Some(OnScreen {
+            x,
+            y,
+            width: width.min(u32::from(u16::MAX)) as u16,
+            height: height.min(u32::from(u16::MAX)) as u16,
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = id;
         None
@@ -307,7 +423,11 @@ pub fn thumbnail(id: u64, max_edge: u16) -> Option<Thumbnail> {
     {
         windows_impl::thumbnail(id, max_edge)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(target_os = "linux", db_pipewire))]
+    {
+        super::capture_kwin::thumbnail(id, max_edge)
+    }
+    #[cfg(not(any(target_os = "windows", all(target_os = "linux", db_pipewire))))]
     {
         let _ = (id, max_edge);
         None

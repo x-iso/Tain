@@ -189,7 +189,11 @@ fn handle_shortcuts(
         .filter(|(tag, _)| from_hook & (1 << tag) != 0)
         .map(|(_, action)| action)
         .collect();
-    if let Some(action) = ctx.input(|i| bindings.triggered(i)) {
+    // Not on Linux while immersed: nothing swallows the keys there, so egui sees
+    // them too, and a shortcut would fire once from each.
+    if !immersive.keys_reach_egui_too()
+        && let Some(action) = ctx.input(|i| bindings.triggered(i))
+    {
         if let Some(key) = bindings.get(action).egui_key() {
             consumed.push(key);
         }
@@ -259,6 +263,9 @@ pub struct SessionWindow {
     toolbar_rect: Option<egui::Rect>,
     /// The window's own caption; see `title_bar`.
     title_bar: TitleBar,
+    /// Whether the desktop has been told to keep the pointer in this window.
+    #[cfg(target_os = "linux")]
+    pointer_confined: bool,
     /// How wide the tools were last frame.
     ///
     /// They are laid out from the right edge, and egui lays a row out left to
@@ -298,6 +305,8 @@ impl Default for SessionWindow {
             pending_mini: None,
             toolbar_rect: None,
             title_bar: TitleBar::default(),
+            #[cfg(target_os = "linux")]
+            pointer_confined: false,
             tools_width: None,
             renaming: None,
             rename_drawn: false,
@@ -338,6 +347,10 @@ impl SessionWindow {
         // The window goes with the last session, and the next one is a new
         // window whose caption has to be taken over again.
         self.title_bar = TitleBar::default();
+        #[cfg(target_os = "linux")]
+        {
+            self.pointer_confined = false;
+        }
         self.tools_width = None;
         self.renaming = None;
         self.touch_reveal_until = 0.0;
@@ -408,6 +421,7 @@ impl SessionWindow {
                 let (events, time) = ctx.input(|i| (i.events.clone(), i.time));
                 super::touch::observe(ctx, &events, time);
 
+                self.title_bar.use_grips(!immersive.is_active());
                 let window_buttons = self.title_bar.update(ctx, &title);
 
                 // # The mini view and fullscreen, in order
@@ -501,6 +515,19 @@ impl SessionWindow {
                     if let Some(rect) = rect {
                         immersive.confine_cursor(rect, ctx.pixels_per_point());
                     }
+                }
+                // On Linux the desktop does the confining, for a window rather
+                // than a rectangle, and only the window's own commands reach it.
+                #[cfg(target_os = "linux")]
+                if immersive.is_active() != self.pointer_confined {
+                    self.pointer_confined = immersive.is_active();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                        if self.pointer_confined {
+                            egui::CursorGrab::Confined
+                        } else {
+                            egui::CursorGrab::None
+                        },
+                    ));
                 }
 
                 super::touch::paint_feedback(ctx, self.pointer_on_picture);
@@ -685,7 +712,8 @@ impl SessionWindow {
                         let over_toolbar = ui
                             .ctx()
                             .pointer_latest_pos()
-                            .is_some_and(|p| self.toolbar_rect.is_some_and(|r| r.contains(p)));
+                            .is_some_and(|p| self.toolbar_rect.is_some_and(|r| r.contains(p)))
+                            || self.title_bar.over_grip();
                         self.pointer_on_picture = resp.contains_pointer() && !over_toolbar;
                         // # Keyboard first, deliberately
                         //
@@ -1525,8 +1553,17 @@ impl SessionWindow {
 
         // Windows hit-tests this one itself, for snap layouts, so egui never
         // sees the pointer over it: the frame says what state it is in, and
-        // the frame clicks it.
-        let (hovered, pressed) = self.title_bar.maximize_state();
+        // the frame clicks it. Where there is no such frame, it is egui's.
+        let (hovered, pressed) = if title_bar::EGUI_MAXIMIZES {
+            let resp = ui.interact(maximize, ui.id().with("window-maximize"), egui::Sense::click());
+            if resp.clicked() {
+                let maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            (resp.hovered(), resp.is_pointer_button_down_on())
+        } else {
+            self.title_bar.maximize_state()
+        };
         painter.rect_filled(maximize, 0.0, button_fill(hovered, pressed));
         let c = crisp(painter, maximize.center());
         if ctx.input(|i| i.viewport().maximized).unwrap_or(false) {
@@ -3254,8 +3291,15 @@ fn forward_keyboard(
         // Read from the OS rather than from egui. egui's modifier flag is not
         // dependable inside this immediate viewport, and it cannot tell left
         // from right in any case.
+        //
+        // Only where there is no such source does egui's flag have to do, on an
+        // X11 desktop, as the left-hand keys.
         let vks = super::immersive::MODIFIER_VKS;
-        let down = std::array::from_fn(|i| super::immersive::key_is_down(vks[i]));
+        let down = if super::immersive::keys_are_raw() {
+            std::array::from_fn(|i| super::immersive::key_is_down(vks[i]))
+        } else {
+            [modifiers.shift, false, modifiers.ctrl, false, modifiers.alt, false]
+        };
         for event in session.modifiers_mut().diff_actual(down, vks) {
             session.send_input(InputEvent::Key(event));
         }
@@ -3278,7 +3322,7 @@ fn forward_keyboard(
             continue;
         }
         // Already sent, with a better code than egui could give.
-        if key == egui::Key::Tab {
+        if key == egui::Key::Tab && super::immersive::keys_are_raw() {
             continue;
         }
         let Some(keycode) = keymap::vk_for(key) else { continue };

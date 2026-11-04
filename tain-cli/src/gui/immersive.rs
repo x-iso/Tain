@@ -45,6 +45,27 @@ use tain_core::protocol::KeyEvent;
 
 pub use platform::{key_is_down, release_keyboard_raw_input, MODIFIER_VKS, MOD_ALT, MOD_CTRL, MOD_SHIFT};
 
+// On Linux there is no hook, and no need of one. See `wayland_keys`.
+#[cfg(target_os = "linux")]
+use super::wayland_keys as platform;
+
+/// Whether keys come from the hook or its equivalent, rather than only from
+/// egui, which is what an X11 desktop has.
+pub fn keys_are_raw() -> bool {
+    platform::live()
+}
+
+/// Start reading the keyboard, given the window system's connection to the
+/// desktop. Nothing to do unless that is Wayland.
+#[cfg(target_os = "linux")]
+pub fn attach_display(display: raw_window_handle::RawDisplayHandle) {
+    if let raw_window_handle::RawDisplayHandle::Wayland(wayland) = display {
+        // SAFETY: winit's own connection, which it keeps for the life of the
+        // event loop, and the event loop is the life of the process.
+        unsafe { super::wayland_keys::start(wayland.display.as_ptr()) };
+    }
+}
+
 /// Windows virtual-key codes for the left and right Win keys.
 ///
 /// Referenced by the tests only: the hook no longer singles these out, because
@@ -121,6 +142,8 @@ pub struct Immersive {
     backgrounded_since: Option<std::time::Instant>,
     /// Rate limit for [`Immersive::log_foreground`].
     last_foreground_log: Option<std::time::Instant>,
+    /// When the mode last ended. See [`Immersive::keys_reach_egui_too`].
+    left_at: Option<std::time::Instant>,
 }
 
 impl Immersive {
@@ -130,12 +153,32 @@ impl Immersive {
 
     /// Whether the hook is capturing right now.
     ///
-    /// Identical to [`Self::is_active`] — kept as a separate name because the
-    /// input path is asking a different question ("which keyboard source do I
-    /// read"), and the two were genuinely different before the suspend
-    /// behaviour was removed.
+    /// Identical to [`Self::is_active`] where there is a hook — kept as a
+    /// separate name because the input path is asking a different question
+    /// ("which keyboard source do I read"), and the two were genuinely different
+    /// before the suspend behaviour was removed. Different again on an X11
+    /// desktop, where egui is the only source there is, so it stays the one read.
     pub fn is_armed(&self) -> bool {
-        self.active
+        self.active && platform::live()
+    }
+
+    /// Whether egui is hearing the keys that are going to the host.
+    ///
+    /// Never on Windows, where the hook has taken them first. Always while the
+    /// mode is on under Wayland, which takes them by listening beside egui, so
+    /// a shortcut egui recognises would fire a second time.
+    ///
+    /// And for a moment after it ends. The way out is seen on the listening
+    /// thread, and egui may not hear that same press until a frame or two later,
+    /// by which time the mode is off and it would read as a request to turn it
+    /// back on.
+    pub fn keys_reach_egui_too(&self) -> bool {
+        /// Comfortably longer than egui takes to catch up, and shorter than a
+        /// person takes to press a shortcut twice on purpose.
+        const CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(300);
+
+        let settling = self.left_at.is_some_and(|at| at.elapsed() < CATCHING_UP);
+        (self.active || settling) && platform::keys_also_reach_egui()
     }
 
     /// The combination that leaves immersive mode.
@@ -308,6 +351,7 @@ impl Immersive {
             platform::install_key_hook();
             tracing::info!("Immersive mode on — the keyboard goes to the host, pointer confined");
         } else {
+            self.left_at = Some(std::time::Instant::now());
             let counts = platform::counters();
             for line in platform::take_trace() {
                 tracing::info!("Immersive hook saw: {line}");
@@ -1733,6 +1777,16 @@ mod platform {
         CAPTURE_ACTIVE.store(active, Ordering::Relaxed);
     }
 
+    /// The hook is the keyboard, whether or not it is capturing right now.
+    pub fn live() -> bool {
+        true
+    }
+
+    /// It takes the keys before egui could see them.
+    pub fn keys_also_reach_egui() -> bool {
+        false
+    }
+
     pub fn install_key_hook() {
         // Cheap, and the one thing that decides whether any of the rest works.
         release_keyboard_raw_input();
@@ -1818,15 +1872,21 @@ mod platform {
 
 // ── Everything else ───────────────────────────────────────────
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod platform {
     pub const MOD_CTRL: u8 = 1;
     pub const MOD_SHIFT: u8 = 2;
     pub const MOD_ALT: u8 = 4;
 
+    pub fn live() -> bool {
+        false
+    }
+    pub fn keys_also_reach_egui() -> bool {
+        false
+    }
     pub fn install_key_hook() {
         tracing::warn!(
-            "Immersive mode is Windows-only for now — system keys will stay local \
+            "Immersive mode is not available here — system keys will stay local \
              and the pointer will not be confined."
         );
     }
@@ -1950,7 +2010,9 @@ mod tests {
         assert!(!immersive.is_armed(), "nothing captured before it is asked for");
 
         immersive.set_active(true);
-        assert!(immersive.is_armed(), "asking for it is the whole condition");
+        // Asking for it is the whole condition, given a keyboard to capture: an
+        // X11 desktop, or this test under Linux, has only egui's to read.
+        assert_eq!(immersive.is_armed(), keys_are_raw());
         assert!(immersive.is_active());
 
         immersive.release();

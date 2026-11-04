@@ -279,7 +279,7 @@ The timeout **denies** rather than downgrading. An unattended machine must not e
 
 **The window icon is rasterised by hand** rather than through an SVG library. `usvg` 0.37 splits parsing across several crates, and the mark is three flat shapes in one colour — `gui/icon.rs` fills them directly with 4× supersampling. Keep it in sync if `logo.svg` changes; its tests assert specific pixels.
 
-**Clipboard**: egui only surfaces paste as a keyboard event, so the design's paste *button* needs `arboard` to read the clipboard on demand.
+**Clipboard**: the design's paste *button* asks the window for the clipboard with `ViewportCommand::RequestPaste` and takes the answer out of the next frames' input. It used to read `arboard` directly, which on Wayland meant XWayland: `arboard` is X11 only without its `wayland-data-control` feature, and a compositor only offers the clipboard to a client whose own surface has keyboard focus, so a code copied from a Wayland app read as an empty clipboard. That feature would not have settled it, since GNOME does not implement the protocol. The window already holds the right connection for every desktop, through `egui-winit`: its own Wayland one, or X11 under XWayland. An empty clipboard sends no answer, so the button stops waiting after `PASTE_WAIT_FRAMES`.
 
 ## Session Loop: Separate Reader Task and Writer Loop
 
@@ -3081,6 +3081,80 @@ is what the end-to-end test runs against.
 portal answers on a Request object whose path it derives from the caller's bus
 name and a token. The response is subscribed to at that predicted path before
 the method is called, or a fast answer is lost.
+
+**Off Plasma, a window share is chosen by the desktop, and only watched**: a Wayland
+client cannot list another's windows, so the accept dialog offers *Share one
+window* where Windows has a picker, and the grant carries one reserved id,
+`window_capture::DESKTOP_CHOOSES`. KDE's RemoteDesktop portal creates streams only
+for outputs, a workspace or a virtual output (`remotedesktop.cpp`), so a window
+has to come through a plain ScreenCast session, which takes no input. These
+sessions are view-only on every desktop for now, and show one window, which is
+where the work stopped rather than a limit: `docs/linux.md` says what several
+windows and control would take. The host drops their input, because nothing it
+could do with it would land in the window, and the stream's `source_type` is
+checked, because a share that quietly became a screen is the one failure this
+cannot have.
+
+**On Plasma, windows go through KWin instead, as on Windows**: KWin's own
+`org_kde_plasma_window_management`, `zkde_screencast_unstable_v1` and
+`org_kde_kwin_fake_input` are what its portal is built on, and they give
+everything the portal does not — a list of windows for Tain's own picker, a
+window's stream with no dialog, and input in the desktop's coordinates. So on
+Plasma the Windows paths are used whole: the picker, `capture_wall`'s grid of
+windows, the guest's switcher, and clicks mapped per tile. See `kwin.rs`.
+
+KWin keeps these interfaces from a program unless the `.desktop` file whose
+`Exec=` first word canonicalises to the running binary lists them in
+`X-KDE-Wayland-Interfaces` (`serviceutils.h`, through Plasma 6.5; later KWin
+restricts only sandboxed clients). Without it Tain falls back to the portal and
+says why in the log, at startup rather than at the first accept dialog.
+
+**Tain writes its own `.desktop` entry**: the first attempt shipped the file and
+a `sed` line to put the binary's path into it, and on the first machine it met
+the line pointed somewhere else, so windows fell back to the portal and the
+taskbar showed a generic icon with nothing saying why. The binary knows its own
+path, so `desktop_entry.rs` writes the entry and icon at every start when they
+differ from what they should say, before the window opens and before the host
+asks KWin anything, then runs `kbuildsycoca6` so KWin's next query sees it. A
+packaged entry naming the same binary is left alone. Measured in a headless
+KWin with no entry anywhere: written, rebuilt, and granted on that same first
+run. `kwin::get` also asks again, on a thread, ten seconds after a refusal, so a
+desktop slow to notice still comes round within the run.
+
+**Gotcha — the window being shared is often behind another**: KWin streams the
+window itself, whole, so the guest sees it unobscured, and a click is placed
+wherever the window is on the host's desk — on top of which may be another
+window. A press first activates the shared window under the pointer
+(`org_kde_plasma_window.set_state`), so the click lands in what the guest is
+looking at, and keys after it follow. A Windows host has the same hole and is
+not given the same answer here; only the Linux path changed.
+
+**Gotcha — `Deferring` dropped `set_mapping`**: the wrapper every session's
+injector is wrapped in forwarded `set_shown` but not `set_mapping`, which has a
+default that does nothing — so a grid of windows' tiles never reached the
+Windows injector and every click in one was placed as if the grid were the
+primary screen. Found while routing the same call to KWin. Forwarded now, with
+a test that every way of describing the picture reaches the platform injector.
+
+**Gotcha — a headless KWin answers slowly**: under llvmpipe in WSL the first
+registry round trip took five to twelve seconds, and a window opened seconds
+earlier was not yet in the list. Waiting longer for the session to settle, not
+anything in the protocol code, is what the live test needed.
+
+**The keyboard on Wayland is a second `wl_keyboard`**: on the same `wl_display` as
+winit, on its own queue and thread, the way `smithay-clipboard` shares it. See
+`gui/wayland_keys.rs`. Unlike the Windows hook it swallows nothing, so egui hears
+every key too, and that has to be allowed for.
+
+**Gotcha — one press, two shortcuts**: the way out of immersive mode is recognised
+on the listening thread, which turned the mode off, and then egui, seeing the same
+Ctrl+Shift+E with the mode now off, turned it straight back on. Sometimes in the
+same frame and sometimes the next, because egui hears it later. So
+`Immersive::keys_reach_egui_too` stays true for 300 ms after the mode ends.
+
+**Gotcha — `wtype` cannot test this**: it uploads a keymap of its own and sends
+made-up key codes, so a reader of hardware codes sees nonsense. A virtual keyboard
+that sends real evdev codes under a real keymap is what shows the behaviour.
 
 **Gotcha — PulseAudio's null sink idles in two-second blocks**: the playback
 test fed one second of sound into a null sink and heard nothing, because an
