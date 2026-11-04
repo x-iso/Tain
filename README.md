@@ -2,11 +2,11 @@
 
 A peer-to-peer remote desktop application built in Rust, using [iroh](https://iroh.computer) for NAT-traversing P2P QUIC connections. Designed for wide hardware compatibility — from low-latency gaming to light desktop tasks.
 
-Tain runs on Windows. The protocol, networking, passcodes and adaptive controller
-build anywhere, but capture, encoding, audio and input injection are Windows-only
-for now. **Linux** hosts and views too, with sound and GPU video through
-VA-API, and ships with each release; what it needs and what it lacks are in
-[docs/linux.md](docs/linux.md).
+Tain runs on Windows and **Linux**, and each release ships both. The protocol,
+networking, passcodes and adaptive controller build anywhere; capture, encoding,
+audio and input injection exist for those two. On Linux it hosts and views with
+sound and GPU video through VA-API, and on Plasma shares windows as it does on
+Windows; what it needs and what it lacks are in [docs/linux.md](docs/linux.md).
 
 ## Features
 
@@ -766,7 +766,9 @@ this is ever shipped commercially.
 ## Input Injection
 
 - **Windows**: `SendInput` for mouse and keyboard, and `InjectTouchInput` for touch
-- **Linux**: the RemoteDesktop portal, in the session that shares the screen
+- **Linux**: the RemoteDesktop portal, in the session that shares the screen; for
+  windows shared on Plasma, KWin's fake input, with the clicked window brought
+  forward first
 - **macOS**: log-only stubs
 
 The `input_inject.rs` module provides a trait-based abstraction so the actual injection logic can be swapped per platform without touching protocol code.
@@ -811,7 +813,7 @@ decode and display-driver paths are tested on the hardware that has them.
 | Guest connect from GUI | ✅ Works | Paste a code, the host is checked, then connect |
 | Saved connections | ✅ Works | Names in JSON, codes in the credential store; reconnect, rename, forget |
 | Mouse, keyboard, touch (guest) | ✅ Works | Sent on change only, gated on grants |
-| Input injection (host) | ✅ Windows, Linux | `SendInput` and touch injection; the RemoteDesktop portal on Linux. macOS is a log-only stub |
+| Input injection (host) | ✅ Windows, Linux | `SendInput` and touch injection; the RemoteDesktop portal on Linux, and KWin's fake input for shared windows on Plasma. macOS is a log-only stub |
 | Local input priority | ✅ Windows | Guest input yields to the host's own; releases always delivered |
 | Pointer capture | ✅ Works | Relative movement for games; automatic or by shortcut |
 | Immersive mode | ✅ Windows | Win key forwarded via a keyboard hook, pointer confined to the window |
@@ -835,7 +837,7 @@ decode and display-driver paths are tested on the hardware that has them.
 | Localisation | ✅ Works | English and Russian; a test fails on any key the catalogue lacks |
 | Settings | ✅ Works | Persisted to JSON; unknown or bad fields fall back without losing the rest |
 | CLI subcommands | ❌ Not wired | `host.rs` / `guest.rs` are not compiled in |
-| Linux | ✅ Works | Hosting through the screen cast and remote desktop portals, VA-API decode and encode, PulseAudio sound. No unattended access, virtual displays or per-app sound exclusion yet. See [docs/linux.md](docs/linux.md) |
+| Linux | ✅ Works | Hosting screens through the screen cast and remote desktop portals, and windows through KWin on Plasma; VA-API decode and encode, PulseAudio sound, notifications, immersive mode. No unattended access, virtual displays or per-app sound exclusion yet. See [docs/linux.md](docs/linux.md) |
 
 ## Roadmap / Next Steps
 

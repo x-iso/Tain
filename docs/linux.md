@@ -13,22 +13,24 @@ release ships `tain-x86_64-linux.tar.gz` beside `tain.exe`.
 |---|---|---|
 | Codes, approval, saved connections, discovery, relays, settings, languages | ✅ | The same code as Windows |
 | **Viewing**: H.264, H.265, AV1 | ✅ | GPU decode through VA-API; OpenH264 for H.264 on the processor where the GPU cannot |
-| **Hosting**: sharing a screen or a window | ✅ | The screen cast portal and PipeWire, on Wayland |
+| **Hosting**: sharing a screen | ✅ | The screen cast portal and PipeWire, on Wayland |
 | Hosting: mouse, keyboard, touch, pointer capture | ✅ | The RemoteDesktop portal, in the same session |
 | Hosting: GPU encode, H.264, H.265, AV1 | ✅ | VA-API; OpenH264 for H.264 where the GPU cannot |
-| Hosting: sharing windows, one or several, with control | ✅ on Plasma | KWin's own protocols, given the `.desktop` file; see below |
-| Hosting: sharing a window elsewhere | ⚠️ | One, picked in the desktop's own dialog, and view-only |
+| Hosting: sharing windows — picked from pictures of them, several at once, controlled | ✅ on Plasma | KWin's own protocols; see [Sharing windows](#sharing-windows) |
+| Hosting: sharing a window on other desktops | ⚠️ | One, picked in the desktop's own dialog, and view-only |
 | **Sound**, both directions, on the device chosen in Settings | ✅ | PulseAudio's API, which PipeWire also answers |
 | Leaving applications out of the sound | ❌ | The whole mix |
+| The menu entry, the taskbar icon | ✅ | Tain writes its own `.desktop` entry and icon; see [Installing](#installing-the-release) |
+| Notifications of a guest connecting | ✅ | `org.freedesktop.Notifications`, critical while a guest waits for approval; a click asks for Tain to come forward |
+| Paste passcode | ✅ | Through the window's own clipboard connection, Wayland or X11 |
 | The wallpaper on a host's card | ✅ | GNOME and its descendants, Plasma, Xfce, swaybg, hyprpaper; a plain colour elsewhere, never a picture of the screen |
 | The session window's own title bar | ✅ | Decorations off; the desktop moves and resizes it on request |
 | Immersive mode | ✅ | A second `wl_keyboard`, `keyboard-shortcuts-inhibit`, a confined pointer. On X11 only the pointer |
 | Drawing decoded frames straight from the GPU | ❌ | Frames are read back and converted on the processor |
 | The pointer sent separately from the picture | ❌ | Drawn into the picture by the desktop |
-| Notifications of a guest connecting, a click on one bringing Tain forward | ✅ | `org.freedesktop.Notifications`; critical while a guest waits for approval |
 | `tain://` links, the mini view | ❌ | Stubs; a Wayland window cannot place itself or stay on top |
 | Unattended access, virtual displays | ❌ | No portal equivalent; see the end |
-| Hosting on X11 | ⚠️ | Through the portal, where the desktop's portal shares an X11 session; untested |
+| Hosting on X11 | ⚠️ | Through the portal, where the desktop's portal shares an X11 session; untested. KWin's window sharing needs Wayland |
 
 ### GPU video
 
@@ -61,25 +63,36 @@ One RemoteDesktop session carries both the picture and the input, so one
 dialog covers both. On a desktop with no RemoteDesktop portal (wlroots-based
 ones, today) the screen is still shared, without control.
 
-### Sharing one window
+### Sharing windows
 
 **On Plasma, as on Windows.** KWin lists every window, streams any one of them
 on request and takes pointer, keys and touch for it, through its own protocols
 (`org_kde_plasma_window_management`, `zkde_screencast_unstable_v1`,
-`org_kde_kwin_fake_input`; see `tain-core/src/kwin.rs`). So the accept dialog's
-*Individual windows…* opens Tain's own picker, with a picture of each window;
-several can be shared, tiled into one picture or shown one at a time; and the
-guest drives them, each click mapped into the window it was aimed at. Keys go to
-whatever has the focus, as on Windows.
+`org_kde_kwin_fake_input`; see `tain-core/src/kwin.rs`). So it goes as it does
+on Windows:
 
-KWin only allows this for a program whose `.desktop` file asks, which Tain sees
-to itself — see [Installing the release](#installing-the-release). Through
-Plasma 6.5, anyway: later KWin keeps these from sandboxed programs only.
+1. The accept dialog's *Individual windows…* opens Tain's own picker, *Windows
+   to share*, with a picture of each window, before anything is allowed.
+2. Pick one or several and press *Done*; the dialog's button then says how many.
+3. *Allow*. The guest sees them tiled into one picture, or one at a time through
+   its switcher, and drives them: each click is mapped into the window it was
+   aimed at. A press first brings that window forward, because KWin streams the
+   window whole even where another covers it on the host, and the click would
+   otherwise land on whatever is on top. Keys go to whatever has the focus,
+   as on Windows.
 
-**Everywhere else**, and on Plasma without that `.desktop` file, an application
-cannot list another's windows, so the accept dialog has no list of them. *Share
-one window* asks the desktop instead, in its own dialog, right after the guest
-is allowed in, and every time: the remembered choice is only for whole screens.
+KWin allows this only for a program whose `.desktop` entry asks, which Tain
+sees to itself — see [Installing the release](#installing-the-release) — through
+Plasma 6.5; later KWin keeps these from sandboxed programs only. The log says
+which way it went at startup: `Sharing windows through KWin`, or `Windows are
+shared through the portal here:` followed by what KWin refused. A refusal is
+asked about again ten seconds later, so a desktop slow to notice the entry
+still comes round.
+
+**On other desktops**, and on Plasma when KWin refuses, an application cannot
+list another's windows, so the accept dialog has no list of them. *Share one
+window…* asks the desktop instead, in its own dialog, right after the guest is
+allowed in, and every time: the remembered choice is only for whole screens.
 That session is view-only and shows one window:
 
 - **Several windows** would need no second dialog: the portal's `multiple`
@@ -129,10 +142,12 @@ instead, so a modified FFmpeg can be substituted.
 | Wayland or X11, xkbcommon, EGL/GL | The window | Tain does not start (see below) | present on any desktop | present | present |
 | `libva.so.2`, `libva-drm.so.2` | GPU video | Processor H.264 only; sound still works | `libva2`, `libva-drm2` | `libva` | `libva` |
 | A VA-API driver | GPU video | The same | `intel-media-va-driver` or `mesa-va-drivers` | `intel-media-driver` (in Bazzite) or `mesa-va-drivers` | `intel-media-driver` or `mesa` |
-| `libpulse-simple.so.0` and a sound server | Sound | No sound | `libpulse0` | `pulseaudio-libs` | `libpulse` |
-| `libpipewire-0.3.so.0` | Hosting | Cannot share the screen | `libpipewire-0.3-0` | `pipewire-libs` | `libpipewire` |
-| `xdg-desktop-portal` and the desktop's backend | Hosting | Cannot share the screen | `xdg-desktop-portal-gnome` or `-kde` | present | `xdg-desktop-portal-kde` or `-gnome` |
+| `libpulse-simple.so.0`, `libpulse.so.0` and a sound server | Sound, and the list of devices to choose from | No sound; only the default named | `libpulse0` | `pulseaudio-libs` | `libpulse` |
+| `libpipewire-0.3.so.0` | Hosting | Cannot share the screen or a window | `libpipewire-0.3-0` | `pipewire-libs` | `libpipewire` |
+| `xdg-desktop-portal` and the desktop's backend | Hosting a screen; a window off Plasma | Cannot share the screen | `xdg-desktop-portal-gnome` or `-kde` | present | `xdg-desktop-portal-kde` or `-gnome` |
 | A Secret Service | Saved codes, a stable host code | A new code every launch | `gnome-keyring` | present (see below) | `gnome-keyring` or KWallet |
+| A notification service | Notifications | None shown | present on any desktop | present | present |
+| `gsettings`, `xfconf-query` | The wallpaper on GNOME's family and Xfce | A plain colour on the card | present with the desktop | present | present |
 
 The window's libraries are opened by winit and glutin, and a missing one is a
 panic in the log rather than an error dialog. Every desktop installation has
@@ -158,6 +173,7 @@ Settings → KDE Wallet → *Use KWallet for the Secret Service interface*, or
 | Log | `~/.local/state/Tain/tain.log`; `TAIN_LOG_FILE` overrides it |
 | The remembered screen sharing choice | `~/.local/state/Tain/screen-sharing-token`, readable only by you |
 | Codes, identity | The Secret Service, above |
+| The menu entry and its icon | `~/.local/share/applications/tain.desktop`, `~/.local/share/icons/hicolor/scalable/apps/tain.svg` (under `$XDG_DATA_HOME` if set) |
 
 ## Installing the release
 
@@ -188,7 +204,7 @@ That entry matters more than it looks:
 - **Notifications** carry Tain's name and icon through it.
 - **The portal** files the remembered sharing choice under the same id.
 - **On Plasma, sharing windows as on Windows** — see [Sharing
-  windows](#sharing-one-window). KWin keeps its window list, window capture and
+  windows](#sharing-windows). KWin keeps its window list, window capture and
   fake input from programs that have not asked for them in
   `X-KDE-Wayland-Interfaces`, and finds the entry by matching the running binary
   against the first word of its `Exec=` line, by full path. Tain rebuilds
@@ -196,6 +212,10 @@ That entry matters more than it looks:
   already works; its log says `Sharing windows through KWin` when it does.
 
 It does not register `tain://` yet, because nothing would receive the link.
+
+To remove Tain, delete the binary and the two files under
+[Where it keeps things](#where-it-keeps-things); `~/.config/Tain` and
+`~/.local/state/Tain` hold its settings and log.
 
 ## Building it
 
@@ -274,26 +294,43 @@ when a session starts, `VA-API device: …`.
 As a **guest**, connecting to a Windows host:
 
 1. The window opens with the Tain icon in the taskbar, resizes, survives a
-   change of scaling, goes fullscreen and back.
+   change of scaling, goes fullscreen and back. The log's first lines include
+   `Installed Tain's desktop entry` on the first run.
 2. Quit and start again: the same host code means the credential store works.
    A new one, or `No credential store` in the log, is the KDE setting above.
-3. Connect with the host on H.264, then H.265, then AV1. The stats line names
+3. Copy a code from another application and press *Paste passcode*.
+4. Connect with the host on H.264, then H.265, then AV1. The stats line names
    the decoder; `VA-API` in it is the GPU. A codec the iGPU cannot decode ends
    the session saying so.
-4. Sound from the host, and its volume and mute.
-5. Mouse, keyboard (a non-US layout if you use one), scrolling, touch.
+5. The session window's header holds the tabs and tools; drag it by its empty
+   part, resize it from an edge, and use its minimize, maximize and close.
+6. Sound from the host, its volume and mute, and *Play on* in the speaker's menu
+   listing this machine's devices; choosing one moves the sound there.
+7. Mouse, keyboard (a non-US layout if you use one), scrolling, touch. After a
+   tap, the host's pointer still shows when the mouse moves again.
+8. Immersive mode: `Super` and `Alt+Tab` go to the host, not to Plasma, the
+   pointer stays in the window, and `Ctrl+Shift+E` leaves it. GNOME asks once
+   whether Tain may take the shortcuts.
 
 As a **host**, with a Windows or Linux guest:
 
-1. The first connection shows the desktop's sharing dialog. Allow it, with
+1. A guest connecting raises a notification, which stays while it waits for
+   approval. Clicking it should bring Tain forward.
+2. The first screen share shows the desktop's sharing dialog. Allow it, with
    "remember" if offered. The guest sees the screen and can drive it.
-2. Disconnect and connect again: no dialog this time.
-3. Share a window instead: delete the token file above so the dialog asks
-   again, and pick a window in it.
-4. The stats line on the guest names the encoder: `h264_vaapi (VA-API, …)` is
+3. Disconnect and connect again: no dialog this time.
+4. Share windows instead: *Individual windows…* in the accept dialog, pick two
+   in the picker, *Done*, *Allow*. The guest sees both, can switch to one, and
+   can drive it — including one partly behind another window here, which comes
+   forward on the first click. Off Plasma, *Share one window…* asks the
+   desktop's dialog after *Allow*, and the guest can only watch.
+5. The stats line on the guest names the encoder: `h264_vaapi (VA-API, …)` is
    the GPU. Try H.265 and AV1 in Settings → Video.
-5. Sound from the host reaches the guest.
-6. Decline the dialog once: the guest's session ends and says why.
+6. Sound from the host reaches the guest, from the device chosen in Settings →
+   Audio.
+7. The guest's card for this machine shows this desktop's wallpaper, blurred,
+   once the session ends.
+8. Decline the sharing dialog once: the guest's session ends and says why.
 
 Discovery on the same network should find a host in under a second. If not,
 `firewall-cmd --get-active-zones`: Fedora's desktop zone allows mDNS and high
@@ -310,7 +347,8 @@ the tests that need more than that are `#[ignore]`d with what they need:
 | `audio_capture::tests::*` | A PulseAudio or PipeWire sound server; a null sink will do |
 | `capture_portal::tests::frames_arrive_from_a_pipewire_video_node` | PipeWire with WirePlumber, and a video source node |
 | `capture_portal::tests::the_host_path_against_a_stand_in_portal` | The above, and `scripts/mock-portal.py` on a session bus |
-| `capture_kwin::tests::against_a_running_kwin` | A KWin session (`kwin_wayland --virtual` will do) with PipeWire and WirePlumber, one or two Tain windows open, `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1` for the test binary, and `TAIN_TEST_OUT` for the pictures it saves; `TAIN_TEST_CLICK=x,y` clicks there in the window |
+| `capture_kwin::tests::against_a_running_kwin` | A KWin session (below) with PipeWire and WirePlumber, one or two Tain windows open, and `TAIN_TEST_OUT` for the pictures it saves; `TAIN_TEST_CLICK=x,y` clicks there in the window |
+| `capture_kwin::tests::drive_a_tain_window` | The same; clicks in and photographs the Tain window of process `TAIN_TEST_PID` by `TAIN_TEST_STEPS`, for watching the interface work with nobody at it |
 
 A video source node, standing in for a compositor's screen:
 
@@ -334,6 +372,18 @@ That runs the whole host path: the portal conversation, frames from PipeWire,
 input sent back and where it lands, the session closing, and the restore token
 carried into the next session. The GPU paths need a GPU.
 
+For the KWin tests, a headless KWin in a session bus of its own will do — Plasma
+5.27's has the same protocols and the same permission check as Plasma 6:
+
+```bash
+KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual --width 1600 --height 1000 --no-lockscreen --socket kwin-0
+```
+
+The variable is read by KWin, not by the client, and lets the test binary in,
+which no `.desktop` entry names. Leave it out to see Tain earn the permission
+through the entry it writes. KWin under software rendering answers slowly; give
+a window a few seconds to appear in its list.
+
 ## What is left
 
 In order of value.
@@ -349,28 +399,37 @@ In order of value.
    the guest's frame rate, as on Windows.
 4. **Sound.** Leaving applications out, which means building the capture from
    their own PipeWire streams rather than the mix.
-5. **The guest's extras.** `tain://` links through `MimeType=` in the `.desktop`
-   file and a socket in `$XDG_RUNTIME_DIR`; immersive mode's keyboard on X11, through
-   `XGrabKeyboard`; pointer capture through winit's pointer lock.
-6. **NVIDIA.** Vulkan Video, which FFmpeg 7.1 decodes H.264, H.265 and AV1
+5. **Windows off Plasma.** Several at once through the portal's `multiple`
+   option, which needs reading several streams from one portal session; and
+   control on GNOME, whose remote desktop dialog may take a window — untried.
+6. **The guest's extras.** `tain://` links through `MimeType=` in the `.desktop`
+   entry and a socket in `$XDG_RUNTIME_DIR`; immersive mode's keyboard on X11,
+   through `XGrabKeyboard`; pointer capture through winit's pointer lock; and a
+   notification's click raising the window for certain, by handing the
+   activation token the notification service sends to `xdg-activation`, which
+   eframe has no way to take today — without it Plasma may only highlight the
+   taskbar entry.
+7. **NVIDIA.** Vulkan Video, which FFmpeg 7.1 decodes H.264, H.265 and AV1
    through on every vendor, would cover it, and could replace VA-API outright.
-7. **Unattended access and virtual displays.** A portal session needs someone
+8. **Unattended access and virtual displays.** A portal session needs someone
    logged in to grant it. The lock screen and a machine nobody is signed in to
    need the desktop's own remote desktop service (GNOME Remote Desktop, KDE's
    KRdp), or what Sunshine on Bazzite does: KMS capture with `CAP_SYS_ADMIN`
    and input through `/dev/uinput`, which needs a privileged install. The
    portal's *virtual* source type is the road to virtual displays.
-8. **Packaging.** A Flatpak on Flathub: portals are what a Flatpak may use
+9. **Packaging.** A Flatpak on Flathub: portals are what a Flatpak may use
    anyway, it brings its own runtime, and it is how Bazzite and SteamOS
-   install things. It needs a reverse-DNS application id.
+   install things. It needs a reverse-DNS application id, and gives up
+   KWin's window sharing: KWin keeps those interfaces from a sandboxed program
+   unless its desktop id is granted them.
 
 ## Open decisions
 
-- **The application id.** It is `tain`, which the `.desktop` file, the window
+- **The application id.** It is `tain`, which the `.desktop` entry, the window
   and the portal's remembered permissions all key on. Flathub requires a
   reverse-DNS one (`io.github.x_iso.Tain`, or one under a domain of your own).
-  Changing it later loses remembered sharing choices and renames the
-  `.desktop` file under anyone who installed the old one, so it is worth
+  Changing it later loses remembered sharing choices and leaves the old
+  `tain.desktop` behind under anyone whose Tain wrote one, so it is worth
   settling before a Flatpak.
 - **The glibc floor.** 2.35, which leaves out RHEL 9.
 - **Release gating.** `publish` waits for both platforms, so a broken Linux
